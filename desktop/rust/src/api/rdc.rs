@@ -519,7 +519,7 @@ pub fn sync_env(
     org_id: u64,
     sink: StreamSink<SyncPhase>,
 ) -> Result<()> {
-    let folder = PathBuf::from(folder);
+    let folder_path = PathBuf::from(&folder);
     let _ = sink.add(SyncPhase::Started);
 
     // Forward rdc's real, rendered log into the stream, line by line.
@@ -527,26 +527,49 @@ pub fn sync_env(
         sink: sink.clone(),
         buf: Vec::new(),
     };
-    // TODO(task-11): no prompt route is installed here, so a gate this cycle
-    // hits falls through to `read_line_coordinated`'s stdin branch and reads
-    // this GUI process's stdin — which is EOF. That degrades to `Skip`/`N`,
-    // which is safe but silent. Task 11 installs a route for `sync_env` too
-    // (the same registry key a watch uses), so a one-shot sync prompts
-    // exactly like a watch does; delete this comment there.
+
+    let cancel = rdc::cli::sync::watch::CancelToken::new();
+    let (answer_tx, answer_rx) = std::sync::mpsc::channel::<String>();
+    let next_id = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+    // Registered so `answer_prompt` can find this cycle. A watch on the same
+    // env would contend for the env lock anyway, so displacing one here is
+    // the same rule `watch_env` applies.
+    if let Some(previous) = crate::watch_registry::insert(
+        &folder,
+        &env,
+        crate::watch_registry::WatchHandle {
+            cancel: cancel.clone(),
+            answers: answer_tx,
+            next_prompt_id: next_id.clone(),
+        },
+    ) {
+        previous.cancel.cancel();
+    }
+    let route: std::sync::Arc<dyn rdc::cli::sync::embed::PromptRoute> =
+        std::sync::Arc::new(SinkPromptRoute {
+            sink: sink.clone(),
+            answers: std::sync::Mutex::new(answer_rx),
+            next_id,
+        });
+
     let result: Result<u64> = block_on(async {
-        rdc::cli::init::write_scaffold_files(&folder, &env, &api_base, org_id)?;
-        let token = rdc::secrets::resolve_token(&folder, &env, &api_base).await?;
-        rdc::cli::sync::embed::sync_logged(
-            &folder,
-            &env,
-            &token,
-            rdc::cli::sync::embed::EmbedSyncOptions::default(),
-            Box::new(forwarder),
-        )
+        rdc::cli::init::write_scaffold_files(&folder_path, &env, &api_base, org_id)?;
+        let token = rdc::secrets::resolve_token(&folder_path, &env, &api_base).await?;
+        rdc::cli::sync::embed::with_route(route, async {
+            rdc::cli::sync::embed::sync_logged(
+                &folder_path,
+                &env,
+                &token,
+                rdc::cli::sync::embed::EmbedSyncOptions::default(),
+                Box::new(forwarder),
+            )
+            .await
+        })
         .await?;
-        Ok(discover::count_files(&folder.join(format!("envs/{env}"))))
+        Ok(discover::count_files(&folder_path.join(format!("envs/{env}"))))
     });
 
+    crate::watch_registry::remove(&folder, &env);
     match result {
         Ok(file_count) => {
             // run_cycle omits its closing summary when a renderer is supplied,
@@ -591,6 +614,173 @@ impl std::io::Write for LineForwarder {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------- watch
+
+/// Turns a blocked core prompt into a `SyncPhase::Prompt` on the stream and
+/// blocks until the UI answers through `answer_prompt`.
+///
+/// `[e]` (shells out to $EDITOR) and `[h]` (a stateful per-hunk walk) are
+/// stripped from the offered keys: neither has a meaning in a GUI process.
+/// The core's own re-prompt loop covers the case where an answer arrives
+/// that is not in the offered set.
+struct SinkPromptRoute {
+    sink: StreamSink<SyncPhase>,
+    answers: std::sync::Mutex<std::sync::mpsc::Receiver<String>>,
+    next_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl rdc::cli::sync::embed::PromptRoute for SinkPromptRoute {
+    fn ask(&self, prompt: &rdc::cli::sync::embed::Prompt) -> Option<String> {
+        use std::sync::atomic::Ordering;
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let keys: Vec<PromptChoice> = prompt
+            .keys
+            .iter()
+            .filter(|k| !matches!(k.key, 'e' | 'h'))
+            .map(|k| PromptChoice {
+                key: k.key.to_string(),
+                label: k.label.clone(),
+            })
+            .collect();
+
+        let rx = self.answers.lock().unwrap();
+        // Drop anything queued from a previous prompt so a late answer can
+        // never be read as the answer to this one.
+        while rx.try_recv().is_ok() {}
+
+        if self
+            .sink
+            .add(SyncPhase::Prompt {
+                id,
+                kind: kind_to_dto(prompt.kind),
+                question: prompt.question.clone(),
+                keys,
+            })
+            .is_err()
+        {
+            return None; // Dart stream gone: degrade to EOF (skip / N).
+        }
+
+        let answer = rx.recv().ok();
+        let _ = self.sink.add(SyncPhase::PromptResolved { id });
+        answer
+    }
+}
+
+/// No catch-all arm on purpose: a future `PromptKind` variant must fail to
+/// compile here rather than silently fall through to some existing label —
+/// a wrong label on this path can mean a user answers a question they were
+/// never actually asked, on a flow that can delete objects from a live org.
+fn kind_to_dto(k: rdc::cli::sync::embed::PromptKind) -> PromptKindDto {
+    use rdc::cli::sync::embed::PromptKind as K;
+    match k {
+        K::Conflict => PromptKindDto::Conflict,
+        K::RemoteDelete => PromptKindDto::RemoteDelete,
+        K::PushDrift => PromptKindDto::PushDrift,
+        K::BulkConfirm => PromptKindDto::BulkConfirm,
+        K::DeleteGate => PromptKindDto::DeleteGate,
+        K::DeleteDrift => PromptKindDto::DeleteDrift,
+        K::MdhIndexDrop => PromptKindDto::MdhIndexDrop,
+        K::MdhRowDelete => PromptKindDto::MdhRowDelete,
+        K::Unknown => PromptKindDto::Unknown,
+    }
+}
+
+/// Watch one environment: reconcile once, then re-reconcile on a local file
+/// change or on the poll timer, until `stop_watch` is called.
+///
+/// Blocks the calling FRB pool thread for the watch's whole life (the pool
+/// is `num_cpus::get()` threads, so a great many concurrent watches would
+/// starve other bridge calls). Progress, prompts and the between-cycle
+/// countdown all arrive on `sink`.
+///
+/// Returns `Ok(())` even when the watch fails: the terminal outcome reaches
+/// the caller as `SyncPhase::Error` / `SyncPhase::Stopped`, matching
+/// `sync_env`'s contract.
+pub fn watch_env(
+    folder: String,
+    env: String,
+    api_base: String,
+    org_id: u64,
+    poll_secs: Option<u64>,
+    sink: StreamSink<SyncPhase>,
+) -> Result<()> {
+    let folder_path = PathBuf::from(&folder);
+    let _ = sink.add(SyncPhase::Started);
+
+    let cancel = rdc::cli::sync::watch::CancelToken::new();
+    let (answer_tx, answer_rx) = std::sync::mpsc::channel::<String>();
+    let handle = crate::watch_registry::WatchHandle {
+        cancel: cancel.clone(),
+        answers: answer_tx,
+        next_prompt_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+    };
+    // One watch per env: a second would fight the first for the env lock.
+    if let Some(previous) = crate::watch_registry::insert(&folder, &env, handle.clone()) {
+        previous.cancel.cancel();
+    }
+
+    let route: std::sync::Arc<dyn rdc::cli::sync::embed::PromptRoute> =
+        std::sync::Arc::new(SinkPromptRoute {
+            sink: sink.clone(),
+            answers: std::sync::Mutex::new(answer_rx),
+            next_id: handle.next_prompt_id.clone(),
+        });
+
+    let forwarder = LineForwarder {
+        sink: sink.clone(),
+        buf: Vec::new(),
+    };
+    let poll = poll_secs.map(std::time::Duration::from_secs);
+
+    let result: Result<()> = block_on(async {
+        rdc::cli::init::write_scaffold_files(&folder_path, &env, &api_base, org_id)?;
+        let token = rdc::secrets::resolve_token(&folder_path, &env, &api_base).await?;
+        rdc::cli::sync::embed::watch_logged(
+            &folder_path,
+            &env,
+            &api_base,
+            token,
+            poll,
+            Box::new(forwarder),
+            route,
+            cancel,
+        )
+        .await
+    });
+
+    crate::watch_registry::remove(&folder, &env);
+    match result {
+        Ok(()) => {
+            let _ = sink.add(SyncPhase::Stopped);
+        }
+        Err(e) => {
+            let _ = sink.add(SyncPhase::Error {
+                message: format!("{e:#}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Ask a running watch to stop. No-op if that env is not being watched.
+pub fn stop_watch(folder: String, env: String) -> Result<()> {
+    if let Some(h) = crate::watch_registry::get(&folder, &env) {
+        h.cancel.cancel();
+    }
+    Ok(())
+}
+
+/// Answer the prompt a watch (or a one-shot sync) is currently blocked on.
+/// No-op if nothing on that env is waiting — an answer for a prompt that
+/// has already been torn down is dropped, not queued.
+pub fn answer_prompt(folder: String, env: String, answer: String) -> Result<()> {
+    if let Some(h) = crate::watch_registry::get(&folder, &env) {
+        let _ = h.answers.send(answer);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- trash / reveal

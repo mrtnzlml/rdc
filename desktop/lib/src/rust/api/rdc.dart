@@ -8,9 +8,9 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 import 'package:freezed_annotation/freezed_annotation.dart' hide protected;
 part 'rdc.freezed.dart';
 
-// These functions are ignored because they are not marked as `pub`: `block_on`, `valid_env_name`, `write_credentials`
-// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `LineForwarder`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `assert_fields_are_eq`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `eq`, `eq`, `flush`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `from`, `from`, `from`, `write`
+// These functions are ignored because they are not marked as `pub`: `block_on`, `kind_to_dto`, `valid_env_name`, `write_credentials`
+// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `LineForwarder`, `SinkPromptRoute`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `ask`, `assert_fields_are_eq`, `assert_fields_are_eq`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `eq`, `eq`, `flush`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `from`, `from`, `from`, `write`
 
 /// rdc's package version, surfaced to the app's About box.
 Future<String?> rdcVersion() => RustLib.instance.api.crateApiRdcRdcVersion();
@@ -101,6 +101,48 @@ Stream<SyncPhase> syncEnv({
   env: env,
   apiBase: apiBase,
   orgId: orgId,
+);
+
+/// Watch one environment: reconcile once, then re-reconcile on a local file
+/// change or on the poll timer, until `stop_watch` is called.
+///
+/// Blocks the calling FRB pool thread for the watch's whole life (the pool
+/// is `num_cpus::get()` threads, so a great many concurrent watches would
+/// starve other bridge calls). Progress, prompts and the between-cycle
+/// countdown all arrive on `sink`.
+///
+/// Returns `Ok(())` even when the watch fails: the terminal outcome reaches
+/// the caller as `SyncPhase::Error` / `SyncPhase::Stopped`, matching
+/// `sync_env`'s contract.
+Stream<SyncPhase> watchEnv({
+  required String folder,
+  required String env,
+  required String apiBase,
+  required BigInt orgId,
+  BigInt? pollSecs,
+}) => RustLib.instance.api.crateApiRdcWatchEnv(
+  folder: folder,
+  env: env,
+  apiBase: apiBase,
+  orgId: orgId,
+  pollSecs: pollSecs,
+);
+
+/// Ask a running watch to stop. No-op if that env is not being watched.
+Future<void> stopWatch({required String folder, required String env}) =>
+    RustLib.instance.api.crateApiRdcStopWatch(folder: folder, env: env);
+
+/// Answer the prompt a watch (or a one-shot sync) is currently blocked on.
+/// No-op if nothing on that env is waiting — an answer for a prompt that
+/// has already been torn down is dropped, not queued.
+Future<void> answerPrompt({
+  required String folder,
+  required String env,
+  required String answer,
+}) => RustLib.instance.api.crateApiRdcAnswerPrompt(
+  folder: folder,
+  env: env,
+  answer: answer,
 );
 
 /// Move a managed Project's folder to the OS trash/recycle bin.

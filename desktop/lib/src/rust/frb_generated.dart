@@ -66,7 +66,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.12.0';
 
   @override
-  int get rustContentHash => 164498314;
+  int get rustContentHash => 401958785;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -87,6 +87,12 @@ abstract class RustLibApi extends BaseApi {
     required String parent,
     required String projectName,
     required AddEnvInput firstEnv,
+  });
+
+  Future<void> crateApiRdcAnswerPrompt({
+    required String folder,
+    required String env,
+    required String answer,
   });
 
   Future<ProjectSummary> crateApiRdcEditProject({
@@ -116,6 +122,11 @@ abstract class RustLibApi extends BaseApi {
 
   Future<void> crateApiRdcRevealInFileManager({required String path});
 
+  Future<void> crateApiRdcStopWatch({
+    required String folder,
+    required String env,
+  });
+
   Stream<SyncPhase> crateApiRdcSyncEnv({
     required String folder,
     required String env,
@@ -127,6 +138,14 @@ abstract class RustLibApi extends BaseApi {
 
   Future<ProjectSummary> crateApiRdcValidateExistingProject({
     required String path,
+  });
+
+  Stream<SyncPhase> crateApiRdcWatchEnv({
+    required String folder,
+    required String env,
+    required String apiBase,
+    required BigInt orgId,
+    BigInt? pollSecs,
   });
 }
 
@@ -207,6 +226,42 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   );
 
   @override
+  Future<void> crateApiRdcAnswerPrompt({
+    required String folder,
+    required String env,
+    required String answer,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(folder, serializer);
+          sse_encode_String(env, serializer);
+          sse_encode_String(answer, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 3,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiRdcAnswerPromptConstMeta,
+        argValues: [folder, env, answer],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiRdcAnswerPromptConstMeta => const TaskConstMeta(
+    debugName: "answer_prompt",
+    argNames: ["folder", "env", "answer"],
+  );
+
+  @override
   Future<ProjectSummary> crateApiRdcEditProject({
     required String folder,
     required String env,
@@ -222,7 +277,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 3,
+            funcId: 4,
             port: port_,
           );
         },
@@ -251,7 +306,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 4,
+            funcId: 5,
             port: port_,
           );
         },
@@ -281,7 +336,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 5,
+            funcId: 6,
             port: port_,
           );
         },
@@ -308,7 +363,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 6,
+            funcId: 7,
             port: port_,
           );
         },
@@ -340,7 +395,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 7,
+            funcId: 8,
             port: port_,
           );
         },
@@ -374,7 +429,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 8,
+            funcId: 9,
             port: port_,
           );
         },
@@ -404,7 +459,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 9,
+            funcId: 10,
             port: port_,
           );
         },
@@ -424,6 +479,38 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         debugName: "reveal_in_file_manager",
         argNames: ["path"],
       );
+
+  @override
+  Future<void> crateApiRdcStopWatch({
+    required String folder,
+    required String env,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(folder, serializer);
+          sse_encode_String(env, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 11,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiRdcStopWatchConstMeta,
+        argValues: [folder, env],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiRdcStopWatchConstMeta =>
+      const TaskConstMeta(debugName: "stop_watch", argNames: ["folder", "env"]);
 
   @override
   Stream<SyncPhase> crateApiRdcSyncEnv({
@@ -446,7 +533,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             pdeCallFfi(
               generalizedFrbRustBinding,
               serializer,
-              funcId: 10,
+              funcId: 12,
               port: port_,
             );
           },
@@ -478,7 +565,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 11,
+            funcId: 13,
             port: port_,
           );
         },
@@ -508,7 +595,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 12,
+            funcId: 14,
             port: port_,
           );
         },
@@ -528,6 +615,51 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         debugName: "validate_existing_project",
         argNames: ["path"],
       );
+
+  @override
+  Stream<SyncPhase> crateApiRdcWatchEnv({
+    required String folder,
+    required String env,
+    required String apiBase,
+    required BigInt orgId,
+    BigInt? pollSecs,
+  }) {
+    final sink = RustStreamSink<SyncPhase>();
+    unawaited(
+      handler.executeNormal(
+        NormalTask(
+          callFfi: (port_) {
+            final serializer = SseSerializer(generalizedFrbRustBinding);
+            sse_encode_String(folder, serializer);
+            sse_encode_String(env, serializer);
+            sse_encode_String(apiBase, serializer);
+            sse_encode_u_64(orgId, serializer);
+            sse_encode_opt_box_autoadd_u_64(pollSecs, serializer);
+            sse_encode_StreamSink_sync_phase_Sse(sink, serializer);
+            pdeCallFfi(
+              generalizedFrbRustBinding,
+              serializer,
+              funcId: 15,
+              port: port_,
+            );
+          },
+          codec: SseCodec(
+            decodeSuccessData: sse_decode_unit,
+            decodeErrorData: sse_decode_AnyhowException,
+          ),
+          constMeta: kCrateApiRdcWatchEnvConstMeta,
+          argValues: [folder, env, apiBase, orgId, pollSecs, sink],
+          apiImpl: this,
+        ),
+      ),
+    );
+    return sink.stream;
+  }
+
+  TaskConstMeta get kCrateApiRdcWatchEnvConstMeta => const TaskConstMeta(
+    debugName: "watch_env",
+    argNames: ["folder", "env", "apiBase", "orgId", "pollSecs", "sink"],
+  );
 
   @protected
   AnyhowException dco_decode_AnyhowException(dynamic raw) {
