@@ -1034,6 +1034,21 @@ Each test must be able to fail for the right reason: delete the `progress.writer
 the function under test, confirm the test goes red, restore it, confirm green. Report both
 observations — that is what distinguishes this from the test it replaces.
 
+- [ ] **Step 7d: Drop the `#[allow(dead_code)]` markers your wiring makes unnecessary**
+
+Task 4 could not land its API without them: this workspace sets `dead_code = "deny"`
+(`Cargo.toml:114`), so a deliberately-inert public item is a hard build error. It marked
+`PromptKey::new`, `PromptKind`, `install_route`, `RouteGuard` and `announce`, each with a
+comment naming the task that wires it.
+
+This task wires `announce`, `Prompt`, `PromptKey` and most `PromptKind` variants. Remove the
+`#[allow(dead_code)]` from every item that now has a real production caller, then build. The
+compiler is the arbiter: if removing one re-introduces the error, that item still has no
+non-test caller and the marker stays — say which in your report, and why.
+
+Leave the markers on anything only a later task wires (`install_route` and `RouteGuard` are
+wired in Task 8; the routing trait's consumer arrives in Task 11).
+
 - [ ] **Step 8: Prove every coordinated read has an announce**
 
 Run:
@@ -2149,6 +2164,17 @@ Note `SinkPromptRoute` must be `Send + Sync`: `StreamSink` is `Send + Sync`, `Mu
 ```
 
 The guard must live for the whole `block_on`, and `install_route` must be called **on the same thread** that runs the cycle — which it is, because `block_on` runs the future on this thread. Call `crate::watch_registry::remove(&folder, &env);` before returning.
+
+- [ ] **Step 2b: Confirm no `#[allow(dead_code)]` from Task 4 survives**
+
+Task 4 added item-level `#[allow(dead_code)]` to `stdin_coord`'s new API because this
+workspace denies dead code and nothing wired it yet. Task 5 removed the ones its own wiring
+made unnecessary. This task installs a `PromptRoute` for real, which is the last consumer.
+
+Remove every remaining marker and build. **Any item that still fails the `dead_code` lint
+after this task has no production caller at all** — that is a finding, not a marker to
+restore. Report it rather than re-adding the allow: it means either a wiring step was missed
+or the item is genuinely unused and should be deleted.
 
 - [ ] **Step 3: Regenerate and check the surface**
 
