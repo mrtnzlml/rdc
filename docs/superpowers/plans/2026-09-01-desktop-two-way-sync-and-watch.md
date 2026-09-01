@@ -1646,6 +1646,27 @@ pub async fn watch_logged(
 }
 ```
 
+- [ ] **Step 2b: Make `force_relogin`'s no-credentials message actionable**
+
+Task 6 shipped this message when an env has no stored credentials to re-login with:
+
+> the API token for env '<env>' was rejected (401), and this env has no saved
+> username/password to sign in with again. Update its token and retry.
+
+Its sibling for the same situation, `cli::auth::refresh_token_for_401` (`src/cli/auth.rs`
+~226), names three concrete remedies instead: re-run on a TTY to refresh interactively, set
+`RDC_USER_<ENV>` + `RDC_PASS_<ENV>`, or run `rdc auth <env> --token <new-token>`.
+
+This task is what wires `force_relogin` into the watch loop, so it owns how that failure
+reaches a user — and it reaches them as a dialog in a GUI, possibly hours into an unattended
+watch. "Update its token" does not say where or how. Rewrite it to name the concrete action a
+desktop user can take (the env's credentials are editable through the app's Edit dialog) and
+the CLI equivalent (`rdc auth <env> --token <new-token>`), keeping it to two sentences.
+
+Update the existing test in `src/secrets.rs` to assert against the new wording rather than
+deleting or loosening it — it currently checks the message names the env and mentions the
+token, and both must remain true.
+
 - [ ] **Step 3: Add a two-way embed test**
 
 `tests/embed_sync.rs` already stands up a `wiremock::MockServer` with the organization GET and all thirteen empty listings, then seeds an `rdc.toml` pointing at it. Create `tests/embed_sync_two_way.rs` by copying that whole fixture verbatim, then:
