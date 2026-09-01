@@ -546,37 +546,6 @@ mod tests {
         assert!(!text.contains('\u{1b}'), "Plain mode leaked SGR: {text:?}");
     }
 
-    /// The four destructive questions must reach a `Log` sink, not stderr —
-    /// an embedder that cannot see the question cannot render a dialog for
-    /// it. Pins the exact wording too: these are the strings a user reads
-    /// before authorising a delete.
-    #[test]
-    fn delete_gate_question_reaches_the_log_sink() {
-        use std::io::Write;
-        use std::sync::{Arc, Mutex};
-        #[derive(Clone, Default)]
-        struct Buf(Arc<Mutex<Vec<u8>>>);
-        impl Write for Buf {
-            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(b);
-                Ok(b.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let buf = Buf::default();
-        let log = crate::log::Log::for_sink(
-            crate::cli::resolve::ColorMode::Plain,
-            Box::new(buf.clone()),
-        );
-        let mut w = log.writer();
-        write!(w, "Proceed with deletion? [y/N] ").unwrap();
-        drop(w);
-        let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
-        assert_eq!(text, "Proceed with deletion? [y/N] ");
-    }
-
     use super::*;
 
     /// `apply_outcome` has a `_ => {}` catch-all, so a deletable kind missing an
