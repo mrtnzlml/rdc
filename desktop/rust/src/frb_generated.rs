@@ -38,7 +38,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.12.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -461862092;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 164498314;
 
 // Section: executor
 
@@ -225,98 +225,6 @@ fn wire__crate__api__rdc__list_projects_impl(
                         Result::<_, ()>::Ok(crate::api::rdc::list_projects(api_parent))?;
                     Ok(output_ok)
                 })())
-            }
-        },
-    )
-}
-fn wire__crate__api__rdc__prepare_promotion_impl(
-    port_: flutter_rust_bridge::for_generated::MessagePort,
-    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
-    rust_vec_len_: i32,
-    data_len_: i32,
-) {
-    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
-        flutter_rust_bridge::for_generated::TaskInfo {
-            debug_name: "prepare_promotion",
-            port: Some(port_),
-            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
-        },
-        move || {
-            let message = unsafe {
-                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
-                    ptr_,
-                    rust_vec_len_,
-                    data_len_,
-                )
-            };
-            let mut deserializer =
-                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
-            let api_folder = <String>::sse_decode(&mut deserializer);
-            let api_src = <String>::sse_decode(&mut deserializer);
-            let api_tgt = <String>::sse_decode(&mut deserializer);
-            let api_mirror = <bool>::sse_decode(&mut deserializer);
-            deserializer.end();
-            move |context| {
-                transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
-                    (move || {
-                        let output_ok = crate::api::rdc::prepare_promotion(
-                            api_folder, api_src, api_tgt, api_mirror,
-                        )?;
-                        Ok(output_ok)
-                    })(),
-                )
-            }
-        },
-    )
-}
-fn wire__crate__api__rdc__push_promotion_impl(
-    port_: flutter_rust_bridge::for_generated::MessagePort,
-    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
-    rust_vec_len_: i32,
-    data_len_: i32,
-) {
-    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
-        flutter_rust_bridge::for_generated::TaskInfo {
-            debug_name: "push_promotion",
-            port: Some(port_),
-            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
-        },
-        move || {
-            let message = unsafe {
-                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
-                    ptr_,
-                    rust_vec_len_,
-                    data_len_,
-                )
-            };
-            let mut deserializer =
-                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
-            let api_folder = <String>::sse_decode(&mut deserializer);
-            let api_src = <String>::sse_decode(&mut deserializer);
-            let api_tgt = <String>::sse_decode(&mut deserializer);
-            let api_mirror = <bool>::sse_decode(&mut deserializer);
-            let api_policy = <crate::api::rdc::ConflictPolicy>::sse_decode(&mut deserializer);
-            let api_allow_deletes = <bool>::sse_decode(&mut deserializer);
-            let api_sink = <StreamSink<
-                crate::api::rdc::SyncPhase,
-                flutter_rust_bridge::for_generated::SseCodec,
-            >>::sse_decode(&mut deserializer);
-            deserializer.end();
-            move |context| {
-                transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
-                    (move || {
-                        let output_ok = crate::api::rdc::push_promotion(
-                            api_folder,
-                            api_src,
-                            api_tgt,
-                            api_mirror,
-                            api_policy,
-                            api_allow_deletes,
-                            api_sink,
-                        )?;
-                        Ok(output_ok)
-                    })(),
-                )
             }
         },
     )
@@ -642,26 +550,6 @@ impl SseDecode for crate::api::rdc::AuthKind {
     }
 }
 
-impl SseDecode for bool {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
-        deserializer.cursor.read_u8().unwrap() != 0
-    }
-}
-
-impl SseDecode for crate::api::rdc::ConflictPolicy {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
-        let mut inner = <i32>::sse_decode(deserializer);
-        return match inner {
-            0 => crate::api::rdc::ConflictPolicy::UseIncoming,
-            1 => crate::api::rdc::ConflictPolicy::KeepTarget,
-            2 => crate::api::rdc::ConflictPolicy::Skip,
-            _ => unreachable!("Invalid variant for ConflictPolicy: {}", inner),
-        };
-    }
-}
-
 impl SseDecode for crate::api::rdc::EditConnectionInput {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -715,18 +603,6 @@ impl SseDecode for i64 {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
         deserializer.cursor.read_i64::<NativeEndian>().unwrap()
-    }
-}
-
-impl SseDecode for Vec<String> {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
-        let mut len_ = <i32>::sse_decode(deserializer);
-        let mut ans_ = Vec::with_capacity(len_ as usize);
-        for idx_ in 0..len_ {
-            ans_.push(<String>::sse_decode(deserializer));
-        }
-        return ans_;
     }
 }
 
@@ -815,14 +691,6 @@ impl SseDecode for crate::api::rdc::ProjectSummary {
     }
 }
 
-impl SseDecode for crate::api::rdc::PromotionPreview {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
-        let mut var_plan = <Vec<String>>::sse_decode(deserializer);
-        return crate::api::rdc::PromotionPreview { plan: var_plan };
-    }
-}
-
 impl SseDecode for crate::api::rdc::SyncPhase {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -873,6 +741,13 @@ impl SseDecode for () {
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {}
 }
 
+impl SseDecode for bool {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        deserializer.cursor.read_u8().unwrap() != 0
+    }
+}
+
 fn pde_ffi_dispatcher_primary_impl(
     func_id: i32,
     port: flutter_rust_bridge::for_generated::MessagePort,
@@ -887,15 +762,13 @@ fn pde_ffi_dispatcher_primary_impl(
         3 => wire__crate__api__rdc__edit_project_impl(port, ptr, rust_vec_len, data_len),
         4 => wire__crate__api__rdc__init_app_impl(port, ptr, rust_vec_len, data_len),
         5 => wire__crate__api__rdc__list_projects_impl(port, ptr, rust_vec_len, data_len),
-        6 => wire__crate__api__rdc__prepare_promotion_impl(port, ptr, rust_vec_len, data_len),
-        7 => wire__crate__api__rdc__push_promotion_impl(port, ptr, rust_vec_len, data_len),
-        8 => wire__crate__api__rdc__rdc_version_impl(port, ptr, rust_vec_len, data_len),
-        9 => wire__crate__api__rdc__remove_env_impl(port, ptr, rust_vec_len, data_len),
-        10 => wire__crate__api__rdc__rename_env_impl(port, ptr, rust_vec_len, data_len),
-        11 => wire__crate__api__rdc__reveal_in_file_manager_impl(port, ptr, rust_vec_len, data_len),
-        12 => wire__crate__api__rdc__sync_env_impl(port, ptr, rust_vec_len, data_len),
-        13 => wire__crate__api__rdc__trash_project_impl(port, ptr, rust_vec_len, data_len),
-        14 => {
+        6 => wire__crate__api__rdc__rdc_version_impl(port, ptr, rust_vec_len, data_len),
+        7 => wire__crate__api__rdc__remove_env_impl(port, ptr, rust_vec_len, data_len),
+        8 => wire__crate__api__rdc__rename_env_impl(port, ptr, rust_vec_len, data_len),
+        9 => wire__crate__api__rdc__reveal_in_file_manager_impl(port, ptr, rust_vec_len, data_len),
+        10 => wire__crate__api__rdc__sync_env_impl(port, ptr, rust_vec_len, data_len),
+        11 => wire__crate__api__rdc__trash_project_impl(port, ptr, rust_vec_len, data_len),
+        12 => {
             wire__crate__api__rdc__validate_existing_project_impl(port, ptr, rust_vec_len, data_len)
         }
         _ => unreachable!(),
@@ -952,28 +825,6 @@ impl flutter_rust_bridge::IntoDart for crate::api::rdc::AuthKind {
 impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::rdc::AuthKind {}
 impl flutter_rust_bridge::IntoIntoDart<crate::api::rdc::AuthKind> for crate::api::rdc::AuthKind {
     fn into_into_dart(self) -> crate::api::rdc::AuthKind {
-        self
-    }
-}
-// Codec=Dco (DartCObject based), see doc to use other codecs
-impl flutter_rust_bridge::IntoDart for crate::api::rdc::ConflictPolicy {
-    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
-        match self {
-            Self::UseIncoming => 0.into_dart(),
-            Self::KeepTarget => 1.into_dart(),
-            Self::Skip => 2.into_dart(),
-            _ => unreachable!(),
-        }
-    }
-}
-impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
-    for crate::api::rdc::ConflictPolicy
-{
-}
-impl flutter_rust_bridge::IntoIntoDart<crate::api::rdc::ConflictPolicy>
-    for crate::api::rdc::ConflictPolicy
-{
-    fn into_into_dart(self) -> crate::api::rdc::ConflictPolicy {
         self
     }
 }
@@ -1045,23 +896,6 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::rdc::ProjectSummary>
     for crate::api::rdc::ProjectSummary
 {
     fn into_into_dart(self) -> crate::api::rdc::ProjectSummary {
-        self
-    }
-}
-// Codec=Dco (DartCObject based), see doc to use other codecs
-impl flutter_rust_bridge::IntoDart for crate::api::rdc::PromotionPreview {
-    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
-        [self.plan.into_into_dart().into_dart()].into_dart()
-    }
-}
-impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
-    for crate::api::rdc::PromotionPreview
-{
-}
-impl flutter_rust_bridge::IntoIntoDart<crate::api::rdc::PromotionPreview>
-    for crate::api::rdc::PromotionPreview
-{
-    fn into_into_dart(self) -> crate::api::rdc::PromotionPreview {
         self
     }
 }
@@ -1144,30 +978,6 @@ impl SseEncode for crate::api::rdc::AuthKind {
     }
 }
 
-impl SseEncode for bool {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
-        serializer.cursor.write_u8(self as _).unwrap();
-    }
-}
-
-impl SseEncode for crate::api::rdc::ConflictPolicy {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
-        <i32>::sse_encode(
-            match self {
-                crate::api::rdc::ConflictPolicy::UseIncoming => 0,
-                crate::api::rdc::ConflictPolicy::KeepTarget => 1,
-                crate::api::rdc::ConflictPolicy::Skip => 2,
-                _ => {
-                    unimplemented!("");
-                }
-            },
-            serializer,
-        );
-    }
-}
-
 impl SseEncode for crate::api::rdc::EditConnectionInput {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
@@ -1204,16 +1014,6 @@ impl SseEncode for i64 {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
         serializer.cursor.write_i64::<NativeEndian>(self).unwrap();
-    }
-}
-
-impl SseEncode for Vec<String> {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
-        <i32>::sse_encode(self.len() as _, serializer);
-        for item in self {
-            <String>::sse_encode(item, serializer);
-        }
     }
 }
 
@@ -1287,13 +1087,6 @@ impl SseEncode for crate::api::rdc::ProjectSummary {
     }
 }
 
-impl SseEncode for crate::api::rdc::PromotionPreview {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
-        <Vec<String>>::sse_encode(self.plan, serializer);
-    }
-}
-
 impl SseEncode for crate::api::rdc::SyncPhase {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
@@ -1337,6 +1130,13 @@ impl SseEncode for u8 {
 impl SseEncode for () {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {}
+}
+
+impl SseEncode for bool {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        serializer.cursor.write_u8(self as _).unwrap();
+    }
 }
 
 #[cfg(not(target_family = "wasm"))]
