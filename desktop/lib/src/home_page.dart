@@ -18,7 +18,7 @@ import 'update_check.dart';
 /// Which pane the main area shows. Selected from the sidebar (there is no rail).
 enum NavView { connection, overview, settings }
 
-enum _St { running, error, synced, never }
+enum _St { running, watching, error, synced, never }
 
 _St _statusOf(AppState s, ProjectItem it, EnvSummary env) {
   switch (s.syncState[s.envKey(it.summary.folder, env.name)]) {
@@ -27,6 +27,7 @@ _St _statusOf(AppState s, ProjectItem it, EnvSummary env) {
     case SyncState.error:
       return _St.error;
     default:
+      if (s.isWatching(it.summary.folder, env.name)) return _St.watching;
       return env.lastSyncUnix != null ? _St.synced : _St.never;
   }
 }
@@ -37,8 +38,28 @@ _St _statusOf(AppState s, ProjectItem it, EnvSummary env) {
       _St.error => ('error', c.dangerBg, c.dangerFg),
       _St.never => ('never', c.infoBg, c.infoFg),
       _St.running => ('syncing', c.infoBg, c.infoFg),
+      _St.watching => ('watching', c.infoBg, c.accent),
       _St.synced => ('synced', c.successBg, c.successFg),
     };
+
+/// True while a watch's stop is still unwinding: `stopWatchItem` flips
+/// `running` to false immediately (so the button can react), but the entry
+/// itself lingers in `state.watch` until `SyncPhase.stopped` arrives and
+/// clears it. `AppState.isWatching` reads false for that whole window, so a
+/// caller that checks only `isWatching` would let a second watch — or a
+/// plain Sync — start on top of a subscription that hasn't unwound yet,
+/// with both ending up writing into the same `pendingPrompts`/`watch` entry.
+bool _isStopping(AppState s, String folder, String env) {
+  final w = s.watch[s.envKey(folder, env)];
+  return w != null && !w.running;
+}
+
+/// Sync is refused for that same window: the Rust side treats a one-shot
+/// sync on a watched env as a deliberate displacement (it cancels the
+/// watch), so Sync must stay disabled for as long as a watch owns the
+/// cycle — watching or mid-stop.
+bool _syncBlocked(AppState s, String folder, String env) =>
+    s.isWatching(folder, env) || _isStopping(s, folder, env);
 
 String _rel(int? unix) {
   if (unix == null) return 'never';
@@ -78,6 +99,9 @@ class _HomePageState extends State<HomePage> {
   NavView _view = NavView.connection;
   double _listWidth = 250;
   String _tab = 'overview';
+  // Guards against stacking a second PromptDialog: set as soon as one is
+  // scheduled to show, cleared only after it's dismissed.
+  bool _promptOpen = false;
 
   @override
   void initState() {
@@ -166,47 +190,77 @@ class _HomePageState extends State<HomePage> {
     return Scaffold(
       body: ListenableBuilder(
         listenable: state,
-        builder: (context, _) => MdhScaffold(
-          state: state,
-          view: _view,
-          listWidth: _listWidth,
-          activeTab: _tab,
-          onResize: (dx) => setState(() => _listWidth = (_listWidth + dx).clamp(200.0, 460.0)),
-          onSelectTab: (t) => setState(() => _tab = t),
-          onSelectConn: (folder) => setState(() {
-            state.selectProject(folder);
-            _view = NavView.connection;
-          }),
-          onSelectEnv: (folder, env) => setState(() {
-            state.selectEnv(folder, env);
-            _view = NavView.connection;
-          }),
-          onSelectFleet: () => setState(() => _view = NavView.overview),
-          onSelectSettings: () => setState(() => _view = NavView.settings),
-          onAdd: _addConnection,
-          onOpen: _openExisting,
-          onSync: (p, e) => state.syncEnvItem(p, e),
-          onSyncAll: _syncAll,
-          onEdit: _editConnection,
-          onReveal: _reveal,
-          onRemove: _confirmRemove,
-          onRevealDir: (path) => _run(() => state.reveal(path)),
-          onAddEnv: _addEnv,
-          onEditEnv: _editEnv,
-          onRemoveEnv: _confirmRemoveEnv,
-          onChooseParent: _chooseParent,
-          onAbout: _about,
-          onCheckUpdate: () async {
-            final messenger = ScaffoldMessenger.of(context);
-            final info = await checkForUpdate();
-            if (!mounted) return;
-            messenger.showSnackBar(SnackBar(
-              content: Text(info == null
-                  ? "You're on the latest version (or the check couldn't reach GitHub)."
-                  : 'A newer version (${info.latest}) is available on GitHub Releases.'),
-            ));
-          },
-        ),
+        builder: (context, _) {
+          // One dialog at a time, oldest first. A second env blocking while
+          // this is open waits its turn; its row still shows the watching
+          // badge.
+          final pending = state.promptQueue;
+          if (pending.isNotEmpty && !_promptOpen) {
+            _promptOpen = true;
+            final p = pending.first;
+            WidgetsBinding.instance.addPostFrameCallback((_) async {
+              await showDialog<void>(
+                context: context,
+                barrierDismissible: false, // a cycle is blocked; there is no "later"
+                builder: (_) => PromptDialog(
+                  prompt: p,
+                  logTail: (state.syncLog[state.envKey(p.folder, p.env)] ?? const <String>[])
+                      .reversed
+                      .take(40)
+                      .toList()
+                      .reversed
+                      .toList(),
+                  onAnswer: (k) {
+                    state.answer(p, k);
+                    Navigator.of(context).pop();
+                  },
+                ),
+              );
+              _promptOpen = false;
+            });
+          }
+          return MdhScaffold(
+            state: state,
+            view: _view,
+            listWidth: _listWidth,
+            activeTab: _tab,
+            onResize: (dx) => setState(() => _listWidth = (_listWidth + dx).clamp(200.0, 460.0)),
+            onSelectTab: (t) => setState(() => _tab = t),
+            onSelectConn: (folder) => setState(() {
+              state.selectProject(folder);
+              _view = NavView.connection;
+            }),
+            onSelectEnv: (folder, env) => setState(() {
+              state.selectEnv(folder, env);
+              _view = NavView.connection;
+            }),
+            onSelectFleet: () => setState(() => _view = NavView.overview),
+            onSelectSettings: () => setState(() => _view = NavView.settings),
+            onAdd: _addConnection,
+            onOpen: _openExisting,
+            onSync: (p, e) => state.syncEnvItem(p, e),
+            onSyncAll: _syncAll,
+            onEdit: _editConnection,
+            onReveal: _reveal,
+            onRemove: _confirmRemove,
+            onRevealDir: (path) => _run(() => state.reveal(path)),
+            onAddEnv: _addEnv,
+            onEditEnv: _editEnv,
+            onRemoveEnv: _confirmRemoveEnv,
+            onChooseParent: _chooseParent,
+            onAbout: _about,
+            onCheckUpdate: () async {
+              final messenger = ScaffoldMessenger.of(context);
+              final info = await checkForUpdate();
+              if (!mounted) return;
+              messenger.showSnackBar(SnackBar(
+                content: Text(info == null
+                    ? "You're on the latest version (or the check couldn't reach GitHub)."
+                    : 'A newer version (${info.latest}) is available on GitHub Releases.'),
+              ));
+            },
+          );
+        },
       ),
     );
   }
@@ -514,10 +568,19 @@ class _EnvRow extends StatelessWidget {
     final c = MdhColors.of(context);
     final sel = item.summary.folder == state.selectedFolder && env.name == state.selectedEnv;
     final st = _statusOf(state, item, env);
-    final dotColor = switch (st) { _St.error => c.danger, _St.never => c.textHint, _ => c.successFg };
+    final w = state.watch[state.envKey(item.summary.folder, env.name)];
     final sub = switch (st) {
-      _St.running => 'syncing…', _St.error => 'failed',
-      _St.synced => _rel(env.lastSyncUnix), _St.never => 'never',
+      _St.running => 'syncing…',
+      _St.watching => w?.nextPollSecs != null ? 'watching · ${w!.nextPollSecs}s' : 'watching',
+      _St.error => 'failed',
+      _St.synced => _rel(env.lastSyncUnix),
+      _St.never => 'never',
+    };
+    final dotColor = switch (st) {
+      _St.error => c.danger,
+      _St.never => c.textHint,
+      _St.watching => c.accent,
+      _ => c.successFg,
     };
     return Padding(
       padding: const EdgeInsets.only(left: 14, top: 1, bottom: 1),
@@ -655,6 +718,9 @@ class _ConnBar extends StatelessWidget {
   Widget build(BuildContext context) {
     final c = MdhColors.of(context);
     final st = _statusOf(state, item, env);
+    final watching = state.isWatching(item.summary.folder, env.name);
+    final stopping = _isStopping(state, item.summary.folder, env.name);
+    final syncBlocked = _syncBlocked(state, item.summary.folder, env.name);
     return Container(
       padding: const EdgeInsets.fromLTRB(18, 12, 18, 12),
       decoration: BoxDecoration(
@@ -691,7 +757,21 @@ class _ConnBar extends StatelessWidget {
             ),
           ),
           const SizedBox(width: 12),
-          MdhBtn(label: st == _St.error ? 'Retry' : 'Sync', primary: true, onTap: st == _St.running ? null : () => onSync(item, env)),
+          Tooltip(
+            message: syncBlocked ? 'Stop watching before syncing' : (st == _St.error ? 'Retry' : 'Sync'),
+            child: MdhBtn(
+              label: st == _St.error ? 'Retry' : 'Sync',
+              primary: true,
+              onTap: (st == _St.running || syncBlocked) ? null : () => onSync(item, env),
+            ),
+          ),
+          const SizedBox(width: 8),
+          MdhBtn(
+            label: watching ? 'Stop' : 'Watch',
+            onTap: watching
+                ? () => state.stopWatchItem(item, env)
+                : (stopping ? null : () => state.watchEnvItem(item, env)),
+          ),
           const SizedBox(width: 8),
           MdhBtn(label: 'Edit', onTap: () => onEdit(item)),
           const SizedBox(width: 8),
@@ -802,6 +882,7 @@ class _SyncLogCardState extends State<_SyncLogCard> {
     } else {
       final (String text, Color col) = switch (st) {
         _St.running => ('syncing…', c.textPrimary),
+        _St.watching => ('watching…', c.textPrimary),
         _St.error => ('✕ ${msg ?? 'sync failed'}', c.dangerFg),
         _St.synced => ('✓ ${msg ?? 'up to date · ${_rel(widget.env.lastSyncUnix)} ago'}', c.successFg),
         _St.never => ('— not synced yet', c.textSecondary),
@@ -956,7 +1037,9 @@ class _EnvTable extends StatelessWidget {
   // those same columns inside one Expanded (see _EnvTableRow) to keep the
   // action buttons outside the row's tap target.
   static const _infoFlex = 8;
-  static const _actionsFlex = 3;
+  // 4 (not 3): the action cluster grew a 4th icon button (watch) in task 14
+  // and 3 no longer leaves enough width for it at narrow window sizes.
+  static const _actionsFlex = 4;
 
   @override
   Widget build(BuildContext context) {
@@ -1033,6 +1116,9 @@ class _EnvTableRow extends StatelessWidget {
     final c = MdhColors.of(context);
     final st = _statusOf(state, item, env);
     final (String badge, Color bg, Color fg) = _badgeFor(c, st);
+    final watching = state.isWatching(item.summary.folder, env.name);
+    final stopping = _isStopping(state, item.summary.folder, env.name);
+    final syncBlocked = _syncBlocked(state, item.summary.folder, env.name);
     Widget cell(Widget child, {int flex = 1}) =>
         Expanded(flex: flex, child: Padding(padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11), child: child));
 
@@ -1068,8 +1154,16 @@ class _EnvTableRow extends StatelessWidget {
             child: Row(mainAxisAlignment: MainAxisAlignment.end, mainAxisSize: MainAxisSize.min, children: [
               _RowIconBtn(
                 icon: Icons.sync,
-                tooltip: st == _St.error ? 'Retry' : 'Sync',
-                onTap: st == _St.running ? null : () => onSync(item, env),
+                tooltip: syncBlocked ? 'Stop watching before syncing' : (st == _St.error ? 'Retry' : 'Sync'),
+                onTap: (st == _St.running || syncBlocked) ? null : () => onSync(item, env),
+              ),
+              const SizedBox(width: 6),
+              _RowIconBtn(
+                icon: watching ? Icons.visibility : Icons.visibility_outlined,
+                tooltip: watching ? 'Stop watching' : (stopping ? 'Stopping…' : 'Watch'),
+                onTap: watching
+                    ? () => state.stopWatchItem(item, env)
+                    : (stopping ? null : () => state.watchEnvItem(item, env)),
               ),
               const SizedBox(width: 6),
               _RowIconBtn(icon: Icons.edit_outlined, tooltip: 'Edit', onTap: () => onEdit(item, env)),
@@ -1669,6 +1763,7 @@ class _StatusPill extends StatelessWidget {
     final c = MdhColors.of(context);
     final (String label, Color bg, Color fg, Color bd) = switch (st) {
       _St.running => ('● syncing', c.infoBg, c.infoFg, c.infoBorder),
+      _St.watching => ('◐ watching', c.infoBg, c.accent, c.infoBorder),
       _St.error => ('✕ sync failed', c.dangerBg, c.dangerFg, c.dangerBorder),
       _St.synced => ('● synced', c.successBg, c.successFg, c.successBorder),
       _St.never => ('○ never synced', c.warningBg, c.warningFg, c.warningBorder),
