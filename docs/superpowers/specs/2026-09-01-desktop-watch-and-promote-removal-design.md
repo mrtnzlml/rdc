@@ -286,25 +286,39 @@ line instead of tearing against it.
 
 ```rust
 pub struct PromptKey { pub key: char, pub label: String }
-pub struct Prompt { pub text: String, pub keys: Vec<PromptKey>, pub kind: PromptKind }
+pub enum PromptKind { Conflict, RemoteDelete, PushDrift, BulkConfirm,
+                      DeleteGate, DeleteDrift, MdhIndexDrop, MdhRowDelete }
+pub struct Prompt { pub kind: PromptKind, pub question: String, pub keys: Vec<PromptKey> }
 
-pub fn ask<W: Write>(w: &mut W, p: &Prompt) -> io::Result<Option<String>>;
+pub fn announce(p: Prompt);
 ```
 
-`text` renders exactly as today, so the CLI is unaffected; `keys` is the
-machine-readable half. All seven sites call `ask`; the existing re-prompt loops
-simply call it again on unrecognised input.
+Each site declares what it is asking immediately before writing the question,
+then writes and reads exactly as it does today. `question` is the same string
+the terminal shows; `keys` is the machine-readable half.
+
+**Why `announce` and not a combined `ask(w, &prompt)` that both writes and
+reads.** The three big resolvers take a generic `R: BufRead` input precisely so
+their unit tests can drive them with a `Cursor`. Folding the read into `ask`
+would route those tests through the coordinator and break every one of them.
+Splitting the two halves leaves the read path untouched: a test supplying its
+own `Cursor` never reaches `read_line_coordinated`, and only production, which
+uses `CoordinatorStdin`, sees the route.
+
+Eight sites announce, not seven — `confirm_bulk` is a nested read inside the
+conflict prompt, and without its own announce it would inherit an
+already-consumed slot and show the app a stale question.
 
 ### 6.4 Thread-local prompt routing
 
 ```rust
 pub trait PromptRoute: Send + Sync {
-    fn ask(&self, req: PromptRequest) -> Option<String>;   // None = EOF/cancel
+    fn ask(&self, prompt: &Prompt) -> Option<String>;   // None = EOF/cancel
 }
 thread_local! { static ROUTE: RefCell<Option<Arc<dyn PromptRoute>>> = … }
 ```
 
-Resolution order inside `ask` / `read_line_coordinated`: **thread-local route →
+Resolution order inside `read_line_coordinated`: **thread-local route →
 global `COORD` → real stdin.** The CLI never installs a thread-local, so its
 path is provably untouched, and the global coordinator keeps working for
 `--watch` on a TTY.
@@ -435,7 +449,7 @@ bidirectional.
 
 1. Pin CLI prompt output (§10.1). No behaviour change.
 2. `Log::writer()`; move the three stderr sinks and four `eprint!`s onto it.
-3. `Prompt` / `ask` / thread-local `PromptRoute`; CLI unchanged throughout.
+3. `Prompt` / `announce` / thread-local `PromptRoute`; CLI unchanged throughout.
 4. `WatchConfig` + generalized `event_loop`; `run_watch` becomes a thin caller.
 5. `embed::sync_logged` + `embed::watch_logged` + `secrets::force_relogin`.
 6. Remove promote from the bridge; add `watch_env` / `stop_watch` /
