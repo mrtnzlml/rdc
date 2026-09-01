@@ -22,12 +22,13 @@ PendingPrompt _conflict() => PendingPrompt(
 
 void main() {
   testWidgets('offers one button per key and reports the key pressed', (t) async {
+    final prompt = _conflict();
     String? answered;
     await t.pumpWidget(MaterialApp(
       theme: mdhTheme(Brightness.light),
       home: Scaffold(
         body: PromptDialog(
-          prompt: _conflict(),
+          prompt: prompt,
           logTail: ['patch  queues  invoices  +2  -1'],
           onAnswer: (k) => answered = k,
         ),
@@ -40,6 +41,11 @@ void main() {
     // exact match isolates the button itself.
     expect(find.text('[k] keep local'), findsOneWidget);
     expect(find.text('[r] use dev'), findsOneWidget);
+    expect(find.text('[s] skip (shadow file)'), findsOneWidget);
+    expect(find.text('[a] abort'), findsOneWidget);
+    // One button per key, no more, no fewer — a stray extra button would
+    // otherwise pass the four checks above unnoticed.
+    expect(find.byType(MdhBtn), findsNWidgets(prompt.keys.length));
     // The two terminal-only keys must never reach the UI, in either the
     // buttons or the raw question line.
     expect(find.textContaining('[e]'), findsNothing);

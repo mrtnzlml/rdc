@@ -10,20 +10,31 @@ import 'watch_state.dart';
 // ------------------------------------------------------------ shared shell
 
 /// MDH-style modal: a clean card with a title, body, and a right-aligned
-/// Cancel + primary action.
+/// action row. By default that row is Cancel + one primary action (every
+/// dialog below except [PromptDialog] uses this). Pass [actions] to render a
+/// different row **in place of** that default footer instead — [PromptDialog]
+/// needs this because its answer set is N keys the core already chose, none
+/// of which is a generic "Cancel", and the default Cancel button pops the
+/// dialog via `Navigator.pop` **without calling any handler** — exactly
+/// wrong for a dialog whose whole point is that a worker thread is parked
+/// behind it waiting for one specific key to come back.
 class _Frame extends StatelessWidget {
   const _Frame({
     required this.title,
     required this.child,
-    required this.primaryLabel,
-    required this.onPrimary,
+    this.primaryLabel,
+    this.onPrimary,
     this.busy = false,
-  });
+    this.actions,
+    this.maxWidth = 440,
+  }) : assert(actions != null || primaryLabel != null, 'either actions, or primaryLabel/onPrimary, is required');
   final String title;
   final Widget child;
-  final String primaryLabel;
+  final String? primaryLabel;
   final VoidCallback? onPrimary;
   final bool busy;
+  final List<Widget>? actions;
+  final double maxWidth;
 
   @override
   Widget build(BuildContext context) {
@@ -33,7 +44,7 @@ class _Frame extends StatelessWidget {
       surfaceTintColor: Colors.transparent,
       shape: RoundedRectangleBorder(side: BorderSide(color: c.border), borderRadius: BorderRadius.circular(10)),
       child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 440),
+        constraints: BoxConstraints(maxWidth: maxWidth),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -47,17 +58,19 @@ class _Frame extends StatelessWidget {
             Flexible(child: SingleChildScrollView(padding: const EdgeInsets.fromLTRB(20, 8, 20, 8), child: child)),
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 8, 16, 14),
-              child: Row(children: [
-                const Spacer(),
-                TextButton(onPressed: () => Navigator.of(context).pop(false), child: const Text('Cancel')),
-                const SizedBox(width: 8),
-                FilledButton(
-                  onPressed: busy ? null : onPrimary,
-                  child: busy
-                      ? const SizedBox(width: 15, height: 15, child: CircularProgressIndicator(strokeWidth: 2))
-                      : Text(primaryLabel),
-                ),
-              ]),
+              child: actions != null
+                  ? Wrap(alignment: WrapAlignment.end, spacing: 8, runSpacing: 8, children: actions!)
+                  : Row(children: [
+                      const Spacer(),
+                      TextButton(onPressed: () => Navigator.of(context).pop(false), child: const Text('Cancel')),
+                      const SizedBox(width: 8),
+                      FilledButton(
+                        onPressed: busy ? null : onPrimary,
+                        child: busy
+                            ? const SizedBox(width: 15, height: 15, child: CircularProgressIndicator(strokeWidth: 2))
+                            : Text(primaryLabel!),
+                      ),
+                    ]),
             ),
           ],
         ),
@@ -477,15 +490,15 @@ class RemoveEnvDialog extends StatelessWidget {
 /// is where the diff, the connector line and the object list already are,
 /// in colour — and the buttons are exactly the keys the core offered.
 ///
-/// This does not build on [_Frame]. `_Frame` bakes in exactly one Cancel
-/// button (which pops the dialog without answering anything) plus one
-/// primary action, but a prompt's answer set is N keys chosen by the core
-/// and rendered verbatim — there is no separate "Cancel" to add, and no
-/// single action to call primary. Adding a `_Frame`-supplied Cancel button
-/// would let the user dismiss the dialog without an answer while the worker
-/// thread behind it stays parked waiting for one, and would render a key
-/// (“Cancel”) the core never offered. So this dialog uses the same visual
-/// shell (card, border, rounded corners, title styling) by hand instead.
+/// Built on [_Frame] like every other dialog here, but passes [actions]
+/// instead of a `primaryLabel`/`onPrimary` pair: `_Frame`'s default footer
+/// bakes in exactly one Cancel button (which pops the dialog without
+/// answering anything) plus one primary action, but a prompt's answer set is
+/// N keys chosen by the core and rendered verbatim — there is no separate
+/// "Cancel" to add, and no single action to call primary. Letting `_Frame`
+/// supply its default Cancel button would let the user dismiss the dialog
+/// without an answer while the worker thread behind it stays parked waiting
+/// for one, and would render a key ("Cancel") the core never offered.
 class PromptDialog extends StatelessWidget {
   const PromptDialog({
     super.key,
@@ -506,65 +519,37 @@ class PromptDialog extends StatelessWidget {
       spans.addAll(ansiSpans(logTail[i], c, 12.5));
       if (i < logTail.length - 1) spans.add(const TextSpan(text: '\n'));
     }
-    return Dialog(
-      backgroundColor: c.bgCard,
-      surfaceTintColor: Colors.transparent,
-      shape: RoundedRectangleBorder(side: BorderSide(color: c.border), borderRadius: BorderRadius.circular(10)),
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 560),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 18, 20, 6),
-              child: Text(
-                '${prompt.title} · ${prompt.env}',
-                style: TextStyle(color: c.textPrimary, fontSize: 16, fontWeight: FontWeight.w600),
-              ),
+    return _Frame(
+      title: '${prompt.title} · ${prompt.env}',
+      maxWidth: 560,
+      actions: [
+        for (final k in prompt.keys)
+          MdhBtn(
+            label: '[${k.key}] ${k.label}',
+            primary: k.key == 'n' || k.key == 's',
+            onTap: () => onAnswer(k.key),
+          ),
+      ],
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: double.infinity,
+            constraints: const BoxConstraints(maxHeight: 260),
+            decoration: BoxDecoration(
+              color: c.bgCode,
+              border: Border.all(color: c.borderCard),
+              borderRadius: BorderRadius.circular(6),
             ),
-            Flexible(
-              child: SingleChildScrollView(
-                padding: const EdgeInsets.fromLTRB(20, 8, 20, 0),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Container(
-                      width: double.infinity,
-                      constraints: const BoxConstraints(maxHeight: 260),
-                      decoration: BoxDecoration(
-                        color: c.bgCode,
-                        border: Border.all(color: c.borderCard),
-                        borderRadius: BorderRadius.circular(6),
-                      ),
-                      padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
-                      child: SingleChildScrollView(
-                        child: SelectableText.rich(TextSpan(children: spans)),
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    SelectableText(prompt.question, style: monoStyle(c.textSecondary, 12.5)),
-                  ],
-                ),
-              ),
+            padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
+            child: SingleChildScrollView(
+              child: SelectableText.rich(TextSpan(children: spans)),
             ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 12, 20, 18),
-              child: Wrap(
-                spacing: 8,
-                runSpacing: 8,
-                children: [
-                  for (final k in prompt.keys)
-                    MdhBtn(
-                      label: '[${k.key}] ${k.label}',
-                      primary: k.key == 'n' || k.key == 's',
-                      onTap: () => onAnswer(k.key),
-                    ),
-                ],
-              ),
-            ),
-          ],
-        ),
+          ),
+          const SizedBox(height: 12),
+          SelectableText(prompt.question, style: monoStyle(c.textSecondary, 12.5)),
+        ],
       ),
     );
   }
