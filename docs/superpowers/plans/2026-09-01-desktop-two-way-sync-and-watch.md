@@ -2391,6 +2391,17 @@ Add to `AppState`:
 
 Check the generated `watchEnv`'s actual `pollSecs` parameter type before compiling: the Rust side is `Option<u64>`, which FRB renders as `BigInt?`. If the generated signature differs, match it rather than changing the Rust.
 
+- [ ] **Step 2c: Fix the now-false "Pulled N files" message**
+
+`app_state.dart`'s `syncEnvItem` sets `syncMessage[k] = 'Pulled $fileCount files'` on
+`SyncPhase_Done`. That wording is left over from when the app was pull-only. `sync_env` is
+two-way as of Task 9, so a cycle that pushed — or pushed and pulled — still reports "Pulled".
+
+Reword it to something true of a two-way cycle. `fileCount` is the count of files in
+`envs/<env>/` after the cycle, not a number of changes, so do not invent a change count the
+value cannot support — "Synced · N files" or similar is honest. Check what the Rust side
+actually puts in `Done { file_count }` before choosing the wording.
+
 - [ ] **Step 3: Write the tests**
 
 Create `desktop/test/watch_state_test.dart`:
