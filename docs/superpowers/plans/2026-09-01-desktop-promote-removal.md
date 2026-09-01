@@ -93,7 +93,7 @@ Run:
 ```bash
 cd desktop && flutter test test/project_view_test.dart test/app_state_test.dart test/sidebar_multi_env_test.dart
 ```
-Expected: all pass. (`test/promote_test.dart` is expected to still pass too — it drives `AppState`, not the widgets. It is deleted in Task 2.)
+Expected: all pass. (`test/promote_test.dart` is NOT run here: it has a four-`testWidgets` group driving `_PromotePanel`, three of which fail once this step deletes the panel from `_ProjectView` — that's why this step runs a scoped list of test files rather than the full suite. `promote_test.dart` is deleted in Task 2.)
 
 - [ ] **Step 5: Commit**
 
