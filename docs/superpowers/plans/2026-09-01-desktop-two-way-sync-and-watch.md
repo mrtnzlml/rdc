@@ -2986,7 +2986,35 @@ unattended and repeatedly.
 
 Verify each flag against `src/cli/mod.rs`'s `Sync` variant before writing it — the arg definitions are the source of truth, not this plan.
 
-- [ ] **Step 5: Full verification**
+- [ ] **Step 5: Correct three stale doc comments in `src/` that this plan's predecessor could not touch**
+
+The promote-removal plan froze `src/`, so three comments there still assert a desktop promote
+path that no longer exists. They were found by that plan's whole-branch review and handed
+forward, because nothing else in this plan touches `migrate` and they would otherwise persist
+indefinitely.
+
+`src/cli/sync/embed.rs` — the `sync_push_logged` doc says "Used by the desktop app's promote
+Push." Task 8 of this plan deletes that function outright, so this one **self-resolves**; only
+verify it is gone.
+
+`src/cli/migrate/mod.rs`, on `run_at` (near line 2573) — documented as "the embedding seam
+non-CLI consumers (e.g. the desktop app's promote flow) use". No non-CLI consumer remains;
+`run_at`'s only caller is now `migrate::run`. The function is still needed — rewrite the
+comment to describe what it is (the cwd-parameterised form of `migrate::run`) without claiming
+a caller that does not exist.
+
+`src/cli/migrate/mod.rs`, on `format_saved_view_ref_error` (near line 743) — its rationale
+reads "the whole listing lives in the returned error rather than in `eprintln!`s beside it,
+because `run_at` is also the desktop app's promote seam: an error written straight to stderr
+never reaches a GUI." The behaviour is right and stays; the justification is dead. Keep the
+first half (an error carrying its own listing is better than stderr side-effects) and drop the
+promote-seam clause.
+
+Verify the line numbers before editing — they are from a review at `5fe7b6a` and this plan has
+changed `src/` since. Grep for `promote` under `src/` and fix what you find; there should be
+nothing left after this step.
+
+- [ ] **Step 6: Full verification**
 
 Run:
 ```bash
@@ -2996,10 +3024,10 @@ cd desktop && flutter analyze && flutter test && flutter build macos 2>&1 | tail
 ```
 Expected: all green.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add desktop/test/golden_mdh_test.dart desktop/test/goldens desktop/README.md README.md
+git add desktop/test/golden_mdh_test.dart desktop/test/goldens desktop/README.md README.md src/cli/migrate/mod.rs
 git commit -m "docs: document sync-and-watch, and --watch in the root README
 
 --watch shipped in 2026-05 and has never been in the README.
