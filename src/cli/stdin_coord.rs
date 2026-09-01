@@ -48,11 +48,12 @@ impl PromptKey {
 /// Which decision is being asked. A non-terminal consumer uses this to
 /// title its dialog; the resolvers do not branch on it.
 ///
-/// Only `Conflict` is constructed by this task's own code (`Prompt::unknown`);
-/// the rest are named ahead of the prompt sites that will construct them
-/// (`announce` call sites land in the next task of this plan). `dead_code`
-/// is denied workspace-wide, hence the explicit allow rather than leaving
-/// this route half-typed.
+/// `Unknown` is the only variant this task's own code constructs
+/// (`Prompt::unknown`, the fallback for a read whose site never
+/// announced); the other eight are named ahead of the prompt sites that
+/// will construct them (`announce` call sites land in the next task of
+/// this plan). `dead_code` is denied workspace-wide, hence the explicit
+/// allow rather than leaving this route half-typed.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptKind {
@@ -64,6 +65,12 @@ pub enum PromptKind {
     DeleteDrift,
     MdhIndexDrop,
     MdhRowDelete,
+    /// A coordinated read whose site never called [`announce`]. Should be
+    /// unreachable in a correctly wired build — every resolver announces
+    /// before it reads — so it exists to make a missed announce loud (a
+    /// visibly wrong dialog) rather than silently disguised as one of the
+    /// real decisions above.
+    Unknown,
 }
 
 /// What a blocked prompt is asking, in machine-readable form. `question` is
@@ -77,11 +84,14 @@ pub struct Prompt {
 
 impl Prompt {
     /// Fallback for a coordinated read whose site has not announced —
-    /// a free-text answer with no offered keys. Keeps an un-announced read
-    /// working rather than panicking.
+    /// a free-text answer with no offered keys, labelled
+    /// [`PromptKind::Unknown`] rather than a real decision so a missed
+    /// `announce` call surfaces as visibly wrong instead of being
+    /// disguised as a legitimate one. Keeps an un-announced read working
+    /// rather than panicking.
     fn unknown() -> Self {
         Self {
-            kind: PromptKind::Conflict,
+            kind: PromptKind::Unknown,
             question: String::new(),
             keys: Vec::new(),
         }
@@ -119,6 +129,13 @@ pub fn install_route(route: Arc<dyn PromptRoute>) -> RouteGuard {
     RouteGuard(())
 }
 
+/// Uninstalls the calling thread's route (and drops any pending
+/// announcement) when this drops, so a route's lifetime bounds exactly
+/// one watch's prompts.
+///
+/// Nothing in the CLI constructs one yet — Task 8 wires the desktop
+/// bridge to hold this guard for the lifetime of a watch. `dead_code` is
+/// denied workspace-wide, hence the explicit allow.
 #[allow(dead_code)]
 pub struct RouteGuard(());
 
@@ -230,10 +247,21 @@ pub fn maybe_ring_bell() {
 /// Read one logical line for an interactive prompt. Returns `Ok(None)` at
 /// end of input. The returned string never includes the trailing newline.
 ///
-/// In watch mode (coordinator [`activate`]d) this registers as the waiting
-/// prompt and blocks until the owner delivers a line — it never touches the
-/// real stdin, so it cannot deadlock against the owner. Otherwise it reads
-/// the real stdin directly.
+/// Resolution order, highest priority first:
+///
+/// 1. A thread-local [`PromptRoute`] ([`install_route`]), for a
+///    non-terminal consumer such as the desktop app. Per-thread rather
+///    than process-global because a cycle never leaves its thread, so
+///    this is exactly one route per watch — see [`PromptRoute`]'s doc for
+///    why a process-global slot can't make that guarantee.
+/// 2. The process-global watch coordinator (coordinator [`activate`]d):
+///    registers as the waiting prompt and blocks until the owner
+///    delivers a line — it never touches the real stdin, so it cannot
+///    deadlock against the owner.
+/// 3. The real stdin, read directly.
+///
+/// The CLI never installs a route, so its path through steps 2 and 3 is
+/// unchanged.
 pub fn read_line_coordinated() -> io::Result<Option<String>> {
     // Ring the watch attention bell the moment a prompt blocks for input.
     // EVERY coordinated prompt (conflict / remote-delete / destructive-delete
@@ -440,6 +468,7 @@ mod tests {
         // Second read saw the fallback, not a stale copy of the first.
         assert_eq!(seen[0].question, "q");
         assert_eq!(seen[1].question, "");
+        assert_eq!(seen[1].kind, PromptKind::Unknown);
         drop(guard);
     }
 
@@ -481,13 +510,5 @@ mod tests {
         assert_eq!(tb.join().unwrap(), Some("B".to_string()));
         assert_eq!(a.seen.lock().unwrap()[0].question, "from-a");
         assert_eq!(b.seen.lock().unwrap()[0].question, "from-b");
-    }
-
-    #[test]
-    fn no_route_leaves_the_global_coordinator_path_intact() {
-        // Nothing installed on this thread: `read_line_coordinated` must not
-        // touch the thread-local branch. Exercised indirectly by the existing
-        // `delivers_to_waiting_prompt` test, which still passes.
-        assert!(ROUTE.with(|r| r.borrow().is_none()));
     }
 }
