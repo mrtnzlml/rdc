@@ -115,6 +115,45 @@ const List<String> kMonoFallback = <String>[
   'Ubuntu Mono', 'DejaVu Sans Mono', 'monospace',
 ];
 
+/// Monospace text style for technical values (host, org id, path, log).
+/// Shared by [home_page.dart] and [dialogs.dart] — lift changes here, don't
+/// re-add a per-file copy.
+TextStyle monoStyle(Color color, double size, [FontWeight w = FontWeight.w400]) =>
+    TextStyle(color: color, fontSize: size, fontWeight: w,
+        fontFamily: kMonoFamily, fontFamilyFallback: kMonoFallback);
+
+/// A small outlined/filled button matching the MDH look, used throughout the
+/// app's custom widgets (not stock Material buttons). Shared by
+/// [home_page.dart] and [dialogs.dart] — lift changes here, don't re-add a
+/// per-file copy.
+class MdhBtn extends StatelessWidget {
+  const MdhBtn({super.key, required this.label, this.primary = false, this.onTap});
+  final String label;
+  final bool primary;
+  final VoidCallback? onTap;
+  @override
+  Widget build(BuildContext context) {
+    final c = MdhColors.of(context);
+    return Opacity(
+      opacity: onTap == null ? 0.5 : 1,
+      child: InkWell(
+        onTap: onTap,
+        mouseCursor: onTap == null ? SystemMouseCursors.basic : SystemMouseCursors.click,
+        borderRadius: BorderRadius.circular(6),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          decoration: BoxDecoration(
+            color: primary ? c.accent : c.bgCard,
+            border: Border.all(color: primary ? c.accent : c.border),
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: Text(label, style: TextStyle(color: primary ? Colors.white : c.textPrimary, fontSize: 12.5, fontWeight: FontWeight.w600)),
+        ),
+      ),
+    );
+  }
+}
+
 /// Material theme hosting the MDH look: system sans by default, the palette
 /// above, light/dark following the OS. Most UI is custom widgets reading
 /// [MdhColors.of]; this sets backgrounds, text color, and accent so stock bits

@@ -1,9 +1,11 @@
 import 'package:flutter/material.dart';
 
+import 'ansi.dart';
 import 'app_state.dart';
 import 'error_text.dart';
 import 'mdh_theme.dart';
 import 'rust/api/rdc.dart';
+import 'watch_state.dart';
 
 // ------------------------------------------------------------ shared shell
 
@@ -464,6 +466,105 @@ class RemoveEnvDialog extends StatelessWidget {
         'Removes the "${env.name}" environment and its local files from "${item.summary.name}". '
         'If it is the last environment, the whole project is moved to the Trash.',
         style: TextStyle(color: c.textPrimary, fontSize: 13, height: 1.5),
+      ),
+    );
+  }
+}
+
+// ------------------------------------------------------------ blocked prompt
+
+/// A blocked cycle, rendered. The body is the tail of the sync log — which
+/// is where the diff, the connector line and the object list already are,
+/// in colour — and the buttons are exactly the keys the core offered.
+///
+/// This does not build on [_Frame]. `_Frame` bakes in exactly one Cancel
+/// button (which pops the dialog without answering anything) plus one
+/// primary action, but a prompt's answer set is N keys chosen by the core
+/// and rendered verbatim — there is no separate "Cancel" to add, and no
+/// single action to call primary. Adding a `_Frame`-supplied Cancel button
+/// would let the user dismiss the dialog without an answer while the worker
+/// thread behind it stays parked waiting for one, and would render a key
+/// (“Cancel”) the core never offered. So this dialog uses the same visual
+/// shell (card, border, rounded corners, title styling) by hand instead.
+class PromptDialog extends StatelessWidget {
+  const PromptDialog({
+    super.key,
+    required this.prompt,
+    required this.logTail,
+    required this.onAnswer,
+  });
+
+  final PendingPrompt prompt;
+  final List<String> logTail;
+  final void Function(String key) onAnswer;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = MdhColors.of(context);
+    final spans = <InlineSpan>[];
+    for (var i = 0; i < logTail.length; i++) {
+      spans.addAll(ansiSpans(logTail[i], c, 12.5));
+      if (i < logTail.length - 1) spans.add(const TextSpan(text: '\n'));
+    }
+    return Dialog(
+      backgroundColor: c.bgCard,
+      surfaceTintColor: Colors.transparent,
+      shape: RoundedRectangleBorder(side: BorderSide(color: c.border), borderRadius: BorderRadius.circular(10)),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 560),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 18, 20, 6),
+              child: Text(
+                '${prompt.title} · ${prompt.env}',
+                style: TextStyle(color: c.textPrimary, fontSize: 16, fontWeight: FontWeight.w600),
+              ),
+            ),
+            Flexible(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.fromLTRB(20, 8, 20, 0),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Container(
+                      width: double.infinity,
+                      constraints: const BoxConstraints(maxHeight: 260),
+                      decoration: BoxDecoration(
+                        color: c.bgCode,
+                        border: Border.all(color: c.borderCard),
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
+                      child: SingleChildScrollView(
+                        child: SelectableText.rich(TextSpan(children: spans)),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    SelectableText(prompt.question, style: monoStyle(c.textSecondary, 12.5)),
+                  ],
+                ),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 12, 20, 18),
+              child: Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  for (final k in prompt.keys)
+                    MdhBtn(
+                      label: '[${k.key}] ${k.label}',
+                      primary: k.key == 'n' || k.key == 's',
+                      onTap: () => onAnswer(k.key),
+                    ),
+                ],
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

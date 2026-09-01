@@ -64,10 +64,6 @@ String _fmtSize(int b) {
   return '${mb.toStringAsFixed(mb < 10 ? 1 : 0)} MB';
 }
 
-TextStyle _mono(Color color, double size, [FontWeight w = FontWeight.w400]) =>
-    TextStyle(color: color, fontSize: size, fontWeight: w,
-        fontFamily: kMonoFamily, fontFamilyFallback: kMonoFallback);
-
 // ------------------------------------------------------------ page
 
 class HomePage extends StatefulWidget {
@@ -499,7 +495,7 @@ class _ProjectRow extends StatelessWidget {
             Expanded(child: Text(item.summary.name,
                 overflow: TextOverflow.ellipsis,
                 style: TextStyle(color: c.textPrimary, fontSize: 13, fontWeight: FontWeight.w600))),
-            if (item.isExternal) Text('ext', style: _mono(c.textHint, 10)),
+            if (item.isExternal) Text('ext', style: monoStyle(c.textHint, 10)),
           ]),
         ),
       ),
@@ -544,7 +540,7 @@ class _EnvRow extends StatelessWidget {
               child: Text('org ${env.orgId} · $sub',
                   overflow: TextOverflow.ellipsis,
                   maxLines: 1,
-                  style: _mono(sel ? Colors.white70 : c.textSecondary, 10.5)),
+                  style: monoStyle(sel ? Colors.white70 : c.textSecondary, 10.5)),
             ),
           ]),
         ),
@@ -604,7 +600,7 @@ class _ConnMain extends StatelessWidget {
           children: [
             Text('No environment selected', style: TextStyle(color: c.textSecondary)),
             const SizedBox(height: 12),
-            _Btn(label: 'New project', primary: true, onTap: onAdd),
+            MdhBtn(label: 'New project', primary: true, onTap: onAdd),
           ],
         ),
       );
@@ -681,7 +677,7 @@ class _ConnBar extends StatelessWidget {
                           style: TextStyle(color: c.textPrimary, fontSize: 15, fontWeight: FontWeight.w600)),
                       const SizedBox(height: 2),
                       Text('${_host(env.apiBase)} · org ${env.orgId}', maxLines: 1, overflow: TextOverflow.ellipsis,
-                          style: _mono(c.textSecondary, 12)),
+                          style: monoStyle(c.textSecondary, 12)),
                     ],
                   ),
                 ),
@@ -695,13 +691,13 @@ class _ConnBar extends StatelessWidget {
             ),
           ),
           const SizedBox(width: 12),
-          _Btn(label: st == _St.error ? 'Retry' : 'Sync', primary: true, onTap: st == _St.running ? null : () => onSync(item, env)),
+          MdhBtn(label: st == _St.error ? 'Retry' : 'Sync', primary: true, onTap: st == _St.running ? null : () => onSync(item, env)),
           const SizedBox(width: 8),
-          _Btn(label: 'Edit', onTap: () => onEdit(item)),
+          MdhBtn(label: 'Edit', onTap: () => onEdit(item)),
           const SizedBox(width: 8),
-          _Btn(label: 'Reveal', onTap: () => onReveal(item)),
+          MdhBtn(label: 'Reveal', onTap: () => onReveal(item)),
           const SizedBox(width: 8),
-          _Btn(label: item.isExternal ? 'Detach' : 'Remove', onTap: () => onRemove(item)),
+          MdhBtn(label: item.isExternal ? 'Detach' : 'Remove', onTap: () => onRemove(item)),
         ],
       ),
     );
@@ -810,7 +806,7 @@ class _SyncLogCardState extends State<_SyncLogCard> {
         _St.synced => ('✓ ${msg ?? 'up to date · ${_rel(widget.env.lastSyncUnix)} ago'}', c.successFg),
         _St.never => ('— not synced yet', c.textSecondary),
       };
-      body = Align(alignment: Alignment.topLeft, child: SelectableText(text, style: _mono(col, 12.5)));
+      body = Align(alignment: Alignment.topLeft, child: SelectableText(text, style: monoStyle(col, 12.5)));
     }
 
     return Container(
@@ -860,7 +856,7 @@ class _ProjectView extends StatelessWidget {
           children: [
             Text('No projects yet', style: TextStyle(color: c.textSecondary)),
             const SizedBox(height: 12),
-            _Btn(label: 'New project', primary: true, onTap: onAdd),
+            MdhBtn(label: 'New project', primary: true, onTap: onAdd),
           ],
         ),
       );
@@ -925,14 +921,14 @@ class _ProjectBar extends StatelessWidget {
                     style: TextStyle(color: c.textPrimary, fontSize: 15, fontWeight: FontWeight.w600)),
                 const SizedBox(height: 2),
                 Text(item.summary.folder, maxLines: 1, overflow: TextOverflow.ellipsis,
-                    style: _mono(c.textSecondary, 12)),
+                    style: monoStyle(c.textSecondary, 12)),
               ],
             ),
           ),
           const SizedBox(width: 12),
-          _Btn(label: 'Sync all envs', primary: true, onTap: onSyncAll),
+          MdhBtn(label: 'Sync all envs', primary: true, onTap: onSyncAll),
           const SizedBox(width: 8),
-          _Btn(label: 'Add environment', onTap: onAddEnv),
+          MdhBtn(label: 'Add environment', onTap: onAddEnv),
         ],
       ),
     );
@@ -1054,9 +1050,9 @@ class _EnvTableRow extends StatelessWidget {
             child: Row(children: [
               cell(Text('${item.summary.name} · ${env.name}', overflow: TextOverflow.ellipsis,
                   style: TextStyle(color: c.textPrimary, fontSize: 12.5, fontWeight: FontWeight.w600)), flex: 2),
-              cell(Text(env.orgId.toString(), style: _mono(c.textSecondary, 12))),
-              cell(Text(_host(env.apiBase), overflow: TextOverflow.ellipsis, style: _mono(c.textSecondary, 12)), flex: 2),
-              cell(Text(env.fileCount.toString(), style: _mono(c.textSecondary, 12))),
+              cell(Text(env.orgId.toString(), style: monoStyle(c.textSecondary, 12))),
+              cell(Text(_host(env.apiBase), overflow: TextOverflow.ellipsis, style: monoStyle(c.textSecondary, 12)), flex: 2),
+              cell(Text(env.fileCount.toString(), style: monoStyle(c.textSecondary, 12))),
               cell(Text(st == _St.never ? '—' : '${_rel(env.lastSyncUnix)} ago', style: TextStyle(color: c.textPrimary, fontSize: 12.5))),
               cell(Align(alignment: Alignment.centerLeft, child: _MiniBadge(badge, bg, fg))),
             ]),
@@ -1290,7 +1286,7 @@ class _FilesPanelState extends State<_FilesPanel> {
     // Breadcrumb: navigable directory segments, then the file name when previewing.
     final crumbs = <Widget>[];
     void sep() => crumbs.add(Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 3), child: Text('›', style: _mono(c.textHint, 12.5))));
+        padding: const EdgeInsets.symmetric(horizontal: 3), child: Text('›', style: monoStyle(c.textHint, 12.5))));
     for (var i = 0; i < dirSegs.length; i++) {
       final current = i == dirSegs.length - 1 && !previewing;
       crumbs.add(InkWell(
@@ -1299,7 +1295,7 @@ class _FilesPanelState extends State<_FilesPanel> {
         borderRadius: BorderRadius.circular(4),
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
-          child: Text(dirSegs[i], style: _mono(current ? c.textPrimary : c.textSecondary, 12.5, current ? FontWeight.w600 : FontWeight.w400)),
+          child: Text(dirSegs[i], style: monoStyle(current ? c.textPrimary : c.textSecondary, 12.5, current ? FontWeight.w600 : FontWeight.w400)),
         ),
       ));
       if (i < dirSegs.length - 1 || previewing) sep();
@@ -1307,7 +1303,7 @@ class _FilesPanelState extends State<_FilesPanel> {
     if (previewing) {
       crumbs.add(Padding(
         padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
-        child: Text(_previewName!, style: _mono(c.textPrimary, 12.5, FontWeight.w600)),
+        child: Text(_previewName!, style: monoStyle(c.textPrimary, 12.5, FontWeight.w600)),
       ));
     }
 
@@ -1336,7 +1332,7 @@ class _FilesPanelState extends State<_FilesPanel> {
             const SizedBox(width: 10),
             Expanded(child: Wrap(crossAxisAlignment: WrapCrossAlignment.center, children: crumbs)),
             const SizedBox(width: 10),
-            _Btn(label: 'Reveal in Finder', onTap: () => widget.onRevealDir(revealTarget)),
+            MdhBtn(label: 'Reveal in Finder', onTap: () => widget.onRevealDir(revealTarget)),
           ],
         ),
         const SizedBox(height: 12),
@@ -1405,9 +1401,9 @@ class _FilesPanelState extends State<_FilesPanel> {
               Icon(e.isDir ? Icons.folder_rounded : Icons.insert_drive_file_outlined,
                   size: 18, color: e.isDir ? c.accent : c.textSecondary),
               const SizedBox(width: 12),
-              Expanded(child: Text(e.name, overflow: TextOverflow.ellipsis, style: _mono(c.textPrimary, 13, FontWeight.w500))),
+              Expanded(child: Text(e.name, overflow: TextOverflow.ellipsis, style: monoStyle(c.textPrimary, 13, FontWeight.w500))),
               const SizedBox(width: 12),
-              Text(e.isDir ? '${e.count} item${e.count == 1 ? '' : 's'}' : _fmtSize(e.size), style: _mono(c.textHint, 12)),
+              Text(e.isDir ? '${e.count} item${e.count == 1 ? '' : 's'}' : _fmtSize(e.size), style: monoStyle(c.textHint, 12)),
             ]),
           ),
         );
@@ -1487,12 +1483,12 @@ class _FleetView extends StatelessWidget {
             Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
               Text('Fleet overview', style: TextStyle(color: c.textPrimary, fontSize: 15, fontWeight: FontWeight.w600)),
               const SizedBox(height: 2),
-              Text(state.parentFolder ?? '', style: _mono(c.textSecondary, 12)),
+              Text(state.parentFolder ?? '', style: monoStyle(c.textSecondary, 12)),
             ]),
             const Spacer(),
-            _Btn(label: 'Sync all', primary: true, onTap: rows.isEmpty ? null : onSyncAll),
+            MdhBtn(label: 'Sync all', primary: true, onTap: rows.isEmpty ? null : onSyncAll),
             const SizedBox(width: 8),
-            _Btn(label: 'New project', onTap: onNew),
+            MdhBtn(label: 'New project', onTap: onNew),
           ]),
         ),
         Expanded(
@@ -1585,9 +1581,9 @@ class _FleetRow extends StatelessWidget {
             Flexible(child: Text('${item.summary.name} · ${env.name}', overflow: TextOverflow.ellipsis, style: TextStyle(color: c.textPrimary, fontSize: 12.5))),
             if (item.isExternal) Padding(padding: const EdgeInsets.only(left: 6), child: _MiniBadge('external', c.extBg, c.extFg)),
           ]), flex: 2),
-          cell(Text(env.orgId.toString(), style: _mono(c.textSecondary, 12)), ),
-          cell(Text(_host(env.apiBase), overflow: TextOverflow.ellipsis, style: _mono(c.textSecondary, 12)), flex: 2),
-          cell(Text(env.fileCount.toString(), style: _mono(c.textSecondary, 12))),
+          cell(Text(env.orgId.toString(), style: monoStyle(c.textSecondary, 12)), ),
+          cell(Text(_host(env.apiBase), overflow: TextOverflow.ellipsis, style: monoStyle(c.textSecondary, 12)), flex: 2),
+          cell(Text(env.fileCount.toString(), style: monoStyle(c.textSecondary, 12))),
           cell(Text(st == _St.never ? '—' : '${_rel(env.lastSyncUnix)} ago', style: TextStyle(color: c.textPrimary, fontSize: 12.5))),
           cell(Align(alignment: Alignment.centerLeft, child: _MiniBadge(badge, bg, fg))),
         ]),
@@ -1621,10 +1617,10 @@ class _SettingsView extends StatelessWidget {
               _SpecCard(k: 'Projects folder', v: state.parentFolder ?? '(not set)', width: 260),
               const SizedBox(height: 14),
               Wrap(spacing: 12, runSpacing: 12, children: [
-                _Btn(label: 'Change folder…', onTap: onChooseParent),
-                _Btn(label: 'Open existing project…', onTap: onOpen),
-                _Btn(label: 'Check for updates', onTap: onCheckUpdate),
-                _Btn(label: 'About rdc', onTap: onAbout),
+                MdhBtn(label: 'Change folder…', onTap: onChooseParent),
+                MdhBtn(label: 'Open existing project…', onTap: onOpen),
+                MdhBtn(label: 'Check for updates', onTap: onCheckUpdate),
+                MdhBtn(label: 'About rdc', onTap: onAbout),
               ]),
             ]),
           ),
@@ -1656,7 +1652,7 @@ class _ChooseFolderEmpty extends StatelessWidget {
           Text('Each connection is a subfolder that the CLI and this app share.',
               textAlign: TextAlign.center, style: TextStyle(color: c.textSecondary)),
           const SizedBox(height: 18),
-          _Btn(label: 'Choose folder…', primary: true, onTap: onChoose),
+          MdhBtn(label: 'Choose folder…', primary: true, onTap: onChoose),
         ]),
       ),
     );
@@ -1664,34 +1660,6 @@ class _ChooseFolderEmpty extends StatelessWidget {
 }
 
 // ------------------------------------------------------------ shared bits
-
-class _Btn extends StatelessWidget {
-  const _Btn({required this.label, this.primary = false, this.onTap});
-  final String label;
-  final bool primary;
-  final VoidCallback? onTap;
-  @override
-  Widget build(BuildContext context) {
-    final c = MdhColors.of(context);
-    return Opacity(
-      opacity: onTap == null ? 0.5 : 1,
-      child: InkWell(
-        onTap: onTap,
-        mouseCursor: onTap == null ? SystemMouseCursors.basic : SystemMouseCursors.click,
-        borderRadius: BorderRadius.circular(6),
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-          decoration: BoxDecoration(
-            color: primary ? c.accent : c.bgCard,
-            border: Border.all(color: primary ? c.accent : c.border),
-            borderRadius: BorderRadius.circular(6),
-          ),
-          child: Text(label, style: TextStyle(color: primary ? Colors.white : c.textPrimary, fontSize: 12.5, fontWeight: FontWeight.w600)),
-        ),
-      ),
-    );
-  }
-}
 
 class _StatusPill extends StatelessWidget {
   const _StatusPill({required this.st});
@@ -1785,7 +1753,7 @@ class _SpecCard extends StatelessWidget {
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Text(k.toUpperCase(), style: TextStyle(color: c.textSecondary, fontSize: 10.5, fontWeight: FontWeight.w600, letterSpacing: 0.5)),
         const SizedBox(height: 8),
-        SelectableText(v, style: _mono(c.textPrimary, 13)),
+        SelectableText(v, style: monoStyle(c.textPrimary, 13)),
       ]),
     );
   }
