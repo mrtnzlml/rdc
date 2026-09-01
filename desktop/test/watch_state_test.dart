@@ -47,6 +47,32 @@ void main() {
     expect(s.pendingPrompts[k], isNull);
   });
 
+  test('a watch that ends in error clears its entry so the env is usable again', () {
+    final s = AppState(Settings(parentFolder: '/tmp'));
+    const folder = '/tmp/acme';
+    const env = 'dev';
+    final k = s.envKey(folder, env);
+
+    // What watchEnvItem installs when a cycle starts.
+    s.watch[k] = WatchState(running: true);
+
+    // The Rust side makes Error and Stopped mutually exclusive terminal
+    // outcomes of the same watch call: once an Error phase arrives, no
+    // Stopped is ever coming to clear this entry. If applyWatchPhase only
+    // flipped `running` to false (as it used to) instead of removing the
+    // entry, `watch[k]` would sit there forever — `isWatching` already
+    // reads false, but any presence-based "a watch still owns this env"
+    // check (which is exactly how the desktop UI gates Sync/Watch) would
+    // stay true permanently, for something as ordinary as a network blip
+    // or an expired token.
+    s.applyWatchPhase(folder, env, const SyncPhase.error(message: 'token expired'));
+
+    expect(s.watch[k], isNull, reason: 'an errored watch must not leave its entry behind');
+    expect(s.isWatching(folder, env), isFalse);
+    expect(s.syncState[k], SyncState.error);
+    expect(s.syncMessage[k], 'token expired');
+  });
+
   test('every prompt kind has a title', () {
     for (final k in PromptKindDto.values) {
       final t = _prompt('/tmp/acme', 'dev', 1);

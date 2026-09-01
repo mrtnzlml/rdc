@@ -170,6 +170,11 @@ class _HomePageState extends State<HomePage> {
   void _syncAll() {
     for (final p in state.projects) {
       for (final e in p.summary.envs) {
+        // Skip envs a watch owns (watching or mid-stop): a one-shot Sync
+        // there would double-subscribe, the exact hazard Step 3b's header
+        // and row gates exist to prevent. Sync the rest; don't refuse the
+        // whole bulk action for one watched env.
+        if (_syncBlocked(state, p.summary.folder, e.name)) continue;
         state.syncEnvItem(p, e);
       }
     }
@@ -721,64 +726,90 @@ class _ConnBar extends StatelessWidget {
     final watching = state.isWatching(item.summary.folder, env.name);
     final stopping = _isStopping(state, item.summary.folder, env.name);
     final syncBlocked = _syncBlocked(state, item.summary.folder, env.name);
+
+    // Capped (not just Flexible) now that this sits in a Wrap run rather
+    // than an Expanded slot: a Wrap doesn't hand a child a narrower budget
+    // to shrink into the way Row/Expanded did, so without a ceiling here a
+    // pathologically long project/env/host name would never hit the
+    // Text widgets' own ellipsis and could push this run arbitrarily wide.
+    final titleGroup = ConstrainedBox(
+      constraints: const BoxConstraints(maxWidth: 480),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Flexible(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text('${item.summary.name} · ${env.name}', maxLines: 1, overflow: TextOverflow.ellipsis,
+                    style: TextStyle(color: c.textPrimary, fontSize: 15, fontWeight: FontWeight.w600)),
+                const SizedBox(height: 2),
+                Text('${_host(env.apiBase)} · org ${env.orgId}', maxLines: 1, overflow: TextOverflow.ellipsis,
+                    style: monoStyle(c.textSecondary, 12)),
+              ],
+            ),
+          ),
+          const SizedBox(width: 12),
+          // Flexible (not a rigid sibling) so the pill can also give up room
+          // under extreme width pressure instead of forcing a hard RenderFlex
+          // overflow; at any width with room to spare it just renders at its
+          // natural size, identical to before.
+          Flexible(child: _StatusPill(st: st)),
+        ],
+      ),
+    );
+
+    // A Wrap, not a fixed row: no platform runner enforces a minimum window
+    // width (the macOS runner sets only an *initial* size, and there is no
+    // Dart-side floor either), so an ordinary drag can leave less room than
+    // five buttons need. A Wrap flows the overflow buttons onto a second
+    // line instead of throwing a RenderFlex overflow.
+    final actions = Wrap(
+      alignment: WrapAlignment.end,
+      spacing: 8,
+      runSpacing: 8,
+      children: [
+        Tooltip(
+          message: syncBlocked ? 'Stop watching before syncing' : (st == _St.error ? 'Retry' : 'Sync'),
+          child: MdhBtn(
+            label: st == _St.error ? 'Retry' : 'Sync',
+            primary: true,
+            onTap: (st == _St.running || syncBlocked) ? null : () => onSync(item, env),
+          ),
+        ),
+        Tooltip(
+          message: watching
+              ? 'Stop watching'
+              : (stopping ? 'Stopping — wait for it to finish' : 'Watch this environment'),
+          child: MdhBtn(
+            label: watching ? 'Stop' : 'Watch',
+            onTap: watching
+                ? () => state.stopWatchItem(item, env)
+                : (stopping ? null : () => state.watchEnvItem(item, env)),
+          ),
+        ),
+        MdhBtn(label: 'Edit', onTap: () => onEdit(item)),
+        MdhBtn(label: 'Reveal', onTap: () => onReveal(item)),
+        MdhBtn(label: item.isExternal ? 'Detach' : 'Remove', onTap: () => onRemove(item)),
+      ],
+    );
+
     return Container(
       padding: const EdgeInsets.fromLTRB(18, 12, 18, 12),
       decoration: BoxDecoration(
         color: c.bgCard,
         border: Border(bottom: BorderSide(color: c.border)),
       ),
-      child: Row(
-        children: [
-          // The whole left group is one Expanded so all slack lives here and
-          // the action buttons stay flush against the right edge.
-          Expanded(
-            child: Row(
-              children: [
-                Flexible(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text('${item.summary.name} · ${env.name}', maxLines: 1, overflow: TextOverflow.ellipsis,
-                          style: TextStyle(color: c.textPrimary, fontSize: 15, fontWeight: FontWeight.w600)),
-                      const SizedBox(height: 2),
-                      Text('${_host(env.apiBase)} · org ${env.orgId}', maxLines: 1, overflow: TextOverflow.ellipsis,
-                          style: monoStyle(c.textSecondary, 12)),
-                    ],
-                  ),
-                ),
-                const SizedBox(width: 12),
-                // Flexible (not a rigid sibling) so the pill can also give up
-                // room under extreme width pressure instead of forcing a
-                // hard RenderFlex overflow; at any width with room to spare
-                // it just renders at its natural size, identical to before.
-                Flexible(child: _StatusPill(st: st)),
-              ],
-            ),
-          ),
-          const SizedBox(width: 12),
-          Tooltip(
-            message: syncBlocked ? 'Stop watching before syncing' : (st == _St.error ? 'Retry' : 'Sync'),
-            child: MdhBtn(
-              label: st == _St.error ? 'Retry' : 'Sync',
-              primary: true,
-              onTap: (st == _St.running || syncBlocked) ? null : () => onSync(item, env),
-            ),
-          ),
-          const SizedBox(width: 8),
-          MdhBtn(
-            label: watching ? 'Stop' : 'Watch',
-            onTap: watching
-                ? () => state.stopWatchItem(item, env)
-                : (stopping ? null : () => state.watchEnvItem(item, env)),
-          ),
-          const SizedBox(width: 8),
-          MdhBtn(label: 'Edit', onTap: () => onEdit(item)),
-          const SizedBox(width: 8),
-          MdhBtn(label: 'Reveal', onTap: () => onReveal(item)),
-          const SizedBox(width: 8),
-          MdhBtn(label: item.isExternal ? 'Detach' : 'Remove', onTap: () => onRemove(item)),
-        ],
+      // spaceBetween: when both groups fit on one line this pins the title
+      // to the left edge and the actions to the right edge — the same look
+      // as the old Expanded-based Row — and when they don't fit, the
+      // actions group simply drops to its own line below.
+      child: Wrap(
+        alignment: WrapAlignment.spaceBetween,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        runSpacing: 10,
+        children: [titleGroup, actions],
       ),
     );
   }
@@ -948,7 +979,16 @@ class _ProjectView extends StatelessWidget {
       children: [
         _ProjectBar(
           item: item,
-          onSyncAll: envs.isEmpty ? null : () { for (final e in envs) { onSync(item, e); } },
+          onSyncAll: envs.isEmpty
+              ? null
+              : () {
+                  for (final e in envs) {
+                    // Same skip as the Fleet view's "Sync all": don't
+                    // double-subscribe an env a watch already owns.
+                    if (_syncBlocked(state, item.summary.folder, e.name)) continue;
+                    onSync(item, e);
+                  }
+                },
           onAddEnv: () => onAddEnv(item),
         ),
         Expanded(
@@ -1037,8 +1077,13 @@ class _EnvTable extends StatelessWidget {
   // those same columns inside one Expanded (see _EnvTableRow) to keep the
   // action buttons outside the row's tap target.
   static const _infoFlex = 8;
-  // 4 (not 3): the action cluster grew a 4th icon button (watch) in task 14
-  // and 3 no longer leaves enough width for it at narrow window sizes.
+  // 4 (not 3): the action cluster grew a 4th icon button (watch) in task 14,
+  // so this gives it a bit more of the table's width by default. It is a
+  // default, not a safety margin — nothing here guarantees these icons fit
+  // on one line at every window width (there is no enforced minimum window
+  // width), which is why the action cluster itself is a Wrap, not a Row:
+  // when this share genuinely isn't enough, the icons flow onto a second
+  // line instead of overflowing.
   static const _actionsFlex = 4;
 
   @override
@@ -1148,16 +1193,18 @@ class _EnvTableRow extends StatelessWidget {
           flex: _EnvTable._actionsFlex,
           child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-            // Icon buttons (not _Btn) — a row of three labeled buttons doesn't
-            // fit this column at the app's minimum width; row actions are a
-            // narrow column by design, unlike the header bar's full buttons.
-            child: Row(mainAxisAlignment: MainAxisAlignment.end, mainAxisSize: MainAxisSize.min, children: [
+            // Icon buttons (not MdhBtn) — narrow by design so more table
+            // columns fit, unlike the header bar's full-label buttons. A
+            // Wrap, not a fixed Row: this column's share of the table width
+            // isn't backed by any enforced minimum window width, so at a
+            // narrow enough window these four icons flow onto a second line
+            // instead of throwing a RenderFlex overflow.
+            child: Wrap(alignment: WrapAlignment.end, spacing: 6, runSpacing: 4, children: [
               _RowIconBtn(
                 icon: Icons.sync,
                 tooltip: syncBlocked ? 'Stop watching before syncing' : (st == _St.error ? 'Retry' : 'Sync'),
                 onTap: (st == _St.running || syncBlocked) ? null : () => onSync(item, env),
               ),
-              const SizedBox(width: 6),
               _RowIconBtn(
                 icon: watching ? Icons.visibility : Icons.visibility_outlined,
                 tooltip: watching ? 'Stop watching' : (stopping ? 'Stopping…' : 'Watch'),
@@ -1165,9 +1212,7 @@ class _EnvTableRow extends StatelessWidget {
                     ? () => state.stopWatchItem(item, env)
                     : (stopping ? null : () => state.watchEnvItem(item, env)),
               ),
-              const SizedBox(width: 6),
               _RowIconBtn(icon: Icons.edit_outlined, tooltip: 'Edit', onTap: () => onEdit(item, env)),
-              const SizedBox(width: 6),
               _RowIconBtn(icon: Icons.delete_outline, tooltip: 'Remove', danger: true, onTap: () => onRemove(item, env)),
             ]),
           ),

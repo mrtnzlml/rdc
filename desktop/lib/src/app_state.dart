@@ -324,41 +324,7 @@ class AppState extends ChangeNotifier {
       // TODO(task 15): replace with the per-env poll-interval setting.
       pollSecs: BigInt.from(60),
     ).listen(
-      (phase) {
-        final w = watch[k];
-        if (w == null) return; // stopped and cleared while in flight
-        switch (phase) {
-          case SyncPhase_Started():
-            w.running = true;
-          case SyncPhase_Log(:final line):
-            (syncLog[k] ??= <String>[]).add(line);
-            w.nextPollSecs = null; // a cycle is running
-          case SyncPhase_Prompt(:final id, :final kind, :final question, :final keys):
-            pendingPrompts[k] = PendingPrompt(
-              id: id,
-              kind: kind,
-              question: question,
-              keys: keys,
-              folder: folder,
-              env: env.name,
-            );
-          case SyncPhase_PromptResolved(:final id):
-            resolvePrompt(k, id);
-          case SyncPhase_Idle(:final nextPollSecs):
-            w.nextPollSecs = nextPollSecs?.toInt();
-          case SyncPhase_Done():
-            reload();
-          case SyncPhase_Error(:final message):
-            w.running = false;
-            pendingPrompts.remove(k);
-            syncState[k] = SyncState.error;
-            syncMessage[k] = message;
-          case SyncPhase_Stopped():
-            watch.remove(k);
-            reload();
-        }
-        notifyListeners();
-      },
+      (phase) => applyWatchPhase(folder, env.name, phase),
       onError: (Object e) {
         watch.remove(k);
         syncState[k] = SyncState.error;
@@ -367,6 +333,62 @@ class AppState extends ChangeNotifier {
         notifyListeners();
       },
     );
+  }
+
+  /// Applies one phase of a watch's stream to state. Split out of
+  /// [watchEnvItem]'s `listen` callback so this logic — the terminal `Error`
+  /// handling in particular — can be driven directly by a test: the stream
+  /// itself comes from a live Rust bridge call and can't run under
+  /// `flutter test`.
+  ///
+  /// A no-op if the watch was already stopped and cleared while this phase
+  /// was in flight (`watch[k]` gone).
+  void applyWatchPhase(String folder, String envName, SyncPhase phase) {
+    final k = envKey(folder, envName);
+    final w = watch[k];
+    if (w == null) return;
+    switch (phase) {
+      case SyncPhase_Started():
+        w.running = true;
+      case SyncPhase_Log(:final line):
+        (syncLog[k] ??= <String>[]).add(line);
+        w.nextPollSecs = null; // a cycle is running
+      case SyncPhase_Prompt(:final id, :final kind, :final question, :final keys):
+        pendingPrompts[k] = PendingPrompt(
+          id: id,
+          kind: kind,
+          question: question,
+          keys: keys,
+          folder: folder,
+          env: envName,
+        );
+      case SyncPhase_PromptResolved(:final id):
+        resolvePrompt(k, id);
+      case SyncPhase_Idle(:final nextPollSecs):
+        w.nextPollSecs = nextPollSecs?.toInt();
+      case SyncPhase_Done():
+        reload();
+      case SyncPhase_Error(:final message):
+        // Terminal: the Rust side makes Error and Stopped mutually
+        // exclusive outcomes of the same watch call, so once an Error
+        // phase has arrived no Stopped is ever coming to clear this entry.
+        // Leaving it in `watch` would permanently block Sync (any
+        // presence-based "a watch still owns this env" check reads true
+        // forever) and leave Watch stuck disabled, with no way to reach
+        // "Stop" — the env's controls would need an app restart to
+        // recover, for something as ordinary as a network blip or an
+        // expired token. `onError` below already clears the entry for a
+        // broken *stream*; this arm must agree for an in-band Error phase
+        // on an otherwise-live stream.
+        watch.remove(k);
+        pendingPrompts.remove(k);
+        syncState[k] = SyncState.error;
+        syncMessage[k] = message;
+      case SyncPhase_Stopped():
+        watch.remove(k);
+        reload();
+    }
+    notifyListeners();
   }
 
   void stopWatchItem(ProjectItem item, EnvSummary env) {
