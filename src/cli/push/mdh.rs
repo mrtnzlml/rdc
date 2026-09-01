@@ -707,6 +707,52 @@ pub(crate) fn classify_delete_gate(
     DeleteGate::Prompt
 }
 
+/// Emit the pending index drops as change rows through `Log`.
+///
+/// Split out from the prompt so it can be tested without stdin, and because
+/// the list is the part an embedder needs: this gate used `eprintln!`, so a
+/// consumer of `Log::for_sink` saw none of it.
+fn report_pending_index_drops(
+    progress: &Arc<Log>,
+    collection_name: &str,
+    pending_regular: &[String],
+    pending_search: &[String],
+) {
+    use crate::cli::change_view::{ChangeRow, RowVerb, RowWidths, render_row};
+    let n = pending_regular.len() + pending_search.len();
+    // Through `Log`, like the object-delete gate — an embedder consuming
+    // `Log::for_sink` used to see none of this.
+    progress.event(
+        Action::Delete,
+        &format!(
+            "{n} MDH index(es) on '{collection_name}' would be DROPPED \
+             (no longer present locally)"
+        ),
+    );
+    let w = RowWidths::fit([("mdh", collection_name)]);
+    let mode = crate::cli::resolve::detect_color_mode();
+    for (name, what) in pending_regular
+        .iter()
+        .map(|n| (n, "regular index"))
+        .chain(pending_search.iter().map(|n| (n, "search index")))
+    {
+        let note = format!("{what} '{name}'");
+        progress.row(&render_row(
+            &ChangeRow {
+                verb: RowVerb::Drop,
+                kind: "mdh",
+                name: collection_name,
+                // An index has no body, so a line count would be meaningless.
+                added: None,
+                removed: None,
+                note: Some(&note),
+            },
+            w,
+            mode,
+        ));
+    }
+}
+
 /// Interactive [y/N] confirmation for dropping remote MDH indexes that are no
 /// longer present locally. Returns `true` to proceed with the drops.
 fn prompt_confirm_index_drops(
@@ -715,20 +761,9 @@ fn prompt_confirm_index_drops(
     pending_regular: &[String],
     pending_search: &[String],
 ) -> Result<bool> {
+    report_pending_index_drops(progress, collection_name, pending_regular, pending_search);
     progress.with_prompt(|| -> Result<bool> {
         use std::io::Write;
-        let n = pending_regular.len() + pending_search.len();
-        eprintln!();
-        eprintln!(
-            "The following {n} MDH index(es) on '{collection_name}' would be DROPPED \
-             (no longer present locally):"
-        );
-        for name in pending_regular {
-            eprintln!("  - regular index '{name}'");
-        }
-        for name in pending_search {
-            eprintln!("  - search index '{name}'");
-        }
         eprint!("Proceed with the drop(s)? [y/N] ");
         std::io::stderr().flush().ok();
         let ans = crate::cli::stdin_coord::read_line_coordinated()?
@@ -871,6 +906,51 @@ fn def_options_only(def: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    /// In-memory `Log` sink, standing in for an embedder (the desktop app
+    /// consumes rdc through `Log::for_sink`).
+    #[derive(Clone, Default)]
+    struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Buf {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    /// Same regression as the object-delete gate: the index-drop list was
+    /// `eprintln!`, invisible to an embedder.
+    #[test]
+    fn index_drop_gate_writes_its_rows_into_the_log_sink() {
+        let buf = Buf::default();
+        let log = crate::log::Log::for_sink(
+            crate::cli::resolve::ColorMode::Plain,
+            Box::new(buf.clone()),
+        );
+        report_pending_index_drops(
+            &log,
+            "vendors",
+            &["idx_vendor_no".to_string()],
+            &["srch_name".to_string()],
+        );
+        let text = buf.text();
+        assert!(
+            text.contains("2 MDH index(es) on 'vendors' would be DROPPED"),
+            "header missing: {text:?}"
+        );
+        assert!(text.contains("regular index 'idx_vendor_no'"), "{text:?}");
+        assert!(text.contains("search index 'srch_name'"), "{text:?}");
+        assert!(text.contains("drop") && text.contains("mdh"), "{text:?}");
+        assert!(!text.contains('\u{1b}'), "Plain mode leaked SGR: {text:?}");
+    }
+
 
     /// Creating a dataset from scratch: Data Storage answers a REGULAR index
     /// listing on a missing collection with an empty list but 404s the SEARCH

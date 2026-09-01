@@ -471,7 +471,7 @@ async fn push_one_drifted(
     use crate::cli::resolve::{PushDriftOutcome, resolve_push_drift};
     match resolve_push_drift(
         interactive,
-        crate::cli::resolve::ObjectRef { kind: "rules", slug: slug },
+        crate::cli::resolve::ObjectRef { kind: "rules", slug },
         local_json_path, &remote_json,
         env,
     )? {

@@ -87,15 +87,52 @@ pub fn confirm_or_refuse(
     tombstones: &Tombstones,
     interactive: bool,
     allow_deletes: bool,
+    progress: &Arc<Log>,
 ) -> Result<ConfirmOutcome> {
+    use crate::cli::change_view::{ChangeRow, RowVerb, RowWidths, render_row};
     let n = tombstones.total();
-    eprintln!();
-    eprintln!("The following {n} object(s) would be DELETED from the remote:");
-    print_tombstone_list(tombstones);
-    eprintln!();
+
+    // Through `Log`, not `eprintln!`. This is the most destructive list rdc
+    // prints and it used to bypass the renderer entirely, which meant an
+    // embedder consuming `Log::for_sink` never saw a single line of it.
+    //
+    // Rows are in reverse-dependency order (children first), so the list is
+    // also the exact sequence the deletes will run in.
+    progress.event(
+        Action::Delete,
+        &format!("{n} object(s) would be DELETED from the remote"),
+    );
+    let mut rows: Vec<(&'static str, &str, u64)> = Vec::new();
+    for (kind, map) in reverse_dep_order_iter(tombstones) {
+        for (slug, id) in map {
+            rows.push((kind, slug.as_str(), *id));
+        }
+    }
+    let w = RowWidths::fit(rows.iter().map(|(k, s, _)| (*k, *s)));
+    let mode = crate::cli::resolve::detect_color_mode();
+    for (kind, slug, id) in &rows {
+        let note = format!("id {id}");
+        progress.row(&render_row(
+            &ChangeRow {
+                verb: RowVerb::Delete,
+                kind,
+                name: slug,
+                // A tombstone is decided from the lockfile; rdc holds no body
+                // to count lines against.
+                added: None,
+                removed: None,
+                note: Some(&note),
+            },
+            w,
+            mode,
+        ));
+    }
 
     if allow_deletes {
-        eprintln!("--allow-deletes set; proceeding without prompt.");
+        progress.event(
+            Action::Info,
+            "--allow-deletes set; proceeding without prompt",
+        );
         return Ok(ConfirmOutcome::Proceed);
     }
     if !interactive {
@@ -105,6 +142,9 @@ pub fn confirm_or_refuse(
              restore the local files to cancel the deletion."
         );
     }
+    // The question stays on raw stderr: it must sit on the cursor's line for
+    // the answer to be typed after it, which a `Log` line cannot do. Only the
+    // list above is information an embedder needs.
     eprint!("Proceed with deletion? [y/N] ");
     std::io::stderr().flush().ok();
     // Route via the stdin coordinator so this prompt cooperates with the
@@ -118,16 +158,6 @@ pub fn confirm_or_refuse(
         Ok(ConfirmOutcome::Proceed)
     } else {
         Ok(ConfirmOutcome::Aborted)
-    }
-}
-
-fn print_tombstone_list(t: &Tombstones) {
-    // Print in reverse-dep order (children first) so the user sees the
-    // exact sequence the deletes will run in.
-    for (name, map) in reverse_dep_order_iter(t) {
-        for (slug, id) in map {
-            eprintln!("  - {name}/{slug} (id {id})");
-        }
     }
 }
 
@@ -447,6 +477,60 @@ use IsTerminal as _;
 
 #[cfg(test)]
 mod tests {
+    /// In-memory `Log` sink, standing in for an embedder (the desktop app
+    /// consumes rdc through `Log::for_sink`).
+    #[derive(Clone, Default)]
+    struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Buf {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    /// The regression: this gate printed with `eprintln!`, so an embedder
+    /// consuming `Log::for_sink` received not one line of the most
+    /// destructive list rdc prints.
+    #[test]
+    fn delete_gate_writes_the_object_list_into_the_log_sink() {
+        let buf = Buf::default();
+        let log = crate::log::Log::for_sink(
+            crate::cli::resolve::ColorMode::Plain,
+            Box::new(buf.clone()),
+        );
+        let mut t = Tombstones::default();
+        t.hooks.insert("legacy-export".to_string(), 9137);
+        t.engines.insert("custom-eu".to_string(), 4410);
+
+        // `allow_deletes` returns before the prompt, so this never reads stdin.
+        let out = confirm_or_refuse(&t, false, true, &log).unwrap();
+        assert!(matches!(out, ConfirmOutcome::Proceed));
+
+        let text = buf.text();
+        assert!(
+            text.contains("2 object(s) would be DELETED from the remote"),
+            "header missing from the sink: {text:?}"
+        );
+        for needle in ["hooks", "legacy-export", "id 9137", "engines", "custom-eu", "id 4410"] {
+            assert!(text.contains(needle), "{needle:?} missing from the sink: {text:?}");
+        }
+        // Reverse-dependency order: engines (a child) before hooks, which is
+        // the order the DELETEs actually run in.
+        assert!(
+            text.find("custom-eu").unwrap() < text.find("legacy-export").unwrap(),
+            "rows must be in reverse-dependency order: {text:?}"
+        );
+        assert!(!text.contains('\u{1b}'), "Plain mode leaked SGR: {text:?}");
+    }
+
     use super::*;
 
     /// `apply_outcome` has a `_ => {}` catch-all, so a deletable kind missing an

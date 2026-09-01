@@ -317,13 +317,16 @@ fn prompt_confirm_row_deletes(
     collection_name: &str,
     pending: usize,
 ) -> Result<bool> {
+    // Through `Log`, like the other two destructive gates.
+    progress.event(
+        Action::Delete,
+        &format!(
+            "{pending} row(s) on '{collection_name}' are absent from data.jsonl and would \
+             be DELETED"
+        ),
+    );
     progress.with_prompt(|| -> Result<bool> {
         use std::io::Write;
-        eprintln!();
-        eprintln!(
-            "{pending} row(s) on '{collection_name}' are absent from data.jsonl and would \
-             be DELETED."
-        );
         eprint!("Proceed with the deletion(s)? [y/N] ");
         std::io::stderr().flush().ok();
         let ans = crate::cli::stdin_coord::read_line_coordinated()?

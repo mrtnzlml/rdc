@@ -3571,6 +3571,7 @@ pub async fn run(
                     &tombstones,
                     interactive,
                     allow_deletes,
+                    progress,
                 )?;
                 *confirm_out.borrow_mut() = Some(o);
                 Ok(())
