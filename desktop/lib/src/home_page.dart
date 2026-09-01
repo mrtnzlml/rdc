@@ -757,6 +757,20 @@ class _ConnBar extends StatelessWidget {
   final void Function(ProjectItem, EnvSummary) onSync;
   final void Function(ProjectItem) onEdit, onReveal, onRemove;
 
+  // The five action buttons' measured, unconstrained single-line width
+  // (Sync 480.75px / Retry 493.5px — Retry is the wider label) rounded up
+  // with a small margin, via a throwaway probe rendering exactly this
+  // button row unconstrained. This is the row's true single-line floor:
+  // below `_actionsIntrinsicWidth + spacer`, the buttons cannot coexist
+  // with the title on one line no matter how far the title shrinks, so
+  // there is nothing to tune here — re-measure if the buttons ever change.
+  static const _actionsIntrinsicWidth = 500.0;
+
+  // A sliver reserved for the title even in the tightest one-line case, so
+  // it never shrinks to literally nothing before the layout switches to
+  // wrapping the actions instead.
+  static const _titleReserve = 40.0;
+
   @override
   Widget build(BuildContext context) {
     final c = MdhColors.of(context);
@@ -781,7 +795,15 @@ class _ConnBar extends StatelessWidget {
             ],
           ),
         ),
-        const SizedBox(width: 12),
+        // Flexible even though it's a spacer: this whole Row can itself be
+        // squeezed to almost nothing in the narrow/wrapping layout below
+        // (Expanded(flex: 1) there can hand it well under 12px). A bare
+        // SizedBox is rigid — Flex never shrinks a non-flex child below its
+        // declared size — so at some point it alone would demand more
+        // width than the Row has, throwing regardless of how far the
+        // Column/pill around it can shrink. Wrapped in Flexible it clamps
+        // down to whatever's actually left instead.
+        const Flexible(child: SizedBox(width: 12)),
         // Flexible (not a rigid sibling) so the pill can also give up room
         // under extreme width pressure instead of forcing a hard RenderFlex
         // overflow; at any width with room to spare it just renders at its
@@ -790,58 +812,39 @@ class _ConnBar extends StatelessWidget {
       ],
     );
 
-    // Expanded (tight), not a plain Wrap child: a Wrap given the
-    // effectively-unbounded main-axis budget a Row hands its non-flex
-    // children never wraps — it just reports its natural, un-narrowed
-    // single-line width, which is exactly how this overflowed before. Being
-    // Expanded forces this cell to an exact, always-bounded width (2/3 of
-    // what's left after the title's own Expanded share and the spacer), so
-    // the inner Wrap has something real to wrap against: comfortably one
-    // line at the golden canvas and wider, flowing onto a second line as
-    // the window narrows — never a RenderFlex overflow. WrapAlignment.end
-    // keeps the buttons pinned to this cell's right edge (the row's right
-    // edge, since this is the last child) even when the cell is wider than
-    // the buttons actually need — the same "flush right, title yields
-    // first" look the old Expanded+plain-Row design had.
-    final actions = Wrap(
-      alignment: WrapAlignment.end,
-      spacing: 8,
-      runSpacing: 8,
-      children: [
-        Tooltip(
-          message: syncBlocked ? 'Stop watching before syncing' : (st == _St.error ? 'Retry' : 'Sync'),
-          child: MdhBtn(
-            label: st == _St.error ? 'Retry' : 'Sync',
-            primary: true,
-            onTap: (st == _St.running || syncBlocked) ? null : () => onSync(item, env),
-          ),
-        ),
-        Tooltip(
-          message: watching
-              ? 'Stop watching'
-              : (stopping ? 'Stopping — wait for it to finish' : 'Watch this environment'),
-          child: MdhBtn(
-            label: watching ? 'Stop' : 'Watch',
-            onTap: watching
-                ? () => state.stopWatchItem(item, env)
-                : (stopping
-                    ? null
-                    : () async {
-                        // A watch's first action is a full two-way reconcile,
-                        // so this needs the same gate Sync has -- otherwise
-                        // starting a watch on a never-synced-by-this-build
-                        // project would push without the notice ever showing.
-                        if (await _confirmTwoWay(context, state, item)) {
-                          state.watchEnvItem(item, env);
-                        }
-                      }),
-          ),
-        ),
-        MdhBtn(label: 'Edit', onTap: () => onEdit(item)),
-        MdhBtn(label: 'Reveal', onTap: () => onReveal(item)),
-        MdhBtn(label: item.isExternal ? 'Detach' : 'Remove', onTap: () => onRemove(item)),
-      ],
+    final syncBtn = Tooltip(
+      message: syncBlocked ? 'Stop watching before syncing' : (st == _St.error ? 'Retry' : 'Sync'),
+      child: MdhBtn(
+        label: st == _St.error ? 'Retry' : 'Sync',
+        primary: true,
+        onTap: (st == _St.running || syncBlocked) ? null : () => onSync(item, env),
+      ),
     );
+    final watchBtn = Tooltip(
+      message: watching
+          ? 'Stop watching'
+          : (stopping ? 'Stopping — wait for it to finish' : 'Watch this environment'),
+      child: MdhBtn(
+        label: watching ? 'Stop' : 'Watch',
+        onTap: watching
+            ? () => state.stopWatchItem(item, env)
+            : (stopping
+                ? null
+                : () async {
+                    // A watch's first action is a full two-way reconcile,
+                    // so this needs the same gate Sync has -- otherwise
+                    // starting a watch on a never-synced-by-this-build
+                    // project would push without the notice ever showing.
+                    if (await _confirmTwoWay(context, state, item)) {
+                      state.watchEnvItem(item, env);
+                    }
+                  }),
+      ),
+    );
+    final editBtn = MdhBtn(label: 'Edit', onTap: () => onEdit(item));
+    final revealBtn = MdhBtn(label: 'Reveal', onTap: () => onReveal(item));
+    final removeBtn = MdhBtn(label: item.isExternal ? 'Detach' : 'Remove', onTap: () => onRemove(item));
+    final actionWidgets = [syncBtn, watchBtn, editBtn, revealBtn, removeBtn];
 
     return Container(
       padding: const EdgeInsets.fromLTRB(18, 12, 18, 12),
@@ -849,16 +852,55 @@ class _ConnBar extends StatelessWidget {
         color: c.bgCard,
         border: Border(bottom: BorderSide(color: c.border)),
       ),
-      child: Row(
-        children: [
-          // Title takes whatever share is left after the actions cell below
-          // claims its own (fixed, larger) share — exactly the old
-          // "Expanded so all slack lives here" comment, just against a
-          // sibling Expanded rather than a run of un-flexed buttons.
-          Expanded(child: titleGroup),
-          const SizedBox(width: 12),
-          Expanded(flex: 2, child: actions),
-        ],
+      // A fixed Expanded(actions) share (tried in an earlier pass) doesn't
+      // track how much room the buttons actually need: any ratio generous
+      // enough to hold one line at ordinary widths still forces a wrap at
+      // ample ones (the buttons don't need 2/3 of a 1080px-wide bar), so
+      // the header wrapped far earlier than the buttons' own natural width
+      // required. LayoutBuilder makes that comparison for real: above the
+      // buttons' measured single-line floor, this renders literally the
+      // pre-Task-14 layout (Expanded title takes whatever the buttons'
+      // *actual* width leaves, exactly like a plain, un-flexed button row
+      // would) — intrinsic sizing, no tuned ratio. Only below that floor,
+      // where no title width (down to _titleReserve) would make the
+      // buttons fit on one line, does it switch to a bounded, wrapping
+      // Wrap — degrading instead of throwing a RenderFlex overflow.
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final oneLineFits = constraints.maxWidth >= _actionsIntrinsicWidth + 12 + _titleReserve;
+          if (oneLineFits) {
+            return Row(
+              children: [
+                Expanded(child: titleGroup),
+                const SizedBox(width: 12),
+                syncBtn,
+                const SizedBox(width: 8),
+                watchBtn,
+                const SizedBox(width: 8),
+                editBtn,
+                const SizedBox(width: 8),
+                revealBtn,
+                const SizedBox(width: 8),
+                removeBtn,
+              ],
+            );
+          }
+          return Row(
+            children: [
+              Expanded(child: titleGroup),
+              const SizedBox(width: 12),
+              Expanded(
+                flex: 2,
+                child: Wrap(
+                  alignment: WrapAlignment.end,
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: actionWidgets,
+                ),
+              ),
+            ],
+          );
+        },
       ),
     );
   }
@@ -1872,7 +1914,13 @@ class _StatusPill extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
       decoration: BoxDecoration(color: bg, border: Border.all(color: bd), borderRadius: BorderRadius.circular(999)),
-      child: Text(label, style: TextStyle(color: fg, fontSize: 11, fontWeight: FontWeight.w600)),
+      child: Text(
+        label,
+        overflow: TextOverflow.ellipsis,
+        maxLines: 1,
+        softWrap: false,
+        style: TextStyle(color: fg, fontSize: 11, fontWeight: FontWeight.w600),
+      ),
     );
   }
 }
