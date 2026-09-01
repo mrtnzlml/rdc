@@ -20,10 +20,13 @@ class Settings {
   /// Keys this build owns. Anything else lands in [extra].
   static const _known = {'parentFolder', 'externalPaths'};
 
-  /// Overrides the on-disk file used by the instance methods [save]/[load]
-  /// below. `null` (the production default) means "use the real per-user
-  /// file" (see [_file]). Tests pass a temp file here so `flutter test` can
-  /// never read or write the developer's real `~/.rdc-desktop/settings.json`.
+  /// Overrides the on-disk file used by the instance method [save] below.
+  /// `null` (the production default) means "use the real per-user file" (see
+  /// [_file]). Tests pass a temp file here so `flutter test` can never write
+  /// the developer's real `~/.rdc-desktop/settings.json`. Note this only
+  /// affects [save]: [load] is `static` and always reads the real per-user
+  /// file via [_file] directly, so it never sees this override — a test
+  /// that needs a loaded instance should go through [fromJson] instead.
   final File? _overrideFile;
 
   Settings({
@@ -57,8 +60,10 @@ class Settings {
 
   /// Pure (no disk I/O) deserialization, so it's unit-testable and `load`
   /// can delegate to it. Tolerates a missing/legacy file: any absent key
-  /// falls back to its default.
-  static Settings fromJson(Map<String, dynamic> m) => Settings(
+  /// falls back to its default. `file` is forwarded to the constructor so a
+  /// test can decode a fixture and still route the resulting instance's
+  /// [save] at a temp file instead of the real per-user one.
+  static Settings fromJson(Map<String, dynamic> m, {File? file}) => Settings(
         parentFolder: m['parentFolder'] as String?,
         externalPaths:
             (m['externalPaths'] as List?)?.map((e) => e as String).toList() ?? [],
@@ -66,6 +71,7 @@ class Settings {
           for (final e in m.entries)
             if (!_known.contains(e.key)) e.key: e.value,
         },
+        file: file,
       );
 
   /// Known keys are written last so a stale value in [extra] can never
