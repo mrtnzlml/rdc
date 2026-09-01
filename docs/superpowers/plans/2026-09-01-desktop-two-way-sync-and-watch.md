@@ -1739,6 +1739,11 @@ pub enum PromptKindDto {
     DeleteDrift,
     MdhIndexDrop,
     MdhRowDelete,
+    /// A coordinated read whose site never announced. Should be unreachable;
+    /// it exists so that if it ever happens the UI can say so instead of
+    /// silently mislabelling the prompt as a conflict. Render it as an
+    /// explicit "unrecognised prompt" state, not as a normal dialog.
+    Unknown,
 }
 
 #[derive(Debug, Clone)]
@@ -2116,6 +2121,7 @@ fn kind_to_dto(k: rdc::cli::stdin_coord::PromptKind) -> PromptKindDto {
         K::DeleteDrift => PromptKindDto::DeleteDrift,
         K::MdhIndexDrop => PromptKindDto::MdhIndexDrop,
         K::MdhRowDelete => PromptKindDto::MdhRowDelete,
+        K::Unknown => PromptKindDto::Unknown,
     }
 }
 
@@ -2262,6 +2268,7 @@ class PendingPrompt {
         PromptKindDto.deleteDrift => 'Deleted locally, changed remotely',
         PromptKindDto.mdhIndexDrop => 'Drop indexes?',
         PromptKindDto.mdhRowDelete => 'Delete rows?',
+        PromptKindDto.unknown => 'Unrecognised prompt',
       };
 }
 
