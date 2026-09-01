@@ -623,8 +623,8 @@ mod tests {
     /// installed route and asserts both halves: the question text still
     /// reaches the log sink, and the announced `Prompt` carries the `kind`
     /// and `keys` a non-terminal consumer needs to render its own dialog.
-    #[test]
-    fn delete_gate_announces_and_writes_the_question() {
+    #[tokio::test]
+    async fn delete_gate_announces_and_writes_the_question() {
         let buf = Buf::default();
         let log = crate::log::Log::for_sink(
             crate::cli::resolve::ColorMode::Plain,
@@ -634,11 +634,14 @@ mod tests {
             answer: "y".into(),
             seen: std::sync::Mutex::new(Vec::new()),
         });
-        let _guard = crate::cli::stdin_coord::install_route(route.clone());
 
         let mut t = Tombstones::default();
         t.hooks.insert("legacy-export".to_string(), 9137);
-        let out = confirm_or_refuse(&t, true, false, &log).unwrap();
+        let out = crate::cli::stdin_coord::with_route(route.clone(), async {
+            confirm_or_refuse(&t, true, false, &log)
+        })
+        .await
+        .unwrap();
         assert!(matches!(out, ConfirmOutcome::Proceed));
 
         let text = buf.text();
@@ -661,8 +664,8 @@ mod tests {
     }
 
     /// Same genuine-coverage shape for the delete-drift resolver.
-    #[test]
-    fn delete_drift_announces_and_writes_the_question() {
+    #[tokio::test]
+    async fn delete_drift_announces_and_writes_the_question() {
         let buf = Buf::default();
         let log = crate::log::Log::for_sink(
             crate::cli::resolve::ColorMode::Plain,
@@ -672,9 +675,12 @@ mod tests {
             answer: "k".into(),
             seen: std::sync::Mutex::new(Vec::new()),
         });
-        let _guard = crate::cli::stdin_coord::install_route(route.clone());
 
-        let choice = resolve_delete_drift(&log, true, "hooks", "legacy-export").unwrap();
+        let choice = crate::cli::stdin_coord::with_route(route.clone(), async {
+            resolve_delete_drift(&log, true, "hooks", "legacy-export")
+        })
+        .await
+        .unwrap();
         assert!(matches!(choice, DeleteDriftChoice::KeepDelete));
 
         let text = buf.text();

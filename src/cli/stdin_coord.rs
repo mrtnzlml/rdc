@@ -19,6 +19,7 @@
 //! so non-watch `rdc sync` / `deploy` behave exactly as before.
 
 use std::cell::RefCell;
+use std::future::Future;
 use std::io::{self, BufRead, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -96,11 +97,19 @@ impl Prompt {
 }
 
 /// Where a blocked prompt's question goes and where its answer comes from,
-/// when the consumer is not a terminal. Installed per thread, because a
-/// cycle never leaves its thread (engine concurrency is `buffer_unordered`
-/// on the current task, never `tokio::spawn` — see `api::mod`) and the
-/// process-global [`COORD`] has a single waiting slot, so two concurrent
-/// watches sharing it would hang the first one.
+/// when the consumer is not a terminal. Scoped to the current async TASK
+/// (via [`with_route`] / `tokio::task_local!`), not the OS thread: a
+/// thread-local route is silently wrong under a multi-thread runtime,
+/// because tokio's work-stealing scheduler is free to resume a task's
+/// `.await` continuation on a different worker thread than the one that
+/// started it — a watch's route would then either vanish or, worse, read
+/// back whatever OTHER task's route happened to be installed on the
+/// resuming thread. A task-local value travels WITH the task across such
+/// moves, so it stays attached to the one watch that installed it
+/// regardless of which OS thread ends up polling it. The process-global
+/// [`COORD`] (below) has a single waiting slot for the same reason two
+/// concurrent watches can't share it — but a route is scoped per-watch, so
+/// task-local is the right granularity, not process-global.
 pub trait PromptRoute: Send + Sync {
     /// Block until the consumer answers. `None` means end of input; every
     /// resolver already degrades safely on that (conflicts skip, gates
@@ -108,48 +117,46 @@ pub trait PromptRoute: Send + Sync {
     fn ask(&self, prompt: &Prompt) -> Option<String>;
 }
 
-thread_local! {
-    static ROUTE: RefCell<Option<Arc<dyn PromptRoute>>> = const { RefCell::new(None) };
-    static PENDING: RefCell<Option<Prompt>> = const { RefCell::new(None) };
+tokio::task_local! {
+    static ROUTE: Arc<dyn PromptRoute>;
+    // Scoped alongside `ROUTE` (see `with_route`), not separately: an
+    // earlier version kept this thread-local on the theory that `announce`
+    // is always immediately followed by the read that consumes it, with no
+    // intervening `.await` for another task to interleave on the same OS
+    // thread. That theory does not need to hold for every future caller —
+    // and empirically it took only a deliberately adversarial test
+    // (`routes_do_not_cross_talk_between_concurrent_tasks`, which yields
+    // between `announce` and the read specifically to force a reschedule)
+    // to falsify it: thread-local `PENDING` handed one task's announced
+    // question to the OTHER task's route after a work-stealing move. Task-
+    // local removes the assumption entirely.
+    static PENDING: RefCell<Option<Prompt>>;
 }
 
-/// Install `route` for the calling thread until the returned guard drops.
+/// Run `f` with `route` installed as the [`PromptRoute`] for every
+/// coordinated prompt `f` (or anything it calls, including across
+/// `.await` points) issues, via [`announce`] + [`read_line_coordinated`].
 ///
-/// Nothing in the CLI calls this — it is installed by a non-terminal
-/// consumer (the desktop bridge), which lands in a later task of this
-/// plan. `dead_code` is denied workspace-wide, hence the explicit allow
-/// rather than leaving this half-wired route unbuildable in the meantime.
-#[allow(dead_code)]
-#[must_use = "the route is uninstalled when the guard drops"]
-pub fn install_route(route: Arc<dyn PromptRoute>) -> RouteGuard {
-    ROUTE.with(|r| *r.borrow_mut() = Some(route));
-    RouteGuard(())
-}
-
-/// Uninstalls the calling thread's route (and drops any pending
-/// announcement) when this drops, so a route's lifetime bounds exactly
-/// one watch's prompts.
-///
-/// Nothing in the CLI constructs one yet — Task 8 wires the desktop
-/// bridge to hold this guard for the lifetime of a watch. `dead_code` is
-/// denied workspace-wide, hence the explicit allow.
-#[allow(dead_code)]
-pub struct RouteGuard(());
-
-impl Drop for RouteGuard {
-    fn drop(&mut self) {
-        ROUTE.with(|r| *r.borrow_mut() = None);
-        PENDING.with(|p| *p.borrow_mut() = None);
-    }
+/// Nothing in the CLI calls this — it is the entry point a non-terminal
+/// consumer (the desktop bridge, `cli::sync::embed::watch_logged`) uses to
+/// scope one watch's prompts to its own route. Backed by `tokio::task_local!`
+/// (see [`PromptRoute`]'s doc for why), so the route (and its pending
+/// announcement — see [`PENDING`]) is visible for exactly the lifetime of
+/// `f` and disappears the instant `f` resolves — no guard to drop, no risk
+/// of a stale route outliving its watch.
+pub async fn with_route<F: Future>(route: Arc<dyn PromptRoute>, f: F) -> F::Output {
+    ROUTE
+        .scope(route, PENDING.scope(RefCell::new(None), f))
+        .await
 }
 
 /// Declare what the next coordinated read is asking. Call immediately
 /// before writing the question. A no-op when no route is installed, which
-/// is every CLI invocation.
+/// is every CLI invocation — `PENDING` is only in scope while `ROUTE` is
+/// (both are scoped together by [`with_route`]), so `try_with` fails
+/// exactly when there is no route to announce to.
 pub fn announce(p: Prompt) {
-    if ROUTE.with(|r| r.borrow().is_some()) {
-        PENDING.with(|slot| *slot.borrow_mut() = Some(p));
-    }
+    let _ = PENDING.try_with(|slot| *slot.borrow_mut() = Some(p));
 }
 
 /// Routing state shared between the stdin owner and interactive prompts.
@@ -241,11 +248,12 @@ pub fn maybe_ring_bell() {
 ///
 /// Resolution order, highest priority first:
 ///
-/// 1. A thread-local [`PromptRoute`] ([`install_route`]), for a
-///    non-terminal consumer such as the desktop app. Per-thread rather
-///    than process-global because a cycle never leaves its thread, so
-///    this is exactly one route per watch — see [`PromptRoute`]'s doc for
-///    why a process-global slot can't make that guarantee.
+/// 1. A task-local [`PromptRoute`] ([`with_route`]), for a non-terminal
+///    consumer such as the desktop app. Scoped to the current async task
+///    (not the OS thread) so it stays attached to the one watch that
+///    installed it even when tokio's scheduler resumes that task on a
+///    different worker thread — see [`PromptRoute`]'s doc for why a
+///    thread-local (or a process-global slot) can't make that guarantee.
 /// 2. The process-global watch coordinator (coordinator [`activate`]d):
 ///    registers as the waiting prompt and blocks until the owner
 ///    delivers a line — it never touches the real stdin, so it cannot
@@ -261,12 +269,14 @@ pub fn read_line_coordinated() -> io::Result<Option<String>> {
     // `CoordinatorStdin` — so this single call covers them all. No-op outside
     // watch (never armed) or off a TTY.
     maybe_ring_bell();
-    // A thread-local route (the desktop app) outranks the process-global
+    // A task-local route (the desktop app) outranks the process-global
     // coordinator (`rdc sync --watch` on a TTY), which outranks real stdin.
     // The CLI never installs a route, so its path is unchanged.
-    if let Some(route) = ROUTE.with(|r| r.borrow().clone()) {
+    if let Ok(route) = ROUTE.try_with(|r| r.clone()) {
         let prompt = PENDING
-            .with(|p| p.borrow_mut().take())
+            .try_with(|p| p.borrow_mut().take())
+            .ok()
+            .flatten()
             .unwrap_or_else(Prompt::unknown);
         return Ok(route.ask(&prompt));
     }
@@ -422,85 +432,113 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_installed_route_answers_and_sees_the_announced_prompt() {
+    #[tokio::test]
+    async fn an_installed_route_answers_and_sees_the_announced_prompt() {
         let route = Arc::new(Canned {
             answer: "k".into(),
             seen: Mutex::new(Vec::new()),
         });
-        let guard = install_route(route.clone());
-        announce(Prompt {
-            kind: PromptKind::DeleteGate,
-            question: "Proceed with deletion? [y/N] ".into(),
-            keys: vec![PromptKey::new('y', "yes"), PromptKey::new('n', "no")],
-        });
-        assert_eq!(read_line_coordinated().unwrap(), Some("k".to_string()));
+        with_route(route.clone(), async {
+            announce(Prompt {
+                kind: PromptKind::DeleteGate,
+                question: "Proceed with deletion? [y/N] ".into(),
+                keys: vec![PromptKey::new('y', "yes"), PromptKey::new('n', "no")],
+            });
+            assert_eq!(read_line_coordinated().unwrap(), Some("k".to_string()));
+        })
+        .await;
         let seen = route.seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].kind, PromptKind::DeleteGate);
         assert_eq!(seen[0].keys.len(), 2);
-        drop(guard);
     }
 
-    #[test]
-    fn a_pending_prompt_is_consumed_once() {
+    #[tokio::test]
+    async fn a_pending_prompt_is_consumed_once() {
         let route = Arc::new(Canned {
             answer: "s".into(),
             seen: Mutex::new(Vec::new()),
         });
-        let guard = install_route(route.clone());
-        announce(Prompt {
-            kind: PromptKind::Conflict,
-            question: "q".into(),
-            keys: vec![PromptKey::new('s', "skip")],
-        });
-        let _ = read_line_coordinated().unwrap();
-        let _ = read_line_coordinated().unwrap();
+        with_route(route.clone(), async {
+            announce(Prompt {
+                kind: PromptKind::Conflict,
+                question: "q".into(),
+                keys: vec![PromptKey::new('s', "skip")],
+            });
+            let _ = read_line_coordinated().unwrap();
+            let _ = read_line_coordinated().unwrap();
+        })
+        .await;
         let seen = route.seen.lock().unwrap();
         // Second read saw the fallback, not a stale copy of the first.
         assert_eq!(seen[0].question, "q");
         assert_eq!(seen[1].question, "");
         assert_eq!(seen[1].kind, PromptKind::Unknown);
-        drop(guard);
     }
 
-    /// The constraint that ruled out the process-global coordinator: two
-    /// watches must be able to prompt at the same time without either
-    /// answer landing on the wrong thread.
-    #[test]
-    fn routes_are_per_thread_and_do_not_cross_talk() {
-        let a = Arc::new(Canned {
-            answer: "A".into(),
-            seen: Mutex::new(Vec::new()),
-        });
-        let b = Arc::new(Canned {
-            answer: "B".into(),
-            seen: Mutex::new(Vec::new()),
-        });
+    /// The constraint that ruled out the process-global coordinator, now
+    /// proven against concurrent TASKS rather than OS threads: N watches
+    /// must be able to prompt at the same time, surviving tokio's
+    /// work-stealing scheduler moving any of them to a different worker
+    /// thread mid-await, without an answer ever landing on the wrong watch.
+    ///
+    /// Multi-thread runtime with 2 workers is deliberate — a
+    /// current-thread runtime can never reschedule a task onto a different
+    /// OS thread, so it would pass trivially and prove nothing. 6 tasks
+    /// (more than the 2 workers) on 2 workers is also deliberate: with
+    /// exactly as many tasks as workers, each worker can just keep running
+    /// its own task locally forever and never needs to steal — no
+    /// migration occurs, and the test passes even against the OLD
+    /// `thread_local!` storage this is supposed to falsify (verified: see
+    /// the task 8 fix-round-1 report). Oversubscribing forces real
+    /// work-stealing pressure. Each task sleeps (not just `yield_now`, which
+    /// tokio's LIFO slot can satisfy without ever touching another worker's
+    /// queue) between `announce` and the read specifically to give the
+    /// scheduler a chance to migrate it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn routes_do_not_cross_talk_between_concurrent_tasks() {
+        const N: usize = 6;
+        let routes: Vec<Arc<Canned>> = (0..N)
+            .map(|i| {
+                Arc::new(Canned {
+                    answer: i.to_string(),
+                    seen: Mutex::new(Vec::new()),
+                })
+            })
+            .collect();
 
-        let (a2, b2) = (a.clone(), b.clone());
-        let ta = std::thread::spawn(move || {
-            let _g = install_route(a2);
-            announce(Prompt {
-                kind: PromptKind::Conflict,
-                question: "from-a".into(),
-                keys: vec![],
-            });
-            read_line_coordinated().unwrap()
-        });
-        let tb = std::thread::spawn(move || {
-            let _g = install_route(b2);
-            announce(Prompt {
-                kind: PromptKind::Conflict,
-                question: "from-b".into(),
-                keys: vec![],
-            });
-            read_line_coordinated().unwrap()
-        });
+        let handles: Vec<_> = routes
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(i, route)| {
+                tokio::spawn(with_route(route, async move {
+                    announce(Prompt {
+                        kind: PromptKind::Conflict,
+                        question: format!("from-{i}"),
+                        keys: vec![],
+                    });
+                    for _ in 0..20 {
+                        tokio::time::sleep(std::time::Duration::from_micros(50)).await;
+                    }
+                    read_line_coordinated().unwrap()
+                }))
+            })
+            .collect();
 
-        assert_eq!(ta.join().unwrap(), Some("A".to_string()));
-        assert_eq!(tb.join().unwrap(), Some("B".to_string()));
-        assert_eq!(a.seen.lock().unwrap()[0].question, "from-a");
-        assert_eq!(b.seen.lock().unwrap()[0].question, "from-b");
+        for (i, h) in handles.into_iter().enumerate() {
+            assert_eq!(
+                h.await.unwrap(),
+                Some(i.to_string()),
+                "task {i} got the wrong answer"
+            );
+        }
+        for (i, route) in routes.iter().enumerate() {
+            assert_eq!(
+                route.seen.lock().unwrap()[0].question,
+                format!("from-{i}"),
+                "route {i} was asked the wrong question"
+            );
+        }
     }
 }

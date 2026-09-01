@@ -817,8 +817,8 @@ mod tests {
     /// asserts both that the question text reaches the log sink and that
     /// the announced `Prompt` carries the `kind` and `keys` a non-terminal
     /// consumer needs.
-    #[test]
-    fn row_delete_gate_announces_and_writes_the_question() {
+    #[tokio::test]
+    async fn row_delete_gate_announces_and_writes_the_question() {
         let buf = Buf::default();
         let log = crate::log::Log::for_sink(
             crate::cli::resolve::ColorMode::Plain,
@@ -828,9 +828,12 @@ mod tests {
             answer: "y".into(),
             seen: std::sync::Mutex::new(Vec::new()),
         });
-        let _guard = crate::cli::stdin_coord::install_route(route.clone());
 
-        let proceed = prompt_confirm_row_deletes(&log, "gl-codes", 3).unwrap();
+        let proceed = crate::cli::stdin_coord::with_route(route.clone(), async {
+            prompt_confirm_row_deletes(&log, "gl-codes", 3)
+        })
+        .await
+        .unwrap();
         assert!(proceed);
 
         let text = buf.text();

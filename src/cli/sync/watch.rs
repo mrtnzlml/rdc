@@ -654,7 +654,54 @@ fn path_should_be_ignored(path: &std::path::Path, env: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex as StdMutex, MutexGuard, OnceLock};
     use tokio::sync::mpsc;
+
+    /// Guard returned by [`cwd_lock`]: holds the global mutex AND restores
+    /// the working directory captured at lock time when dropped —
+    /// including on panic.
+    ///
+    /// Duplicated from `tests/cli_migrate.rs`'s helper of the same name
+    /// rather than shared, since that file is a separate integration-test
+    /// binary and this is a `--lib` unit test module; there is no existing
+    /// `#[cfg(test)]`-only location both already depend on, and this is
+    /// the only file under `src/` whose tests touch the process cwd (see
+    /// `grep -rn set_current_dir src/`), so a shared module would have
+    /// exactly one caller on this side anyway.
+    ///
+    /// Without the restore, a test that panics inside its
+    /// `set_current_dir` window leaves the process cwd pointing into its
+    /// (now deleted) tempdir and every later test in this binary that
+    /// reads `current_dir()` fails with `NotFound` — this is exactly the
+    /// failure `event_loop_uses_the_injected_cwd_not_the_process_cwd` and
+    /// `event_loop_exits_cleanly_on_shutdown` could inflict on each other
+    /// (and any future cwd-touching test in this module) when `cargo test`
+    /// runs them on parallel threads, since both mutate the one
+    /// process-wide cwd with no serialization.
+    struct CwdLock {
+        _lock: MutexGuard<'static, ()>,
+        prev: Option<std::path::PathBuf>,
+    }
+
+    impl Drop for CwdLock {
+        fn drop(&mut self) {
+            if let Some(prev) = self.prev.take() {
+                let _ = std::env::set_current_dir(prev);
+            }
+        }
+    }
+
+    fn cwd_lock() -> CwdLock {
+        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        let lock = LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        CwdLock {
+            _lock: lock,
+            prev: std::env::current_dir().ok(),
+        }
+    }
 
     #[test]
     fn polling_bar_tenths() {
@@ -679,6 +726,14 @@ mod tests {
 
     #[tokio::test]
     async fn event_loop_exits_cleanly_on_shutdown() {
+        // Holds the process-wide cwd mutex for the rest of this test and
+        // restores the pre-test cwd on drop (including on panic) — see
+        // `CwdLock`'s doc. Without it this test and
+        // `event_loop_uses_the_injected_cwd_not_the_process_cwd` race on
+        // `std::env::set_current_dir` under `cargo test`'s parallel
+        // threads.
+        let _cwd_guard = cwd_lock();
+
         let (_tx, rx) = mpsc::channel::<CycleTrigger>(8);
 
         // event_loop expects a project context — without one, the lock acquire
@@ -687,7 +742,6 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join(".rdc/state")).unwrap();
-        let saved_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(tmp.path()).unwrap();
 
         let cancel = CancelToken::new();
@@ -722,7 +776,6 @@ mod tests {
         )
         .await;
 
-        std::env::set_current_dir(saved_cwd).unwrap();
         assert!(result.is_ok(), "{result:?}");
     }
 
@@ -748,9 +801,12 @@ mod tests {
         // land under the process CWD instead (see the falsification note
         // in the task 7 report: flipping `cwd` to `None` here does fail
         // this assertion, and only this one).
+        // See `event_loop_exits_cleanly_on_shutdown`'s comment on `CwdLock`:
+        // this test also mutates the process-wide cwd.
+        let _cwd_guard = cwd_lock();
+
         let process_cwd = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        let saved_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(process_cwd.path()).unwrap();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<CycleTrigger>(8);
@@ -785,8 +841,6 @@ mod tests {
             &refresher,
         )
         .await;
-
-        std::env::set_current_dir(&saved_cwd).unwrap();
 
         // The cycle fails (no rdc.toml anywhere) — that failure is not
         // what this test is about.
