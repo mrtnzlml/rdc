@@ -29,4 +29,12 @@ void main() {
     s.parentFolder = '/tmp/new';
     expect(s.toJson()['parentFolder'], '/tmp/new');
   });
+
+  test('a stale key in extra never shadows the live field', () {
+    // Only the public constructor can produce this state: fromJson's _known
+    // filter keeps known keys out of extra. Reversing toJson's spread order
+    // would flip this assertion — which is the point.
+    final s = Settings(parentFolder: '/tmp/live', extra: {'parentFolder': '/tmp/stale'});
+    expect(s.toJson()['parentFolder'], '/tmp/live');
+  });
 }
