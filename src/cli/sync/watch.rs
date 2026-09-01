@@ -3,10 +3,51 @@
 //! Spec: docs/superpowers/specs/2026-05-14-watch-mode-design.md
 
 use anyhow::Result;
+use futures::future::BoxFuture;
 use std::io::IsTerminal;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+/// Cooperative shutdown for a watch loop. The CLI wires Ctrl-C to it; an
+/// embedder wires its own stop button. Cloneable, and `cancel` is
+/// idempotent so a double stop is harmless.
+#[derive(Clone)]
+pub struct CancelToken {
+    flag: Arc<AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl Default for CancelToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CancelToken {
+    pub fn new() -> Self {
+        Self {
+            flag: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+    pub fn cancel(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+    /// Resolves once cancelled. Returns immediately if already cancelled,
+    /// so a cancel that lands before the `select!` is not lost.
+    pub async fn cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        self.notify.notified().await;
+    }
+}
 
 /// Ten-segment bar showing position within the polling interval.
 fn polling_bar(elapsed: u64, total: u64) -> String {
@@ -45,7 +86,7 @@ fn paint_polling_status(renderer: &crate::log::Log, interval_secs: u64, elapsed:
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CycleTrigger {
+pub enum CycleTrigger {
     /// A local file changed (after debounce).
     FileEvent,
     /// The poll timer fired.
@@ -57,6 +98,40 @@ pub(crate) enum CycleTrigger {
     Manual,
 }
 
+/// Everything `event_loop` (and the reconcile before it) needs that a
+/// non-CLI caller must be able to override: which project directory to
+/// treat as cwd, which token to use instead of on-disk secrets, and the
+/// same sync flags `rdc sync` exposes on the command line.
+pub struct WatchConfig<'a> {
+    pub env: &'a str,
+    pub cwd: Option<&'a Path>,
+    pub token: Option<String>,
+    pub interactive: bool,
+    pub allow_deletes: bool,
+    pub no_push: bool,
+    pub no_pull: bool,
+    pub poll: Option<Duration>,
+    pub verbose: bool,
+    pub no_bell: bool,
+}
+
+/// Refreshes the token for `env` on a 401. `Ok(Some(tok))` is the new token
+/// to retry with; `Ok(None)` means the caller refreshed the on-disk secrets
+/// in place and `run_cycle` should fall back to re-reading them (the CLI's
+/// `inquire`-backed prompt does this). The CLI wires this to
+/// `auth::refresh_token_for_401`; an embedder can prompt its own UI.
+pub type TokenRefresher =
+    Arc<dyn Fn(String) -> BoxFuture<'static, Result<Option<String>>> + Send + Sync>;
+
+/// Installed by the CLI to take ownership of the terminal's stdin. Given
+/// the event sender and the `sync_running` flag (a mid-cycle keypress must
+/// be dropped, not queued) plus the cancel token, it spawns the reader.
+/// Embedders pass `None`: they answer prompts through a `PromptRoute` and
+/// never touch stdin.
+pub type StdinHook = Box<
+    dyn FnOnce(tokio::sync::mpsc::Sender<CycleTrigger>, Arc<AtomicBool>, CancelToken) + Send,
+>;
+
 pub async fn run_watch(
     env: &str,
     interactive: bool,
@@ -67,36 +142,158 @@ pub async fn run_watch(
     verbose: bool,
     no_bell: bool,
 ) -> Result<()> {
-    let cwd = std::env::current_dir()?;
-    let paths = crate::paths::Paths::for_env(&cwd, env);
-
     // Construct the renderer ONCE so freshness clocks persist across cycles.
     let renderer = crate::log::Log::new(crate::cli::resolve::detect_color_mode());
+    let cancel = CancelToken::new();
+
+    // Wire ctrl-c → cancel.
+    let ctrlc_cancel = cancel.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        ctrlc_cancel.cancel();
+    });
+
+    // Stdin reader — the SOLE owner of the terminal's stdin while watching
+    // (see `cli::stdin_coord`). It reads lines and routes each one:
+    //
+    //   1. to a waiting interactive prompt (a conflict / remote-delete /
+    //      destructive-delete resolver blocked mid-cycle), if one is
+    //      registered with the coordinator; else
+    //   2. as an Enter-trigger that fires a cycle ahead of the next poll,
+    //      when idle; else
+    //   3. dropped, when a cycle is running but no prompt is waiting (a
+    //      mid-cycle keypress must not queue an extra cycle).
+    //
+    // Routing through the coordinator is what lets the cycle's prompts and
+    // this reader share stdin without fighting over the process-global
+    // stdin lock — the resolvers read via the coordinator, never the real
+    // stdin, so they can't deadlock against this reader's blocking read.
+    //
+    // TTY only: in non-interactive contexts (CI piping logs) stdin is EOF
+    // or unrelated content, and prompts are non-interactive anyway, so the
+    // coordinator is never activated and resolvers read stdin directly.
+    //
+    // This stays here (built as a `StdinHook`, not inlined in
+    // `run_watch_with`) because taking ownership of stdin is CLI-only: an
+    // embedder answers prompts through a `PromptRoute` and never touches
+    // stdin.
+    let stdin_hook: Option<StdinHook> = if std::io::stdin().is_terminal() {
+        Some(Box::new(|stdin_tx, stdin_sync_running: Arc<AtomicBool>, _cancel| {
+            // Activate synchronously, before the first event-loop cycle can
+            // run a prompt, so the coordinator is live when a prompt registers.
+            let coord = crate::cli::stdin_coord::activate();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncBufReadExt, BufReader};
+                let mut lines = BufReader::new(tokio::io::stdin()).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    // Hand the line to a waiting prompt first; fall through
+                    // only when no prompt wants it.
+                    let Err(_) = coord.try_deliver(line) else {
+                        continue;
+                    };
+                    if stdin_sync_running.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    if stdin_tx.send(CycleTrigger::Manual).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }))
+    } else {
+        None
+    };
+
+    let refresher: TokenRefresher =
+        Arc::new(|env: String| -> BoxFuture<'static, Result<Option<String>>> {
+            Box::pin(async move {
+                crate::cli::auth::refresh_token_for_401(&env).await?;
+                Ok(None) // secrets file rewritten in place; run_cycle re-reads it
+            })
+        });
+
+    run_watch_with(
+        WatchConfig {
+            env,
+            cwd: None,
+            token: None,
+            interactive,
+            allow_deletes,
+            no_push,
+            no_pull,
+            poll: poll_interval,
+            verbose,
+            no_bell,
+        },
+        renderer,
+        cancel,
+        refresher,
+        stdin_hook,
+    )
+    .await?;
+
+    // Exit the process directly instead of returning `Ok(())` and letting
+    // `main` fall into the tokio runtime's `Drop`.
+    //
+    // The stdin reader task above is parked in a `tokio::io::stdin()`
+    // blocking read, which cannot be cancelled and only returns on EOF.
+    // Dropping the multi-threaded runtime blocks until that read completes,
+    // so a returned `Ok(())` would hang the process after Ctrl-C until the
+    // user also pressed Ctrl-D (EOF) — the exact bug this fixes. We only
+    // reach this point via the event loop's shutdown branch (Ctrl-C), so a
+    // clean `exit(0)` is the right outcome. The logger flushes on every
+    // event, so the "stopped" lines above are already on screen. Error
+    // paths still propagate through `?` and are handled by `main`'s
+    // `exit(1)`, which likewise bypasses the hanging `Drop`.
+    std::process::exit(0)
+}
+
+/// Runs the reconcile-and-watch loop against `cfg`: the initial reconcile,
+/// the polling ticker, the file watcher, and `event_loop`. Everything here
+/// is non-terminal-specific — this does not take ownership of stdin,
+/// install a Ctrl-C handler, or exit the process. Those are `run_watch`'s
+/// job (the CLI caller); an embedder drives this directly instead, with
+/// its own `CancelToken` and (typically) no `stdin_hook`.
+pub async fn run_watch_with(
+    cfg: WatchConfig<'_>,
+    renderer: Arc<crate::log::Log>,
+    cancel: CancelToken,
+    refresher: TokenRefresher,
+    stdin_hook: Option<StdinHook>,
+) -> Result<()> {
+    let cwd = match cfg.cwd {
+        Some(p) => p.to_path_buf(),
+        None => std::env::current_dir()?,
+    };
+    let paths = crate::paths::Paths::for_env(&cwd, cfg.env);
 
     // Initial reconcile.
     {
         let _lock =
             crate::cli::sync::lock::EnvLock::acquire(&paths.env_lock(), Duration::from_secs(30))?;
-        if !no_bell {
+        if !cfg.no_bell {
             crate::cli::stdin_coord::arm_bell();
         }
         crate::cli::sync::run_cycle(
-            env,
-            interactive,
+            cfg.env,
+            cfg.interactive,
             false,
-            allow_deletes,
-            no_push,
-            no_pull,
+            cfg.allow_deletes,
+            cfg.no_push,
+            cfg.no_pull,
             None, // conflict_strategy: `--conflict` is not supported under `--watch`
             Some(renderer.clone()),
-            None,
-            None,
+            cfg.cwd,
+            cfg.token.clone(),
         )
         .await?;
     }
 
-    renderer.event(crate::log::Action::Watch, &format!("start envs/{env}"));
-    if let Some(d) = poll_interval {
+    renderer.event(
+        crate::log::Action::Watch,
+        &format!("start envs/{}", cfg.env),
+    );
+    if let Some(d) = cfg.poll {
         renderer.event(
             crate::log::Action::Watch,
             &format!("polling every {}s", d.as_secs()),
@@ -106,13 +303,6 @@ pub async fn run_watch(
     }
 
     let (events_tx, events_rx) = tokio::sync::mpsc::channel(64);
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-
-    // Wire ctrl-c → shutdown.
-    tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        let _ = shutdown_tx.send(());
-    });
 
     // Shared flag the ticker reads to know when to pause its in-place
     // status drawing. The event_loop flips it true around each cycle.
@@ -125,7 +315,7 @@ pub async fn run_watch(
     // uniform-random [0, N] gap after any non-Poll cycle.
     let timer_reset = Arc::new(tokio::sync::Notify::new());
 
-    if let Some(interval_duration) = poll_interval {
+    if let Some(interval_duration) = cfg.poll {
         let tx = events_tx.clone();
         let renderer_ticker = renderer.clone();
         let sync_running_ticker = sync_running.clone();
@@ -166,67 +356,22 @@ pub async fn run_watch(
     }
 
     let env_root = paths.env_root();
-    let watcher = spawn_file_watcher(env.to_string(), env_root.clone(), events_tx.clone())?;
+    let watcher = spawn_file_watcher(cfg.env.to_string(), env_root.clone(), events_tx.clone())?;
 
-    // Stdin reader — the SOLE owner of the terminal's stdin while watching
-    // (see `cli::stdin_coord`). It reads lines and routes each one:
-    //
-    //   1. to a waiting interactive prompt (a conflict / remote-delete /
-    //      destructive-delete resolver blocked mid-cycle), if one is
-    //      registered with the coordinator; else
-    //   2. as an Enter-trigger that fires a cycle ahead of the next poll,
-    //      when idle; else
-    //   3. dropped, when a cycle is running but no prompt is waiting (a
-    //      mid-cycle keypress must not queue an extra cycle).
-    //
-    // Routing through the coordinator is what lets the cycle's prompts and
-    // this reader share stdin without fighting over the process-global
-    // stdin lock — the resolvers read via the coordinator, never the real
-    // stdin, so they can't deadlock against this reader's blocking read.
-    //
-    // TTY only: in non-interactive contexts (CI piping logs) stdin is EOF
-    // or unrelated content, and prompts are non-interactive anyway, so the
-    // coordinator is never activated and resolvers read stdin directly.
-    if std::io::stdin().is_terminal() {
-        // Activate synchronously, before the first event-loop cycle can
-        // run a prompt, so the coordinator is live when a prompt registers.
-        let coord = crate::cli::stdin_coord::activate();
-        let stdin_tx = events_tx.clone();
-        let stdin_sync_running = sync_running.clone();
-        tokio::spawn(async move {
-            use tokio::io::{AsyncBufReadExt, BufReader};
-            let mut lines = BufReader::new(tokio::io::stdin()).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                // Hand the line to a waiting prompt first; fall through
-                // only when no prompt wants it.
-                let Err(_) = coord.try_deliver(line) else {
-                    continue;
-                };
-                if stdin_sync_running.load(Ordering::Relaxed) {
-                    continue;
-                }
-                if stdin_tx.send(CycleTrigger::Manual).await.is_err() {
-                    break;
-                }
-            }
-        });
+    if let Some(hook) = stdin_hook {
+        hook(events_tx.clone(), sync_running.clone(), cancel.clone());
     }
 
     event_loop(
-        env,
-        interactive,
-        allow_deletes,
-        no_push,
-        no_pull,
-        verbose,
-        no_bell,
+        &cfg,
         events_rx,
-        shutdown_rx,
+        cancel,
         Some(watcher),
         env_root,
         Some(renderer.clone()),
         sync_running.clone(),
         timer_reset.clone(),
+        &refresher,
     )
     .await?;
     renderer.finish_status();
@@ -235,21 +380,7 @@ pub async fn run_watch(
     // after the first cycle), so the watch loop emits it here on exit.
     renderer.event(crate::log::Action::Done, "stopped watch");
     renderer.event(crate::log::Action::Watch, "stopped");
-
-    // Exit the process directly instead of returning `Ok(())` and letting
-    // `main` fall into the tokio runtime's `Drop`.
-    //
-    // The stdin reader task above is parked in a `tokio::io::stdin()`
-    // blocking read, which cannot be cancelled and only returns on EOF.
-    // Dropping the multi-threaded runtime blocks until that read completes,
-    // so a returned `Ok(())` would hang the process after Ctrl-C until the
-    // user also pressed Ctrl-D (EOF) — the exact bug this fixes. We only
-    // reach this point via the event loop's shutdown branch (Ctrl-C), so a
-    // clean `exit(0)` is the right outcome. The logger flushes on every
-    // event, so the "stopped" lines above are already on screen. Error
-    // paths still propagate through `?` and are handled by `main`'s
-    // `exit(1)`, which likewise bypasses the hanging `Drop`.
-    std::process::exit(0)
+    Ok(())
 }
 
 /// The testable inner loop: drain events, run cycles, exit on shutdown.
@@ -260,30 +391,28 @@ pub async fn run_watch(
 /// of when cycles fire — restarts its `interval_secs` countdown from the
 /// moment the cycle ended, not from some prior baseline.
 pub(crate) async fn event_loop(
-    env: &str,
-    interactive: bool,
-    allow_deletes: bool,
-    no_push: bool,
-    no_pull: bool,
-    verbose: bool,
-    no_bell: bool,
+    cfg: &WatchConfig<'_>,
     mut events: tokio::sync::mpsc::Receiver<CycleTrigger>,
-    mut shutdown: tokio::sync::oneshot::Receiver<()>,
+    cancel: CancelToken,
     mut watcher: Option<notify::RecommendedWatcher>,
     env_root: std::path::PathBuf,
     renderer: Option<Arc<crate::log::Log>>,
     sync_running: Arc<AtomicBool>,
     timer_reset: Arc<tokio::sync::Notify>,
+    refresher: &TokenRefresher,
 ) -> Result<()> {
     use notify::{RecursiveMode, Watcher};
 
-    let cwd = std::env::current_dir()?;
-    let paths = crate::paths::Paths::for_env(&cwd, env);
+    let cwd = match cfg.cwd {
+        Some(p) => p.to_path_buf(),
+        None => std::env::current_dir()?,
+    };
+    let paths = crate::paths::Paths::for_env(&cwd, cfg.env);
 
     loop {
         tokio::select! {
             biased;
-            _ = &mut shutdown => break,
+            _ = cancel.cancelled() => break,
             evt = events.recv() => {
                 let Some(trigger) = evt else { break };
                 // Debounce only file events. Poll events run immediately.
@@ -329,12 +458,12 @@ pub(crate) async fn event_loop(
                 let _cycle_guard = CycleGuard(&sync_running);
                 // Re-arm the attention bell once per cycle so the first
                 // blocking prompt (conflict / delete / drift / 401) rings.
-                if !no_bell {
+                if !cfg.no_bell {
                     crate::cli::stdin_coord::arm_bell();
                 }
                 let _outcome = match crate::cli::sync::run_cycle(
-                    env, interactive, false, allow_deletes, no_push, no_pull,
-                    None, renderer.clone(), None, None,
+                    cfg.env, cfg.interactive, false, cfg.allow_deletes, cfg.no_push, cfg.no_pull,
+                    None, renderer.clone(), cfg.cwd, cfg.token.clone(),
                 ).await {
                     Ok(o) => o,
                     Err(e) if crate::api::anyhow_has_status(&e, 401) => {
@@ -352,10 +481,11 @@ pub(crate) async fn event_loop(
                         } else {
                             eprintln!("auth: token expired");
                         }
-                        crate::cli::auth::refresh_token_for_401(env).await?;
+                        let fresh = refresher(cfg.env.to_string()).await?;
+                        let token = fresh.or_else(|| cfg.token.clone());
                         crate::cli::sync::run_cycle(
-                            env, interactive, false, allow_deletes, no_push, no_pull,
-                            None, renderer.clone(), None, None,
+                            cfg.env, cfg.interactive, false, cfg.allow_deletes, cfg.no_push, cfg.no_pull,
+                            None, renderer.clone(), cfg.cwd, token,
                         ).await?
                     }
                     Err(e) if is_transient_network_error(&e) => {
@@ -400,7 +530,7 @@ pub(crate) async fn event_loop(
                 // also already shows the summary via `progress.finish_ok`
                 // inside `run_cycle`. `verbose` is retained on the signature
                 // for backward compatibility but has no effect today.
-                let _ = verbose;
+                let _ = cfg.verbose;
             }
         }
     }
@@ -478,7 +608,7 @@ fn path_should_be_ignored(path: &std::path::Path, env: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::{mpsc, oneshot};
+    use tokio::sync::mpsc;
 
     #[test]
     fn polling_bar_tenths() {
@@ -504,7 +634,6 @@ mod tests {
     #[tokio::test]
     async fn event_loop_exits_cleanly_on_shutdown() {
         let (_tx, rx) = mpsc::channel::<CycleTrigger>(8);
-        let (sh_tx, sh_rx) = oneshot::channel();
 
         // event_loop expects a project context — without one, the lock acquire
         // would fail on a non-existent .rdc/state/ dir. For this minimal test,
@@ -515,26 +644,91 @@ mod tests {
         let saved_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(tmp.path()).unwrap();
 
-        sh_tx.send(()).unwrap(); // shutdown before any event
+        let cancel = CancelToken::new();
+        cancel.cancel(); // shutdown before any event
+
+        let cfg = WatchConfig {
+            env: "test",
+            cwd: None, // covers the CLI path: event_loop falls back to process cwd
+            token: None,
+            interactive: false,
+            allow_deletes: false,
+            no_push: false,
+            no_pull: false,
+            poll: None,
+            verbose: false,
+            no_bell: false,
+        };
+        let refresher: TokenRefresher =
+            Arc::new(|_: String| -> BoxFuture<'static, Result<Option<String>>> {
+                Box::pin(async { Ok(None) })
+            });
         let result = event_loop(
-            "test",
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
+            &cfg,
             rx,
-            sh_rx,
+            cancel,
             None,
             std::path::PathBuf::new(),
             None,
             Arc::new(AtomicBool::new(false)),
             Arc::new(tokio::sync::Notify::new()),
+            &refresher,
         )
         .await;
 
         std::env::set_current_dir(saved_cwd).unwrap();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn cancel_token_resolves_even_when_cancelled_first() {
+        let c = CancelToken::new();
+        c.cancel();
+        // Would hang forever if `cancelled()` only awaited the Notify.
+        tokio::time::timeout(std::time::Duration::from_secs(1), c.cancelled())
+            .await
+            .expect("a pre-cancelled token must resolve immediately");
+    }
+
+    #[tokio::test]
+    async fn event_loop_uses_the_injected_cwd_not_the_process_cwd() {
+        // A project at `tmp`, and a process CWD somewhere else entirely.
+        // With cfg.cwd wired through, the loop must lock tmp's env lock and
+        // never look at the process CWD.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".rdc/state")).unwrap();
+        let (_tx, rx) = tokio::sync::mpsc::channel::<CycleTrigger>(8);
+        let cancel = CancelToken::new();
+        cancel.cancel(); // shut down before any cycle runs
+
+        let cfg = WatchConfig {
+            env: "test",
+            cwd: Some(tmp.path()),
+            token: Some("tok".into()),
+            interactive: false,
+            allow_deletes: false,
+            no_push: false,
+            no_pull: false,
+            poll: None,
+            verbose: false,
+            no_bell: true,
+        };
+        let refresher: TokenRefresher =
+            Arc::new(|_: String| -> BoxFuture<'static, Result<Option<String>>> {
+                Box::pin(async { Ok(None) })
+            });
+        let result = event_loop(
+            &cfg,
+            rx,
+            cancel,
+            None,
+            tmp.path().join("envs/test"),
+            None,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(tokio::sync::Notify::new()),
+            &refresher,
+        )
+        .await;
         assert!(result.is_ok(), "{result:?}");
     }
 
