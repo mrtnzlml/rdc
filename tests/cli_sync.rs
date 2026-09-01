@@ -902,13 +902,19 @@ async fn sync_dry_run_lists_clean_remote_delete_under_pull() {
         String::from_utf8_lossy(&dry.stderr)
     );
     assert!(dry.status.success(), "dry-run must succeed: {all}");
+    let row = all
+        .lines()
+        .find(|l| l.contains("doomed-label"))
+        .unwrap_or_else(|| panic!("no plan row for doomed-label: {all}"));
     assert!(
-        all.contains("labels/doomed-label (delete local; deleted on env)"),
-        "clean RemoteDelete must be listed on the pull side: {all}"
+        row.contains("pull")
+            && row.contains("labels")
+            && row.contains("delete local; deleted on env"),
+        "clean RemoteDelete must be a pull row naming its kind: {row:?}"
     );
     assert!(
-        !all.contains("doomed-label -- deleted on env"),
-        "clean RemoteDelete must not appear as a prompt item: {all}"
+        !row.contains("prompt"),
+        "clean RemoteDelete must not be a prompt row: {row:?}"
     );
     assert!(
         all.contains("0 would prompt"),
@@ -3219,9 +3225,13 @@ async fn sync_dry_run_previews_new_mdh_collection_under_pull() {
         String::from_utf8_lossy(&dry.stderr)
     );
     assert!(dry.status.success(), "dry-run must succeed: {all}");
+    let row = all
+        .lines()
+        .find(|l| l.contains("vendors") && l.contains("mdh"))
+        .unwrap_or_else(|| panic!("no plan row for the new MDH collection: {all}"));
     assert!(
-        all.contains("mdh/vendors (new)"),
-        "a new env-only MDH collection must be previewed under would-pull: {all}"
+        row.contains("pull") && row.contains("new"),
+        "a new env-only MDH collection must be previewed as a pull row: {row:?}"
     );
     assert!(
         all.contains("1 would pull"),

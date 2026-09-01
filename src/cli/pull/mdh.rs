@@ -138,9 +138,26 @@ pub(crate) enum MdhPlanDir {
 #[derive(Debug, Clone)]
 pub(crate) struct MdhPlanItem {
     pub dir: MdhPlanDir,
-    /// Display line including the `mdh/<slug>` prefix plus the trailing note
-    /// / action, e.g. `mdh/vendors (new)` or `mdh/vendors PATCH`.
-    pub line: String,
+    /// Dataset slug — the `name` column of the plan row.
+    pub slug: String,
+    /// The row's verb. MDH bypasses the sync classifier, so this is derived
+    /// here rather than from a `SyncClass`.
+    pub verb: crate::cli::change_view::RowVerb,
+    /// Trailing detail for the row's note column, e.g. `new` or `data PATCH`.
+    pub note: Option<String>,
+}
+
+#[cfg(test)]
+impl MdhPlanItem {
+    /// `"<verb> mdh/<slug>[ <note>]"` — a compact description of what was
+    /// planned, so the planner's tests can assert on the plan rather than on
+    /// how a row happens to render.
+    fn describe(&self) -> String {
+        match &self.note {
+            Some(n) => format!("{} mdh/{} {n}", self.verb.token(), self.slug),
+            None => format!("{} mdh/{}", self.verb.token(), self.slug),
+        }
+    }
 }
 
 /// Predict the MDH operations `sync` would perform, for `--dry-run`.
@@ -205,7 +222,9 @@ pub(crate) fn plan_mdh(
             if base_hash(slug).as_deref() != Some(local_hash.as_str()) {
                 items.push(MdhPlanItem {
                     dir: MdhPlanDir::Push,
-                    line: format!("mdh/{slug} PATCH"),
+                    slug: slug.to_string(),
+                    verb: crate::cli::change_view::RowVerb::Patch,
+                    note: None,
                 });
             }
         }
@@ -243,7 +262,9 @@ pub(crate) fn plan_mdh(
             if base.as_deref() != Some(local_hash.as_str()) {
                 items.push(MdhPlanItem {
                     dir: MdhPlanDir::Push,
-                    line: format!("mdh/{slug} data PATCH"),
+                    slug: slug.to_string(),
+                    verb: crate::cli::change_view::RowVerb::Patch,
+                    note: Some("data".to_string()),
                 });
             }
         }
@@ -257,7 +278,9 @@ pub(crate) fn plan_mdh(
             }
             items.push(MdhPlanItem {
                 dir: MdhPlanDir::Push,
-                line: format!("mdh/{slug} POST"),
+                slug: slug.to_string(),
+                    verb: crate::cli::change_view::RowVerb::Post,
+                    note: None,
             });
         }
     }
@@ -268,7 +291,9 @@ pub(crate) fn plan_mdh(
         if !paths.dataset_dir(slug).join("indexes.json").is_file() {
             items.push(MdhPlanItem {
                 dir: MdhPlanDir::Pull,
-                line: format!("mdh/{slug} (new)"),
+                slug: slug.to_string(),
+                    verb: crate::cli::change_view::RowVerb::Pull,
+                    note: Some("new".to_string()),
             });
         }
     }
@@ -289,7 +314,9 @@ pub(crate) fn plan_mdh(
         {
             items.push(MdhPlanItem {
                 dir: MdhPlanDir::Pull,
-                line: format!("mdh/{slug} data (new)"),
+                slug: slug.to_string(),
+                    verb: crate::cli::change_view::RowVerb::Pull,
+                    note: Some("data (new)".to_string()),
             });
         }
     }
@@ -304,7 +331,9 @@ pub(crate) fn plan_mdh(
             if !remote_slugs.contains(slug) {
                 items.push(MdhPlanItem {
                     dir: MdhPlanDir::Pull,
-                    line: format!("mdh/{slug} (delete local; deleted on env)"),
+                    slug: slug.to_string(),
+                    verb: crate::cli::change_view::RowVerb::Pull,
+                    note: Some("delete local; deleted on env".to_string()),
                 });
             }
         }
@@ -336,7 +365,9 @@ fn index_edit_item(
     Ok(match action {
         PullAction::Write => Some(MdhPlanItem {
             dir: MdhPlanDir::Pull,
-            line: format!("mdh/{slug} (index update)"),
+            slug: slug.to_string(),
+                    verb: crate::cli::change_view::RowVerb::Pull,
+                    note: Some("index update".to_string()),
         }),
         // NoChange: local already matches remote. KeepLocal / Conflict: the
         // local file diverged — a push or the resolver owns those, not a pull.
@@ -444,7 +475,9 @@ pub(crate) async fn plan_mdh_index_edits(
                 if action == PullAction::Write {
                     items.push(MdhPlanItem {
                         dir: MdhPlanDir::Pull,
-                        line: format!("mdh/{slug} data (update)"),
+                        slug: slug.to_string(),
+                    verb: crate::cli::change_view::RowVerb::Pull,
+                    note: Some("data (update)".to_string()),
                     });
                 }
             }
@@ -1360,18 +1393,18 @@ mod tests {
 
         let mut got: Vec<(MdhPlanDir, String)> = plan_mdh(&listed, &lf, &paths, false)
             .into_iter()
-            .map(|i| (i.dir, i.line))
+            .map(|i| (i.dir, i.describe()))
             .collect();
         got.sort_by(|a, b| a.1.cmp(&b.1));
         assert_eq!(
             got,
             vec![
-                (MdhPlanDir::Pull, "mdh/brandnew (new)".to_string()),
-                (MdhPlanDir::Push, "mdh/drift PATCH".to_string()),
-                (MdhPlanDir::Push, "mdh/localcreate POST".to_string()),
+                (MdhPlanDir::Push, "patch mdh/drift".to_string()),
+                (MdhPlanDir::Push, "post mdh/localcreate".to_string()),
+                (MdhPlanDir::Pull, "pull mdh/brandnew new".to_string()),
                 (
                     MdhPlanDir::Pull,
-                    "mdh/orphan (delete local; deleted on env)".to_string()
+                    "pull mdh/orphan delete local; deleted on env".to_string()
                 ),
             ],
             "must preview new/drift/create/orphan and skip the clean dataset"
@@ -1380,12 +1413,12 @@ mod tests {
         // `--no-push` drops the push-side ops; the pulls survive.
         let np: Vec<String> = plan_mdh(&listed, &lf, &paths, true)
             .into_iter()
-            .map(|i| i.line)
+            .map(|i| i.describe())
             .collect();
-        assert!(np.contains(&"mdh/brandnew (new)".to_string()));
-        assert!(np.contains(&"mdh/orphan (delete local; deleted on env)".to_string()));
+        assert!(np.contains(&"pull mdh/brandnew new".to_string()));
+        assert!(np.contains(&"pull mdh/orphan delete local; deleted on env".to_string()));
         assert!(
-            !np.iter().any(|l| l.contains("PATCH") || l.contains("POST")),
+            !np.iter().any(|l| l.starts_with("patch") || l.starts_with("post")),
             "no-push must suppress MDH pushes: {np:?}"
         );
     }
@@ -1448,24 +1481,24 @@ mod tests {
         );
 
         let lines: Vec<String> =
-            plan_mdh(&listed, &lf, &paths, false).into_iter().map(|i| i.line).collect();
+            plan_mdh(&listed, &lf, &paths, false).into_iter().map(|i| i.describe()).collect();
         assert!(
-            lines.contains(&"mdh/drifted data PATCH".to_string()),
+            lines.contains(&"patch mdh/drifted data".to_string()),
             "drifted rows must be forecast as a push: {lines:?}"
         );
         assert!(
-            lines.contains(&"mdh/fresh data (new)".to_string()),
+            lines.contains(&"pull mdh/fresh data (new)".to_string()),
             "a manual dataset with no local rows must be forecast as a pull: {lines:?}"
         );
         assert!(
-            !lines.iter().any(|l| l.starts_with("mdh/plain data")),
+            !lines.iter().any(|l| l.contains("mdh/plain data")),
             "a non-manual dataset must produce no data forecast: {lines:?}"
         );
 
         // --no-push keeps the pull-side forecast, drops the push-side one.
         let np: Vec<String> =
-            plan_mdh(&listed, &lf, &paths, true).into_iter().map(|i| i.line).collect();
-        assert!(np.contains(&"mdh/fresh data (new)".to_string()));
+            plan_mdh(&listed, &lf, &paths, true).into_iter().map(|i| i.describe()).collect();
+        assert!(np.contains(&"pull mdh/fresh data (new)".to_string()));
         assert!(!np.iter().any(|l| l.contains("data PATCH")));
     }
 
@@ -1615,8 +1648,8 @@ mod tests {
         let proposed = b"{\n  \"regular\": [ { \"name\": \"acct\" } ],\n  \"search\": []\n}\n";
         let item = index_edit_item("gl-codes", &ix_path, Some(&base), proposed).unwrap();
         assert_eq!(
-            item.map(|i| (i.dir, i.line)),
-            Some((MdhPlanDir::Pull, "mdh/gl-codes (index update)".to_string())),
+            item.map(|i| (i.dir, i.describe())),
+            Some((MdhPlanDir::Pull, "pull mdh/gl-codes index update".to_string())),
             "a remote index-body edit on an unedited local file must be forecast as a pull"
         );
 
@@ -1701,10 +1734,10 @@ mod tests {
             .await
             .unwrap();
         let lines: Vec<(MdhPlanDir, String)> =
-            items.into_iter().map(|i| (i.dir, i.line)).collect();
+            items.into_iter().map(|i| (i.dir, i.describe())).collect();
         assert_eq!(
             lines,
-            vec![(MdhPlanDir::Pull, "mdh/gl-codes (index update)".to_string())],
+            vec![(MdhPlanDir::Pull, "pull mdh/gl-codes index update".to_string())],
             "a remote index-body edit must be forecast as a would-pull"
         );
     }
@@ -1813,10 +1846,10 @@ mod tests {
             .await
             .unwrap();
         let lines: Vec<(MdhPlanDir, String)> =
-            items.into_iter().map(|i| (i.dir, i.line)).collect();
+            items.into_iter().map(|i| (i.dir, i.describe())).collect();
         assert_eq!(
             lines,
-            vec![(MdhPlanDir::Pull, "mdh/gl-codes data (update)".to_string())],
+            vec![(MdhPlanDir::Pull, "pull mdh/gl-codes data (update)".to_string())],
             "a remote row edit on an unedited local file must be forecast as a \
              would-pull, and nothing else"
         );
@@ -1973,11 +2006,11 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert_eq!(
-            items.iter().map(|i| i.line.clone()).collect::<Vec<_>>(),
+            items.iter().map(|i| i.describe()).collect::<Vec<_>>(),
             vec![
-                "mdh/a-set (index update)".to_string(),
-                "mdh/b-set (index update)".to_string(),
-                "mdh/c-set (index update)".to_string(),
+                "pull mdh/a-set index update".to_string(),
+                "pull mdh/b-set index update".to_string(),
+                "pull mdh/c-set index update".to_string(),
             ],
             "items must stay in dataset listing order, and d-set must be absent"
         );

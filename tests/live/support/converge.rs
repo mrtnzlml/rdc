@@ -217,26 +217,37 @@ fn tail(s: &str) -> String {
     s[start..].to_string()
 }
 
-/// The per-item plan lines a `--dry-run` printed for objects carrying
-/// `prefix`, each tagged with the section it appeared under, e.g.
-/// `[would pull] - hooks/rdc-it-x-validator (new)`.
+/// The per-item plan rows a `--dry-run` printed for objects carrying `prefix`,
+/// each tagged with the direction its verb implies, e.g.
+/// `[would pull] pull   hooks   rdc-it-x-validator   new`.
 ///
 /// The org-wide counters in the `Dry run: …` summary are useless on a shared
-/// sandbox — they count everybody's drift. The item lines carry the slug, so
-/// they can be filtered down to the objects this run owns; carrying the
-/// section along makes a convergence failure say which DIRECTION did not
-/// settle, which is most of the diagnosis.
+/// sandbox — they count everybody's drift. The rows carry the slug, so they can
+/// be filtered down to the objects this run owns; carrying the direction along
+/// makes a convergence failure say which DIRECTION did not settle, which is
+/// most of the diagnosis.
+///
+/// The plan used to print `would pull` / `would push` section headers over
+/// `- kind/slug` bullets, so this had to remember which section it was in.
+/// Rows carry their own verb, so the direction is read off each row and no
+/// state is needed.
 pub fn plan_lines_for(output: &str, prefix: &str) -> Vec<String> {
-    let mut section = "unknown";
     let mut out = Vec::new();
     for line in output.lines().map(str::trim_end) {
-        for name in ["would pull", "would push", "would prompt"] {
-            if line.ends_with(name) && !line.starts_with("- ") {
-                section = name;
-            }
-        }
-        if line.starts_with("- ") && line.contains(prefix) {
-            out.push(format!("[{section}] {line}"));
+        // A plan row is indented nine spaces (so its verb lands in the event
+        // log's action column) and starts with one of the row verbs.
+        let Some(rest) = line.strip_prefix("         ") else {
+            continue;
+        };
+        let verb = rest.split_whitespace().next().unwrap_or_default();
+        let section = match verb {
+            "pull" => "would pull",
+            "patch" | "post" | "delete" | "drop" => "would push",
+            "prompt" => "would prompt",
+            _ => continue,
+        };
+        if rest.contains(prefix) {
+            out.push(format!("[{section}] {}", rest.trim_end()));
         }
     }
     out
@@ -546,22 +557,43 @@ mod tests {
     #[test]
     fn plan_lines_keep_only_this_runs_items() {
         let out = "\
-13:34:58 plan   would pull
-- hooks/attach-rossum-url-cib (delete local; deleted on env)
-- queues/ap-documents-header-level-taxation
-- labels/rdc-it-abc-priority (new)
+13:34:58 sync   start envs/test
+         pull   hooks    validator                         delete local; deleted on env
+         pull   queues   invoices
+         pull   labels   rdc-it-abc-priority               new
 13:34:58 done   Dry run: 0 would push, 3 would pull, 0 would prompt (no writes)";
-        assert_eq!(
-            plan_lines_for(out, PFX),
-            vec!["[would pull] - labels/rdc-it-abc-priority (new)"]
+        let got = plan_lines_for(out, PFX);
+        assert_eq!(got.len(), 1, "only this run's object should survive: {got:?}");
+        assert!(got[0].starts_with("[would pull] pull"), "{got:?}");
+        assert!(
+            got[0].contains("labels") && got[0].contains("rdc-it-abc-priority"),
+            "{got:?}"
         );
         assert!(planned_successfully(out));
+    }
+
+    /// Direction now comes off each row's verb, not a remembered section
+    /// header — so a push row is tagged correctly even with no header above it.
+    #[test]
+    fn plan_lines_read_direction_from_the_row_verb() {
+        let out = "\
+13:34:58 sync   start envs/test
+         patch  rules    rdc-it-abc-totals
+         prompt queues   rdc-it-abc-orders                 both diverged
+         pull   labels   rdc-it-abc-priority               new
+13:34:58 done   Dry run: 1 would push, 1 would pull, 1 would prompt (no writes)";
+        let got = plan_lines_for(out, PFX);
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert!(got[0].starts_with("[would push] patch"), "{got:?}");
+        assert!(got[1].starts_with("[would prompt] prompt"), "{got:?}");
+        assert!(got[2].starts_with("[would pull] pull"), "{got:?}");
     }
 
     #[test]
     fn a_plan_naming_only_other_peoples_objects_reads_as_converged() {
         let out = "\
-- hooks/attach-rossum-url-cib (delete local; deleted on env)
+13:34:58 sync   start envs/test
+         pull   hooks    validator                         delete local; deleted on env
 13:34:58 done   Dry run: 0 would push, 1 would pull, 0 would prompt (no writes)";
         assert!(plan_lines_for(out, PFX).is_empty());
     }

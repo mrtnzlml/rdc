@@ -385,23 +385,6 @@ pub(crate) async fn run_cycle(
             })
             .collect();
         let pull_count = pull_items.len() + mdh_pull.len();
-        if pull_count > 0 {
-            progress.event(Action::Plan, "would pull");
-            let mut body = String::new();
-            use std::fmt::Write as _;
-            for it in &pull_items {
-                let note = match it.class {
-                    SyncClass::RemoteCreate => " (new)",
-                    SyncClass::RemoteDelete => " (delete local; deleted on env)",
-                    _ => "",
-                };
-                let _ = writeln!(body, "- {}/{}{}", it.kind, it.slug, note);
-            }
-            for it in &mdh_pull {
-                let _ = writeln!(body, "- {}", it.line);
-            }
-            progress.block(&body);
-        }
 
         // Push-side items (would write remote).
         let push_items: Vec<&crate::cli::sync::classify::ClassifiedItem> = classified
@@ -441,27 +424,6 @@ pub(crate) async fn run_cycle(
             .collect();
 
         let push_count = push_items.len() + mdh_push.len() + secret_only.len();
-        if push_count > 0 {
-            progress.event(Action::Plan, "would push");
-            let mut body = String::new();
-            use std::fmt::Write as _;
-            for it in &push_items {
-                let action = match it.class {
-                    SyncClass::LocalEdit => "PATCH",
-                    SyncClass::LocalCreate => "POST",
-                    SyncClass::LocalDelete => "DELETE",
-                    _ => "",
-                };
-                let _ = writeln!(body, "- {}/{} {}", it.kind, it.slug, action);
-            }
-            for it in &mdh_push {
-                let _ = writeln!(body, "- {}", it.line);
-            }
-            for slug in &secret_only {
-                let _ = writeln!(body, "- hooks/{slug} PATCH (secrets)");
-            }
-            progress.block(&body);
-        }
 
         // Conflict / destructive prompts.
         let prompt_items: Vec<&crate::cli::sync::classify::ClassifiedItem> = classified
@@ -475,20 +437,89 @@ pub(crate) async fn run_cycle(
                 )
             })
             .collect();
-        if !prompt_items.is_empty() {
-            progress.event(Action::Plan, "would prompt");
-            let mut body = String::new();
-            use std::fmt::Write as _;
-            for it in &prompt_items {
-                let tag = match it.class {
-                    SyncClass::BothDiverged => "both diverged",
-                    SyncClass::LocalEditRemoteDelete => "local edit, deleted on env",
-                    SyncClass::LocalDeleteRemoteEdit => "local delete, edited on env",
-                    _ => "",
-                };
-                let _ = writeln!(body, "- {}/{} -- {}", it.kind, it.slug, tag);
+        // Rows, not sections. The verb column already says which direction
+        // every object moves, so `would pull` / `would push` / `would prompt`
+        // headers would only say it a second time. One width across the whole
+        // cycle, so these line up with the prompts and the executed rows.
+        //
+        // The `±` columns stay blank here. A plan is decided from hashes; the
+        // bodies it would need to count lines are per-kind, and reaching for
+        // them would add another silent dispatch site (see `kinds.rs`) on a
+        // preview path. Counts appear where rdc genuinely holds both sides —
+        // the conflict prompts, which are already diffing.
+        {
+            use crate::cli::change_view::{ChangeRow, RowVerb, RowWidths, render_row};
+            let mode = crate::cli::resolve::detect_color_mode();
+            let rows: Vec<(RowVerb, &str, &str, Option<String>)> = pull_items
+                .iter()
+                .map(|it| {
+                    let note = match it.class {
+                        SyncClass::RemoteCreate => Some("new".to_string()),
+                        SyncClass::RemoteDelete => {
+                            Some("delete local; deleted on env".to_string())
+                        }
+                        _ => None,
+                    };
+                    (RowVerb::Pull, it.kind.as_str(), it.slug.as_str(), note)
+                })
+                .chain(
+                    mdh_pull
+                        .iter()
+                        .map(|i| (i.verb, "mdh", i.slug.as_str(), i.note.clone())),
+                )
+                .chain(push_items.iter().map(|it| {
+                    let verb = match it.class {
+                        SyncClass::LocalEdit => RowVerb::Patch,
+                        SyncClass::LocalCreate => RowVerb::Post,
+                        _ => RowVerb::Delete,
+                    };
+                    (verb, it.kind.as_str(), it.slug.as_str(), None)
+                }))
+                .chain(
+                    mdh_push
+                        .iter()
+                        .map(|i| (i.verb, "mdh", i.slug.as_str(), i.note.clone())),
+                )
+                .chain(secret_only.iter().map(|s| {
+                    (
+                        RowVerb::Patch,
+                        "hooks",
+                        s.as_str(),
+                        Some("secrets".to_string()),
+                    )
+                }))
+                .chain(prompt_items.iter().map(|it| {
+                    let tag = match it.class {
+                        SyncClass::BothDiverged => "both diverged",
+                        SyncClass::LocalEditRemoteDelete => "local edit, deleted on env",
+                        SyncClass::LocalDeleteRemoteEdit => "local delete, edited on env",
+                        _ => "",
+                    };
+                    (
+                        RowVerb::Prompt,
+                        it.kind.as_str(),
+                        it.slug.as_str(),
+                        Some(tag.to_string()),
+                    )
+                }))
+                .collect();
+            if !rows.is_empty() {
+                let w = RowWidths::fit(rows.iter().map(|(_, k, n, _)| (*k, *n)));
+                for (verb, kind, name, note) in &rows {
+                    progress.row(&render_row(
+                        &ChangeRow {
+                            verb: *verb,
+                            kind,
+                            name,
+                            added: None,
+                            removed: None,
+                            note: note.as_deref(),
+                        },
+                        w,
+                        mode,
+                    ));
+                }
             }
-            progress.block(&body);
         }
 
         // Secret entries whose slug matches no hook (typo, or a slug left stale
