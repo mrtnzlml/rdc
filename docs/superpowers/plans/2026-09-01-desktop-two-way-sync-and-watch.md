@@ -2258,7 +2258,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 **Interfaces:**
 - Produces:
   - `class PendingPrompt { final BigInt id; final PromptKindDto kind; final String question; final List<PromptChoice> keys; final String folder; final String env; }`
-  - `class WatchState { bool running; int? nextPollSecs; PendingPrompt? prompt; }`
+  - `class WatchState { bool running; int? nextPollSecs; }` (prompts live in `AppState.pendingPrompts`)
   - On `AppState`: `Map<String, WatchState> watch`, `void watchEnvItem(ProjectItem, EnvSummary)`, `void stopWatchItem(ProjectItem, EnvSummary)`, `void answer(PendingPrompt, String key)`, `List<PendingPrompt> get promptQueue`, `bool isWatching(String folder, String env)`.
 
 - [ ] **Step 1: Write the state file**
@@ -2373,7 +2373,7 @@ Add to `AppState`:
             reload();
           case SyncPhase_Error(:final message):
             w.running = false;
-            w.prompt = null;
+            pendingPrompts.remove(k);
             syncState[k] = SyncState.error;
             syncMessage[k] = message;
           case SyncPhase_Stopped():
@@ -2451,20 +2451,22 @@ void main() {
 
   test('two blocked envs both appear in the prompt queue', () {
     final s = AppState(Settings(parentFolder: '/tmp'));
-    s.watch[s.envKey('/tmp/acme', 'dev')] =
-        WatchState(running: true, prompt: _prompt('/tmp/acme', 'dev', 1));
-    s.watch[s.envKey('/tmp/beta', 'dev')] =
-        WatchState(running: true, prompt: _prompt('/tmp/beta', 'dev', 1));
+    s.watch[s.envKey('/tmp/acme', 'dev')] = WatchState(running: true);
+    s.watch[s.envKey('/tmp/beta', 'dev')] = WatchState(running: true);
+    s.pendingPrompts[s.envKey('/tmp/acme', 'dev')] = _prompt('/tmp/acme', 'dev', 1);
+    s.pendingPrompts[s.envKey('/tmp/beta', 'dev')] = _prompt('/tmp/beta', 'dev', 1);
     expect(s.promptQueue.length, 2);
   });
 
   test('a stale PromptResolved does not clear a newer prompt', () {
-    final w = WatchState(running: true, prompt: _prompt('/tmp/acme', 'dev', 7));
+    final s = AppState(Settings(parentFolder: '/tmp'));
+    final k = s.envKey('/tmp/acme', 'dev');
+    s.pendingPrompts[k] = _prompt('/tmp/acme', 'dev', 7);
     // Simulating the guard in the SyncPhase_PromptResolved arm.
-    if (w.prompt?.id == BigInt.from(6)) w.prompt = null;
-    expect(w.prompt, isNotNull);
-    if (w.prompt?.id == BigInt.from(7)) w.prompt = null;
-    expect(w.prompt, isNull);
+    if (s.pendingPrompts[k]?.id == BigInt.from(6)) s.pendingPrompts.remove(k);
+    expect(s.pendingPrompts[k], isNotNull);
+    if (s.pendingPrompts[k]?.id == BigInt.from(7)) s.pendingPrompts.remove(k);
+    expect(s.pendingPrompts[k], isNull);
   });
 
   test('every prompt kind has a title', () {
@@ -3174,6 +3176,30 @@ promote-seam clause.
 Verify the line numbers before editing — they are from a review at `5fe7b6a` and this plan has
 changed `src/` since. Grep for `promote` under `src/` and fix what you find; there should be
 nothing left after this step.
+
+- [ ] **Step 5b: Remove `PromptKind::PushDrift` and its bridge mirror**
+
+`kind_to_dto` matches it, but nothing constructs it: push-drift prompts funnel through the
+shared resolver, which announces `PromptKind::Conflict`. It survives only behind an
+`#[allow(dead_code)]` in `src/cli/stdin_coord.rs`, which this workspace otherwise denies.
+
+Delete the variant, its `PromptKindDto` mirror in `desktop/rust/src/api/rdc.rs`, its arm in
+`kind_to_dto`, and the now-unnecessary allow. An enum variant that cannot occur is worse than
+an absent one — it invites someone to build a dialog for a state that never arrives. If a
+distinct mid-cycle-drift prompt is ever wanted, it should land with the wiring that produces
+it. Regenerate the FRB bindings (confirm codegen `2.12.0` first) since a bridged enum changed.
+
+- [ ] **Step 5c: Make the drain test isolate the drain**
+
+`ask_drains_a_stale_answer_before_waiting` in `desktop/rust/src/api/rdc.rs` no longer proves
+what it claims: deleting the `while rx.try_recv().is_ok() {}` line leaves it green, because
+the stale value it seeds (`"stale"`) is rejected by the newer key-validation check anyway. Its
+comment ("If the stale answer were not drained, this would return 'stale' immediately") is now
+false.
+
+Seed the channel with a value that IS in the offered key set instead, so an undrained channel
+would genuinely return it. Then prove it: delete the drain line, confirm the test fails,
+restore it, confirm it passes. Report both observations.
 
 - [ ] **Step 6: Full verification**
 
