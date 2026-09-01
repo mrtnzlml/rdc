@@ -1829,11 +1829,19 @@ cd desktop && flutter_rust_bridge_codegen generate
 `app_state.dart`'s `syncEnvItem` has a `switch (phase)` over the sealed class. Add the new arms; for now the four new ones are inert in a one-shot sync:
 
 ```dart
-          case SyncPhase_Prompt():
-          case SyncPhase_PromptResolved():
+          case SyncPhase_Prompt(:final id, :final kind, :final question, :final keys):
+            // A one-shot sync blocks on the same gates a watch does, and its
+            // bridge call installs a real route — so this MUST be handled here
+            // too, or the cycle hangs with nothing to answer it.
+            pendingPrompts[k] = PendingPrompt(
+              id: id, kind: kind, question: question, keys: keys,
+              folder: folder, env: env.name,
+            );
+          case SyncPhase_PromptResolved(:final id):
+            if (pendingPrompts[k]?.id == id) pendingPrompts.remove(k);
           case SyncPhase_Idle():
           case SyncPhase_Stopped():
-            break; // handled by the watch stream (see watchEnvItem)
+            break; // watch-only phases; a one-shot sync never emits them
 ```
 
 - [ ] **Step 4: Build both sides**
@@ -2295,10 +2303,9 @@ class PendingPrompt {
 
 /// Per-env watch state. Absent from `AppState.watch` means "not watching".
 class WatchState {
-  WatchState({this.running = false, this.nextPollSecs, this.prompt});
+  WatchState({this.running = false, this.nextPollSecs});
   bool running;
   int? nextPollSecs;
-  PendingPrompt? prompt;
 }
 ```
 
@@ -2313,10 +2320,20 @@ Add to `AppState`:
   bool isWatching(String folder, String env) =>
       watch[envKey(folder, env)]?.running ?? false;
 
+  /// Every prompt currently blocking, keyed like [syncState] by (folder, env).
+  ///
+  /// Deliberately NOT stored inside [WatchState]: a one-shot `Sync` blocks on
+  /// exactly the same gates a watch does, and its bridge call installs a real
+  /// prompt route. If prompts lived only on watch state, a gate hit during a
+  /// plain Sync would emit `SyncPhase.prompt`, find no consumer, and leave the
+  /// bridge thread blocked forever with no dialog to answer — strictly worse
+  /// than the silent skip it replaced. Both streams write here.
+  final Map<String, PendingPrompt> pendingPrompts = {};
+
   /// Every prompt currently blocking, oldest first. More than one is
-  /// reachable: two watched envs can block at the same time.
-  List<PendingPrompt> get promptQueue =>
-      [for (final w in watch.values) if (w.prompt != null) w.prompt!];
+  /// reachable: two watched envs, or a watch and a one-shot sync, can block
+  /// at the same time.
+  List<PendingPrompt> get promptQueue => pendingPrompts.values.toList();
 
   void watchEnvItem(ProjectItem item, EnvSummary env) {
     final folder = item.summary.folder;
@@ -2344,12 +2361,12 @@ Add to `AppState`:
             (syncLog[k] ??= <String>[]).add(line);
             w.nextPollSecs = null; // a cycle is running
           case SyncPhase_Prompt(:final id, :final kind, :final question, :final keys):
-            w.prompt = PendingPrompt(
+            pendingPrompts[k] = PendingPrompt(
               id: id, kind: kind, question: question, keys: keys,
               folder: folder, env: env.name,
             );
           case SyncPhase_PromptResolved(:final id):
-            if (w.prompt?.id == id) w.prompt = null;
+            if (pendingPrompts[k]?.id == id) pendingPrompts.remove(k);
           case SyncPhase_Idle(:final nextPollSecs):
             w.nextPollSecs = nextPollSecs?.toInt();
           case SyncPhase_Done():
@@ -2384,7 +2401,7 @@ Add to `AppState`:
 
   void answer(PendingPrompt p, String key) {
     answerPrompt(folder: p.folder, env: p.env, answer: key);
-    watch[envKey(p.folder, p.env)]?.prompt = null;
+    pendingPrompts.remove(envKey(p.folder, p.env));
     notifyListeners();
   }
 ```
