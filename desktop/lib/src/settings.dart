@@ -11,12 +11,14 @@ class Settings {
   String? parentFolder;
   List<String> externalPaths;
 
-  /// Per-project promote defaults, keyed by project folder. Each value is
-  /// `{src, tgt, mirror, policy}` (`policy` is a [ConflictPolicy] name
-  /// string) — the last direction/options the user prepared for that
-  /// project, so re-selecting it re-arms the same picks instead of falling
-  /// back to the first-two-envs default.
-  Map<String, Map<String, dynamic>> promoteDefaults;
+  /// Every key in the on-disk JSON this build does not recognise, kept
+  /// verbatim so a save never destroys them. That covers `promoteDefaults`
+  /// (written by builds that still had the Promote panel — downgrading must
+  /// still find it) and any key a future build adds.
+  final Map<String, dynamic> extra;
+
+  /// Keys this build owns. Anything else lands in [extra].
+  static const _known = {'parentFolder', 'externalPaths'};
 
   /// Overrides the on-disk file used by the instance methods [save]/[load]
   /// below. `null` (the production default) means "use the real per-user
@@ -27,10 +29,10 @@ class Settings {
   Settings({
     this.parentFolder,
     List<String>? externalPaths,
-    Map<String, Map<String, dynamic>>? promoteDefaults,
+    Map<String, dynamic>? extra,
     File? file,
   })  : externalPaths = externalPaths ?? [],
-        promoteDefaults = promoteDefaults ?? {},
+        extra = extra ?? {},
         _overrideFile = file;
 
   static File _file() {
@@ -55,23 +57,23 @@ class Settings {
 
   /// Pure (no disk I/O) deserialization, so it's unit-testable and `load`
   /// can delegate to it. Tolerates a missing/legacy file: any absent key
-  /// falls back to its default (in particular `promoteDefaults` → `{}`).
+  /// falls back to its default.
   static Settings fromJson(Map<String, dynamic> m) => Settings(
         parentFolder: m['parentFolder'] as String?,
         externalPaths:
-            (m['externalPaths'] as List?)?.map((e) => e as String).toList() ??
-                [],
-        promoteDefaults: (m['promoteDefaults'] as Map?)?.map(
-              (k, v) => MapEntry(k as String, Map<String, dynamic>.from(v as Map)),
-            ) ??
-            {},
+            (m['externalPaths'] as List?)?.map((e) => e as String).toList() ?? [],
+        extra: {
+          for (final e in m.entries)
+            if (!_known.contains(e.key)) e.key: e.value,
+        },
       );
 
-  /// Pure (no disk I/O) serialization; `save` delegates to it.
+  /// Known keys are written last so a stale value in [extra] can never
+  /// shadow the live one.
   Map<String, dynamic> toJson() => {
+        ...extra,
         'parentFolder': parentFolder,
         'externalPaths': externalPaths,
-        'promoteDefaults': promoteDefaults,
       };
 
   static Settings load() {
