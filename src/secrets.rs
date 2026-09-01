@@ -339,7 +339,8 @@ pub async fn force_relogin(project_root: &Path, env: &str, api_base: &str) -> Re
     else {
         return Err(anyhow!(
             "the API token for env '{env}' was rejected (401), and this env has no saved \
-             username/password to sign in with again. Update its token and retry."
+             username/password to sign in with again. Update its credentials in the app's \
+             Edit dialog, or run `rdc auth {env} --token <new-token>`."
         ));
     };
     if username.is_empty() || password.is_empty() {
@@ -1191,6 +1192,10 @@ mod tests {
         assert!(
             msg.contains("token") && msg.contains("dev"),
             "error must name the env and say the token was rejected: {msg}"
+        );
+        assert!(
+            msg.contains("Edit dialog") && msg.contains("rdc auth dev --token"),
+            "error must name a concrete desktop action (Edit dialog) and the CLI equivalent: {msg}"
         );
     }
 }

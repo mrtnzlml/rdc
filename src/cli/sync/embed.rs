@@ -14,6 +14,8 @@ use crate::cli::sync::CycleOutcome;
 use crate::log::Log;
 use anyhow::Result;
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
 /// Run one no-push reconciliation cycle.
 ///
@@ -44,18 +46,47 @@ pub async fn sync_no_push(cwd: &Path, env: &str, token: &str) -> Result<CycleOut
     .await
 }
 
-/// Like [`sync_no_push`], but streams rdc's rendered progress log into
-/// `log_sink` — one `write` per line — so an embedder (the desktop app) can
-/// show the real sync log instead of a synthesized one.
+/// How an embedder wants one reconciliation cycle run.
 ///
-/// Lines carry rdc's normal ANSI color (`ColorMode::Color`) so the embedder can
-/// preserve it; the log is non-TTY (scrollback-clean lines, no cursor redraws).
-/// Because a renderer is supplied, `run_cycle` omits its own cycle-closing
-/// summary event; the caller adds its own completion line.
-pub async fn sync_no_push_logged(
+/// `Default` is the desktop app's policy, and the three interlocking parts
+/// of it are load-bearing: `interactive: true` so a gate prompts instead of
+/// bailing, `allow_deletes: false` so the gate is actually reached, and
+/// `conflict: None` so a divergence is asked about rather than decided.
+/// Changing any one of them silently removes a user's say over a delete.
+pub struct EmbedSyncOptions {
+    pub interactive: bool,
+    pub allow_deletes: bool,
+    pub no_push: bool,
+    pub no_pull: bool,
+    pub dry_run: bool,
+    pub conflict: Option<ConflictStrategy>,
+}
+
+impl Default for EmbedSyncOptions {
+    fn default() -> Self {
+        Self {
+            interactive: true,
+            allow_deletes: false,
+            no_push: false,
+            no_pull: false,
+            dry_run: false,
+            conflict: None,
+        }
+    }
+}
+
+/// Run one reconciliation cycle, streaming rdc's rendered log into
+/// `log_sink` — one `write` per line.
+///
+/// Lines carry rdc's normal ANSI colour so the embedder can preserve it,
+/// and the log is non-TTY (no cursor redraws). Because a renderer is
+/// supplied, `run_cycle` omits its cycle-closing summary; the caller adds
+/// its own completion line.
+pub async fn sync_logged(
     cwd: &Path,
     env: &str,
     token: &str,
+    opts: EmbedSyncOptions,
     log_sink: Box<dyn std::io::Write + Send>,
 ) -> Result<CycleOutcome> {
     let paths = crate::paths::Paths::for_env(cwd, env);
@@ -66,12 +97,12 @@ pub async fn sync_no_push_logged(
     let renderer = Log::for_sink(crate::cli::resolve::ColorMode::Color, log_sink);
     crate::cli::sync::run_cycle(
         env,
-        false, // interactive
-        false, // dry_run
-        false, // allow_deletes
-        true,  // no_push
-        false, // no_pull
-        None,  // conflict_strategy
+        opts.interactive,
+        opts.dry_run,
+        opts.allow_deletes,
+        opts.no_push,
+        opts.no_pull,
+        opts.conflict,
         Some(renderer),
         Some(cwd),
         Some(token.to_string()),
@@ -79,37 +110,62 @@ pub async fn sync_no_push_logged(
     .await
 }
 
-/// Run one `--no-pull` (deploy) reconciliation cycle, streaming rdc's rendered
-/// log into `log_sink`. `dry_run` renders the plan and stops before executing.
-/// `conflict` selects the non-interactive BothDiverged strategy; `allow_deletes`
-/// permits local-tombstone → remote DELETE. Pull is never performed (local files
-/// are never overwritten). Used by the desktop app's promote Push.
-pub async fn sync_push_logged(
+/// Run a watch loop against `cwd`/`env` until `cancel` fires, streaming the
+/// log into `log_sink` and routing every blocking prompt to `route`.
+///
+/// Unlike `cli::sync::watch::run_watch` this owns no stdin, installs no
+/// signal handler, and returns normally instead of exiting the process.
+/// 401s are resolved with `secrets::force_relogin` rather than the CLI's
+/// interactive refresh, because the app's credentials live in the secrets
+/// file, not in `RDC_USER_<ENV>` / `RDC_PASS_<ENV>`.
+#[allow(clippy::too_many_arguments)]
+pub async fn watch_logged(
     cwd: &Path,
     env: &str,
-    token: &str,
-    conflict: Option<ConflictStrategy>,
-    allow_deletes: bool,
-    dry_run: bool,
+    api_base: &str,
+    token: String,
+    poll: Option<Duration>,
     log_sink: Box<dyn std::io::Write + Send>,
-) -> Result<CycleOutcome> {
-    let paths = crate::paths::Paths::for_env(cwd, env);
-    let _lock = crate::cli::sync::lock::EnvLock::acquire(
-        &paths.env_lock(),
-        std::time::Duration::from_secs(30),
-    )?;
+    route: Arc<dyn crate::cli::stdin_coord::PromptRoute>,
+    cancel: crate::cli::sync::watch::CancelToken,
+) -> Result<()> {
+    // Installed for this thread only, for the whole watch. A cycle never
+    // leaves its thread, so this scopes exactly one route per watch.
+    let _route_guard = crate::cli::stdin_coord::install_route(route);
+
     let renderer = Log::for_sink(crate::cli::resolve::ColorMode::Color, log_sink);
-    crate::cli::sync::run_cycle(
-        env,
-        false, // interactive
-        dry_run,
-        allow_deletes,
-        false, // no_push
-        true,  // no_pull  <-- deploy: push local, never overwrite local
-        conflict,
-        Some(renderer),
-        Some(cwd),
-        Some(token.to_string()),
+
+    let root = cwd.to_path_buf();
+    let base = api_base.to_string();
+    let refresher: crate::cli::sync::watch::TokenRefresher = Arc::new(
+        move |env: String| -> futures::future::BoxFuture<'static, Result<Option<String>>> {
+            let root = root.clone();
+            let base = base.clone();
+            Box::pin(async move {
+                let t = crate::secrets::force_relogin(&root, &env, &base).await?;
+                Ok(Some(t))
+            })
+        },
+    );
+
+    crate::cli::sync::watch::run_watch_with(
+        crate::cli::sync::watch::WatchConfig {
+            env,
+            cwd: Some(cwd),
+            token: Some(token),
+            interactive: true,
+            allow_deletes: false,
+            no_push: false,
+            no_pull: false,
+            poll,
+            verbose: false,
+            no_bell: true, // a terminal BEL means nothing in a GUI process
+        },
+        renderer,
+        cancel,
+        refresher,
+        None, // post_reconcile_hook: no signal handling to install
+        None, // stdin_hook: prompts arrive through `route`, not stdin
     )
     .await
 }
