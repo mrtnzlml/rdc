@@ -23,7 +23,6 @@ class PendingPrompt {
   String get title => switch (kind) {
         PromptKindDto.conflict => 'Changed in both places',
         PromptKindDto.remoteDelete => 'Deleted on one side',
-        PromptKindDto.pushDrift => 'Changed remotely while syncing',
         PromptKindDto.bulkConfirm => 'Apply to all?',
         PromptKindDto.deleteGate => 'Delete from Rossum?',
         PromptKindDto.deleteDrift => 'Deleted locally, changed remotely',

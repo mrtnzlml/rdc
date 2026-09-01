@@ -104,7 +104,6 @@ pub struct PromptChoice {
 pub enum PromptKindDto {
     Conflict,
     RemoteDelete,
-    PushDrift,
     BulkConfirm,
     DeleteGate,
     DeleteDrift,
@@ -530,7 +529,6 @@ pub fn sync_env(
 
     let cancel = rdc::cli::sync::watch::CancelToken::new();
     let (answer_tx, answer_rx) = std::sync::mpsc::channel::<String>();
-    let next_prompt_id = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
     let generation = crate::watch_registry::next_id();
     // Registered so `answer_prompt` can find this cycle. A watch on the same
     // env would contend for the env lock anyway, so displacing one here is
@@ -545,7 +543,6 @@ pub fn sync_env(
             id: generation,
             cancel: cancel.clone(),
             answers: answer_tx,
-            next_prompt_id: next_prompt_id.clone(),
         },
     ) {
         previous.cancel.cancel();
@@ -554,7 +551,6 @@ pub fn sync_env(
         std::sync::Arc::new(SinkPromptRoute {
             sink: sink.clone(),
             answers: std::sync::Mutex::new(answer_rx),
-            next_id: next_prompt_id,
             cancel: cancel.clone(),
         });
 
@@ -651,7 +647,6 @@ impl PromptSink for StreamSink<SyncPhase> {
 struct SinkPromptRoute<S: PromptSink = StreamSink<SyncPhase>> {
     sink: S,
     answers: std::sync::Mutex<std::sync::mpsc::Receiver<String>>,
-    next_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Cloned from the same `WatchHandle` registered for this cycle. Polled
     /// by the wait loop below so a `stop_watch` that fires while this `ask`
     /// is parked can unblock it — nothing else observes this token while a
@@ -661,11 +656,15 @@ struct SinkPromptRoute<S: PromptSink = StreamSink<SyncPhase>> {
 
 impl<S: PromptSink + Send + Sync> rdc::cli::sync::embed::PromptRoute for SinkPromptRoute<S> {
     fn ask(&self, prompt: &rdc::cli::sync::embed::Prompt) -> Option<String> {
-        use std::sync::atomic::Ordering;
         use std::sync::mpsc::RecvTimeoutError;
         use std::time::Duration;
 
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        // Process-global, not per-route: two generations on the same env (a
+        // displaced watch still unwinding a blocked `ask`, and the cycle
+        // that displaced it) must never hand out the same id, or a stale
+        // `PromptResolved` from the displaced generation could clear the
+        // live generation's prompt out from under the user.
+        let id = crate::watch_registry::next_prompt_id();
         let keys: Vec<PromptChoice> = prompt
             .keys
             .iter()
@@ -726,7 +725,6 @@ fn kind_to_dto(k: rdc::cli::sync::embed::PromptKind) -> PromptKindDto {
     match k {
         K::Conflict => PromptKindDto::Conflict,
         K::RemoteDelete => PromptKindDto::RemoteDelete,
-        K::PushDrift => PromptKindDto::PushDrift,
         K::BulkConfirm => PromptKindDto::BulkConfirm,
         K::DeleteGate => PromptKindDto::DeleteGate,
         K::DeleteDrift => PromptKindDto::DeleteDrift,
@@ -765,7 +763,6 @@ pub fn watch_env(
         id: generation,
         cancel: cancel.clone(),
         answers: answer_tx,
-        next_prompt_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
     };
     // One watch per env: a second would fight the first for the env lock.
     if let Some(previous) = crate::watch_registry::insert(&folder, &env, handle.clone()) {
@@ -776,7 +773,6 @@ pub fn watch_env(
         std::sync::Arc::new(SinkPromptRoute {
             sink: sink.clone(),
             answers: std::sync::Mutex::new(answer_rx),
-            next_id: handle.next_prompt_id.clone(),
             cancel: cancel.clone(),
         });
 
@@ -1256,7 +1252,6 @@ mod tests {
         let route = SinkPromptRoute {
             sink: FakeSink::new(),
             answers: std::sync::Mutex::new(rx),
-            next_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
             cancel: rdc::cli::sync::watch::CancelToken::new(),
         };
         (route, tx)
@@ -1278,15 +1273,19 @@ mod tests {
     #[test]
     fn ask_drains_a_stale_answer_before_waiting() {
         let (route, tx) = route_with_channel();
-        // Leftover from an earlier, already-resolved prompt.
-        tx.send("stale".to_string()).unwrap();
+        // Leftover from an earlier, already-resolved prompt. Must be a key
+        // `sample_prompt` actually offers ("n", not e.g. "stale") — an
+        // un-offered value would be rejected by the wait loop's own
+        // key-validation regardless of whether it was drained, which would
+        // let this test pass even with the drain deleted.
+        tx.send("n".to_string()).unwrap();
         let sender = tx.clone();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(50));
             sender.send("y".to_string()).unwrap();
         });
-        // If the stale answer were not drained, this would return "stale"
-        // immediately instead of blocking for the real one.
+        // If the stale answer were not drained, this would return "n"
+        // immediately instead of blocking for the real "y".
         assert_eq!(route.ask(&sample_prompt()), Some("y".to_string()));
     }
 
@@ -1354,7 +1353,6 @@ mod tests {
         use rdc::cli::sync::embed::PromptKind as K;
         assert_eq!(kind_to_dto(K::Conflict), PromptKindDto::Conflict);
         assert_eq!(kind_to_dto(K::RemoteDelete), PromptKindDto::RemoteDelete);
-        assert_eq!(kind_to_dto(K::PushDrift), PromptKindDto::PushDrift);
         assert_eq!(kind_to_dto(K::BulkConfirm), PromptKindDto::BulkConfirm);
         assert_eq!(kind_to_dto(K::DeleteGate), PromptKindDto::DeleteGate);
         assert_eq!(kind_to_dto(K::DeleteDrift), PromptKindDto::DeleteDrift);

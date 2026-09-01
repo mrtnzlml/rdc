@@ -9,7 +9,7 @@ use rdc::cli::sync::watch::CancelToken;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
 /// Monotonic source of registration identities. `insert` can silently
 /// displace whatever handle already sits at a key (by design — see its own
@@ -24,6 +24,20 @@ pub fn next_id() -> u64 {
     NEXT_ID.fetch_add(1, Ordering::SeqCst)
 }
 
+/// Monotonic source of prompt ids, shared by every `SinkPromptRoute` in the
+/// process rather than counted per `WatchHandle`. A displaced watch's
+/// generation can still be unwinding a blocked `ask()` when the cycle that
+/// displaced it issues its own first prompt; if each counted from 1 the two
+/// would collide on id `1`, and `SyncPhase::PromptResolved` (which carries
+/// only a bare id, no generation tag) from the stale generation could clear
+/// the live generation's prompt out from under the user. A single
+/// process-global counter makes that collision impossible.
+static NEXT_PROMPT_ID: AtomicU64 = AtomicU64::new(1);
+
+pub fn next_prompt_id() -> u64 {
+    NEXT_PROMPT_ID.fetch_add(1, Ordering::SeqCst)
+}
+
 #[derive(Clone)]
 pub struct WatchHandle {
     /// This registration's identity, from `next_id()`. Compared by
@@ -33,7 +47,6 @@ pub struct WatchHandle {
     pub cancel: CancelToken,
     /// Answers from the UI, delivered to whichever prompt is blocked.
     pub answers: Sender<String>,
-    pub next_prompt_id: Arc<AtomicU64>,
 }
 
 type Map = HashMap<(String, String), WatchHandle>;
@@ -88,7 +101,6 @@ mod tests {
                 id,
                 cancel: CancelToken::new(),
                 answers: tx,
-                next_prompt_id: Arc::new(AtomicU64::new(1)),
             },
             id,
         )

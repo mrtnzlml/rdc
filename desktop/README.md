@@ -29,6 +29,26 @@ parent rdc workspace) because the parent sets `panic = "abort"`, and FRB needs
 unwinding to turn Rust panics into Dart exceptions. It depends on `rdc` via a
 path dependency (`../..`).
 
+## Sync and watch
+
+**Sync** runs one full `rdc sync <env>` cycle: local changes in `envs/<env>/`
+go to the organization, its changes come back. Earlier versions of this app
+only pulled; the first sync of a project says so once.
+
+**Watch** keeps that cycle running — a local file change triggers one
+immediately, and a timer polls the organization for drift (60s by default).
+Several environments can be watched at once.
+
+Anything destructive stops and asks: a conflict, a remote deletion, a pending
+DELETE, an MDH index drop. Those are the same questions `rdc sync` asks in a
+terminal, rendered as a dialog. The two terminal-only answers — `[e]` (open
+`$EDITOR`) and `[h]` (walk the diff hunk by hunk) — are not offered here; use
+the CLI for those.
+
+The app never writes to an environment other than the one being synced.
+Promoting configuration between environments is the GitLab CI deploy job's
+work, where it is gated on the test suite.
+
 ## Prerequisites
 
 - [Flutter](https://docs.flutter.dev/get-started/install) 3.44+ (stable), with

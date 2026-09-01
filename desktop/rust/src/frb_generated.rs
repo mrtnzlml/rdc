@@ -674,6 +674,13 @@ impl SseDecode for crate::api::rdc::AuthKind {
     }
 }
 
+impl SseDecode for bool {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        deserializer.cursor.read_u8().unwrap() != 0
+    }
+}
+
 impl SseDecode for crate::api::rdc::EditConnectionInput {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -857,13 +864,12 @@ impl SseDecode for crate::api::rdc::PromptKindDto {
         return match inner {
             0 => crate::api::rdc::PromptKindDto::Conflict,
             1 => crate::api::rdc::PromptKindDto::RemoteDelete,
-            2 => crate::api::rdc::PromptKindDto::PushDrift,
-            3 => crate::api::rdc::PromptKindDto::BulkConfirm,
-            4 => crate::api::rdc::PromptKindDto::DeleteGate,
-            5 => crate::api::rdc::PromptKindDto::DeleteDrift,
-            6 => crate::api::rdc::PromptKindDto::MdhIndexDrop,
-            7 => crate::api::rdc::PromptKindDto::MdhRowDelete,
-            8 => crate::api::rdc::PromptKindDto::Unknown,
+            2 => crate::api::rdc::PromptKindDto::BulkConfirm,
+            3 => crate::api::rdc::PromptKindDto::DeleteGate,
+            4 => crate::api::rdc::PromptKindDto::DeleteDrift,
+            5 => crate::api::rdc::PromptKindDto::MdhIndexDrop,
+            6 => crate::api::rdc::PromptKindDto::MdhRowDelete,
+            7 => crate::api::rdc::PromptKindDto::Unknown,
             _ => unreachable!("Invalid variant for PromptKindDto: {}", inner),
         };
     }
@@ -944,13 +950,6 @@ impl SseDecode for () {
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {}
 }
 
-impl SseDecode for bool {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
-        deserializer.cursor.read_u8().unwrap() != 0
-    }
-}
-
 fn pde_ffi_dispatcher_primary_impl(
     func_id: i32,
     port: flutter_rust_bridge::for_generated::MessagePort,
@@ -960,23 +959,23 @@ fn pde_ffi_dispatcher_primary_impl(
 ) {
     // Codec=Pde (Serialization + dispatch), see doc to use other codecs
     match func_id {
-        1 => wire__crate__api__rdc__add_env_impl(port, ptr, rust_vec_len, data_len),
-        2 => wire__crate__api__rdc__add_project_impl(port, ptr, rust_vec_len, data_len),
-        3 => wire__crate__api__rdc__answer_prompt_impl(port, ptr, rust_vec_len, data_len),
-        4 => wire__crate__api__rdc__edit_project_impl(port, ptr, rust_vec_len, data_len),
-        5 => wire__crate__api__rdc__init_app_impl(port, ptr, rust_vec_len, data_len),
-        6 => wire__crate__api__rdc__list_projects_impl(port, ptr, rust_vec_len, data_len),
-        7 => wire__crate__api__rdc__rdc_version_impl(port, ptr, rust_vec_len, data_len),
-        8 => wire__crate__api__rdc__remove_env_impl(port, ptr, rust_vec_len, data_len),
-        9 => wire__crate__api__rdc__rename_env_impl(port, ptr, rust_vec_len, data_len),
-        10 => wire__crate__api__rdc__reveal_in_file_manager_impl(port, ptr, rust_vec_len, data_len),
-        11 => wire__crate__api__rdc__stop_watch_impl(port, ptr, rust_vec_len, data_len),
-        12 => wire__crate__api__rdc__sync_env_impl(port, ptr, rust_vec_len, data_len),
-        13 => wire__crate__api__rdc__trash_project_impl(port, ptr, rust_vec_len, data_len),
-        14 => {
+        2 => wire__crate__api__rdc__add_env_impl(port, ptr, rust_vec_len, data_len),
+        3 => wire__crate__api__rdc__add_project_impl(port, ptr, rust_vec_len, data_len),
+        4 => wire__crate__api__rdc__answer_prompt_impl(port, ptr, rust_vec_len, data_len),
+        5 => wire__crate__api__rdc__edit_project_impl(port, ptr, rust_vec_len, data_len),
+        6 => wire__crate__api__rdc__init_app_impl(port, ptr, rust_vec_len, data_len),
+        7 => wire__crate__api__rdc__list_projects_impl(port, ptr, rust_vec_len, data_len),
+        8 => wire__crate__api__rdc__rdc_version_impl(port, ptr, rust_vec_len, data_len),
+        9 => wire__crate__api__rdc__remove_env_impl(port, ptr, rust_vec_len, data_len),
+        10 => wire__crate__api__rdc__rename_env_impl(port, ptr, rust_vec_len, data_len),
+        11 => wire__crate__api__rdc__reveal_in_file_manager_impl(port, ptr, rust_vec_len, data_len),
+        12 => wire__crate__api__rdc__stop_watch_impl(port, ptr, rust_vec_len, data_len),
+        13 => wire__crate__api__rdc__sync_env_impl(port, ptr, rust_vec_len, data_len),
+        14 => wire__crate__api__rdc__trash_project_impl(port, ptr, rust_vec_len, data_len),
+        15 => {
             wire__crate__api__rdc__validate_existing_project_impl(port, ptr, rust_vec_len, data_len)
         }
-        15 => wire__crate__api__rdc__watch_env_impl(port, ptr, rust_vec_len, data_len),
+        16 => wire__crate__api__rdc__watch_env_impl(port, ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -1129,13 +1128,12 @@ impl flutter_rust_bridge::IntoDart for crate::api::rdc::PromptKindDto {
         match self {
             Self::Conflict => 0.into_dart(),
             Self::RemoteDelete => 1.into_dart(),
-            Self::PushDrift => 2.into_dart(),
-            Self::BulkConfirm => 3.into_dart(),
-            Self::DeleteGate => 4.into_dart(),
-            Self::DeleteDrift => 5.into_dart(),
-            Self::MdhIndexDrop => 6.into_dart(),
-            Self::MdhRowDelete => 7.into_dart(),
-            Self::Unknown => 8.into_dart(),
+            Self::BulkConfirm => 2.into_dart(),
+            Self::DeleteGate => 3.into_dart(),
+            Self::DeleteDrift => 4.into_dart(),
+            Self::MdhIndexDrop => 5.into_dart(),
+            Self::MdhRowDelete => 6.into_dart(),
+            Self::Unknown => 7.into_dart(),
             _ => unreachable!(),
         }
     }
@@ -1247,6 +1245,13 @@ impl SseEncode for crate::api::rdc::AuthKind {
             },
             serializer,
         );
+    }
+}
+
+impl SseEncode for bool {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        serializer.cursor.write_u8(self as _).unwrap();
     }
 }
 
@@ -1394,13 +1399,12 @@ impl SseEncode for crate::api::rdc::PromptKindDto {
             match self {
                 crate::api::rdc::PromptKindDto::Conflict => 0,
                 crate::api::rdc::PromptKindDto::RemoteDelete => 1,
-                crate::api::rdc::PromptKindDto::PushDrift => 2,
-                crate::api::rdc::PromptKindDto::BulkConfirm => 3,
-                crate::api::rdc::PromptKindDto::DeleteGate => 4,
-                crate::api::rdc::PromptKindDto::DeleteDrift => 5,
-                crate::api::rdc::PromptKindDto::MdhIndexDrop => 6,
-                crate::api::rdc::PromptKindDto::MdhRowDelete => 7,
-                crate::api::rdc::PromptKindDto::Unknown => 8,
+                crate::api::rdc::PromptKindDto::BulkConfirm => 2,
+                crate::api::rdc::PromptKindDto::DeleteGate => 3,
+                crate::api::rdc::PromptKindDto::DeleteDrift => 4,
+                crate::api::rdc::PromptKindDto::MdhIndexDrop => 5,
+                crate::api::rdc::PromptKindDto::MdhRowDelete => 6,
+                crate::api::rdc::PromptKindDto::Unknown => 7,
                 _ => {
                     unimplemented!("");
                 }
@@ -1476,13 +1480,6 @@ impl SseEncode for u8 {
 impl SseEncode for () {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {}
-}
-
-impl SseEncode for bool {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
-        serializer.cursor.write_u8(self as _).unwrap();
-    }
 }
 
 #[cfg(not(target_family = "wasm"))]

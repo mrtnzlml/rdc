@@ -740,9 +740,9 @@ pub(crate) fn check_saved_view_refs(
 /// two ways out are.
 ///
 /// The whole listing lives in the returned error rather than in `eprintln!`s
-/// beside it, because [`run_at`] is also the desktop app's promote seam: an
-/// error written straight to stderr never reaches a GUI, which would then show
-/// a count with nothing to act on.
+/// beside it: an error that carries its own listing can be shown wherever
+/// the caller wants, rather than depending on stderr already having been
+/// seen.
 pub(crate) fn format_saved_view_ref_error(problems: &[SavedViewRefProblem], tgt: &str) -> String {
     let mut body = String::new();
     for p in problems {
@@ -2569,8 +2569,8 @@ pub fn run(
 }
 
 /// Like [`run`], but takes the project root explicitly instead of reading
-/// the process's current directory — the embedding seam non-CLI consumers
-/// (e.g. the desktop app's promote flow) use to drive migrate without a
+/// the process's current directory — the cwd-parameterised form [`run`]
+/// itself calls, so nothing here has to shell out to a
 /// `std::env::set_current_dir` dance.
 pub fn run_at(
     cwd: &Path,

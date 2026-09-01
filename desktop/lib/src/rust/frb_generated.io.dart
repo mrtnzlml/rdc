@@ -28,10 +28,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   String dco_decode_String(dynamic raw);
 
   @protected
+  PromptSink dco_decode_TraitDef_PromptSink(dynamic raw);
+
+  @protected
   AddEnvInput dco_decode_add_env_input(dynamic raw);
 
   @protected
   AuthKind dco_decode_auth_kind(dynamic raw);
+
+  @protected
+  bool dco_decode_bool(dynamic raw);
 
   @protected
   AddEnvInput dco_decode_box_autoadd_add_env_input(dynamic raw);
@@ -44,6 +50,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   ProjectSummary dco_decode_box_autoadd_project_summary(dynamic raw);
+
+  @protected
+  SyncPhase dco_decode_box_autoadd_sync_phase(dynamic raw);
 
   @protected
   BigInt dco_decode_box_autoadd_u_64(dynamic raw);
@@ -123,6 +132,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   AuthKind sse_decode_auth_kind(SseDeserializer deserializer);
 
   @protected
+  bool sse_decode_bool(SseDeserializer deserializer);
+
+  @protected
   AddEnvInput sse_decode_box_autoadd_add_env_input(
     SseDeserializer deserializer,
   );
@@ -139,6 +151,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   ProjectSummary sse_decode_box_autoadd_project_summary(
     SseDeserializer deserializer,
   );
+
+  @protected
+  SyncPhase sse_decode_box_autoadd_sync_phase(SseDeserializer deserializer);
 
   @protected
   BigInt sse_decode_box_autoadd_u_64(SseDeserializer deserializer);
@@ -209,9 +224,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_decode_unit(SseDeserializer deserializer);
 
   @protected
-  bool sse_decode_bool(SseDeserializer deserializer);
-
-  @protected
   void sse_encode_AnyhowException(
     AnyhowException self,
     SseSerializer serializer,
@@ -231,6 +243,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_auth_kind(AuthKind self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_bool(bool self, SseSerializer serializer);
 
   @protected
   void sse_encode_box_autoadd_add_env_input(
@@ -253,6 +268,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_box_autoadd_project_summary(
     ProjectSummary self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_sync_phase(
+    SyncPhase self,
     SseSerializer serializer,
   );
 
@@ -339,9 +360,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_unit(void self, SseSerializer serializer);
-
-  @protected
-  void sse_encode_bool(bool self, SseSerializer serializer);
 }
 
 // Section: wire_class

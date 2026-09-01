@@ -4,10 +4,12 @@ import 'dart:io';
 
 import 'package:desktop/src/app.dart';
 import 'package:desktop/src/app_state.dart';
+import 'package:desktop/src/dialogs.dart';
 import 'package:desktop/src/home_page.dart';
 import 'package:desktop/src/mdh_theme.dart';
 import 'package:desktop/src/rust/api/rdc.dart';
 import 'package:desktop/src/settings.dart';
+import 'package:desktop/src/watch_state.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -72,6 +74,15 @@ AppState _filesState(Directory root) {
   s.projects = [_proj('acme-invoices', [_env('main', 123456, lastSync: 1000, files: 128)], folder: root.path)];
   s.selectProject(root.path);
   s.selectEnv(root.path, 'main'); // pin the env so _ConnMain (Files tab) renders, not the Project view
+  return s;
+}
+
+/// The seeded connection, but with the pinned env under an active watch —
+/// exercises the header's Watch/Stop control and the countdown badge.
+AppState _watchingState() {
+  final s = _seeded();
+  const sel = '/tmp/Rossum/acme-invoices-eu-prod-primary';
+  s.watch[s.envKey(sel, 'prod')] = WatchState(running: true, nextPollSecs: 42);
   return s;
 }
 
@@ -203,5 +214,40 @@ void main() {
     await t.tap(find.text('invoices.json')); // JSON syntax highlighting
     await t.pumpAndSettle();
     await expectLater(find.byType(MaterialApp), matchesGoldenFile('goldens/mdh_files_preview_json_light.png'));
+  });
+
+  testWidgets('watching env — light', (t) async {
+    await shot(
+        t,
+        _wrap(Brightness.light,
+            MdhScaffold(state: _watchingState(), view: NavView.connection, onSelectEnv: (f, e) {})),
+        'goldens/mdh_watching_light.png');
+  });
+
+  testWidgets('prompt dialog — light', (t) async {
+    await shot(
+        t,
+        _wrap(
+            Brightness.light,
+            PromptDialog(
+              prompt: PendingPrompt(
+                id: BigInt.one,
+                kind: PromptKindDto.deleteGate,
+                question: 'Proceed with deletion? [y/N] ',
+                keys: [
+                  PromptChoice(key: 'y', label: 'delete them'),
+                  PromptChoice(key: 'n', label: 'cancel'),
+                ],
+                folder: '/tmp/Rossum/acme-invoices',
+                env: 'prod',
+              ),
+              logTail: [
+                '14:12:03 delete 2 object(s) would be DELETED from the remote',
+                '         delete  queues          old-intake                id 41',
+                '         delete  schemas         old-intake                id 77',
+              ],
+              onAnswer: (_) {},
+            )),
+        'goldens/mdh_prompt_light.png');
   });
 }

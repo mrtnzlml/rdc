@@ -47,17 +47,14 @@ impl PromptKey {
 ///
 /// `Unknown` is the only variant this task's own code constructs
 /// (`Prompt::unknown`, the fallback for a read whose site never
-/// announced). `PushDrift` is named ahead of its site: the push-drift
-/// prompts (`resolve_push_drift`, and the mid-cycle drift check in
-/// `pull/common.rs`) both route through the shared conflict resolver and
-/// are announced as `Conflict` — same decision, same keys — so nothing
-/// constructs `PushDrift` yet.
+/// announced). The push-drift prompts (`resolve_push_drift`, and the
+/// mid-cycle drift check in `pull/common.rs`) route through the shared
+/// conflict resolver and are announced as `Conflict` — same decision, same
+/// keys — so there is no separate push-drift variant here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptKind {
     Conflict,
     RemoteDelete,
-    #[allow(dead_code)]
-    PushDrift,
     BulkConfirm,
     DeleteGate,
     DeleteDrift,

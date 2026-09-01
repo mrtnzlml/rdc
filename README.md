@@ -294,6 +294,20 @@ rdc sync test --dry-run
 
 Lists every change that would be sent — POSTs, PATCHes, DELETEs — without writing.
 
+### Watch an environment
+
+```sh
+rdc sync test --watch
+```
+
+Reconciles once, then keeps going: a change under `envs/test/` triggers a
+cycle, and a timer polls the environment for drift. `--poll-interval 5m`
+changes the cadence, `--no-poll` turns polling off and leaves the file
+watcher, and pressing Enter runs a cycle immediately. Conflicts and deletions
+prompt exactly as they do in a one-shot sync; `--conflict` is not accepted
+here, because a watch that resolves conflicts without asking would do so
+unattended and repeatedly.
+
 ### Conflicts
 
 When both local and the env have changed since the last sync, an inline resolver opens for each conflicting file:

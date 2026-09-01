@@ -11,6 +11,7 @@ part 'rdc.freezed.dart';
 // These functions are ignored because they are not marked as `pub`: `block_on`, `kind_to_dto`, `valid_env_name`, `write_credentials`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `LineForwarder`, `SinkPromptRoute`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `ask`, `assert_fields_are_eq`, `assert_fields_are_eq`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `eq`, `eq`, `flush`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `from`, `from`, `from`, `write`
+// These functions are ignored (category: IgnoreBecauseNotAllowedOwner): `emit`
 
 /// rdc's package version, surfaced to the app's About box.
 Future<String?> rdcVersion() => RustLib.instance.api.crateApiRdcRdcVersion();
@@ -128,7 +129,10 @@ Stream<SyncPhase> watchEnv({
   pollSecs: pollSecs,
 );
 
-/// Ask a running watch to stop. No-op if that env is not being watched.
+/// Ask a running watch to stop. Also unblocks a cycle currently parked on a
+/// prompt (`SinkPromptRoute::ask` polls this same token): the poll loop
+/// reads the cancellation as end-of-input, exactly like a closed UI stream.
+/// No-op if that env is not being watched.
 Future<void> stopWatch({required String folder, required String env}) =>
     RustLib.instance.api.crateApiRdcStopWatch(folder: folder, env: env);
 
@@ -152,6 +156,11 @@ Future<void> trashProject({required String folder}) =>
 /// Reveal a path in the OS file manager (Finder / Explorer / file manager).
 Future<void> revealInFileManager({required String path}) =>
     RustLib.instance.api.crateApiRdcRevealInFileManager(path: path);
+
+abstract class PromptSink {
+  /// Send one phase. `false` means the UI side is gone (closed stream).
+  Future<bool> emit({required SyncPhase phase});
+}
 
 class AddEnvInput {
   final String name;
@@ -336,7 +345,6 @@ class PromptChoice {
 enum PromptKindDto {
   conflict,
   remoteDelete,
-  pushDrift,
   bulkConfirm,
   deleteGate,
   deleteDrift,
