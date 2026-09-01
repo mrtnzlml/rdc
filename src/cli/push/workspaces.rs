@@ -446,6 +446,7 @@ async fn push_one_drifted(
         crate::cli::resolve::ObjectRef { kind: "workspaces", slug: ws_slug },
         ws_path, &remote_bytes,
         env,
+        progress,
     )? {
         PushDriftOutcome::Patch { payload_override } => {
             if let Some(bytes) = payload_override {

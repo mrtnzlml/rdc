@@ -142,11 +142,14 @@ pub fn confirm_or_refuse(
              restore the local files to cancel the deletion."
         );
     }
-    // The question stays on raw stderr: it must sit on the cursor's line for
-    // the answer to be typed after it, which a `Log` line cannot do. Only the
-    // list above is information an embedder needs.
-    eprint!("Proceed with deletion? [y/N] ");
-    std::io::stderr().flush().ok();
+    // The question is written through the renderer rather than emitted as a
+    // Log event: it must sit on the cursor's line for the answer to be typed
+    // after it, which a timestamped event line cannot do. Under `Log::new`
+    // the renderer's sink is stderr, so the terminal sees the same bytes.
+    let mut q = progress.writer();
+    write!(q, "Proceed with deletion? [y/N] ").ok();
+    q.flush().ok();
+    drop(q);
     // Route via the stdin coordinator so this prompt cooperates with the
     // `rdc sync --watch` Enter-trigger reader instead of fighting it for
     // the terminal. Outside watch it reads stdin directly.
@@ -292,7 +295,7 @@ async fn delete_one(
     };
 
     if drifted {
-        match resolve_delete_drift(interactive, kind, slug)? {
+        match resolve_delete_drift(progress, interactive, kind, slug)? {
             DeleteDriftChoice::KeepDelete => { /* fall through to DELETE */ }
             DeleteDriftChoice::Skip => {
                 progress.event(Action::Skip, &format!("{kind}/{slug} (drift)"));
@@ -351,22 +354,34 @@ enum DeleteDriftChoice {
     Abort,
 }
 
-fn resolve_delete_drift(interactive: bool, kind: &str, slug: &str) -> Result<DeleteDriftChoice> {
+fn resolve_delete_drift(
+    progress: &Arc<Log>,
+    interactive: bool,
+    kind: &str,
+    slug: &str,
+) -> Result<DeleteDriftChoice> {
     if !interactive {
         // Non-TTY (CI / --yes): fall back to skip with warning so a
         // drifted delete never silently destroys someone else's work.
-        eprintln!(
-            "warning: {kind}/{slug}: local file deleted but remote modified since last sync; \
-             skipping (run `rdc sync <env>` to retry)."
+        progress.event(
+            Action::Warn,
+            &format!(
+                "{kind}/{slug}: local file deleted but remote modified since last sync; \
+                 skipping (run `rdc sync <env>` to retry)."
+            ),
         );
         return Ok(DeleteDriftChoice::Skip);
     }
-    eprintln!();
-    eprintln!(
+    let mut q = progress.writer();
+    writeln!(q).ok();
+    writeln!(
+        q,
         "{kind}/{slug}: local file deleted, but remote has been modified since the last pull."
-    );
-    eprint!("[k]eep delete  [r]estore  [s]kip  [a]bort > ");
-    std::io::stderr().flush().ok();
+    )
+    .ok();
+    write!(q, "[k]eep delete  [r]estore  [s]kip  [a]bort > ").ok();
+    q.flush().ok();
+    drop(q);
     let ans = crate::cli::stdin_coord::read_line_coordinated()?
         .unwrap_or_default()
         .trim()
@@ -376,8 +391,8 @@ fn resolve_delete_drift(interactive: bool, kind: &str, slug: &str) -> Result<Del
         "r" | "restore" => Ok(DeleteDriftChoice::Restore),
         "s" | "skip" | "" => Ok(DeleteDriftChoice::Skip),
         "a" | "abort" => Ok(DeleteDriftChoice::Abort),
-        _ => {
-            eprintln!("unrecognised choice '{ans}'; skipping");
+        other => {
+            progress.event(Action::Warn, &format!("unrecognised choice '{other}'; skipping"));
             Ok(DeleteDriftChoice::Skip)
         }
     }
@@ -529,6 +544,37 @@ mod tests {
             "rows must be in reverse-dependency order: {text:?}"
         );
         assert!(!text.contains('\u{1b}'), "Plain mode leaked SGR: {text:?}");
+    }
+
+    /// The four destructive questions must reach a `Log` sink, not stderr —
+    /// an embedder that cannot see the question cannot render a dialog for
+    /// it. Pins the exact wording too: these are the strings a user reads
+    /// before authorising a delete.
+    #[test]
+    fn delete_gate_question_reaches_the_log_sink() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let log = crate::log::Log::for_sink(
+            crate::cli::resolve::ColorMode::Plain,
+            Box::new(buf.clone()),
+        );
+        let mut w = log.writer();
+        write!(w, "Proceed with deletion? [y/N] ").unwrap();
+        drop(w);
+        let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(text, "Proceed with deletion? [y/N] ");
     }
 
     use super::*;

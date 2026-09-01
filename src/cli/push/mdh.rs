@@ -764,8 +764,10 @@ fn prompt_confirm_index_drops(
     report_pending_index_drops(progress, collection_name, pending_regular, pending_search);
     progress.with_prompt(|| -> Result<bool> {
         use std::io::Write;
-        eprint!("Proceed with the drop(s)? [y/N] ");
-        std::io::stderr().flush().ok();
+        let mut q = progress.writer();
+        write!(q, "Proceed with the drop(s)? [y/N] ").ok();
+        q.flush().ok();
+        drop(q);
         let ans = crate::cli::stdin_coord::read_line_coordinated()?
             .unwrap_or_default()
             .trim()

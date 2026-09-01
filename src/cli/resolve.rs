@@ -32,6 +32,7 @@ use similar::{Algorithm, TextDiff};
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
 
 /// Build a line-level `TextDiff` using the Histogram algorithm.
 ///
@@ -1227,6 +1228,7 @@ pub fn resolve_combined_file(
     remote_bytes: &[u8],
     interactive: bool,
     paths: &crate::paths::Paths,
+    progress: &Arc<crate::log::Log>,
 ) -> Result<CombinedFileOutcome> {
     use crate::snapshot::writer::write_atomic;
 
@@ -1253,10 +1255,9 @@ pub fn resolve_combined_file(
     // A raw `stdin().lock()` here would deadlock under `--watch`, where the
     // Enter-trigger reader is the sole stdin owner; going through the
     // coordinator also rings the watch attention bell via `read_line_coordinated`.
-    let stderr = std::io::stderr();
     let resolution = prompt_resolve(
         crate::cli::stdin_coord::CoordinatorStdin::new(),
-        stderr.lock(),
+        progress.writer(),
         label_index,
         label_total,
         obj,
@@ -1373,6 +1374,7 @@ pub fn resolve_push_drift(
     local_path: &Path,
     remote_bytes: &[u8],
     env: &str,
+    progress: &Arc<crate::log::Log>,
 ) -> Result<PushDriftOutcome> {
     if !interactive {
         return Ok(PushDriftOutcome::Skip);
@@ -1382,10 +1384,9 @@ pub fn resolve_push_drift(
     // `stdin().lock()` here would deadlock under `--watch`, where the
     // Enter-trigger reader is the sole stdin owner. Reading via the coordinator
     // also rings the watch attention bell through `read_line_coordinated`.
-    let stderr = std::io::stderr();
     let resolution = prompt_resolve(
         crate::cli::stdin_coord::CoordinatorStdin::new(),
-        stderr.lock(),
+        progress.writer(),
         1,
         1,
         obj,
@@ -1966,7 +1967,8 @@ mod tests {
         std::fs::create_dir_all(paths.env_root()).unwrap();
         let path = paths.env_root().join("a.py");
         std::fs::write(&path, b"same\n").unwrap();
-        let out = resolve_combined_file(1, 2, ObjectRef { kind: "queues", slug: "invoices" }, &path, b"same\n", b"same\n", true, &paths).unwrap();
+        let progress = crate::log::Log::new(ColorMode::Plain);
+        let out = resolve_combined_file(1, 2, ObjectRef { kind: "queues", slug: "invoices" }, &path, b"same\n", b"same\n", true, &paths, &progress).unwrap();
         assert_eq!(out.bytes(), b"same\n");
         // Bytes-equal sides are a "Resolved" outcome — caller may advance.
         assert!(
@@ -1984,8 +1986,9 @@ mod tests {
         std::fs::create_dir_all(paths.env_root()).unwrap();
         let path = paths.env_root().join("a.py");
         std::fs::write(&path, b"local\n").unwrap();
+        let progress = crate::log::Log::new(ColorMode::Plain);
         let out =
-            resolve_combined_file(1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path, b"local\n", b"remote\n", false, &paths).unwrap();
+            resolve_combined_file(1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path, b"local\n", b"remote\n", false, &paths, &progress).unwrap();
         assert_eq!(out.bytes(), b"local\n");
         // Non-interactive shadow-skip MUST signal preserve-base so the
         // caller does not advance the entity's combined hash.
@@ -2006,12 +2009,14 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.json");
         std::fs::write(&path, b"local\n").unwrap();
+        let progress = crate::log::Log::new(ColorMode::Plain);
         let r = resolve_push_drift(
             false,
             ObjectRef { kind: "queues", slug: "invoices" },
             &path,
             b"remote\n",
             "test",
+            &progress,
         )
         .unwrap();
         assert!(matches!(r, PushDriftOutcome::Skip));

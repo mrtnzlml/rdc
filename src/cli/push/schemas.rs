@@ -507,6 +507,7 @@ async fn push_one_drifted(
         crate::cli::resolve::ObjectRef { kind: "schemas", slug: q_slug },
         schema_path, &remote_json,
         env,
+        progress,
     )? {
         PushDriftOutcome::Patch { payload_override } => {
             if let Some(bytes) = payload_override {

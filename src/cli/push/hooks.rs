@@ -883,6 +883,7 @@ async fn push_one_drifted(
         crate::cli::resolve::ObjectRef { kind: "hooks", slug },
         local_json_path, &remote_json,
         env,
+        progress,
     )? {
         PushDriftOutcome::Patch { payload_override } => {
             if let Some(bytes) = payload_override {

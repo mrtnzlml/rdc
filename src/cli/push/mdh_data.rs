@@ -327,8 +327,10 @@ fn prompt_confirm_row_deletes(
     );
     progress.with_prompt(|| -> Result<bool> {
         use std::io::Write;
-        eprint!("Proceed with the deletion(s)? [y/N] ");
-        std::io::stderr().flush().ok();
+        let mut q = progress.writer();
+        write!(q, "Proceed with the deletion(s)? [y/N] ").ok();
+        q.flush().ok();
+        drop(q);
         let ans = crate::cli::stdin_coord::read_line_coordinated()?
             .unwrap_or_default()
             .trim()

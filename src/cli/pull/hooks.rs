@@ -224,6 +224,7 @@ pub async fn process(
                         &proposed_json,
                         ctx.interactive && symmetric,
                         ctx.paths,
+                        progress,
                     )?;
 
                     // Track preserve-base intent across both sub-files of the
@@ -246,6 +247,7 @@ pub async fn process(
                                     rem.as_bytes(),
                                     ctx.interactive,
                                     ctx.paths,
+                                    progress,
                                 )?;
                                 preserve_base |= code_outcome.is_preserve_base();
                                 let bytes = code_outcome.into_bytes();

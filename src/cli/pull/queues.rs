@@ -622,6 +622,7 @@ fn write_schema_for_queue(
                     &remote_json_bytes,
                     ctx.interactive,
                     ctx.paths,
+                    progress,
                 )?;
                 let mut preserve_base = json_outcome.is_preserve_base();
                 let resolved_json = json_outcome.into_bytes();
@@ -647,6 +648,7 @@ fn write_schema_for_queue(
                         remote_bytes,
                         ctx.interactive,
                         ctx.paths,
+                        progress,
                     )?;
                     preserve_base |= outcome.is_preserve_base();
                     resolved_formulas.push((field_id.clone(), outcome.into_bytes()));
