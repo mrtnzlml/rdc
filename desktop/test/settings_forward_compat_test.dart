@@ -157,4 +157,33 @@ void main() {
     final writtenAfterClear = jsonDecode(tmpFile.readAsStringSync()) as Map<String, dynamic>;
     expect(writtenAfterClear['watch'], <String, dynamic>{});
   });
+
+  test('every owned key is registered in _known -- none doubles into extra', () {
+    // Settings keeps unrecognised keys in `extra` and owns the keys listed
+    // in its private `_known` set; `_known` can't be referenced directly
+    // from here, so this proves the invariant through Settings' public
+    // surface instead: feed fromJson a fixture naming every currently-owned
+    // field plus one genuinely unknown key, then assert `extra` holds
+    // *only* that one unknown key. If a future field is added to the class
+    // and to toJson() without also being added to `_known`, its key would
+    // fail to be filtered out here -- landing in `extra` in addition to
+    // being written as a top-level key by toJson(), the exact silent
+    // duplication this guards against.
+    final s = Settings.fromJson({
+      'parentFolder': '/tmp/acme',
+      'externalPaths': ['/tmp/beta'],
+      'watch': {
+        '/tmp/acme dev': {'pollSecs': 120},
+      },
+      'ackTwoWay': ['/tmp/acme'],
+      'somethingFromTheFuture': 42,
+    });
+
+    expect(s.extra.keys, {'somethingFromTheFuture'});
+
+    // toJson()'s emitted keys, once the one deliberately-unknown key is
+    // discounted, are exactly the owned-key set -- no more, no less.
+    final ownedKeys = s.toJson().keys.toSet()..remove('somethingFromTheFuture');
+    expect(ownedKeys, {'parentFolder', 'externalPaths', 'watch', 'ackTwoWay'});
+  });
 }

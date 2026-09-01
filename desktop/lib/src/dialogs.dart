@@ -486,24 +486,39 @@ class RemoveEnvDialog extends StatelessWidget {
 
 // ------------------------------------------------------------ two-way notice
 
-/// Shown once per project, the first time it is synced by a build whose Sync
-/// writes. Every earlier build's Sync was `--no-push`, so a project used as a
-/// read-only archive would otherwise start pushing to Rossum with no warning
-/// at all.
+/// Shown once per project, the first time it is synced or watched by a
+/// build whose Sync writes. Every earlier build's Sync was `--no-push`, so a
+/// project used as a read-only archive would otherwise start pushing to
+/// Rossum with no warning at all.
 class TwoWayNoticeDialog extends StatelessWidget {
-  const TwoWayNoticeDialog({super.key, required this.projectName});
+  const TwoWayNoticeDialog({super.key, required this.projectName, this.forWatch = false});
   final String projectName;
+
+  /// True when Watch, not Sync, is the button that triggered this dialog.
+  /// A watch's first action is a full two-way reconcile, so the warning
+  /// applies just as much -- but a user who just pressed a button labelled
+  /// "Watch" and is shown copy about "Syncing" with no mention of the
+  /// action they actually took may wonder which button they hit, at
+  /// exactly the moment we need them reading carefully. This only changes
+  /// the opening sentence and the primary button's label; the title, the
+  /// contrast with earlier versions, and the deletions/conflicts line are
+  /// what carry the warning and stay the same either way.
+  final bool forWatch;
+
   @override
   Widget build(BuildContext context) {
     final c = MdhColors.of(context);
+    final opening = forWatch
+        ? 'Watching "$projectName" starts by syncing it, which sends your local '
+            'changes under envs/ to the Rossum organization, and pulls its changes back.'
+        : 'Syncing "$projectName" sends your local changes under envs/ to the '
+            'Rossum organization, and pulls its changes back.';
     return _Frame(
       title: 'Sync now writes to Rossum',
-      primaryLabel: 'Sync',
+      primaryLabel: forWatch ? 'Watch' : 'Sync',
       onPrimary: () => Navigator.of(context).pop(true),
       child: Text(
-        'Syncing "$projectName" sends your local changes under envs/ to the '
-        'Rossum organization, and pulls its changes back. Earlier versions of '
-        'this app only pulled.\n\n'
+        '$opening Earlier versions of this app only pulled.\n\n'
         'Deletions and conflicts still stop and ask first.',
         style: TextStyle(color: c.textPrimary, fontSize: 13, height: 1.5),
       ),

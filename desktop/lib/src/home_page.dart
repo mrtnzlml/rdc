@@ -97,20 +97,29 @@ final Map<String, Future<bool>> _twoWayConfirmsInFlight = {};
 /// Shows the one-time notice that Sync now writes to Rossum, if `item`'s
 /// project hasn't seen it yet, and records the acknowledgement if the user
 /// proceeds. Returns true when the caller should go ahead with the sync or
-/// watch it was about to start.
+/// watch it was about to start. Pass `forWatch: true` from a Watch call site
+/// so the notice's copy names the action that actually triggered it.
 ///
 /// Shared by every call site that starts a two-way cycle -- the top-level
 /// Sync/Sync-all wiring in [_HomePageState] and the direct `watchEnvItem`
-/// calls in [_ConnBar] and [_EnvTableRow] -- so the notice is asked (and
-/// acknowledged) exactly once regardless of which button triggered it.
-Future<bool> _confirmTwoWay(BuildContext context, AppState state, ProjectItem item) {
+/// calls in [_ConnBar] and [_EnvTableRow]. Two or more callers racing for
+/// the same unacknowledged folder in the same synchronous tick (a
+/// project's "Sync all envs" fires its gated per-env callback once per env
+/// before any dialog result comes back) share the one dialog already on
+/// screen rather than each popping their own. That guarantee is per tick,
+/// not per bulk operation: a caller that `await`s this sequentially across
+/// several envs (`_syncAll`) sees the in-flight entry cleared as soon as
+/// the first dialog resolves, so a decline is *not* remembered between
+/// sequential calls here -- a caller that needs "ask at most once per
+/// project per bulk run" tracks declines itself (see `_syncAll`).
+Future<bool> _confirmTwoWay(BuildContext context, AppState state, ProjectItem item, {bool forWatch = false}) {
   final folder = item.summary.folder;
   if (!state.needsTwoWayNotice(folder)) return Future.value(true);
   return _twoWayConfirmsInFlight[folder] ??= () async {
     try {
       final ok = await showDialog<bool>(
             context: context,
-            builder: (_) => TwoWayNoticeDialog(projectName: item.summary.name),
+            builder: (_) => TwoWayNoticeDialog(projectName: item.summary.name, forWatch: forWatch),
           ) ??
           false;
       if (ok) state.ackTwoWay(folder);
@@ -204,6 +213,13 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _syncAll() async {
+    // Declines recorded for this one call only (a fresh `_syncAll()` --
+    // another click of "Sync all" -- asks again): `_confirmTwoWay` awaited
+    // sequentially per env clears its in-flight-dialog entry as soon as
+    // each dialog resolves, so without tracking declines here ourselves, a
+    // "no" on a project's first env would still let its second env pop a
+    // fresh dialog, and so on for every remaining env of that project.
+    final declinedTwoWay = <String>{};
     for (final p in state.projects) {
       for (final e in p.summary.envs) {
         // Skip envs a watch owns (watching or mid-stop): a one-shot Sync
@@ -211,7 +227,12 @@ class _HomePageState extends State<HomePage> {
         // and row gates exist to prevent. Sync the rest; don't refuse the
         // whole bulk action for one watched env.
         if (_syncBlocked(state, p.summary.folder, e.name)) continue;
-        if (await _confirmTwoWay(context, state, p)) state.syncEnvItem(p, e);
+        if (declinedTwoWay.contains(p.summary.folder)) continue;
+        if (await _confirmTwoWay(context, state, p)) {
+          state.syncEnvItem(p, e);
+        } else {
+          declinedTwoWay.add(p.summary.folder);
+        }
       }
     }
   }
@@ -835,7 +856,7 @@ class _ConnBar extends StatelessWidget {
                     // so this needs the same gate Sync has -- otherwise
                     // starting a watch on a never-synced-by-this-build
                     // project would push without the notice ever showing.
-                    if (await _confirmTwoWay(context, state, item)) {
+                    if (await _confirmTwoWay(context, state, item, forWatch: true)) {
                       state.watchEnvItem(item, env);
                     }
                   }),
@@ -1305,7 +1326,7 @@ class _EnvTableRow extends StatelessWidget {
                         ? null
                         : () async {
                             // Same two-way gate as _ConnBar's Watch button.
-                            if (await _confirmTwoWay(context, state, item)) {
+                            if (await _confirmTwoWay(context, state, item, forWatch: true)) {
                               state.watchEnvItem(item, env);
                             }
                           }),
