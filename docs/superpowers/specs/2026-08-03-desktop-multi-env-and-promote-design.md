@@ -1,6 +1,6 @@
 # Desktop app — multiple environments per project + in-app promote
 
-**Status:** design (brainstorming complete, awaiting review)
+**Status:** Superseded 2026-09-01 — Promote removed; see `docs/superpowers/specs/2026-09-01-desktop-watch-and-promote-removal-design.md`
 **Date:** 2026-08-03
 **Extends:** `2026-07-24-cross-platform-desktop-flutter-design.md` (which listed
 "multiple environments" and "push/deploy" as explicit non-goals — this spec

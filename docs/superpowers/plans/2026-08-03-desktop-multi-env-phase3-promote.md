@@ -1,5 +1,7 @@
 # Desktop multi-env — Phase 3 (in-app promote) Implementation Plan
 
+> **SUPERSEDED 2026-09-01:** Promote was removed from the desktop app; do not build `prepare_promotion`, `push_promotion`, `ConflictPolicy`, or the Promote panel from this plan. See `docs/superpowers/specs/2026-09-01-desktop-watch-and-promote-removal-design.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development / executing-plans. Steps use `- [ ]`.
 
 **Goal:** Promote configuration between two of a project's environments, in either direction, from the Project view: offline **Prepare** (`migrate`) → reviewable **Preview** (dry-run push) → gated non-interactive **Push** (`sync --no-pull`). This is the app's first remote-write path.

@@ -1,5 +1,7 @@
 # Desktop multi-env — Phase 4 (Configure) Implementation Plan
 
+> **SUPERSEDED 2026-09-01:** Promote (the feature this Configure panel extends) was removed from the desktop app; do not build the ⚙ Configure affordance or `promoteDefaults` from this plan. See `docs/superpowers/specs/2026-09-01-desktop-watch-and-promote-removal-design.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development / executing-plans. Steps use `- [ ]`.
 
 **Goal:** Finish the spec's Configure (⚙) slice: **remember** each project's promote direction + mirror + conflict policy (so day-to-day promotion is pick-and-go), and give a **⚙ Configure** affordance that reveals the underlying `.rdc/mapping.toml` and target `envs/<tgt>/overlay/` for advanced edits. Dart-only; no bridge/core changes.
