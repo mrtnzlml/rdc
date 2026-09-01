@@ -84,6 +84,14 @@ Fixed columns. Byte offsets assume the default widths (kind 15, name 22):
 | 60–66 | `-N` | remove red; `0` dim | removed line count; blank when meaningless |
 | 69+ | note | dim | the existing tag strings, verbatim |
 
+> **As shipped:** the `±` columns are populated only where rdc already holds
+> both sides — the conflict, drift and remote-delete prompts, which are
+> diffing anyway. The dry-run plan and the destructive gates render them
+> blank: a plan is decided from hashes and a tombstone from the lockfile, and
+> fetching the bodies to count lines would add another per-kind dispatch site
+> (the class `kinds.rs` documents as failing silently) on a preview path.
+> Column offsets are unchanged either way.
+
 Verb mapping, exhaustive over `SyncClass` plus the two non-classifier sources:
 
 | Source | Verb | Colour bucket |
@@ -101,12 +109,17 @@ Verb mapping, exhaustive over `SyncClass` plus the two non-classifier sources:
 render dim; the leaf renders at full weight. Same rule as kind-vs-name, applied
 one level down.
 
-**Column widths** are sized to the widest entry in the cycle, not fixed. This is
-possible because `classified` is fully built before `execute::run` receives it,
-so the plan, the interactive prompts and the executed rows share one width and
-line up. Minimum kind width 8, minimum name width 12. Name is capped at 40 and
+**Column widths** are sized to the widest entry in the batch, not fixed.
+Minimum kind width 8, minimum name width 12. Name is capped at 40 and
 middle-elided past that, preserving the leaf (`main/…/rejection-default`).
 Longest kind in the registry is `email_templates` (15).
+
+> **As shipped:** each surface fits its own batch — the plan fits the plan, the
+> delete gate fits the tombstones, a conflict prompt fits its single object. So
+> rows align *within* a surface but a plan and a later prompt do not align with
+> each other. One cycle-wide width is possible (`classified` is built before
+> `execute::run` receives it) but needs threading through every prompt call
+> site, which this change did not do. Open.
 
 ### Expansion
 
