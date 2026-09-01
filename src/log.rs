@@ -528,6 +528,42 @@ impl Log {
         *self.phase.lock().unwrap() = None;
         self.finish_status();
     }
+
+    /// A `Write` that routes inline prompt output — the conflict diff, the
+    /// question line — through this log's sink instead of raw stderr.
+    ///
+    /// For `Log::new` the sink IS stderr, so terminal output is unchanged.
+    /// For `Log::for_sink` (the desktop app) it is what finally lets an
+    /// embedder see a prompt's body at all.
+    pub fn writer(&self) -> LogWriter<'_> {
+        LogWriter { log: self }
+    }
+}
+
+/// See [`Log::writer`]. Locks the log's sink per `write` call and releases
+/// it immediately — never across the guard's lifetime. Callers hold one of
+/// these for a whole prompt phase while also calling `event`/`row`, and a
+/// held lock would deadlock the first such call.
+pub struct LogWriter<'a> {
+    log: &'a Log,
+}
+
+impl std::io::Write for LogWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut state = self.log.state.lock().unwrap();
+        if state.status_active {
+            // A prompt must not be drawn on top of the watch countdown.
+            state.out.write_all(b"\r\x1b[K")?;
+            state.status_active = false;
+        }
+        state.out.write_all(buf)?;
+        state.out.flush()?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.log.state.lock().unwrap().out.flush()
+    }
 }
 
 #[cfg(test)]
@@ -733,5 +769,32 @@ mod log_tests {
         let log = Log::for_test(ColorMode::Plain, Box::new(buf.clone()));
         log.bump(100);
         assert_eq!(buf.text(), "", "bump with no active phase must do nothing");
+    }
+
+    #[test]
+    fn writer_passes_bytes_through_verbatim() {
+        use std::io::Write;
+        let buf = Buf::default();
+        let log = Log::for_test(ColorMode::Plain, Box::new(buf.clone()));
+        let mut w = log.writer();
+        write!(w, "[k] keep local  [r] use dev > ").unwrap();
+        assert_eq!(buf.text(), "[k] keep local  [r] use dev > ");
+    }
+
+    #[test]
+    fn writer_does_not_deadlock_against_event() {
+        use std::io::Write;
+        let buf = Buf::default();
+        let log = Log::for_test_with_time(
+            ColorMode::Plain,
+            Box::new(buf.clone()),
+            UNIX_EPOCH + Duration::from_secs(12 * 3600 + 60 + 14),
+        );
+        // The shape `resolve_conflicts` uses: a live writer across events.
+        let mut w = log.writer();
+        write!(w, "a").unwrap();
+        log.event(Action::Sync, "in between");
+        write!(w, "b").unwrap();
+        assert_eq!(buf.text(), "a12:01:14 sync   in between\nb");
     }
 }

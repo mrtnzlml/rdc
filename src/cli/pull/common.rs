@@ -950,10 +950,9 @@ fn resolve_conflict_interactive(
     // deadlock. Outside watch the coordinator reads stdin directly. This
     // path is normally pre-handled by the sync conflict resolver, but a
     // mid-cycle drift can still surface it.
-    let stderr = std::io::stderr();
     let resolution = prompt_resolve(
         crate::cli::stdin_coord::CoordinatorStdin::new(),
-        stderr.lock(),
+        progress.writer(),
         1, // No global counter yet — drivers don't share an index/total.
         1,
         obj,

@@ -345,8 +345,10 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
         .count();
 
     let env = ctx.paths.env().to_string();
-    let stderr = std::io::stderr();
-    let mut stderr_lock = stderr.lock();
+    // Prompt output goes through the renderer, not raw stderr: under
+    // `Log::new` the sink IS stderr (identical bytes), and under
+    // `Log::for_sink` it is the only way an embedder sees the diff.
+    let mut prompt_out = progress.writer();
 
     for (idx, it) in conflicts.iter().enumerate() {
         // Resolve the conflict's "remote object" → (remote bytes, local
@@ -676,7 +678,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
             idx + 1,
             total,
             &mut input,
-            &mut stderr_lock,
+            &mut prompt_out,
             interactive,
             conflict_strategy,
             &env,
@@ -1168,7 +1170,7 @@ fn resolve_one_conflict<R: BufRead>(
     idx_one_based: usize,
     total: usize,
     input: &mut R,
-    stderr_lock: &mut std::io::StderrLock<'_>,
+    prompt_out: &mut dyn std::io::Write,
     interactive: bool,
     conflict_strategy: Option<ConflictStrategy>,
     env: &str,
@@ -1512,7 +1514,7 @@ fn resolve_one_conflict<R: BufRead>(
         );
     }
 
-    let prompt_out: std::cell::RefCell<Option<PromptOutcome>> = std::cell::RefCell::new(None);
+    let prompt_outcome: std::cell::RefCell<Option<PromptOutcome>> = std::cell::RefCell::new(None);
     progress.with_prompt(|| -> anyhow::Result<_> {
         let computed: PromptOutcome = if json_canonicalize_equal && sidecar_diverges {
             match hash_strategy {
@@ -1524,7 +1526,7 @@ fn resolve_one_conflict<R: BufRead>(
                         Some(b) => b.resolution(),
                         None => prompt_resolve_with_bytes_and_color(
                             &mut *input,
-                            &mut *stderr_lock,
+                            &mut *prompt_out,
                             idx_one_based,
                             total,
                             ObjectRef { kind: &it.kind, slug: &it.slug },
@@ -1579,7 +1581,7 @@ fn resolve_one_conflict<R: BufRead>(
                         Some(b) => b.resolution(),
                         None => prompt_resolve_with_bytes_and_color(
                             &mut *input,
-                            &mut *stderr_lock,
+                            &mut *prompt_out,
                             idx_one_based,
                             total,
                             ObjectRef { kind: &it.kind, slug: &it.slug },
@@ -1608,7 +1610,7 @@ fn resolve_one_conflict<R: BufRead>(
                 Some(b) => b.resolution(),
                 None => prompt_resolve_with_bytes_and_color(
                     &mut *input,
-                    &mut *stderr_lock,
+                    &mut *prompt_out,
                     idx_one_based,
                     total,
                     ObjectRef { kind: &it.kind, slug: &it.slug },
@@ -1628,7 +1630,7 @@ fn resolve_one_conflict<R: BufRead>(
                 local_path.clone(),
             )
         };
-        *prompt_out.borrow_mut() = Some(computed);
+        *prompt_outcome.borrow_mut() = Some(computed);
         Ok(())
     })?;
     // The prompt's own byte pair / anchor path are informational only: the
@@ -1636,7 +1638,7 @@ fn resolve_one_conflict<R: BufRead>(
     // parks every divergent half via `divergent_shadow_parts` rather than
     // just the half the prompt happened to focus on.
     let (resolution, code_conflict_only, _prompt_local_bytes, _prompt_remote_bytes, _prompt_path) =
-        prompt_out
+        prompt_outcome
             .into_inner()
             .expect("with_prompt must populate the resolution");
 
@@ -2312,7 +2314,7 @@ async fn prune_mdh_orphans<R: BufRead>(
         progress.with_prompt(|| -> anyhow::Result<()> {
             let r = prompt_remote_delete(
                 &mut input,
-                std::io::stderr().lock(),
+                progress.writer(),
                 ObjectRef { kind: "mdh", slug: &slug },
                 &indexes_for_prompt,
                 &env,
@@ -3175,7 +3177,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                     progress.with_prompt(|| -> anyhow::Result<()> {
                         let r = prompt_remote_delete_with_color(
                             &mut input,
-                            std::io::stderr().lock(),
+                            progress.writer(),
                             ObjectRef { kind: &it.kind, slug: &it.slug },
                             &local_for_prompt,
                             &env,
