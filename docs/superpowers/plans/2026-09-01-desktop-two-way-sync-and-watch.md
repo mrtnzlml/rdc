@@ -994,6 +994,46 @@ In `src/cli/push/mdh_data.rs::prompt_confirm_row_deletes`, same position:
         });
 ```
 
+- [ ] **Step 7b: Route `resolve_combined_file`'s two ad-hoc loggers through `progress`**
+
+Task 3 gave `resolve_combined_file` a `progress: &Arc<Log>` parameter but, per its own narrow
+scope, changed only the prompt sink. Two places inside that function still build their own
+logger and ignore the parameter:
+
+- `src/cli/resolve.rs` ~1242 — the `!interactive` shadow-file path
+- `src/cli/resolve.rs` ~1310 — the `Resolution::Skip` path
+
+Both do `let log = crate::log::Log::new(detect_color_mode());` and then emit
+`"<path> conflict: local preserved, remote at <shadow> (lockfile base preserved; re-run to
+resolve)"`. `Log::new` writes to real stderr, so an embedder never receives it.
+
+This matters more than its size suggests: the `!interactive` branch is exactly what a
+non-terminal consumer takes, and that message is the only explanation of why an object was
+left unsynced. Replace both with `progress.event(...)` — same `Action::Warn`, same wording,
+no other change. Verify the line numbers first; Task 3 shifted this file.
+
+- [ ] **Step 7c: Replace the tautological delete-gate capture test with a real one**
+
+Task 3 added `delete_gate_question_reaches_the_log_sink` in `src/cli/push/deletes.rs` from a
+snippet in this plan. Its reviewer found it proves nothing: it never calls `confirm_or_refuse`
+or any other gate — it writes the question literal into a `Log::writer()` by hand and asserts
+the buffer contains that same literal. It would still pass if the real `progress.writer()`
+call were deleted outright. Task 3's fix round removed it rather than leave false coverage.
+
+Now that a thread-local `PromptRoute` exists (Step 6 of this task), a genuine test is
+straightforward: install a route that records the `Prompt` it is handed and returns a canned
+answer, then drive each of the four gates for real and assert both that the question text
+reached the log sink and that the announced `Prompt` carried the expected `kind` and keys.
+
+Write one such test per gate — `confirm_or_refuse` (`push/deletes.rs`), `resolve_delete_drift`
+(same file), `prompt_confirm_index_drops` (`push/mdh.rs`), `prompt_confirm_row_deletes`
+(`push/mdh_data.rs`). Reuse the module-level `Buf` helper that already exists in
+`deletes.rs`'s `mod tests`; do not define a second one.
+
+Each test must be able to fail for the right reason: delete the `progress.writer()` call in
+the function under test, confirm the test goes red, restore it, confirm green. Report both
+observations — that is what distinguishes this from the test it replaces.
+
 - [ ] **Step 8: Prove every coordinated read has an announce**
 
 Run:
