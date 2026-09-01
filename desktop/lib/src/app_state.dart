@@ -3,6 +3,7 @@ import 'package:flutter/foundation.dart';
 import 'error_text.dart';
 import 'rust/api/rdc.dart';
 import 'settings.dart';
+import 'watch_state.dart';
 
 enum SyncState { idle, running, done, error }
 
@@ -31,6 +32,26 @@ class AppState extends ChangeNotifier {
   final Map<String, SyncState> syncState = {};
   final Map<String, String> syncMessage = {};
   final Map<String, List<String>> syncLog = {};
+
+  /// Live watches, keyed like [syncState] by (folder, env).
+  final Map<String, WatchState> watch = {};
+
+  bool isWatching(String folder, String env) => watch[envKey(folder, env)]?.running ?? false;
+
+  /// Every prompt currently blocking, keyed like [syncState] by (folder, env).
+  ///
+  /// Deliberately NOT stored inside [WatchState]: a one-shot `Sync` blocks on
+  /// exactly the same gates a watch does, and its bridge call installs a real
+  /// prompt route. If prompts lived only on watch state, a gate hit during a
+  /// plain Sync would emit `SyncPhase.prompt`, find no consumer, and leave the
+  /// bridge thread blocked forever with no dialog to answer — strictly worse
+  /// than the silent skip it replaced. Both streams write here.
+  final Map<String, PendingPrompt> pendingPrompts = {};
+
+  /// Every prompt currently blocking, oldest first. More than one is
+  /// reachable: two watched envs, or a watch and a one-shot sync, can block
+  /// at the same time.
+  List<PendingPrompt> get promptQueue => pendingPrompts.values.toList();
 
   String? get parentFolder => _settings.parentFolder;
 
@@ -243,18 +264,31 @@ class AppState extends ChangeNotifier {
             syncState[k] = SyncState.running;
           case SyncPhase_Log(:final line):
             (syncLog[k] ??= <String>[]).add(line);
+          case SyncPhase_Prompt(:final id, :final kind, :final question, :final keys):
+            // A one-shot sync blocks on exactly the same gates a watch does,
+            // and its bridge call installs a real prompt route — so this
+            // must be answered here too, not left for the watch stream.
+            pendingPrompts[k] = PendingPrompt(
+              id: id,
+              kind: kind,
+              question: question,
+              keys: keys,
+              folder: folder,
+              env: env.name,
+            );
+          case SyncPhase_PromptResolved(:final id):
+            if (pendingPrompts[k]?.id == id) pendingPrompts.remove(k);
           case SyncPhase_Done(:final fileCount):
             syncState[k] = SyncState.done;
-            syncMessage[k] = 'Pulled $fileCount files';
+            syncMessage[k] = 'Synced · $fileCount files';
             reload();
           case SyncPhase_Error(:final message):
             syncState[k] = SyncState.error;
+            pendingPrompts.remove(k);
             syncMessage[k] = message;
-          case SyncPhase_Prompt():
-          case SyncPhase_PromptResolved():
           case SyncPhase_Idle():
           case SyncPhase_Stopped():
-            break; // handled by the watch stream (see watchEnvItem)
+            break; // a one-shot sync never emits these
         }
         notifyListeners();
       },
@@ -264,6 +298,80 @@ class AppState extends ChangeNotifier {
         notifyListeners();
       },
     );
+  }
+
+  void watchEnvItem(ProjectItem item, EnvSummary env) {
+    final folder = item.summary.folder;
+    final k = envKey(folder, env.name);
+    if (watch[k]?.running ?? false) return; // already watching
+    watch[k] = WatchState(running: true);
+    syncLog[k] = <String>[];
+    notifyListeners();
+
+    watchEnv(
+      folder: folder,
+      env: env.name,
+      apiBase: env.apiBase,
+      orgId: env.orgId,
+      // TODO(task 15): replace with the per-env poll-interval setting.
+      pollSecs: BigInt.from(60),
+    ).listen(
+      (phase) {
+        final w = watch[k];
+        if (w == null) return; // stopped and cleared while in flight
+        switch (phase) {
+          case SyncPhase_Started():
+            w.running = true;
+          case SyncPhase_Log(:final line):
+            (syncLog[k] ??= <String>[]).add(line);
+            w.nextPollSecs = null; // a cycle is running
+          case SyncPhase_Prompt(:final id, :final kind, :final question, :final keys):
+            pendingPrompts[k] = PendingPrompt(
+              id: id,
+              kind: kind,
+              question: question,
+              keys: keys,
+              folder: folder,
+              env: env.name,
+            );
+          case SyncPhase_PromptResolved(:final id):
+            if (pendingPrompts[k]?.id == id) pendingPrompts.remove(k);
+          case SyncPhase_Idle(:final nextPollSecs):
+            w.nextPollSecs = nextPollSecs?.toInt();
+          case SyncPhase_Done():
+            reload();
+          case SyncPhase_Error(:final message):
+            w.running = false;
+            pendingPrompts.remove(k);
+            syncState[k] = SyncState.error;
+            syncMessage[k] = message;
+          case SyncPhase_Stopped():
+            watch.remove(k);
+            reload();
+        }
+        notifyListeners();
+      },
+      onError: (Object e) {
+        watch.remove(k);
+        syncState[k] = SyncState.error;
+        syncMessage[k] = errorText(e);
+        notifyListeners();
+      },
+    );
+  }
+
+  void stopWatchItem(ProjectItem item, EnvSummary env) {
+    stopWatch(folder: item.summary.folder, env: env.name);
+    // The registry cancels; SyncPhase_Stopped clears the entry. Mark it
+    // stopping now so the button flips immediately.
+    watch[envKey(item.summary.folder, env.name)]?.running = false;
+    notifyListeners();
+  }
+
+  void answer(PendingPrompt p, String key) {
+    answerPrompt(folder: p.folder, env: p.env, answer: key);
+    pendingPrompts.remove(envKey(p.folder, p.env));
+    notifyListeners();
   }
 
   void clearError() {
