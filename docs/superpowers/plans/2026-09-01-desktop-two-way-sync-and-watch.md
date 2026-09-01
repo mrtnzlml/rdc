@@ -2764,6 +2764,26 @@ and give the dot the watching colour:
     };
 ```
 
+- [ ] **Step 3b: Do not let a second generation start on an env that is still unwinding**
+
+`stopWatchItem` sets `running = false` immediately so the button flips, but leaves the entry in
+`watch[k]` until `SyncPhase.stopped` arrives. During that window the env has a live, unwinding
+subscription. Starting a *second* watch, or a plain `Sync`, on the same env in that window
+leaves two subscriptions writing into the same `pendingPrompts[k]` and `watch[k]`.
+
+Two guards, both in this task:
+
+- **Disable `Sync` while an env is watched or stopping.** The Rust side treats a one-shot sync
+  on a watched env as a deliberate displacement — it cancels the watch — so an always-enabled
+  Sync button next to a Watch button is an invitation to trigger that by accident. Gate the
+  Sync action (header button and row icon) on `!isWatching(...)` and on there being no
+  stopping entry, with a tooltip saying why.
+- **Disable `Watch` while an entry is still present but not running**, i.e. mid-stop, so a
+  second generation cannot start before the first has reported `Stopped`.
+
+`isWatching` returns `watch[k]?.running ?? false`, which is false during that window — so it
+is the wrong predicate on its own. Check for the entry's *presence* as well.
+
 - [ ] **Step 4: Show the dialog**
 
 In `_HomePageState.build`, wrap the returned scaffold so a pending prompt overlays it. Follow whatever pattern `_HomePageState` already uses for its update-check dialog (`update_check.dart` is wired in there); if that uses `showDialog` from a listener, do the same — a prompt arriving while a dialog is open must not stack a second one:
@@ -3188,6 +3208,23 @@ Delete the variant, its `PromptKindDto` mirror in `desktop/rust/src/api/rdc.rs`,
 an absent one — it invites someone to build a dialog for a state that never arrives. If a
 distinct mid-cycle-drift prompt is ever wanted, it should land with the wiring that produces
 it. Regenerate the FRB bindings (confirm codegen `2.12.0` first) since a bridged enum changed.
+
+- [ ] **Step 5a: Make prompt ids globally unique, not per-handle**
+
+`SinkPromptRoute`'s `next_id` counter starts at 1 for every `WatchHandle`
+(`desktop/rust/src/api/rdc.rs`, both the `sync_env` and `watch_env` construction sites). So
+two generations on the same env — a watch that a one-shot `Sync` displaced, whose subscription
+is still unwinding — each hand out id `1` for their first prompt. `SyncPhase::PromptResolved`
+carries a bare `id` with no generation tag, so the displaced generation's stale resolve can
+clear the live generation's prompt from the Dart side's `pendingPrompts[k]`, and the user's
+dialog vanishes with the cycle behind it still blocked.
+
+Replace the per-handle counter with a process-global monotonic `AtomicU64` (the registry
+already has `next_id()` for handle generations — either reuse it or add a sibling). Ids then
+never repeat within a process run and a stale resolve can never match a live prompt.
+
+No bridged signature changes (the id stays `u64`), so no FRB regeneration is needed for this
+step — but Step 5b below does change a bridged enum, so regenerate once after both.
 
 - [ ] **Step 5c: Make the drain test isolate the drain**
 
