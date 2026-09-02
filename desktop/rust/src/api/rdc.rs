@@ -521,10 +521,14 @@ pub fn sync_env(
     let folder_path = PathBuf::from(&folder);
     let _ = sink.add(SyncPhase::Started);
 
-    // Forward rdc's real, rendered log into the stream, line by line.
+    // Forward rdc's real, rendered log into the stream, line by line. The
+    // buffer is shared with `route` below so a blocking prompt can discard
+    // a partial (question) line rather than let it corrupt the next one —
+    // see `LineBuffer`'s doc.
+    let log_buf = LineBuffer::default();
     let forwarder = LineForwarder {
         sink: sink.clone(),
-        buf: Vec::new(),
+        buf: log_buf.clone(),
     };
 
     let cancel = rdc::cli::sync::watch::CancelToken::new();
@@ -552,6 +556,7 @@ pub fn sync_env(
             sink: sink.clone(),
             answers: std::sync::Mutex::new(answer_rx),
             cancel: cancel.clone(),
+            log_buf,
         });
 
     let result: Result<u64> = block_on(async {
@@ -590,24 +595,50 @@ pub fn sync_env(
     Ok(())
 }
 
-/// A `std::io::Write` that splits rdc's rendered log output into whole lines
-/// and forwards each as `SyncPhase::Log`. rdc writes one newline-terminated
-/// line per event (plain text under `ColorMode::Plain`, non-TTY).
-struct LineForwarder {
-    sink: StreamSink<SyncPhase>,
-    buf: Vec<u8>,
+/// A buffer shared between a `LineForwarder` and the `SinkPromptRoute` for
+/// the same cycle, so a blocking prompt can drop whatever partial (no
+/// trailing newline) line the forwarder is mid-buffering.
+///
+/// Every prompt writes its question with no trailing newline — correct for
+/// a terminal, where the answer is typed on that same line — so at the
+/// moment `ask()` is about to block, `LineForwarder`'s buffer holds exactly
+/// that un-terminated question text. Left alone, it sits there until the
+/// NEXT real log line arrives after the prompt is answered, and gets
+/// prepended to it: `[k] keep local … [a] abort > 12:01:14 pull
+/// queues/invoices`. `ask()` discards it via this shared handle right
+/// before emitting `SyncPhase::Prompt` — the dialog already renders
+/// `prompt.question` on its own, so the log pane never needed this text.
+#[derive(Clone, Default)]
+struct LineBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl LineBuffer {
+    /// Drop whatever partial bytes are currently buffered, without ever
+    /// forwarding them as a `SyncPhase::Log` line.
+    fn discard(&self) {
+        self.0.lock().unwrap().clear();
+    }
 }
 
-impl std::io::Write for LineForwarder {
+/// A `std::io::Write` that splits rdc's rendered log output into whole lines
+/// and forwards each as `SyncPhase::Log`. rdc writes one newline-terminated
+/// line per event (plain text under `ColorMode::Plain`, non-TTY) — except a
+/// prompt's question, deliberately left unterminated; see `LineBuffer`.
+struct LineForwarder<S: PromptSink = StreamSink<SyncPhase>> {
+    sink: S,
+    buf: LineBuffer,
+}
+
+impl<S: PromptSink> std::io::Write for LineForwarder<S> {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        self.buf.extend_from_slice(data);
-        while let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = self.buf.drain(..=nl).collect();
+        let mut buf = self.buf.0.lock().unwrap();
+        buf.extend_from_slice(data);
+        while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = buf.drain(..=nl).collect();
             let text = String::from_utf8_lossy(&line)
                 .trim_end_matches(['\n', '\r'])
                 .to_string();
             if !text.is_empty() {
-                let _ = self.sink.add(SyncPhase::Log { line: text });
+                let _ = self.sink.emit(SyncPhase::Log { line: text });
             }
         }
         Ok(data.len())
@@ -654,6 +685,9 @@ struct SinkPromptRoute<S: PromptSink = StreamSink<SyncPhase>> {
     /// is parked can unblock it — nothing else observes this token while a
     /// prompt is in flight.
     cancel: rdc::cli::sync::watch::CancelToken,
+    /// Shared with this cycle's `LineForwarder`. See `LineBuffer`'s doc for
+    /// why `ask` discards it before blocking.
+    log_buf: LineBuffer,
 }
 
 impl<S: PromptSink + Send + Sync> rdc::cli::sync::embed::PromptRoute for SinkPromptRoute<S> {
@@ -686,6 +720,13 @@ impl<S: PromptSink + Send + Sync> rdc::cli::sync::embed::PromptRoute for SinkPro
         // Drop anything queued from a previous prompt so a late answer can
         // never be read as the answer to this one.
         while rx.try_recv().is_ok() {}
+
+        // Discard the question `LineForwarder` is still holding (written
+        // with no trailing newline, as a terminal expects) before it can
+        // get prepended to whatever log line arrives once this prompt is
+        // answered — see `LineBuffer`'s doc. The dialog renders
+        // `prompt.question` on its own, so the log pane doesn't need it.
+        self.log_buf.discard();
 
         if !self.sink.emit(SyncPhase::Prompt {
             id,
@@ -779,16 +820,21 @@ pub fn watch_env(
         previous.cancel.cancel();
     }
 
+    // Shared with `forwarder` below so a blocking prompt can discard a
+    // partial (question) line rather than let it corrupt the next one —
+    // see `LineBuffer`'s doc.
+    let log_buf = LineBuffer::default();
     let route: std::sync::Arc<dyn rdc::cli::sync::embed::PromptRoute> =
         std::sync::Arc::new(SinkPromptRoute {
             sink: sink.clone(),
             answers: std::sync::Mutex::new(answer_rx),
             cancel: cancel.clone(),
+            log_buf: log_buf.clone(),
         });
 
     let forwarder = LineForwarder {
         sink: sink.clone(),
-        buf: Vec::new(),
+        buf: log_buf,
     };
     let poll = poll_secs.map(std::time::Duration::from_secs);
 
@@ -1281,6 +1327,7 @@ mod tests {
             sink: FakeSink::new(),
             answers: std::sync::Mutex::new(rx),
             cancel: rdc::cli::sync::watch::CancelToken::new(),
+            log_buf: LineBuffer::default(),
         };
         (route, tx)
     }
@@ -1420,6 +1467,55 @@ mod tests {
         // No answer is ever sent; without the cancellation check this would
         // hang forever rather than returning within one poll interval.
         assert_eq!(route.ask(&sample_prompt()), None);
+    }
+
+    #[test]
+    fn ask_discards_the_forwarders_buffered_partial_question_line() {
+        // Regression test for the log-pane corruption: every prompt writes
+        // its question with NO trailing newline (correct for a terminal,
+        // where the answer is typed on that line), so `LineForwarder`'s
+        // buffer holds exactly that text at the moment `ask()` is about to
+        // block. Without the discard, it would sit there and get prepended
+        // to whatever real log line arrives once the prompt is answered.
+        use std::io::Write as _;
+
+        let log_buf = LineBuffer::default();
+        let mut forwarder = LineForwarder {
+            sink: FakeSink::new(),
+            buf: log_buf.clone(),
+        };
+        forwarder
+            .write_all(b"[k] keep local  [r] use dev  [a] abort > ")
+            .unwrap();
+        assert!(
+            forwarder.sink.emitted.lock().unwrap().is_empty(),
+            "no newline yet -- nothing should have been forwarded as a Log line"
+        );
+
+        let route = SinkPromptRoute {
+            sink: FakeSink::new(),
+            answers: std::sync::Mutex::new(std::sync::mpsc::channel().1),
+            cancel: rdc::cli::sync::watch::CancelToken::new(),
+            log_buf: log_buf.clone(),
+        };
+        // Pre-cancelled: `ask` still runs the drain/discard/emit sequence
+        // before its wait loop ever checks this, so no second thread is
+        // needed to unblock it.
+        route.cancel.cancel();
+        assert_eq!(route.ask(&sample_prompt()), None);
+
+        // The question text must be gone -- discarded, not forwarded -- so
+        // it can never get prepended to the next real line.
+        forwarder
+            .write_all(b"12:01:14 pull  queues/invoices\n")
+            .unwrap();
+        let emitted = forwarder.sink.emitted.lock().unwrap();
+        match &emitted[0] {
+            SyncPhase::Log { line } => {
+                assert_eq!(line, "12:01:14 pull  queues/invoices");
+            }
+            other => panic!("expected a Log phase, got {other:?}"),
+        }
     }
 
     #[test]
