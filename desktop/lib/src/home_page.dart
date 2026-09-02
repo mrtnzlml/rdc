@@ -147,6 +147,13 @@ class _HomePageState extends State<HomePage> {
   // Guards against stacking a second PromptDialog: set as soon as one is
   // scheduled to show, cleared only after it's dismissed.
   bool _promptOpen = false;
+  // Identifies the prompt the open dialog is showing, so a build triggered
+  // by some OTHER env's prompt changing doesn't mistake it for this one
+  // resolving. Cleared by `onAnswer` before it pops, so the "resolved
+  // externally" check below never fires for an answer the user just gave
+  // (see the check's own comment).
+  String? _openPromptKey;
+  BigInt? _openPromptId;
 
   @override
   void initState() {
@@ -260,6 +267,8 @@ class _HomePageState extends State<HomePage> {
           if (pending.isNotEmpty && !_promptOpen) {
             _promptOpen = true;
             final p = pending.first;
+            _openPromptKey = state.envKey(p.folder, p.env);
+            _openPromptId = p.id;
             WidgetsBinding.instance.addPostFrameCallback((_) async {
               await showDialog<void>(
                 context: context,
@@ -273,12 +282,42 @@ class _HomePageState extends State<HomePage> {
                       .reversed
                       .toList(),
                   onAnswer: (k) {
+                    // Clear first: `state.answer` calls notifyListeners
+                    // synchronously, which rebuilds this ListenableBuilder
+                    // (and could hit the "resolved externally" branch
+                    // below) before the `pop()` on the next line ever runs.
+                    // With these already null, that branch sees nothing to
+                    // close and leaves the explicit pop below as the only
+                    // one.
+                    _openPromptKey = null;
+                    _openPromptId = null;
                     state.answer(p, k);
                     Navigator.of(context).pop();
                   },
                 ),
               );
               _promptOpen = false;
+              _openPromptKey = null;
+              _openPromptId = null;
+            });
+          } else if (_promptOpen &&
+              _openPromptKey != null &&
+              state.pendingPrompts[_openPromptKey]?.id != _openPromptId) {
+            // The prompt the open dialog is showing resolved some other
+            // way than the user pressing a button here — the watch was
+            // stopped, the stream errored, or a `SyncPhase::Error` arrived
+            // — so nothing else will close it. `PromptResolved`'s whole
+            // documented purpose is "close the dialog"; this is that half.
+            //
+            // Cleared immediately (not just after the pop completes) so a
+            // fresh prompt — for this env or another — can open on the very
+            // next build instead of waiting for `showDialog`'s future,
+            // which won't resolve until the frame below actually pops it.
+            _openPromptKey = null;
+            _openPromptId = null;
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              final nav = Navigator.of(context, rootNavigator: true);
+              if (nav.canPop()) nav.pop();
             });
           }
           return MdhScaffold(
