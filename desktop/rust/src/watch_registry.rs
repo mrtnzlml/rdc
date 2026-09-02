@@ -45,8 +45,13 @@ pub struct WatchHandle {
     /// has displaced it at the same `(folder, env)` key.
     pub id: u64,
     pub cancel: CancelToken,
-    /// Answers from the UI, delivered to whichever prompt is blocked.
-    pub answers: Sender<String>,
+    /// Answers from the UI, delivered to whichever prompt is blocked. Each
+    /// answer is tagged with the id of the prompt the UI believes it is
+    /// answering (`answer_prompt`'s `prompt_id`) — `SinkPromptRoute::ask`
+    /// checks that tag against the id it minted for the question it is
+    /// CURRENTLY asking and ignores anything else, so a reply to a prompt
+    /// that has already moved on can never be misapplied to the next one.
+    pub answers: Sender<(u64, String)>,
 }
 
 type Map = HashMap<(String, String), WatchHandle>;

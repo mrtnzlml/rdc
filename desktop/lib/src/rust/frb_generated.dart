@@ -92,6 +92,7 @@ abstract class RustLibApi extends BaseApi {
   Future<void> crateApiRdcAnswerPrompt({
     required String folder,
     required String env,
+    required BigInt promptId,
     required String answer,
   });
 
@@ -229,6 +230,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   Future<void> crateApiRdcAnswerPrompt({
     required String folder,
     required String env,
+    required BigInt promptId,
     required String answer,
   }) {
     return handler.executeNormal(
@@ -237,6 +239,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           final serializer = SseSerializer(generalizedFrbRustBinding);
           sse_encode_String(folder, serializer);
           sse_encode_String(env, serializer);
+          sse_encode_u_64(promptId, serializer);
           sse_encode_String(answer, serializer);
           pdeCallFfi(
             generalizedFrbRustBinding,
@@ -250,7 +253,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           decodeErrorData: sse_decode_AnyhowException,
         ),
         constMeta: kCrateApiRdcAnswerPromptConstMeta,
-        argValues: [folder, env, answer],
+        argValues: [folder, env, promptId, answer],
         apiImpl: this,
       ),
     );
@@ -258,7 +261,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   TaskConstMeta get kCrateApiRdcAnswerPromptConstMeta => const TaskConstMeta(
     debugName: "answer_prompt",
-    argNames: ["folder", "env", "answer"],
+    argNames: ["folder", "env", "promptId", "answer"],
   );
 
   @override

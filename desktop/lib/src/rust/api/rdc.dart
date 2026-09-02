@@ -137,15 +137,25 @@ Future<void> stopWatch({required String folder, required String env}) =>
     RustLib.instance.api.crateApiRdcStopWatch(folder: folder, env: env);
 
 /// Answer the prompt a watch (or a one-shot sync) is currently blocked on.
+/// `prompt_id` must be the id of the `SyncPhase::Prompt` being answered —
+/// `SinkPromptRoute::ask` accepts an answer only when it matches the
+/// question it is currently asking, so a mis-delivered or stale answer (a
+/// UI race, a leftover call from a prompt that has already moved on) is
+/// ignored rather than applied to the wrong question. On a path whose
+/// answer can authorise deleting objects from a live organization, that
+/// check is load-bearing, not defensive polish.
+///
 /// No-op if nothing on that env is waiting — an answer for a prompt that
 /// has already been torn down is dropped, not queued.
 Future<void> answerPrompt({
   required String folder,
   required String env,
+  required BigInt promptId,
   required String answer,
 }) => RustLib.instance.api.crateApiRdcAnswerPrompt(
   folder: folder,
   env: env,
+  promptId: promptId,
   answer: answer,
 );
 

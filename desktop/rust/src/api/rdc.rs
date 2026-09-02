@@ -528,7 +528,7 @@ pub fn sync_env(
     };
 
     let cancel = rdc::cli::sync::watch::CancelToken::new();
-    let (answer_tx, answer_rx) = std::sync::mpsc::channel::<String>();
+    let (answer_tx, answer_rx) = std::sync::mpsc::channel::<(u64, String)>();
     let generation = crate::watch_registry::next_id();
     // Registered so `answer_prompt` can find this cycle. A watch on the same
     // env would contend for the env lock anyway, so displacing one here is
@@ -646,7 +646,9 @@ impl PromptSink for StreamSink<SyncPhase> {
 /// `$EDITOR` or enter the hunk walk, both of which wedge this thread.
 struct SinkPromptRoute<S: PromptSink = StreamSink<SyncPhase>> {
     sink: S,
-    answers: std::sync::Mutex<std::sync::mpsc::Receiver<String>>,
+    /// Each answer is tagged with the id the UI believes it is answering
+    /// (`answer_prompt`'s `prompt_id`) — see `WatchHandle::answers`.
+    answers: std::sync::Mutex<std::sync::mpsc::Receiver<(u64, String)>>,
     /// Cloned from the same `WatchHandle` registered for this cycle. Polled
     /// by the wait loop below so a `stop_watch` that fires while this `ask`
     /// is parked can unblock it — nothing else observes this token while a
@@ -699,7 +701,15 @@ impl<S: PromptSink + Send + Sync> rdc::cli::sync::embed::PromptRoute for SinkPro
                 break None; // the watch was stopped while this prompt was parked
             }
             match rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(a) => {
+                Ok((answered_id, a)) => {
+                    if answered_id != id {
+                        // Not an answer to the question we are CURRENTLY
+                        // asking — e.g. a UI-side race that fired after
+                        // this prompt replaced an earlier one. Same policy
+                        // as an off-list key below: ignore and keep
+                        // waiting, never apply it.
+                        continue;
+                    }
                     let first = a.trim().chars().next();
                     if allowed.is_empty() || first.is_some_and(|c| allowed.contains(&c)) {
                         break Some(a);
@@ -757,7 +767,7 @@ pub fn watch_env(
     let _ = sink.add(SyncPhase::Started);
 
     let cancel = rdc::cli::sync::watch::CancelToken::new();
-    let (answer_tx, answer_rx) = std::sync::mpsc::channel::<String>();
+    let (answer_tx, answer_rx) = std::sync::mpsc::channel::<(u64, String)>();
     let generation = crate::watch_registry::next_id();
     let handle = crate::watch_registry::WatchHandle {
         id: generation,
@@ -834,11 +844,19 @@ pub fn stop_watch(folder: String, env: String) -> Result<()> {
 }
 
 /// Answer the prompt a watch (or a one-shot sync) is currently blocked on.
+/// `prompt_id` must be the id of the `SyncPhase::Prompt` being answered —
+/// `SinkPromptRoute::ask` accepts an answer only when it matches the
+/// question it is currently asking, so a mis-delivered or stale answer (a
+/// UI race, a leftover call from a prompt that has already moved on) is
+/// ignored rather than applied to the wrong question. On a path whose
+/// answer can authorise deleting objects from a live organization, that
+/// check is load-bearing, not defensive polish.
+///
 /// No-op if nothing on that env is waiting — an answer for a prompt that
 /// has already been torn down is dropped, not queued.
-pub fn answer_prompt(folder: String, env: String, answer: String) -> Result<()> {
+pub fn answer_prompt(folder: String, env: String, prompt_id: u64, answer: String) -> Result<()> {
     if let Some(h) = crate::watch_registry::get(&folder, &env) {
-        let _ = h.answers.send(answer);
+        let _ = h.answers.send((prompt_id, answer));
     }
     Ok(())
 }
@@ -1257,7 +1275,7 @@ mod tests {
         }
     }
 
-    fn route_with_channel() -> (SinkPromptRoute<FakeSink>, std::sync::mpsc::Sender<String>) {
+    fn route_with_channel() -> (SinkPromptRoute<FakeSink>, std::sync::mpsc::Sender<(u64, String)>) {
         let (tx, rx) = std::sync::mpsc::channel();
         let route = SinkPromptRoute {
             sink: FakeSink::new(),
@@ -1265,6 +1283,20 @@ mod tests {
             cancel: rdc::cli::sync::watch::CancelToken::new(),
         };
         (route, tx)
+    }
+
+    /// Polls `route`'s `FakeSink` until a `SyncPhase::Prompt` has been
+    /// emitted and returns its id. `ask()` mints that id internally (from
+    /// the process-global `next_prompt_id()` counter), so a test that wants
+    /// to send a correctly-tagged reply on the answer channel has no way to
+    /// know it in advance — it has to read it back off the sink.
+    fn wait_for_prompt_id(route: &SinkPromptRoute<FakeSink>) -> u64 {
+        loop {
+            if let Some(SyncPhase::Prompt { id, .. }) = route.sink.emitted.lock().unwrap().last() {
+                return *id;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
     }
 
     fn sample_prompt() -> rdc::cli::sync::embed::Prompt {
@@ -1283,30 +1315,59 @@ mod tests {
     #[test]
     fn ask_drains_a_stale_answer_before_waiting() {
         let (route, tx) = route_with_channel();
-        // Leftover from an earlier, already-resolved prompt. Must be a key
-        // `sample_prompt` actually offers ("n", not e.g. "stale") — an
-        // un-offered value would be rejected by the wait loop's own
-        // key-validation regardless of whether it was drained, which would
-        // let this test pass even with the drain deleted.
-        tx.send("n".to_string()).unwrap();
-        let sender = tx.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            sender.send("y".to_string()).unwrap();
+        // Leftover from an earlier, already-resolved prompt. Tagged with an
+        // id that will never match (0, and `next_prompt_id()` starts at 1)
+        // AND offers a key `sample_prompt` actually has ("n", not e.g.
+        // "stale") — either the drain or the id check alone would reject
+        // it, so this on its own doesn't prove the drain still runs; it's
+        // the id-mismatch test below that isolates that check. This test
+        // stays about the drain: it must never even reach the id check for
+        // this stale entry.
+        tx.send((0, "n".to_string())).unwrap();
+        std::thread::scope(|scope| {
+            let sender = tx.clone();
+            let route_ref = &route;
+            scope.spawn(move || {
+                let id = wait_for_prompt_id(route_ref);
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                sender.send((id, "y".to_string())).unwrap();
+            });
+            // If the stale answer were not drained, this would return "n"
+            // immediately instead of blocking for the real "y".
+            assert_eq!(route.ask(&sample_prompt()), Some("y".to_string()));
         });
-        // If the stale answer were not drained, this would return "n"
-        // immediately instead of blocking for the real "y".
-        assert_eq!(route.ask(&sample_prompt()), Some("y".to_string()));
+    }
+
+    #[test]
+    fn ask_ignores_an_answer_for_a_different_prompt_id() {
+        // Restoring `prompt_id` to `answer_prompt` is only meaningful if
+        // `ask` actually checks it: a reply tagged for some OTHER prompt
+        // (an earlier one, already superseded) must never be applied here,
+        // even though its key ("y") is perfectly valid.
+        let (route, tx) = route_with_channel();
+        std::thread::scope(|scope| {
+            let sender = tx.clone();
+            let route_ref = &route;
+            scope.spawn(move || {
+                let id = wait_for_prompt_id(route_ref);
+                sender.send((id.wrapping_add(1), "y".to_string())).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                sender.send((id, "n".to_string())).unwrap();
+            });
+            assert_eq!(route.ask(&sample_prompt()), Some("n".to_string()));
+        });
     }
 
     #[test]
     fn ask_never_offers_e_or_h() {
         let (route, tx) = route_with_channel();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            tx.send("y".to_string()).unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let id = wait_for_prompt_id(&route);
+                tx.send((id, "y".to_string())).unwrap();
+            });
+            let _ = route.ask(&sample_prompt());
         });
-        let _ = route.ask(&sample_prompt());
         let emitted = route.sink.emitted.lock().unwrap();
         match &emitted[0] {
             SyncPhase::Prompt { keys, .. } => {
@@ -1323,14 +1384,17 @@ mod tests {
         // it must never be accepted even if it somehow arrives on the
         // answer channel (a future UI bug, not reachable today).
         let (route, tx) = route_with_channel();
-        let sender = tx.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            sender.send("e".to_string()).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            sender.send("y".to_string()).unwrap();
+        std::thread::scope(|scope| {
+            let sender = tx.clone();
+            let route_ref = &route;
+            scope.spawn(move || {
+                let id = wait_for_prompt_id(route_ref);
+                sender.send((id, "e".to_string())).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                sender.send((id, "y".to_string())).unwrap();
+            });
+            assert_eq!(route.ask(&sample_prompt()), Some("y".to_string()));
         });
-        assert_eq!(route.ask(&sample_prompt()), Some("y".to_string()));
     }
 
     #[test]

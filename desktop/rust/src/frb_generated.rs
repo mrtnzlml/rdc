@@ -147,13 +147,18 @@ fn wire__crate__api__rdc__answer_prompt_impl(
                 flutter_rust_bridge::for_generated::SseDeserializer::new(message);
             let api_folder = <String>::sse_decode(&mut deserializer);
             let api_env = <String>::sse_decode(&mut deserializer);
+            let api_prompt_id = <u64>::sse_decode(&mut deserializer);
             let api_answer = <String>::sse_decode(&mut deserializer);
             deserializer.end();
             move |context| {
                 transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
                     (move || {
-                        let output_ok =
-                            crate::api::rdc::answer_prompt(api_folder, api_env, api_answer)?;
+                        let output_ok = crate::api::rdc::answer_prompt(
+                            api_folder,
+                            api_env,
+                            api_prompt_id,
+                            api_answer,
+                        )?;
                         Ok(output_ok)
                     })(),
                 )

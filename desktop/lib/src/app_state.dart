@@ -451,7 +451,7 @@ class AppState extends ChangeNotifier {
   }
 
   void answer(PendingPrompt p, String key) {
-    answerPrompt(folder: p.folder, env: p.env, answer: key);
+    answerPrompt(folder: p.folder, env: p.env, promptId: p.id, answer: key);
     pendingPrompts.remove(envKey(p.folder, p.env));
     notifyListeners();
   }
