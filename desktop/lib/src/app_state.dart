@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 
 import 'error_text.dart';
@@ -35,6 +37,42 @@ class AppState extends ChangeNotifier {
 
   /// Live watches, keyed like [syncState] by (folder, env).
   final Map<String, WatchState> watch = {};
+
+  /// Ticks every watching env's [WatchState.nextPollSecs] down to zero once
+  /// a second. `SyncPhase.idle` only ever *sets* the countdown (once per
+  /// cycle boundary); without something ticking between those sets, the
+  /// sidebar would show a static number instead of a countdown. Started by
+  /// [_ensureIdleTicker] when the first watch begins, stopped by
+  /// [_stopIdleTickerIfIdle] once [watch] is empty again.
+  Timer? _idleTicker;
+
+  void _ensureIdleTicker() {
+    _idleTicker ??= Timer.periodic(const Duration(seconds: 1), (_) {
+      var changed = false;
+      for (final w in watch.values) {
+        final secs = w.nextPollSecs;
+        if (secs != null && secs > 0) {
+          w.nextPollSecs = secs - 1;
+          changed = true;
+        }
+      }
+      if (changed) notifyListeners();
+    });
+  }
+
+  void _stopIdleTickerIfIdle() {
+    if (watch.isEmpty) {
+      _idleTicker?.cancel();
+      _idleTicker = null;
+    }
+  }
+
+  @override
+  void dispose() {
+    _idleTicker?.cancel();
+    _idleTicker = null;
+    super.dispose();
+  }
 
   bool isWatching(String folder, String env) => watch[envKey(folder, env)]?.running ?? false;
 
@@ -336,6 +374,7 @@ class AppState extends ChangeNotifier {
       (phase) => applyWatchPhase(folder, env.name, phase),
       onError: (Object e) {
         watch.remove(k);
+        _stopIdleTickerIfIdle();
         syncState[k] = SyncState.error;
         pendingPrompts.remove(k);
         syncMessage[k] = errorText(e);
@@ -359,6 +398,7 @@ class AppState extends ChangeNotifier {
     switch (phase) {
       case SyncPhase_Started():
         w.running = true;
+        _ensureIdleTicker(); // starts on the first watch; a no-op if already running
       case SyncPhase_Log(:final line):
         (syncLog[k] ??= <String>[]).add(line);
         w.nextPollSecs = null; // a cycle is running
@@ -390,11 +430,13 @@ class AppState extends ChangeNotifier {
         // broken *stream*; this arm must agree for an in-band Error phase
         // on an otherwise-live stream.
         watch.remove(k);
+        _stopIdleTickerIfIdle();
         pendingPrompts.remove(k);
         syncState[k] = SyncState.error;
         syncMessage[k] = message;
       case SyncPhase_Stopped():
         watch.remove(k);
+        _stopIdleTickerIfIdle();
         reload();
     }
     notifyListeners();

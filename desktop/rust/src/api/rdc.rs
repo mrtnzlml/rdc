@@ -782,6 +782,15 @@ pub fn watch_env(
     };
     let poll = poll_secs.map(std::time::Duration::from_secs);
 
+    // rdc's own in-place "next sync in Ns" countdown is a no-op off a TTY,
+    // so nothing else tells the app when a watch goes idle or for how long
+    // — this is that signal, one `SyncPhase::Idle` per completed cycle.
+    let idle_sink = sink.clone();
+    let on_idle: std::sync::Arc<dyn Fn(Option<u64>) + Send + Sync> =
+        std::sync::Arc::new(move |next_poll_secs| {
+            let _ = idle_sink.add(SyncPhase::Idle { next_poll_secs });
+        });
+
     let result: Result<()> = block_on(async {
         rdc::cli::init::write_scaffold_files(&folder_path, &env, &api_base, org_id)?;
         let token = rdc::secrets::resolve_token(&folder_path, &env, &api_base).await?;
@@ -794,6 +803,7 @@ pub fn watch_env(
             Box::new(forwarder),
             route,
             cancel,
+            Some(on_idle),
         )
         .await
     });

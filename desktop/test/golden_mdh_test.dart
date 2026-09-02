@@ -82,6 +82,12 @@ AppState _filesState(Directory root) {
 AppState _watchingState() {
   final s = _seeded();
   const sel = '/tmp/Rossum/acme-invoices-eu-prod-primary';
+  // 42 is seeded directly for a deterministic golden image, not produced by
+  // this test. In the running app the real value arrives via
+  // `SyncPhase.idle` (emitted once per completed watch cycle by the Rust
+  // side, see `WatchConfig::on_idle`) and then ticks down once a second via
+  // `AppState`'s idle `Timer.periodic` — see `applyWatchPhase`'s
+  // `SyncPhase_Idle` case and `_ensureIdleTicker`.
   s.watch[s.envKey(sel, 'prod')] = WatchState(running: true, nextPollSecs: 42);
   return s;
 }

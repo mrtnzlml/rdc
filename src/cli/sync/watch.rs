@@ -129,6 +129,16 @@ pub(crate) struct WatchConfig<'a> {
     pub poll: Option<Duration>,
     pub verbose: bool,
     pub no_bell: bool,
+    /// Invoked in `event_loop` right after each cycle completes (success,
+    /// non-fatal continue, or early return alike — see the `ResetOnDrop`
+    /// guard it shares that timing with), with the configured poll interval
+    /// in seconds (`None` when polling is disabled). The CLI has no use for
+    /// this — its own in-place countdown status line already does the job
+    /// on a TTY and is a no-op off one — so `run_watch` passes `None`. An
+    /// embedder with no TTY-driven countdown of its own (the desktop app)
+    /// uses this to learn when a watch goes idle and for how long, so it
+    /// can render its own countdown between cycles.
+    pub on_idle: Option<Arc<dyn Fn(Option<u64>) + Send + Sync>>,
 }
 
 /// Refreshes the token for `env` on a 401. `Ok(Some(tok))` is the new token
@@ -255,6 +265,7 @@ pub async fn run_watch(
             poll: poll_interval,
             verbose,
             no_bell,
+            on_idle: None,
         },
         renderer,
         cancel,
@@ -481,11 +492,29 @@ pub(crate) async fn event_loop(
                 // cleared `sync_running`, so the ticker's reset branch
                 // sees the cycle as complete and immediately repaints a
                 // fresh "next sync in {interval_secs}s ▱…" line.
-                struct ResetOnDrop<'a>(&'a tokio::sync::Notify);
-                impl Drop for ResetOnDrop<'_> {
-                    fn drop(&mut self) { self.0.notify_one(); }
+                //
+                // Also the single point `cfg.on_idle` fires from: every
+                // exit path this guard covers is "the cycle is no longer
+                // running", which is exactly what an embedder's idle
+                // callback means.
+                struct ResetOnDrop<'a> {
+                    notify: &'a tokio::sync::Notify,
+                    on_idle: Option<Arc<dyn Fn(Option<u64>) + Send + Sync>>,
+                    poll_secs: Option<u64>,
                 }
-                let _reset_guard = ResetOnDrop(&timer_reset);
+                impl Drop for ResetOnDrop<'_> {
+                    fn drop(&mut self) {
+                        self.notify.notify_one();
+                        if let Some(cb) = &self.on_idle {
+                            cb(self.poll_secs);
+                        }
+                    }
+                }
+                let _reset_guard = ResetOnDrop {
+                    notify: &timer_reset,
+                    on_idle: cfg.on_idle.clone(),
+                    poll_secs: cfg.poll.map(|d| d.as_secs().max(1)),
+                };
 
                 let _cycle_started = std::time::Instant::now();
                 let _lock = crate::cli::sync::lock::EnvLock::acquire(
@@ -758,6 +787,7 @@ mod tests {
             poll: None,
             verbose: false,
             no_bell: false,
+            on_idle: None,
         };
         let refresher: TokenRefresher =
             Arc::new(|_: String| -> BoxFuture<'static, Result<Option<String>>> {
@@ -824,6 +854,7 @@ mod tests {
             poll: None,
             verbose: false,
             no_bell: true,
+            on_idle: None,
         };
         let refresher: TokenRefresher =
             Arc::new(|_: String| -> BoxFuture<'static, Result<Option<String>>> {
@@ -852,6 +883,68 @@ mod tests {
         assert!(
             !process_cwd.path().join(".rdc").exists(),
             "the process CWD must never be touched when cfg.cwd is set"
+        );
+    }
+
+    #[tokio::test]
+    async fn event_loop_invokes_on_idle_after_a_cycle() {
+        // Regression test for the gap where `SyncPhase::Idle` had no
+        // producer: nothing ever called `cfg.on_idle`, so an embedder's
+        // countdown was permanently stuck. See
+        // `event_loop_uses_the_injected_cwd_not_the_process_cwd`'s comment
+        // on `CwdLock` for why this also grabs the process-wide cwd guard.
+        let _cwd_guard = cwd_lock();
+
+        let process_cwd = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(process_cwd.path()).unwrap();
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<CycleTrigger>(8);
+        tx.send(CycleTrigger::Poll).await.unwrap();
+        let cancel = CancelToken::new();
+
+        let seen: Arc<StdMutex<Vec<Option<u64>>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen_cb = seen.clone();
+
+        let cfg = WatchConfig {
+            env: "test",
+            cwd: Some(project.path()),
+            token: Some("tok".into()),
+            interactive: false,
+            allow_deletes: false,
+            no_push: false,
+            no_pull: false,
+            poll: Some(Duration::from_secs(30)),
+            verbose: false,
+            no_bell: true,
+            on_idle: Some(Arc::new(move |secs| seen_cb.lock().unwrap().push(secs))),
+        };
+        let refresher: TokenRefresher =
+            Arc::new(|_: String| -> BoxFuture<'static, Result<Option<String>>> {
+                Box::pin(async { Ok(None) })
+            });
+        let result = event_loop(
+            &cfg,
+            rx,
+            cancel,
+            None,
+            project.path().join("envs/test"),
+            None,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(tokio::sync::Notify::new()),
+            &refresher,
+        )
+        .await;
+
+        // The cycle itself fails (no rdc.toml anywhere) — irrelevant here;
+        // `on_idle` must still fire, because every exit path of the cycle
+        // (including this early `?` return) drops the same `ResetOnDrop`
+        // guard that invokes it.
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &[Some(30)],
+            "on_idle should fire exactly once, after the one cycle, with the configured poll interval in seconds"
         );
     }
 

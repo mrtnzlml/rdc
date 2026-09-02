@@ -73,6 +73,40 @@ void main() {
     expect(s.syncMessage[k], 'token expired');
   });
 
+  test('the idle countdown ticks down once a second and stops when the watch ends', () async {
+    // Regression test for the gap where `SyncPhase.idle` had a producer on
+    // the Rust side but nothing on the Dart side ever advanced the number
+    // it set — the sidebar showed a static "watching · 3s" forever instead
+    // of a real countdown.
+    final s = AppState(Settings(parentFolder: '/tmp'));
+    const folder = '/tmp/acme';
+    const env = 'dev';
+    final k = s.envKey(folder, env);
+    s.watch[k] = WatchState(running: true);
+
+    // `Started` is what starts the ticker (see `_ensureIdleTicker`); `Idle`
+    // is what sets the number it counts down from.
+    s.applyWatchPhase(folder, env, const SyncPhase.started());
+    s.applyWatchPhase(folder, env, SyncPhase.idle(nextPollSecs: BigInt.from(3)));
+    expect(s.watch[k]!.nextPollSecs, 3);
+
+    await Future<void>.delayed(const Duration(milliseconds: 1100));
+    expect(s.watch[k]!.nextPollSecs, 2);
+
+    await Future<void>.delayed(const Duration(seconds: 1));
+    expect(s.watch[k]!.nextPollSecs, 1);
+
+    // Ending the watch must stop the ticker, not just clear this one entry
+    // — a live `Timer.periodic` outliving every watch would tick forever.
+    // Uses the `error` phase (not `stopped`, which also calls `reload()` —
+    // a real bridge call this plain `test()` can't make) to end it, the
+    // same terminal path `a watch that ends in error clears its entry...`
+    // above exercises.
+    s.applyWatchPhase(folder, env, const SyncPhase.error(message: 'token expired'));
+    expect(s.watch[k], isNull);
+    s.dispose(); // releases the ticker if `_stopIdleTickerIfIdle` somehow missed it
+  });
+
   test('every prompt kind has a title', () {
     for (final k in PromptKindDto.values) {
       final t = _prompt('/tmp/acme', 'dev', 1);

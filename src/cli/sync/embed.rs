@@ -129,6 +129,13 @@ pub async fn sync_logged(
 /// 401s are resolved with `secrets::force_relogin` rather than the CLI's
 /// interactive refresh, because the app's credentials live in the secrets
 /// file, not in `RDC_USER_<ENV>` / `RDC_PASS_<ENV>`.
+///
+/// `on_idle`, when given, is called once per completed cycle with the
+/// configured poll interval in seconds (`None` when polling is disabled) —
+/// see `WatchConfig::on_idle`. The CLI's own `run_watch` has no equivalent
+/// (its in-place countdown line is TTY-only and needs no callback); an
+/// embedder with no such line of its own passes one to learn when a watch
+/// goes idle and render its own countdown.
 #[allow(clippy::too_many_arguments)]
 pub async fn watch_logged(
     cwd: &Path,
@@ -139,6 +146,7 @@ pub async fn watch_logged(
     log_sink: Box<dyn std::io::Write + Send>,
     route: Arc<dyn PromptRoute>,
     cancel: crate::cli::sync::watch::CancelToken,
+    on_idle: Option<Arc<dyn Fn(Option<u64>) + Send + Sync>>,
 ) -> Result<()> {
     let renderer = Log::for_sink(crate::cli::resolve::ColorMode::Color, log_sink);
 
@@ -162,7 +170,7 @@ pub async fn watch_logged(
     with_route(
         route,
         crate::cli::sync::watch::run_watch_with(
-            watch_logged_config(env, cwd, token, poll),
+            watch_logged_config(env, cwd, token, poll, on_idle),
             renderer,
             cancel,
             refresher,
@@ -190,6 +198,7 @@ pub(crate) fn watch_logged_config<'a>(
     cwd: &'a Path,
     token: String,
     poll: Option<Duration>,
+    on_idle: Option<Arc<dyn Fn(Option<u64>) + Send + Sync>>,
 ) -> crate::cli::sync::watch::WatchConfig<'a> {
     crate::cli::sync::watch::WatchConfig {
         env,
@@ -202,6 +211,7 @@ pub(crate) fn watch_logged_config<'a>(
         poll,
         verbose: false,
         no_bell: true, // a terminal BEL means nothing in a GUI process
+        on_idle,
     }
 }
 
@@ -212,7 +222,7 @@ mod tests {
     #[test]
     fn watch_logged_config_prompts_rather_than_bails_and_is_two_way() {
         let cwd = Path::new("/tmp/does-not-matter");
-        let cfg = watch_logged_config("test", cwd, "tok".to_string(), None);
+        let cfg = watch_logged_config("test", cwd, "tok".to_string(), None, None);
         assert!(
             cfg.interactive,
             "false would bail! on a pending delete or conflict and kill an unattended watch"
