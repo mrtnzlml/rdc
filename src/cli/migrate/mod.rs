@@ -3199,11 +3199,11 @@ mod tests {
     use std::collections::BTreeSet;
 
     /// Proves `run_at` takes its project root from the `cwd` PARAMETER, not
-    /// `std::env::current_dir()` — the embedding seam the desktop app relies
-    /// on to drive migrate without a `std::env::set_current_dir` dance (which
-    /// would be unsound to do concurrently from a GUI app). Builds a tiny
-    /// two-env project in a tempdir unrelated to the process cwd, and asserts
-    /// both that the dry-run succeeds and that the process cwd never moved.
+    /// `std::env::current_dir()` — the whole reason `run` (the CLI entry
+    /// point) can call it without a `std::env::set_current_dir` dance. Builds
+    /// a tiny two-env project in a tempdir unrelated to the process cwd, and
+    /// asserts both that the dry-run succeeds and that the process cwd never
+    /// moved.
     #[test]
     fn run_at_uses_explicit_cwd_not_process_current_dir() {
         let before = std::env::current_dir().unwrap();
