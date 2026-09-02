@@ -1009,8 +1009,14 @@ resolve)"`. `Log::new` writes to real stderr, so an embedder never receives it.
 
 This matters more than its size suggests: the `!interactive` branch is exactly what a
 non-terminal consumer takes, and that message is the only explanation of why an object was
-left unsynced. Replace both with `progress.event(...)` — same `Action::Warn`, same wording,
-no other change. Verify the line numbers first; Task 3 shifted this file.
+left unsynced. Replace both with `progress.event(Action::Warn, …)`: the message TEXT is
+unchanged, only the sink is — `progress.event` also clears an active in-place status line
+first, which `Log::new`'s independent stderr write never touched. Do not describe this as the
+same shape of change as Task 3 Step 2's two `push/deletes.rs` conversions: those also moved
+from `eprintln!` to `progress.event(Action::Warn, …)`, but their `eprintln!("warning: …")`
+literally carried a `warning: ` prefix that `progress.event` does not reproduce — the renderer
+instead prepends a timestamp and an action column. That IS a wording change; this one here is
+not. Verify the line numbers first; Task 3 shifted this file.
 
 - [ ] **Step 7c: Replace the tautological delete-gate capture test with a real one**
 

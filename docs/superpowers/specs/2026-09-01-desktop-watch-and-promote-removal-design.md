@@ -66,10 +66,21 @@ Each of these was chosen explicitly; none is a default that fell out.
    with the same semantics they have in the terminal.
 3. Every gate that blocks a cycle is answerable in the app. None silently
    skips, none hard-bails and kills a watch.
-4. The CLI is **byte-for-byte unchanged**, with exactly one deliberate
-   exception: under `--watch`, a prompt now clears the in-place countdown line
-   before drawing instead of tearing against it (§6.2). Every other byte of
-   every other prompt stays identical, pinned by tests.
+4. The CLI is **byte-for-byte unchanged**, with four narrow, deliberate
+   exceptions — none of them a prompt's own question or a diff/list body,
+   which stay identical, pinned by tests:
+   - Under `--watch`, a prompt now clears the in-place countdown line
+     before drawing instead of tearing against it (§6.2).
+   - `push/deletes.rs`'s non-interactive delete-drift warning moved from
+     `eprintln!("warning: …")` to `progress.event(Action::Warn, …)`: it
+     gains a timestamp and an action column and loses the literal
+     `warning: ` prefix.
+   - The same file's `unrecognised choice '…'; skipping` warning made the
+     same conversion, with the same shape change.
+   - `resolve.rs`'s two shadow-file conflict warnings (in
+     `resolve_combined_file`) moved from a throwaway `Log::new` (straight
+     to stderr) to the run's own `progress`, which now clears an active
+     in-place status line first. The wording itself is unchanged.
 5. A project folder stays interchangeable between the CLI and the app, in both
    directions, with no migration.
 

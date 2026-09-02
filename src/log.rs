@@ -532,8 +532,14 @@ impl Log {
     /// A `Write` that routes inline prompt output — the conflict diff, the
     /// question line — through this log's sink instead of raw stderr.
     ///
-    /// For `Log::new` the sink IS stderr, so terminal output is unchanged.
-    /// For `Log::for_sink` (the desktop app) it is what finally lets an
+    /// For `Log::new` the sink IS stderr, so the BYTES this writer emits
+    /// reach the terminal unchanged. That qualification matters: it is
+    /// this writer's bytes that are unchanged, not every call on `Log`.
+    /// A warning raised through the run's own `progress` — e.g. an
+    /// `Action::Warn` event — clears an active in-place status line first,
+    /// something a throwaway, unrelated `Log::new(...)` instance (the old
+    /// pattern this replaced at a few call sites) never touched. For
+    /// `Log::for_sink` (the desktop app) `writer()` is what finally lets an
     /// embedder see a prompt's body at all.
     pub fn writer(&self) -> LogWriter<'_> {
         LogWriter { log: self }

@@ -2569,8 +2569,8 @@ pub fn run(
 }
 
 /// Like [`run`], but takes the project root explicitly instead of reading
-/// the process's current directory — the cwd-parameterised form [`run`]
-/// itself calls, so nothing here has to shell out to a
+/// the process's current directory — this is the cwd-parameterised form
+/// that [`run`] itself calls, so nothing here has to shell out to a
 /// `std::env::set_current_dir` dance.
 pub fn run_at(
     cwd: &Path,
