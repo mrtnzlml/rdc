@@ -608,6 +608,14 @@ pub fn sync_env(
 /// queues/invoices`. `ask()` discards it via this shared handle right
 /// before emitting `SyncPhase::Prompt` — the dialog already renders
 /// `prompt.question` on its own, so the log pane never needed this text.
+///
+/// `#[frb(ignore)]` because this is an internal implementation detail shared
+/// between `LineForwarder` and `SinkPromptRoute`, not part of the bridged
+/// surface. Without it codegen bridges the struct as an opaque Dart class
+/// with a `default_()` factory — ~500 lines of glue for a byte buffer the
+/// UI has no business holding — and its siblings `LineForwarder` and
+/// `SinkPromptRoute` are already ignored for the same reason.
+#[flutter_rust_bridge::frb(ignore)]
 #[derive(Clone, Default)]
 struct LineBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
