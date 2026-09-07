@@ -16,9 +16,9 @@ class Settings {
   /// Only `pollSecs` today; an absent entry means the 60s default.
   Map<String, dynamic> watch;
 
-  /// Projects whose owner has seen the one-time notice that Sync now writes
-  /// to Rossum. Per project, not per env — the surprise is about the app,
-  /// not about any one connection.
+  /// Projects whose owner has seen the one-time notice that Sync writes to
+  /// Rossum. Per project, not per env — the surprise is about the app, not
+  /// about any one connection.
   List<String> ackTwoWay;
 
   /// Every key in the on-disk JSON this build does not recognise, kept

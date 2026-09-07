@@ -94,7 +94,7 @@ String _fmtSize(int b) {
 /// folder awaits the one dialog already on screen.
 final Map<String, Future<bool>> _twoWayConfirmsInFlight = {};
 
-/// Shows the one-time notice that Sync now writes to Rossum, if `item`'s
+/// Shows the one-time notice that Sync writes to Rossum, if `item`'s
 /// project hasn't seen it yet, and records the acknowledgement if the user
 /// proceeds. Returns true when the caller should go ahead with the sync or
 /// watch it was about to start. Pass `forWatch: true` from a Watch call site

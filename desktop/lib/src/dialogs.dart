@@ -500,9 +500,9 @@ class TwoWayNoticeDialog extends StatelessWidget {
   /// "Watch" and is shown copy about "Syncing" with no mention of the
   /// action they actually took may wonder which button they hit, at
   /// exactly the moment we need them reading carefully. This only changes
-  /// the opening sentence and the primary button's label; the title, the
-  /// contrast with earlier versions, and the deletions/conflicts line are
-  /// what carry the warning and stay the same either way.
+  /// the opening sentence and the primary button's label; the title and the
+  /// deletions/conflicts line are what carry the warning and stay the same
+  /// either way.
   final bool forWatch;
 
   @override
@@ -514,12 +514,12 @@ class TwoWayNoticeDialog extends StatelessWidget {
         : 'Syncing "$projectName" sends your local changes under envs/ to the '
             'Rossum organization, and pulls its changes back.';
     return _Frame(
-      title: 'Sync now writes to Rossum',
+      title: 'Sync writes to Rossum',
       primaryLabel: forWatch ? 'Watch' : 'Sync',
       onPrimary: () => Navigator.of(context).pop(true),
       child: Text(
-        '$opening Earlier versions of this app only pulled.\n\n'
-        'Deletions and conflicts still stop and ask first.',
+        '$opening\n\n'
+        'Deletions and conflicts stop and ask first.',
         style: TextStyle(color: c.textPrimary, fontSize: 13, height: 1.5),
       ),
     );

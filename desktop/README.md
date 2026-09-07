@@ -32,8 +32,8 @@ path dependency (`../..`).
 ## Sync and watch
 
 **Sync** runs one full `rdc sync <env>` cycle: local changes in `envs/<env>/`
-go to the organization, its changes come back. Earlier versions of this app
-only pulled; the first sync of a project says so once.
+go to the organization, its changes come back. The first sync of a project
+asks you to confirm that once.
 
 **Watch** keeps that cycle running — a local file change triggers one
 immediately, and a timer polls the organization for drift (60s by default).
