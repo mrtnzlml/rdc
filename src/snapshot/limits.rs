@@ -484,6 +484,21 @@ pub fn required_for_create(kind: &str) -> &'static [&'static str] {
     match kind {
         "inboxes" => &["email_prefix"],
         "saved_views" => &["name", "query"],
+        // `POST /queues` answers `400 schema: This field is required.` — a
+        // queue cannot exist without one. Only `schema` is listed: `workspace`
+        // is legitimately null for an orphan/hidden queue (see `model::Queue`)
+        // and `name` has never been observed absent, so declaring either would
+        // risk refusing a body the server accepts.
+        //
+        // The field is rarely *absent* on disk; the failure mode that made
+        // this worth declaring is a `schema` that is PRESENT as an
+        // `rdc://schemas/<slug>` ref naming a schema the env does not have —
+        // `migrate --only queues/<slug>` writes exactly that, since `--only`
+        // is per-object and never carries the queue's schema along. Push
+        // resolves refs before sending, so the unresolvable one is dropped and
+        // the field reaches the wire absent; `ChangeList::missing_create_fields`
+        // therefore resolves refs the same way before checking.
+        "queues" => &["schema"],
         _ => &[],
     }
 }
@@ -599,13 +614,35 @@ mod tests {
     #[test]
     fn other_kinds_have_no_create_requirements() {
         // The table is opt-in per kind; nothing else may be blocked offline.
-        for kind in ["hooks", "queues", "schemas", "workspaces", "rules", "labels"] {
+        for kind in ["hooks", "schemas", "workspaces", "rules", "labels"] {
             assert!(
                 required_for_create(kind).is_empty(),
                 "{kind} must not gain an offline create requirement"
             );
             assert!(missing_required_for_create(kind, &json!({})).is_empty());
         }
+    }
+
+    /// A queue's `schema` is declared on the strength of the server's own
+    /// answer to `POST /queues` without one: `400 schema: This field is
+    /// required.` Only `schema` — `workspace` is legitimately null for an
+    /// orphan queue, so declaring it would refuse a body the API takes.
+    #[test]
+    fn queue_create_requires_a_schema_and_nothing_else() {
+        assert_eq!(required_for_create("queues"), &["schema"]);
+        assert_eq!(missing_required_for_create("queues", &json!({})), vec!["schema"]);
+        assert_eq!(
+            missing_required_for_create("queues", &json!({ "schema": null })),
+            vec!["schema"]
+        );
+        assert!(
+            missing_required_for_create(
+                "queues",
+                &json!({ "schema": "rdc://schemas/invoices", "workspace": null })
+            )
+            .is_empty(),
+            "a queue that names a schema is complete; a null workspace is legal"
+        );
     }
 
     /// The reported incident: a hook whose `description` grew past 2000

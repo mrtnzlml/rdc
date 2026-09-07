@@ -71,13 +71,15 @@ pub async fn run(env: &str, dry_run: bool) -> Result<()> {
         log.event(
             Action::Warn,
             &format!(
-                "{}/{} -- {}: `{}` is missing and POST /{} requires it; \
-                 `rdc sync {env}` will refuse to push until it is set \
-                 (in the file, or per env in envs/{env}/overlay.toml)",
+                "{}/{} -- {}: `{}` {} and POST /{} requires it; \
+                 `rdc sync {env}` will refuse to push until that is fixed — set the \
+                 field (in the file, or per env in envs/{env}/overlay.toml), or \
+                 migrate the object it references",
                 m.kind,
                 m.slug,
                 m.path.display(),
                 m.field,
+                m.detail.as_deref().unwrap_or("is missing"),
                 m.kind,
             ),
         );

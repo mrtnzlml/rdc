@@ -276,12 +276,43 @@ impl ChangeList {
                     continue; // unparseable — reported by json_parse_errors
                 };
                 crate::snapshot::create::strip_for_create(&mut body, kind);
+                // Blank out every create-required field whose value is a
+                // portable ref nothing will satisfy, so the check sees the
+                // body the WIRE will see. `resolve_value_deferring` drops
+                // such a ref from the payload, so an unresolvable
+                // `rdc://schemas/<slug>` reaches `POST /queues` as an absent
+                // `schema` — the 400 that motivated declaring it required.
+                // Recorded per field so the message can say which ref, rather
+                // than claiming the key is missing from a file that has it.
+                let mut why: BTreeMap<&'static str, String> = BTreeMap::new();
+                if let Some(obj) = body.as_object_mut() {
+                    for field in crate::snapshot::limits::required_for_create(kind) {
+                        let Some(r) = obj.get(*field).and_then(|v| v.as_str()) else {
+                            continue;
+                        };
+                        let Some((rk, rs)) = crate::snapshot::refs::parse_rdc_ref(r) else {
+                            continue; // a concrete URL, or not a ref at all
+                        };
+                        if satisfies(lockfile, self, rk, rs) {
+                            continue;
+                        }
+                        why.insert(
+                            field,
+                            format!(
+                                "names {r}, which this env has neither deployed nor holds a \
+                                 local file for"
+                            ),
+                        );
+                        obj.insert((*field).to_string(), serde_json::Value::Null);
+                    }
+                }
                 for field in crate::snapshot::limits::missing_required_for_create(kind, &body) {
                     out.push(MissingCreateField {
                         kind,
                         slug: slug.clone(),
                         path: path.clone(),
                         field,
+                        detail: why.remove(field),
                     });
                 }
             }
@@ -430,6 +461,27 @@ impl ChangeList {
     }
 }
 
+/// Can this push satisfy `rdc://<kind>/<slug>`?
+///
+/// Yes when the object is already DEPLOYED (the lockfile knows its id, so
+/// resolution succeeds outright) or when it is a local file this same push
+/// will write. The second half is what keeps a brand-new queue and its
+/// brand-new schema working: the drivers run schemas before queues
+/// (`cli::push::mod`), so by the time the queue's POST resolves its `schema`
+/// the schema has an id. `ChangeList` holds exactly the changed/created files,
+/// which is the set the push will write.
+///
+/// A `no` therefore means no ordering can help — the object exists nowhere,
+/// and the ref can only ever reach the wire dropped or dangling.
+fn satisfies(lockfile: &Lockfile, changes: &ChangeList, kind: &str, slug: &str) -> bool {
+    lockfile
+        .objects
+        .get(kind)
+        .and_then(|m| m.get(slug))
+        .is_some()
+        || changes.contains(kind, slug)
+}
+
 /// Build a [`FieldLimitViolation`] from a [`crate::snapshot::limits::LimitViolation`],
 /// filling in the object-identifying fields the limits module doesn't
 /// know about (`kind`, `slug`, `path`). The one place this mapping is
@@ -479,6 +531,11 @@ pub struct MissingCreateField {
     pub path: std::path::PathBuf,
     /// The absent field, from [`crate::snapshot::limits::required_for_create`].
     pub field: &'static str,
+    /// Why it is absent, when the file does carry a value that simply cannot
+    /// survive ref resolution (e.g. `names rdc://schemas/x, which this
+    /// environment has neither deployed nor holds a local file for`). `None`
+    /// when the key is plainly absent or null on disk.
+    pub detail: Option<String>,
 }
 
 /// One unparseable changed local file, as reported by
@@ -1470,6 +1527,7 @@ pub fn detect_slug_collisions(paths: &Paths) -> BTreeMap<String, Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::ObjectEntry;
 
     /// Helper: a ChangeList holding one inbox file with the given body.
     fn inbox_change(
@@ -1998,6 +2056,134 @@ mod tests {
         assert_eq!(v[0].limit, 2000);
         assert_eq!(v[0].actual, 2001);
         assert_eq!(v[0].path, queue_dir.join("formulas/total_amount.py"));
+    }
+
+    /// Build a `queue.json` naming `schema_ref` and hand back its path.
+    fn queue_file(dir: &std::path::Path, schema_ref: &str) -> std::path::PathBuf {
+        let queue_dir = dir.join("workspaces/main/queues/invoices");
+        std::fs::create_dir_all(&queue_dir).unwrap();
+        let path = queue_dir.join("queue.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "name": "Invoices",
+                "workspace": "rdc://workspaces/main",
+                "schema": schema_ref,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        path
+    }
+
+    /// The live failure: a queue that will be CREATED names a schema the env
+    /// has neither deployed nor holds a file for. Push resolves refs before
+    /// sending, so the ref is dropped and `POST /queues` arrives with no
+    /// `schema` -- `400 schema: This field is required.`, after the run's
+    /// workspaces and schemas have already been written.
+    #[test]
+    fn missing_create_fields_reports_a_queue_whose_schema_ref_resolves_to_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = queue_file(dir.path(), "rdc://schemas/invoices");
+
+        let mut cl = ChangeList::default();
+        cl.queues.insert("invoices".to_string(), path.clone());
+
+        let out = cl.missing_create_fields(&Lockfile::default());
+        assert_eq!(out.len(), 1, "the dangling schema must be reported: {out:?}");
+        assert_eq!(out[0].kind, "queues");
+        assert_eq!(out[0].slug, "invoices");
+        assert_eq!(out[0].field, "schema");
+        assert_eq!(out[0].path, path);
+        let detail = out[0].detail.as_deref().expect("a present-but-dangling ref needs a reason");
+        assert!(
+            detail.contains("rdc://schemas/invoices"),
+            "the reason must name the ref, not claim the key is missing: {detail}"
+        );
+    }
+
+    /// A brand-new queue whose brand-new schema is in the SAME push is fine:
+    /// the drivers run schemas before queues, so the ref has an id by the time
+    /// the queue's POST resolves it. Refusing this would break every fresh-env
+    /// deploy.
+    #[test]
+    fn missing_create_fields_accepts_a_schema_created_by_the_same_push() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = queue_file(dir.path(), "rdc://schemas/invoices");
+
+        let mut cl = ChangeList::default();
+        cl.queues.insert("invoices".to_string(), path.clone());
+        cl.schemas
+            .insert("invoices".to_string(), path.parent().unwrap().join("schema.json"));
+
+        assert!(
+            cl.missing_create_fields(&Lockfile::default()).is_empty(),
+            "a schema this push creates satisfies the queue's ref"
+        );
+    }
+
+    /// ...and so is one already deployed: the lockfile resolves it outright.
+    #[test]
+    fn missing_create_fields_accepts_an_already_deployed_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = queue_file(dir.path(), "rdc://schemas/invoices");
+
+        let mut cl = ChangeList::default();
+        cl.queues.insert("invoices".to_string(), path);
+
+        let mut lf = Lockfile::default();
+        lf.upsert("schemas", "invoices", ObjectEntry {
+            id: 42,
+            modified_at: None,
+            modified_by: None,
+            content_hash: None,
+            secrets_hash: None,
+        });
+
+        assert!(
+            cl.missing_create_fields(&lf).is_empty(),
+            "a deployed schema satisfies the queue's ref"
+        );
+    }
+
+    /// A queue the env has ALREADY deployed is a PATCH, and a PATCH that omits
+    /// `schema` leaves the remote's own schema alone -- so a dangling ref
+    /// there is not a create defect. (`restore_undeferrable` keeps the ref in
+    /// the body, and the pre-send guard names it.)
+    #[test]
+    fn missing_create_fields_skips_an_already_deployed_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = queue_file(dir.path(), "rdc://schemas/invoices");
+
+        let mut cl = ChangeList::default();
+        cl.queues.insert("invoices".to_string(), path);
+
+        let mut lf = Lockfile::default();
+        lf.upsert("queues", "invoices", ObjectEntry {
+            id: 7,
+            modified_at: None,
+            modified_by: None,
+            content_hash: None,
+            secrets_hash: None,
+        });
+
+        assert!(
+            cl.missing_create_fields(&lf).is_empty(),
+            "a tracked queue is patched, not posted"
+        );
+    }
+
+    /// A concrete env URL is the user's own doing and must pass through: the
+    /// check only judges `rdc://` refs it can decide offline.
+    #[test]
+    fn missing_create_fields_leaves_a_concrete_schema_url_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = queue_file(dir.path(), "https://acme.rossum.app/api/v1/schemas/9");
+
+        let mut cl = ChangeList::default();
+        cl.queues.insert("invoices".to_string(), path);
+
+        assert!(cl.missing_create_fields(&Lockfile::default()).is_empty());
     }
 
     /// An ORPHANED sidecar: `formulas/<id>.py` whose id is absent from the

@@ -79,7 +79,20 @@ pub async fn push(
                 .with_context(|| format!("reading {}", queue_path.display()))?;
             let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
                 .with_context(|| format!("parsing {}", queue_path.display()))?;
-            let deferred = crate::snapshot::refs::resolve_value_deferring(&mut payload, lockfile);
+            let mut deferred =
+                crate::snapshot::refs::resolve_value_deferring(&mut payload, lockfile);
+            // A queue's `workspace`/`schema` are mandatory links that cannot be
+            // deferred: dropping one from the body does not postpone it, it
+            // sends a create the API refuses (`400 schema: This field is
+            // required.`) — and it refuses it *after* the workspaces and
+            // schemas phases have already written to the env. Restoring the
+            // still-`rdc://` value hands the pre-send guard
+            // (`api::ensure_no_residual_refs`) a ref to name, so the failure
+            // says which reference is dangling instead of which key the server
+            // wanted. The two UPDATE paths have always done this; only the
+            // create path did not, which is why the one case that reaches the
+            // wire unresolvable is the one that reports worst.
+            crate::cli::push::relink::restore_undeferrable("queues", &mut payload, &mut deferred);
             strip_for_create(&mut payload, "queues");
             let create_result = client
                 .create_queue(&payload, Some(progress.clone()))

@@ -573,11 +573,12 @@ pub(crate) async fn run_cycle(
             for m in &missing_create_fields {
                 let _ = writeln!(
                     body,
-                    "- {}/{} -- {}: `{}` is missing; the Rossum API requires it",
+                    "- {}/{} -- {}: `{}` {}; the Rossum API requires it",
                     m.kind,
                     m.slug,
                     m.path.display(),
                     m.field,
+                    m.detail.as_deref().unwrap_or("is missing"),
                 );
             }
             progress.block(&body);
@@ -1742,11 +1743,12 @@ fn refuse_on_offline_defects(
         for m in missing_create_fields {
             let _ = write!(
                 msg,
-                "\n  - {}/{} -- {}: `{}` is missing (the Rossum API requires it)",
+                "\n  - {}/{} -- {}: `{}` {} (the Rossum API requires it)",
                 m.kind,
                 m.slug,
                 m.path.display(),
                 m.field,
+                m.detail.as_deref().unwrap_or("is missing"),
             );
         }
         // The overlay is the supported place to declare a per-env value, and
@@ -1756,6 +1758,17 @@ fn refuse_on_offline_defects(
             "\n  Set it in the file, or per env in envs/<env>/overlay.toml \
              (e.g. [inboxes.<queue-slug>] email_prefix = \"...\") and re-run migrate."
         );
+        // A field that names a missing object is fixed by bringing the object
+        // over, not by editing the field — most often a `migrate --only` that
+        // selected a queue but not its schema.
+        if missing_create_fields.iter().any(|m| m.detail.is_some()) {
+            let _ = write!(
+                msg,
+                "\n  Where the field NAMES an object this env does not have, migrate that \
+                 object too (`--only` is per-object and does not carry a queue's schema \
+                 along)."
+            );
+        }
         anyhow::bail!("{msg}");
     }
 
@@ -2392,6 +2405,7 @@ mod tests {
             slug: "invoices".to_string(),
             path: std::path::PathBuf::from("envs/prod/workspaces/main/queues/invoices/inbox.json"),
             field: "email_prefix",
+            detail: None,
         }];
         let err = refuse_on_offline_defects(&[], &[], &missing, &[], &[], &[])
             .expect_err("a doomed create must refuse the push");

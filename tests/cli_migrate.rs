@@ -889,6 +889,121 @@ fn migrate_carries_score_thresholds_with_flag() {
     );
 }
 
+/// `--only queues/<slug>` for a queue the target has never deployed writes a
+/// `queue.json` naming a schema that was never migrated — `POST /queues`
+/// answers `400 schema: This field is required.` and the env is half-built by
+/// the time it does. `--only` is per-object by design, so migrate refuses
+/// rather than silently widening the selection.
+#[test]
+fn migrate_only_refuses_a_new_queue_whose_schema_is_not_selected() {
+    let project = setup_orphan_queue_project();
+    let root = project.path();
+
+    let _guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+    let result = rdc::cli::migrate::run(
+        "test",
+        "prod",
+        false,
+        false,
+        vec!["queues/invoices".to_string()],
+        false,
+        false,
+    );
+    std::env::set_current_dir(&prev).unwrap();
+
+    let err = result.expect_err("a queue created without its schema must refuse");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("queues/invoices"), "must name the queue: {msg}");
+    assert!(
+        msg.contains("rdc://schemas/invoices"),
+        "must name the schema it points at: {msg}"
+    );
+    assert!(msg.contains("--only"), "must say how to fix it: {msg}");
+}
+
+/// Selecting the schema alongside the queue is the documented fix, and must
+/// work: the projected target set counts objects this very run writes.
+#[test]
+fn migrate_only_accepts_a_new_queue_when_its_schema_is_selected_too() {
+    let project = setup_orphan_queue_project();
+    let root = project.path();
+
+    let _guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+    let result = rdc::cli::migrate::run(
+        "test",
+        "prod",
+        false,
+        false,
+        vec!["queues/invoices".to_string(), "schemas/invoices".to_string()],
+        false,
+        false,
+    );
+    std::env::set_current_dir(&prev).unwrap();
+    result.expect("queue + schema together must migrate");
+
+    let base = root.join("envs/prod/workspaces/main/queues/invoices");
+    assert!(base.join("queue.json").is_file());
+    assert!(
+        base.join("schema.json").is_file(),
+        "the selected schema must land next to the queue"
+    );
+}
+
+/// ...and so must a whole-snapshot migrate, which carries both anyway. A
+/// regression here would refuse every fresh-env promotion.
+#[test]
+fn migrate_whole_snapshot_creates_a_new_queue_with_its_schema() {
+    let project = setup_orphan_queue_project();
+    let root = project.path();
+
+    let _guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], false, false);
+    std::env::set_current_dir(&prev).unwrap();
+    result.expect("a whole-snapshot migrate must succeed");
+
+    let base = root.join("envs/prod/workspaces/main/queues/invoices");
+    assert!(base.join("queue.json").is_file());
+    assert!(base.join("schema.json").is_file());
+}
+
+/// A source tree with one workspace/queue/schema and an EMPTY target env, so
+/// every promoted object is a create.
+fn setup_orphan_queue_project() -> TempDir {
+    let project = init_two_env_project();
+    let root = project.path().to_path_buf();
+    write(
+        &root.join("envs/test/workspaces/main/workspace.json"),
+        &serde_json::json!({ "name": "Main" }),
+    );
+    write(
+        &root.join("envs/test/workspaces/main/queues/invoices/queue.json"),
+        &serde_json::json!({
+            "name": "Invoices",
+            "workspace": "rdc://workspaces/main",
+            "schema": "rdc://schemas/invoices",
+        }),
+    );
+    write(
+        &root.join("envs/test/workspaces/main/queues/invoices/schema.json"),
+        &serde_json::json!({ "name": "Invoices schema", "content": [] }),
+    );
+    let map_dir = root.join(".rdc/map");
+    std::fs::create_dir_all(&map_dir).unwrap();
+    std::fs::write(
+        map_dir.join("test-to-prod.toml"),
+        "version = 1\n\n[workspaces]\n\"main\" = \"main\"\n\n[queues]\n\"invoices\" = \"invoices\"\n\n\
+         [schemas]\n\"invoices\" = \"invoices\"\n",
+    )
+    .unwrap();
+    project
+}
+
 /// A source queue bound to a custom engine, promoted onto a target queue that
 /// sits on the built-in generic engine: the shape that failed in the field.
 ///

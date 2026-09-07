@@ -882,7 +882,7 @@ fn transform_file(
     carried_prefixes: &mut Vec<(String, String)>,
     tgt_env: &str,
     missing_schema_ids: &mut Vec<String>,
-    promoted_views: &mut Vec<(String, serde_json::Value)>,
+    promoted: &mut Vec<(&'static str, String, serde_json::Value)>,
 ) -> Result<FileOutcome> {
     let src_path = src_root.join(rel);
     let dst_rel = remap_relative(rel, mapping);
@@ -1224,8 +1224,11 @@ fn transform_file(
     // afterwards is what lets `--dry-run` validate at all — and collecting
     // after the overlay is what keeps the documented `overlay.toml` escape
     // hatch working.
-    if let Some(("saved_views", slug)) = classify(&dst_rel) {
-        promoted_views.push((slug, value.clone()));
+    // Saved views are collected for their strict ref check; queues for the
+    // `schema` link `POST /queues` demands. Both are validated after the whole
+    // run, against the set of objects the target tree WILL hold.
+    if let Some((kind @ ("saved_views" | "queues"), slug)) = classify(&dst_rel) {
+        promoted.push((kind, slug, value.clone()));
     }
 
     let mut json = serde_json::to_vec_pretty(&value)?;
@@ -2852,7 +2855,7 @@ pub fn run_at(
     // `transform_file` pushes the value itself (post-overlay), so both
     // `--dry-run` and a real run validate the same body without reading
     // anything back off disk.
-    let mut promoted_saved_views: Vec<(String, serde_json::Value)> = Vec::new();
+    let mut promoted: Vec<(&'static str, String, serde_json::Value)> = Vec::new();
     // Every path this run writes, needed by `projected_known`. Collected for
     // EVERY file, not only changed ones: an unchanged target file is still part
     // of what the target tree contains.
@@ -2956,7 +2959,7 @@ pub fn run_at(
             &mut carried_prefixes,
             tgt,
             &mut missing_schema_ids,
-            &mut promoted_saved_views,
+            &mut promoted,
         )
         .with_context(|| format!("migrating {}", rel.display()))?;
         if outcome != FileOutcome::Unchanged {
@@ -3088,7 +3091,7 @@ pub fn run_at(
     // snapshot that has never been synced (no lockfile on disk).
     let src_host = url_host(&src_lockfile.api_base)
         .or_else(|| project_cfg.envs.get(src).and_then(|c| url_host(&c.api_base)));
-    if !promoted_saved_views.is_empty() {
+    if !promoted.is_empty() {
         let existing = enumerate_files(&tgt_root, tgt)?;
         let known = projected_known(ProjectedPaths {
             existing: &existing,
@@ -3096,16 +3099,72 @@ pub fn run_at(
             pruned: &pruned_rels,
         });
         let mut problems: Vec<SavedViewRefProblem> = Vec::new();
-        for (slug, value) in &promoted_saved_views {
-            problems.extend(check_saved_view_refs(
-                slug,
-                value,
-                &known,
-                src_host.as_deref(),
-            ));
+        for (kind, slug, value) in &promoted {
+            if *kind == "saved_views" {
+                problems.extend(check_saved_view_refs(
+                    slug,
+                    value,
+                    &known,
+                    src_host.as_deref(),
+                ));
+            }
         }
         if !problems.is_empty() {
             anyhow::bail!(format_saved_view_ref_error(&problems, tgt));
+        }
+
+        // A queue this run will CREATE in the target must bring its schema.
+        // `POST /queues` answers `400 schema: This field is required.`, so a
+        // queue whose `schema` names something the target will not hold is a
+        // snapshot that can never be pushed — and the push only finds out
+        // after it has already written the run's workspaces and schemas.
+        //
+        // In practice this is `--only`: the selectors are per-object by
+        // design, so `--only queues/<slug>` promotes the queue and nothing
+        // else. That is the right behavior for a queue the target already has
+        // (its PATCH simply leaves the remote's schema alone) and a dead end
+        // for one it does not, which is why the check keys off the target
+        // LOCKFILE rather than the selection: an object the target has never
+        // deployed is the one the push will POST.
+        //
+        // `known` is the same projected set the saved-view check uses, so a
+        // schema this very run writes counts — the whole-snapshot migrate that
+        // carries both queue and schema is unaffected.
+        let mut orphans: Vec<(String, String)> = Vec::new();
+        for (kind, slug, value) in &promoted {
+            if *kind != "queues" {
+                continue;
+            }
+            if tgt_lockfile.objects.get("queues").and_then(|m| m.get(slug)).is_some() {
+                continue; // deployed already: a PATCH, and `schema` may be omitted
+            }
+            let Some(schema_ref) = value.get("schema").and_then(|v| v.as_str()) else {
+                continue; // absent/null is `push`'s missing-create-field check
+            };
+            let Some((rk, rs)) = crate::snapshot::refs::parse_rdc_ref(schema_ref) else {
+                continue; // a concrete URL is the user's own doing
+            };
+            if !known.contains(&(rk.to_string(), rs.to_string())) {
+                orphans.push((slug.clone(), schema_ref.to_string()));
+            }
+        }
+        if !orphans.is_empty() {
+            use std::fmt::Write as _;
+            let mut msg = format!(
+                "{} queue(s) would be created in envs/{tgt} without a schema; \
+                 `POST /queues` requires one:",
+                orphans.len()
+            );
+            for (slug, schema_ref) in &orphans {
+                let _ = write!(msg, "\n  - queues/{slug} -> {schema_ref} (not in envs/{tgt})");
+            }
+            let _ = write!(
+                msg,
+                "\n  `--only` is per-object and does not carry a queue's schema along. \
+                 Add the schema to the selection (e.g. `--only schemas/<slug>`, or \
+                 `--only '*/<slug>'` for both) or migrate without `--only`."
+            );
+            anyhow::bail!(msg);
         }
     }
 
