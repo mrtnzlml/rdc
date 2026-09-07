@@ -1207,6 +1207,109 @@ class _ProjectBar extends StatelessWidget {
   }
 }
 
+// ---------------------------------------------------- table columns
+
+/// How wide one column of an environment table wants to be.
+///
+/// `w` is what it takes when the table has room; `flex` is the share it
+/// falls back to when it does not. Environment/Connection and Host have no
+/// `w` — they hold arbitrary-length strings (a project name plus env name, a
+/// hostname), ellipsize, and always flex, absorbing whatever the bounded
+/// columns leave.
+class _ColSpec {
+  const _ColSpec({this.w, required this.flex});
+  final double? w;
+  final int flex;
+}
+
+/// Shared column geometry for the two environment tables — `_EnvTable` in
+/// the Project view and `_FleetTable` in the fleet overview — so a header
+/// and its rows cannot drift apart, and so the two tables agree.
+///
+/// The four bounded columns get a FIXED width whenever the table is at least
+/// `minTight` wide, because their content has a known maximum: an org id, a
+/// file count, `_rel`'s output, and the widest status word. Below that the
+/// table falls back to sharing every column by flex, which is how it behaved
+/// before — nothing goes off-screen and nothing overflows, it just gets
+/// tight, and `maxLines: 1` means it ellipsizes rather than restacking.
+///
+/// Before this, the columns *only* shared a flex pool, and the action
+/// cluster took 4 of the 12 — handing four 26px icon buttons a third of the
+/// whole table (a measured 267.7px at the default 1180px window, 354.3px at
+/// 1440px) while six info columns split what was left. The status badge got
+/// 29.9px of it and wrapped `synced` onto three lines; `…d ago` also took
+/// three, the org id two, and four of the seven headers two. `_MiniBadge`
+/// additionally had no `maxLines`/`softWrap` guard at all, unlike its
+/// sibling `_StatusPill`.
+///
+/// Each `w` is max(header label, widest data) + 28 cell padding, with ~8px
+/// of margin. The numbers in the comments are TextPainter measurements taken
+/// in the real font from the running app (a temporary probe in `main()`, see
+/// the commit message) rather than estimates — three of these columns are
+/// sized by their *header*, not their data, and sizing to the data alone
+/// left `LAST SYNC` needing 99px in a 64px column.
+///
+/// Deliberately NOT sized for the font `flutter test` substitutes, whose
+/// glyphs are ~1.0248em wide against this font's ~0.55em. Sizing for that
+/// one would have cost ~124px of real table width, taken straight out of
+/// Environment and Host, to make a test convenient. The consequence is that
+/// these cells do truncate under the test font, so
+/// `env_table_layout_test.dart` asserts only font-independent properties and
+/// absolute fit rests on the measurements here.
+class _Cols {
+  static const env = _ColSpec(flex: 3);
+  static const host = _ColSpec(flex: 2);
+  static const org = _ColSpec(w: 86, flex: 1); // ORG 24.8 / 7-digit id 50.6
+  static const files = _ColSpec(w: 72, flex: 1); // FILES 31.4 / 5 digits 36.1
+  static const lastSync = _ColSpec(w: 100, flex: 1); // LAST SYNC 64.4 / '9999d' 39.5
+  static const status = _ColSpec(w: 100, flex: 2); // STATUS 44.3 / 'watching' badge 63.2
+  /// Four 26px icon buttons + three 6px gaps = 122, + 28 cell padding. Its
+  /// flex fallback is 3 rather than the 4 it used to have unconditionally.
+  static const actions = _ColSpec(w: 150, flex: 3);
+
+  static const _fixed = 86.0 + 72 + 100 + 100; // the four bounded columns
+  /// Floor for the flex columns, below which fixed widths stop paying for
+  /// themselves and the all-flex fallback is kinder.
+  static const _flexFloor = 120.0;
+
+  /// At or above this content width a table uses fixed widths for its
+  /// bounded columns; below it, everything shares by flex. Two values
+  /// because only `_EnvTable` carries an action cluster.
+  static const minTightEnv = _fixed + 150 + _flexFloor;
+  static const minTightFleet = _fixed + _flexFloor;
+}
+
+/// One table cell. Exactly one of `width` (a bounded column) or `flex` (a
+/// column that absorbs the leftover) must be given.
+Widget _tCell(Widget child, {int? flex, double? width, Key? key}) {
+  assert((flex == null) != (width == null), 'give exactly one of flex/width');
+  final padded = Padding(
+    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
+    child: child,
+  );
+  return width != null
+      ? SizedBox(key: key, width: width, child: padded)
+      : Expanded(key: key, flex: flex!, child: padded);
+}
+
+/// One cell of a column, fixed-width or flexed depending on the regime the
+/// table picked. A spec with no `w` always flexes.
+Widget _colCell(Widget child, _ColSpec s, bool tight, {Key? key}) =>
+    (tight && s.w != null) ? _tCell(child, width: s.w, key: key) : _tCell(child, flex: s.flex, key: key);
+
+/// A column header. Single-line by construction: a label that outgrows its
+/// column clips instead of silently restacking every row in the table.
+Widget _tHead(MdhColors c, String t, _ColSpec s, bool tight) => _colCell(
+      Text(t.toUpperCase(),
+          maxLines: 1,
+          softWrap: false,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(color: c.textSecondary, fontSize: 10.5, fontWeight: FontWeight.w600, letterSpacing: 0.5)),
+      s,
+      tight,
+    );
+
+
 class _EnvTable extends StatelessWidget {
   const _EnvTable({
     required this.state,
@@ -1223,31 +1326,14 @@ class _EnvTable extends StatelessWidget {
   final void Function(ProjectItem, EnvSummary) onSync, onEdit, onRemove;
   final void Function(String folder, String env) onSelectEnv;
 
-  // The info columns (everything but the trailing action cluster) share this
-  // total flex so the header row lines up with each data row, which nests
-  // those same columns inside one Expanded (see _EnvTableRow) to keep the
-  // action buttons outside the row's tap target.
-  static const _infoFlex = 8;
-  // 4 (not 3): the action cluster grew a 4th icon button (watch) in task 14,
-  // so this gives it a bit more of the table's width by default. It is a
-  // default, not a safety margin — nothing here guarantees these icons fit
-  // on one line at every window width (there is no enforced minimum window
-  // width), which is why the action cluster itself is a Wrap, not a Row:
-  // when this share genuinely isn't enough, the icons flow onto a second
-  // line instead of overflowing.
-  static const _actionsFlex = 4;
+  // Column widths live in _Cols, shared with _FleetTable. The info columns
+  // still nest inside one Expanded (see _EnvTableRow) to keep the action
+  // buttons outside the row's tap target; the header mirrors that nesting so
+  // the two line up.
 
   @override
   Widget build(BuildContext context) {
     final c = MdhColors.of(context);
-    Widget head(String t, {int flex = 1}) => Expanded(
-        flex: flex,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
-          child: Text(t.toUpperCase(),
-              style: TextStyle(color: c.textSecondary, fontSize: 10.5, fontWeight: FontWeight.w600, letterSpacing: 0.5)),
-        ));
-
     if (envs.isEmpty) {
       return Container(
         width: double.infinity,
@@ -1261,30 +1347,35 @@ class _EnvTable extends StatelessWidget {
       decoration: BoxDecoration(color: c.bgCard, border: Border.all(color: c.borderCard), borderRadius: BorderRadius.circular(6),
           boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.04), blurRadius: 3, offset: const Offset(0, 1))]),
       clipBehavior: Clip.antiAlias,
-      child: Column(children: [
-        Container(
-          decoration: BoxDecoration(color: c.bgSidebar, border: Border(bottom: BorderSide(color: c.border))),
-          child: Row(children: [
-            Expanded(
-              flex: _infoFlex,
-              child: Row(children: [
-                head('Environment', flex: 2),
-                head('Org'),
-                head('Host', flex: 2),
-                head('Files'),
-                head('Last sync'),
-                head('Status'),
-              ]),
-            ),
-            head('Actions', flex: _actionsFlex),
-          ]),
-        ),
-        for (var i = 0; i < envs.length; i++)
-          _EnvTableRow(
-            state: state, item: item, env: envs[i], last: i == envs.length - 1,
-            onSync: onSync, onEdit: onEdit, onRemove: onRemove, onSelectEnv: onSelectEnv,
+      // One LayoutBuilder for the whole table, not one per cell: the header
+      // and every row must agree on the regime or their columns won't line
+      // up.
+      child: LayoutBuilder(builder: (_, cs) {
+        final tight = cs.maxWidth >= _Cols.minTightEnv;
+        return Column(children: [
+          Container(
+            decoration: BoxDecoration(color: c.bgSidebar, border: Border(bottom: BorderSide(color: c.border))),
+            child: Row(children: [
+              Expanded(
+                child: Row(children: [
+                  _tHead(c, 'Environment', _Cols.env, tight),
+                  _tHead(c, 'Org', _Cols.org, tight),
+                  _tHead(c, 'Host', _Cols.host, tight),
+                  _tHead(c, 'Files', _Cols.files, tight),
+                  _tHead(c, 'Last sync', _Cols.lastSync, tight),
+                  _tHead(c, 'Status', _Cols.status, tight),
+                ]),
+              ),
+              _tHead(c, 'Actions', _Cols.actions, tight),
+            ]),
           ),
-      ]),
+          for (var i = 0; i < envs.length; i++)
+            _EnvTableRow(
+              state: state, item: item, env: envs[i], last: i == envs.length - 1, tight: tight,
+              onSync: onSync, onEdit: onEdit, onRemove: onRemove, onSelectEnv: onSelectEnv,
+            ),
+        ]);
+      }),
     );
   }
 }
@@ -1295,6 +1386,7 @@ class _EnvTableRow extends StatelessWidget {
     required this.item,
     required this.env,
     required this.last,
+    required this.tight,
     required this.onSync,
     required this.onEdit,
     required this.onRemove,
@@ -1304,6 +1396,8 @@ class _EnvTableRow extends StatelessWidget {
   final ProjectItem item;
   final EnvSummary env;
   final bool last;
+  /// Whether the table chose fixed widths; see `_Cols`.
+  final bool tight;
   final void Function(ProjectItem, EnvSummary) onSync, onEdit, onRemove;
   final void Function(String folder, String env) onSelectEnv;
 
@@ -1315,9 +1409,9 @@ class _EnvTableRow extends StatelessWidget {
     final watching = state.isWatching(item.summary.folder, env.name);
     final stopping = _isStopping(state, item.summary.folder, env.name);
     final syncBlocked = _syncBlocked(state, item.summary.folder, env.name);
-    Widget cell(Widget child, {int flex = 1}) =>
-        Expanded(flex: flex, child: Padding(padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11), child: child));
-
+    Widget actionsBox(Widget child) => tight
+        ? SizedBox(width: _Cols.actions.w, child: child)
+        : Expanded(flex: _Cols.actions.flex, child: child);
     return Container(
       decoration: BoxDecoration(border: last ? null : Border(bottom: BorderSide(color: c.border))),
       child: Row(children: [
@@ -1325,31 +1419,44 @@ class _EnvTableRow extends StatelessWidget {
         // cluster below sits outside this InkWell so its buttons don't also
         // trigger onSelectEnv.
         Expanded(
-          flex: _EnvTable._infoFlex,
           child: InkWell(
             onTap: () => onSelectEnv(item.summary.folder, env.name),
             mouseCursor: SystemMouseCursors.click,
             child: Row(children: [
-              cell(Text('${item.summary.name} · ${env.name}', overflow: TextOverflow.ellipsis,
-                  style: TextStyle(color: c.textPrimary, fontSize: 12.5, fontWeight: FontWeight.w600)), flex: 2),
-              cell(Text(env.orgId.toString(), style: monoStyle(c.textSecondary, 12))),
-              cell(Text(_host(env.apiBase), overflow: TextOverflow.ellipsis, style: monoStyle(c.textSecondary, 12)), flex: 2),
-              cell(Text(env.fileCount.toString(), style: monoStyle(c.textSecondary, 12))),
-              cell(Text(st == _St.never ? '—' : '${_rel(env.lastSyncUnix)} ago', style: TextStyle(color: c.textPrimary, fontSize: 12.5))),
-              cell(Align(alignment: Alignment.centerLeft, child: _MiniBadge(badge, bg, fg))),
+              _colCell(Text('${item.summary.name} · ${env.name}', maxLines: 1, overflow: TextOverflow.ellipsis,
+                  style: TextStyle(color: c.textPrimary, fontSize: 12.5, fontWeight: FontWeight.w600)), _Cols.env, tight),
+              _colCell(Text(env.orgId.toString(), maxLines: 1, overflow: TextOverflow.ellipsis,
+                  style: monoStyle(c.textSecondary, 12)), _Cols.org, tight),
+              _colCell(Text(_host(env.apiBase), maxLines: 1, overflow: TextOverflow.ellipsis,
+                  style: monoStyle(c.textSecondary, 12)), _Cols.host, tight),
+              _colCell(Text(env.fileCount.toString(), maxLines: 1, overflow: TextOverflow.ellipsis,
+                  style: monoStyle(c.textSecondary, 12)), _Cols.files, tight),
+              // No ' ago' suffix: the header already says LAST SYNC, and
+              // dropping it is what keeps '999d' inside a column narrow
+              // enough to leave the two flex columns real width.
+              _colCell(Text(st == _St.never ? '—' : _rel(env.lastSyncUnix), maxLines: 1, overflow: TextOverflow.ellipsis,
+                  style: TextStyle(color: c.textPrimary, fontSize: 12.5)), _Cols.lastSync, tight),
+              // Keyed so env_table_layout_test.dart can assert the badge
+              // actually fits the column, which a Text-level check cannot
+              // see: the badge sets softWrap: false, so it lays out at its
+              // intrinsic width and any clipping happens at this cell.
+              _colCell(Align(alignment: Alignment.centerLeft, child: _MiniBadge(badge, bg, fg)),
+                  _Cols.status, tight, key: ValueKey('status-cell-${env.name}')),
             ]),
           ),
         ),
-        Expanded(
-          flex: _EnvTable._actionsFlex,
-          child: Padding(
+        // The action cluster builds its own box rather than going through
+        // _colCell, because it keeps its own vertical padding (8, not the
+        // cell default's 11) to sit four 26px buttons centred in the row.
+        //
+        // Icon buttons (not MdhBtn) — narrow by design so more table columns
+        // fit, unlike the header bar's full-label buttons. In the tight
+        // regime _Cols.actions.w reserves exactly their intrinsic width; in
+        // the flex fallback nothing guarantees it, which is why this is a
+        // Wrap and not a Row: the icons flow onto a second line instead of
+        // throwing a RenderFlex overflow.
+        actionsBox(Padding(
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-            // Icon buttons (not MdhBtn) — narrow by design so more table
-            // columns fit, unlike the header bar's full-label buttons. A
-            // Wrap, not a fixed Row: this column's share of the table width
-            // isn't backed by any enforced minimum window width, so at a
-            // narrow enough window these four icons flow onto a second line
-            // instead of throwing a RenderFlex overflow.
             child: Wrap(alignment: WrapAlignment.end, spacing: 6, runSpacing: 4, children: [
               _RowIconBtn(
                 icon: Icons.sync,
@@ -1372,9 +1479,7 @@ class _EnvTableRow extends StatelessWidget {
               ),
               _RowIconBtn(icon: Icons.edit_outlined, tooltip: 'Edit', onTap: () => onEdit(item, env)),
               _RowIconBtn(icon: Icons.delete_outline, tooltip: 'Remove', danger: true, onTap: () => onRemove(item, env)),
-            ]),
-          ),
-        ),
+            ]))),
       ]),
     );
   }
@@ -1823,12 +1928,6 @@ class _FleetTable extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final c = MdhColors.of(context);
-    Widget cell(Widget child, {int flex = 1}) =>
-        Expanded(flex: flex, child: Padding(padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11), child: child));
-    Widget head(String t, {int flex = 1}) => cell(
-        Text(t.toUpperCase(), style: TextStyle(color: c.textSecondary, fontSize: 10.5, fontWeight: FontWeight.w600, letterSpacing: 0.5)),
-        flex: flex);
-
     if (rows.isEmpty) {
       return Container(
         width: double.infinity,
@@ -1842,26 +1941,41 @@ class _FleetTable extends StatelessWidget {
       decoration: BoxDecoration(color: c.bgCard, border: Border.all(color: c.borderCard), borderRadius: BorderRadius.circular(6),
           boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.04), blurRadius: 3, offset: const Offset(0, 1))]),
       clipBehavior: Clip.antiAlias,
-      child: Column(children: [
-        Container(
-          decoration: BoxDecoration(color: c.bgSidebar, border: Border(bottom: BorderSide(color: c.border))),
-          child: Row(children: [head('Connection', flex: 2), head('Org'), head('Host', flex: 2), head('Files'), head('Last sync'), head('Status')]),
-        ),
-        for (var i = 0; i < rows.length; i++)
-          _FleetRow(state: state, item: rows[i].$1, env: rows[i].$2, last: i == rows.length - 1, onOpenConn: onOpenConn, cell: cell),
-      ]),
+      // Its own threshold, not _EnvTable's: this table has no action
+      // cluster, so it reaches the tight regime on a narrower window.
+      child: LayoutBuilder(builder: (_, cs) {
+        final tight = cs.maxWidth >= _Cols.minTightFleet;
+        return Column(children: [
+          Container(
+            decoration: BoxDecoration(color: c.bgSidebar, border: Border(bottom: BorderSide(color: c.border))),
+            child: Row(children: [
+              _tHead(c, 'Connection', _Cols.env, tight),
+              _tHead(c, 'Org', _Cols.org, tight),
+              _tHead(c, 'Host', _Cols.host, tight),
+              _tHead(c, 'Files', _Cols.files, tight),
+              _tHead(c, 'Last sync', _Cols.lastSync, tight),
+              _tHead(c, 'Status', _Cols.status, tight),
+            ]),
+          ),
+          for (var i = 0; i < rows.length; i++)
+            _FleetRow(state: state, item: rows[i].$1, env: rows[i].$2, last: i == rows.length - 1,
+                tight: tight, onOpenConn: onOpenConn),
+        ]);
+      }),
     );
   }
 }
 
 class _FleetRow extends StatelessWidget {
-  const _FleetRow({required this.state, required this.item, required this.env, required this.last, required this.onOpenConn, required this.cell});
+  const _FleetRow({required this.state, required this.item, required this.env, required this.last,
+      required this.tight, required this.onOpenConn});
   final AppState state;
   final ProjectItem item;
   final EnvSummary env;
   final bool last;
+  /// Whether the table chose fixed widths; see `_Cols`.
+  final bool tight;
   final void Function(String folder, String env) onOpenConn;
-  final Widget Function(Widget, {int flex}) cell;
 
   @override
   Widget build(BuildContext context) {
@@ -1874,15 +1988,20 @@ class _FleetRow extends StatelessWidget {
       child: Container(
         decoration: BoxDecoration(border: last ? null : Border(bottom: BorderSide(color: c.border))),
         child: Row(children: [
-          cell(Row(children: [
-            Flexible(child: Text('${item.summary.name} · ${env.name}', overflow: TextOverflow.ellipsis, style: TextStyle(color: c.textPrimary, fontSize: 12.5))),
+          _colCell(Row(children: [
+            Flexible(child: Text('${item.summary.name} · ${env.name}', maxLines: 1, overflow: TextOverflow.ellipsis, style: TextStyle(color: c.textPrimary, fontSize: 12.5))),
             if (item.isExternal) Padding(padding: const EdgeInsets.only(left: 6), child: _MiniBadge('external', c.extBg, c.extFg)),
-          ]), flex: 2),
-          cell(Text(env.orgId.toString(), style: monoStyle(c.textSecondary, 12)), ),
-          cell(Text(_host(env.apiBase), overflow: TextOverflow.ellipsis, style: monoStyle(c.textSecondary, 12)), flex: 2),
-          cell(Text(env.fileCount.toString(), style: monoStyle(c.textSecondary, 12))),
-          cell(Text(st == _St.never ? '—' : '${_rel(env.lastSyncUnix)} ago', style: TextStyle(color: c.textPrimary, fontSize: 12.5))),
-          cell(Align(alignment: Alignment.centerLeft, child: _MiniBadge(badge, bg, fg))),
+          ]), _Cols.env, tight),
+          _colCell(Text(env.orgId.toString(), maxLines: 1, overflow: TextOverflow.ellipsis,
+              style: monoStyle(c.textSecondary, 12)), _Cols.org, tight),
+          _colCell(Text(_host(env.apiBase), maxLines: 1, overflow: TextOverflow.ellipsis,
+              style: monoStyle(c.textSecondary, 12)), _Cols.host, tight),
+          _colCell(Text(env.fileCount.toString(), maxLines: 1, overflow: TextOverflow.ellipsis,
+              style: monoStyle(c.textSecondary, 12)), _Cols.files, tight),
+          _colCell(Text(st == _St.never ? '—' : _rel(env.lastSyncUnix), maxLines: 1, overflow: TextOverflow.ellipsis,
+              style: TextStyle(color: c.textPrimary, fontSize: 12.5)), _Cols.lastSync, tight),
+          _colCell(Align(alignment: Alignment.centerLeft, child: _MiniBadge(badge, bg, fg)),
+              _Cols.status, tight, key: ValueKey('fleet-status-cell-${env.name}')),
         ]),
       ),
     );
@@ -2116,7 +2235,13 @@ class _MiniBadge extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
       decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(999)),
-      child: Text(text, style: TextStyle(color: fg, fontSize: 10.5, fontWeight: FontWeight.w600)),
+      // A badge is a fixed token, so it must never wrap — its sibling
+      // _StatusPill has carried this guard all along, and _MiniBadge not
+      // having it is what wrapped 'synced' onto three lines. Clip rather
+      // than ellipsize: a badge reading 'syn…' is worse than a clipped one,
+      // and _Cols.statusW is sized so that neither actually happens.
+      child: Text(text, maxLines: 1, softWrap: false,
+          style: TextStyle(color: fg, fontSize: 10.5, fontWeight: FontWeight.w600)),
     );
   }
 }
