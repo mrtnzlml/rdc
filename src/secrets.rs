@@ -378,11 +378,10 @@ pub fn write_secrets_file(
 }
 
 /// Literal string rdc writes in `secrets/<env>.hook-secrets.json` for
-/// every required key the user hasn't filled in yet. The deploy
-/// precheck and the push injection sites both treat any value equal
-/// to this constant as "missing" — so a re-run of `rdc deploy` with
-/// the placeholders unchanged still refuses to proceed and re-prompts
-/// the user.
+/// every required key the user hasn't filled in yet. The push injection
+/// sites treat any value equal to this constant as "missing" — so a re-run
+/// of `rdc sync <env>` with the placeholders unchanged still refuses to
+/// proceed and re-prompts the user.
 ///
 /// Angle brackets are deliberate: they're not valid in any sane real
 /// secret value (API keys, passwords, JWTs), so the chance of a real
@@ -408,9 +407,9 @@ pub const UNFILLED_SENTINEL: &str = "<unfilled>";
 /// ```
 ///
 /// A value equal to [`UNFILLED_SENTINEL`] (`"<unfilled>"`) means rdc
-/// pre-populated the key during a deploy precheck and the user hasn't
-/// typed a real value yet — the next precheck refuses the deploy on
-/// that key, the push pipeline never sends it to the API.
+/// pre-populated the key and the user hasn't typed a real value yet — the
+/// push pipeline treats the key as still missing and never sends it to the
+/// API.
 ///
 /// Values are never read back from the server (`GET /hooks/<id>` does
 /// not return `secrets`; `GET /hooks/<id>/secrets_keys` exposes the
@@ -457,8 +456,8 @@ impl HookSecrets {
     }
 
     /// Full slug → K/V map. Exposed so callers can produce merged
-    /// outputs (e.g. the deploy template writer that pre-populates the
-    /// file with sentinel placeholders for missing keys) without
+    /// outputs (e.g. [`write_hook_secrets_template`], which pre-populates
+    /// the file with sentinel placeholders for missing keys) without
     /// re-reading from disk.
     pub fn entries(&self) -> &BTreeMap<String, BTreeMap<String, String>> {
         &self.by_slug
@@ -518,10 +517,12 @@ pub fn load_hook_secrets(project_root: &Path, env: &str) -> Result<HookSecrets> 
 /// Slugs already present in `existing` but not in `required_per_slug`
 /// are passed through unchanged so unrelated hooks aren't clobbered.
 ///
-/// Used by `rdc deploy`'s pre-flight when the target's local file lacks
+/// Written for a pre-flight that finds the env's local file missing
 /// values: instead of asking the user to figure out the JSON shape, rdc
 /// hands them a fill-in-the-blanks form. Returns the absolute path
 /// written so callers can quote it in the actionable error message.
+/// The pre-flight that called it belonged to `rdc deploy` and went with
+/// it; only tests reach this today.
 ///
 /// Pretty-printed with sorted keys (BTreeMap iteration order) so the
 /// file is human-editable and re-runs produce stable diffs. The atomic

@@ -25,10 +25,11 @@ pub struct RossumClient {
     base_url: String,
     token: String,
     http: Client,
-    /// Env name (e.g. `"dev-eu"`) attached to errors via [`EnvTag`] so a
-    /// caller juggling multiple clients (notably `rdc deploy`, which holds
-    /// src+tgt) can attribute a 401 back to the right env and refresh its
-    /// token. `None` means errors are not env-tagged.
+    /// Env name (e.g. `"dev-eu"`) attached to errors as
+    /// `ApiError::Status { env, .. }` so a caller juggling multiple clients
+    /// can attribute a 401 back to the right env and refresh its token.
+    /// `None` — the state every command is in today — means errors are not
+    /// env-tagged. Set only via [`RossumClient::with_env_label`].
     env: Option<String>,
     /// Per-token client-side rate limiter. Defaults to the
     /// `default.core_api` policy Rossum enforces server-side (10 req/s,
@@ -117,10 +118,13 @@ impl RossumClient {
     }
 
     /// Attach an env label so any non-2xx error this client produces
-    /// carries the env name in its `ApiError::Status { env, .. }`. Used by
-    /// `rdc deploy`, which holds two clients (src + tgt); the retry
-    /// wrapper inspects the tag to know which env's token to refresh on a
-    /// 401.
+    /// carries the env name in its `ApiError::Status { env, .. }`, so a
+    /// retry wrapper knows which env's token to refresh on a 401.
+    ///
+    /// Written for a command holding two clients (src + tgt). The command
+    /// that did — `rdc deploy` — was replaced by the offline `rdc migrate`,
+    /// which opens no client at all, so this has **no caller today**; it is
+    /// kept for the next multi-env caller rather than as live behavior.
     pub fn with_env_label(mut self, env: impl Into<String>) -> Self {
         self.env = Some(env.into());
         self
@@ -378,9 +382,11 @@ impl RossumClient {
 
     // --- delete endpoints (DELETE) ------------------------------------
     //
-    // Used by `rdc deploy --mirror`, which prunes tgt-only resources so
-    // PROD becomes exactly TEST. Mirror mode is opt-in and gated behind
-    // an interactive confirmation; same-env `rdc push` never deletes.
+    // Reached only through `rdc sync`'s delete phase
+    // (`cli::push::deletes`), which commits lockfile tombstones — a local
+    // deletion, or the tgt-only objects `rdc migrate --mirror` pruned from
+    // the target snapshot. Always gated: an interactive `[y/N]` on a TTY,
+    // and `--allow-deletes` otherwise. Nothing else in rdc issues a DELETE.
 
     /// Generic DELETE `<base>/<path>`. Accepts 204 (deleted) and 404
     /// (already gone) as success; surfaces every other non-2xx.

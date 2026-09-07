@@ -8,9 +8,11 @@ pub enum ApiError {
     /// HTTP failure. `env` is the rdc env name (e.g. `"dev-eu"`) the
     /// failing call was made against, when the client knows it; it's
     /// `None` for code paths that don't carry an env label. Surfacing the
-    /// env lets multi-env commands (notably `rdc deploy`, holding both
-    /// src and tgt clients) attribute a 401 back to the right env on
-    /// retry.
+    /// env lets a caller that holds more than one client (a src + tgt pair)
+    /// attribute a 401 back to the right env on retry. No command does today
+    /// — `rdc migrate` is pure-local and every other command drives a single
+    /// env — so the label is unset in practice; see
+    /// [`crate::api::RossumClient::with_env_label`].
     #[error("{}", render_status(*status, body, env.as_deref()))]
     Status {
         status: u16,

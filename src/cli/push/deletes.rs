@@ -1,5 +1,5 @@
-//! Delete phase for `rdc push`: turn lockfile tombstones (lockfile entry +
-//! missing local file) into `DELETE /<kind>/<id>` calls.
+//! Delete phase of `rdc sync`'s push: turn lockfile tombstones (lockfile
+//! entry + missing local file) into `DELETE /<kind>/<id>` calls.
 //!
 //! Safety model (matches the user-confirmed design):
 //!

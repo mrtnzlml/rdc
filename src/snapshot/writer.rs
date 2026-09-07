@@ -7,7 +7,7 @@ use std::path::Path;
 /// Creates parent directories if missing.
 ///
 /// Skips the write entirely when `path` already contains exactly these bytes,
-/// so a no-op `rdc pull` doesn't bump mtimes on every file (otherwise every
+/// so a no-op pull doesn't bump mtimes on every file (otherwise every
 /// re-pull would look like "everything changed" to mtime-aware tools).
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Ok(existing) = fs::read(path)

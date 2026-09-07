@@ -1528,6 +1528,10 @@ pub fn format_user_choices(users: &[crate::model::User], self_user_id: Option<u6
 /// Prompt interactively. Returns `Some((picked_user_url, apply_to_all))`
 /// or `None` if the user aborted. Non-TTY callers must skip this and
 /// check the overlay state up-front.
+///
+/// **No caller today.** This was `rdc deploy`'s store-extension step; a
+/// `token_owner` is now declared per env in `overlay.toml`
+/// (`[hooks."*"] token_owner`, or per hook).
 pub fn prompt_token_owner(
     slug: &str,
     tgt_env: &str,
@@ -1539,7 +1543,7 @@ pub fn prompt_token_owner(
 
     let sorted = sort_users_for_picker(users);
     let mut options = format_user_choices(users, self_user_id);
-    let abort_label = "abort the deploy".to_string();
+    let abort_label = "abort the promotion".to_string();
     options.push(abort_label.clone());
 
     let prompt = format!("Pick the token_owner for store extension '{slug}' on {tgt_env}");

@@ -11,7 +11,7 @@ pub fn pick_env(question: &str, env: Option<String>) -> Result<String> {
 }
 
 /// Like [`pick_env`], but hides any envs in `exclude` from the picker.
-/// Used by paired commands (e.g. `rdc deploy <src> <tgt>`) so the second
+/// Used by the one paired command, `rdc migrate <src> <tgt>`, so the second
 /// pick can't be the same as the first.
 pub fn pick_env_excluding(
     question: &str,

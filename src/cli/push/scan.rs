@@ -1,8 +1,7 @@
-//! Phase 1 of `rdc push`: walk the local snapshot, hash every writable file,
-//! compare to lockfile, and produce a list of items needing PATCH per kind.
-//! Phase 2 (the per-kind drivers) consumes this list — until Task 20 lands,
-//! drivers still iterate the local tree themselves; the ChangeList is used
-//! only for the early-exit "no changes" UX path.
+//! Phase 1 of `rdc sync`'s push: walk the local snapshot, hash every
+//! writable file, compare to lockfile, and produce a list of items needing
+//! PATCH per kind. Phase 2 (the per-kind drivers) consumes this list —
+//! each driver iterates the `ChangeList` it is handed rather than the tree.
 //!
 //! The scan also reports **tombstones**: lockfile entries whose on-disk
 //! file is missing. These are the user's explicit "delete this from

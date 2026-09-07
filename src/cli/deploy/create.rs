@@ -1,4 +1,4 @@
-//! Filesystem helper shared with `rdc pull`'s portabilize pass.
+//! Filesystem helper shared with the pull phase's portabilize pass.
 
 use crate::paths::Paths;
 

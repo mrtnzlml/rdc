@@ -222,8 +222,9 @@ impl Lockfile {
     }
 
     /// Multi-kind reverse lookup: given a URL, find which `(kind, slug)`
-    /// owns it. Used by `rdc deploy` to rewrite cross-references in a
-    /// payload from src URLs to tgt URLs.
+    /// owns it. Drives [`crate::snapshot::refs::url_to_rdc`], i.e. the pull
+    /// side's portabilization of a live cross-reference into
+    /// `rdc://<kind>/<slug>`.
     pub fn lookup_url(&self, url: &str) -> Option<(&str, &str)> {
         // A portable `rdc://<kind>/<slug>` reference resolves directly to its
         // (kind, slug) coordinate when that object is tracked here.

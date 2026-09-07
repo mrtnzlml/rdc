@@ -15,7 +15,9 @@
 //!    a shadow that mirrors no source sidecar is a hard error).
 //!
 //! Afterwards the user reviews `git diff` and runs `rdc sync <tgt>` to push.
-//! `rdc deploy` is untouched; `migrate` is added alongside it.
+//! This is the whole local half of a promotion: the command it replaced,
+//! `rdc deploy`, is gone (invoking it now emits a guiding error — see
+//! `cli::Command::Deploy`).
 
 use crate::mapping::{GenericMapping, Mapping};
 use crate::overlay::{Overlay, apply_overrides};

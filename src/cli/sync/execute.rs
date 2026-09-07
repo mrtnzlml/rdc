@@ -94,7 +94,8 @@ fn build_bulk_prompt(
     }
     if recreate_local > 0 {
         keep.push_str(&format!(
-            "\n  {recreate_local} local deletion(s) need a follow-up `rdc push --allow-deletes {env}`"
+            "\n  {recreate_local} local deletion(s) need a follow-up \
+             `rdc sync {env} --allow-deletes`"
         ));
         remote.push_str(&format!(
             "\n  {recreate_local} local file(s) recreated from {env}"
@@ -3237,7 +3238,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                                 Action::Info,
                                 &format!(
                                     "{}: committing the local tombstone needs an \
-                                 explicit `rdc push --allow-deletes {}` follow-up; \
+                                 explicit `rdc sync {} --allow-deletes` follow-up; \
                                  the lockfile entry was retained so the deletion isn't lost",
                                     local_path.display(),
                                     env,
@@ -4463,8 +4464,20 @@ mod tests {
         assert!(b.use_remote_summary.contains("2 local file(s) deleted"));
         assert!(b.use_remote_summary.contains("1 local file(s) recreated from prod"));
         assert!(b.keep_local_summary.contains("39 local file(s) kept and pushed to prod"));
-        assert!(b.keep_local_summary.contains("rdc push --allow-deletes prod"));
-        assert!(!b.use_remote_summary.contains("rdc push --allow-deletes"), "allow-deletes note belongs only to keep-local: {}", b.use_remote_summary);
+        assert!(b.keep_local_summary.contains("rdc sync prod --allow-deletes"));
+        // The follow-up has to name a subcommand that EXISTS. It once named
+        // a push subcommand, which rdc has never had — push is a phase of
+        // sync. `tests/command_references.rs` guards the whole tree for this.
+        assert!(
+            !b.keep_local_summary.contains("rdc push"),
+            "the follow-up must name a real subcommand: {}",
+            b.keep_local_summary
+        );
+        assert!(
+            !b.use_remote_summary.contains("--allow-deletes"),
+            "allow-deletes note belongs only to keep-local: {}",
+            b.use_remote_summary
+        );
     }
 
     /// The clean-`RemoteDelete` event line must not claim a remote deletion for

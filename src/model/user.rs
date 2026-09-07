@@ -3,7 +3,10 @@ use serde_json::Value;
 use indexmap::IndexMap;
 
 /// Rossum user. Lightweight slice sufficient for the interactive
-/// token_owner picker on `rdc deploy`; unknown fields survive via `extra`.
+/// token_owner picker (`cli::resolve::prompt_token_owner`); unknown fields
+/// survive via `extra`. Nothing calls that picker today — a store
+/// extension's `token_owner` is declared in `overlay.toml` instead (see
+/// `snapshot::create::strip_for_cross_env_patch`).
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct User {
     #[serde(default, deserialize_with = "crate::model::null_as_default")]

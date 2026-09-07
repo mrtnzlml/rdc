@@ -200,8 +200,8 @@ pub enum Command {
     /// `rdc://<kind>/<slug>` references from src slugs to tgt slugs, and
     /// applying the target env's overlay. Afterwards review the changes with
     /// `git diff` and run `rdc sync <tgt>` to push them (sync creates objects
-    /// in dependency order). This replaces the remote half of `rdc deploy`
-    /// with an offline, reviewable file transform.
+    /// in dependency order). Promotion is therefore two reviewable steps: this
+    /// offline file transform, then a push you can dry-run.
     ///
     /// Per-env code overrides: a file at `envs/<tgt>/overlay/<relpath>` replaces
     /// the migrated code/formula sidecar at `<relpath>` (hook/rule `.py`/`.js` or

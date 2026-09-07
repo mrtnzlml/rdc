@@ -1,10 +1,11 @@
 //! `_index.md` generator for a pulled env snapshot.
 //!
-//! The file is regenerated on every `rdc pull` and at the end of every
-//! `rdc push`. It's the entry point for an agent (Claude Code or
-//! similar) or a human dropping into the repo: every object is listed
-//! with its on-disk path, human name, type-specific signals, and the
-//! related objects it points at (and that point at it).
+//! Regenerated once at the end of every `rdc sync` cycle, right after the
+//! lockfile is saved (`cli::sync::run`) — so it reflects the state both the
+//! push and the pull phase left behind. It's the entry point for an agent
+//! (Claude Code or similar) or a human dropping into the repo: every object
+//! is listed with its on-disk path, human name, type-specific signals, and
+//! the related objects it points at (and that point at it).
 //!
 //! Design goals:
 //! - **Deterministic.** Same lockfile + same on-disk JSONs ⇒ byte-for-byte

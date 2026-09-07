@@ -1,6 +1,6 @@
 //! Helpers for the resource-creation push path.
 //!
-//! When `rdc push` sees a local file with no lockfile entry, it treats it as
+//! When the push phase sees a local file with no lockfile entry, it treats it as
 //! a new object and POSTs it. The POST body is the user-authored JSON minus
 //! the server-managed fields. Stripping them client-side keeps the request
 //! clean — the user's placeholder `id: 0` / `url: ""` (or missing fields)

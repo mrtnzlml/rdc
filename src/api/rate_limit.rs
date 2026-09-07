@@ -33,7 +33,7 @@
 //! The limiter is intentionally **per-client**, not global: each
 //! `RossumClient` or `DataStorageClient` carries its own `Arc<RateLimiter>`
 //! so all in-flight calls from one client share the same bucket, while two
-//! clients of the same kind (e.g. `rdc deploy`'s src + tgt `RossumClient`s)
+//! clients of the same kind (two `RossumClient`s over different envs)
 //! get independent buckets — matching the server's per-token scope. See the
 //! bucket-lifetime note on [`RateLimiter::rossum_data_storage`] for how
 //! often each kind of client (and therefore each bucket) gets rebuilt.

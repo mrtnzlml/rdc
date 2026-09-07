@@ -66,8 +66,8 @@ pub struct LimitViolation {
 }
 
 /// `rules.trigger_condition` is capped at 4000 characters. For every
-/// snapshot `rdc pull` produces, the codec always extracts it into a
-/// `<slug>.py` sidecar (see `snapshot::rule::read_rule_value`), so a
+/// snapshot `rdc sync`'s pull phase produces, the codec always extracts it
+/// into a `<slug>.py` sidecar (see `snapshot::rule::read_rule_value`), so a
 /// `trigger_condition` entry in [`field_limits`] — which only inspects
 /// top-level JSON keys — would be dead for every pulled project. It lives
 /// here instead, and `ChangeList::field_limit_violations` reads the
