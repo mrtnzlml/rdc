@@ -37,7 +37,8 @@ pub async fn run(env: &str, dry_run: bool) -> Result<()> {
     let log = Log::new(crate::cli::resolve::detect_color_mode());
 
     // 1. Pre-flight: local changes not yet pushed to the remote (offline).
-    let (unpushed, limit_violations, missing_create_fields) = scan_unpushed(&paths, &api_base)?;
+    let (unpushed, limit_violations, missing_create_fields, engine_conflicts) =
+        scan_unpushed(&paths, &api_base)?;
 
     // Fields the API will reject on length. Reported here — the offline
     // pre-flight — because it is the cheapest place to learn: `rdc sync`
@@ -78,6 +79,25 @@ pub async fn run(env: &str, dry_run: bool) -> Result<()> {
                 m.path.display(),
                 m.field,
                 m.kind,
+            ),
+        );
+    }
+
+    // Queues naming two engines at once. Same reason again: the API accepts
+    // exactly one binding, so this is decidable offline and otherwise arrives
+    // as a mid-push 400 on a remote queue id. Not auto-fixable — which of the
+    // two bindings the env should keep is the user's call (a re-migrate makes
+    // it the source's).
+    for c in &engine_conflicts {
+        log.event(
+            Action::Warn,
+            &format!(
+                "queues/{} -- {}: binds {}, but the Rossum API accepts only one; \
+                 `rdc sync {env}` will refuse to push until one binding is left \
+                 (set the others to null, or re-run migrate)",
+                c.slug,
+                c.path.display(),
+                c.fields.join(", "),
             ),
         );
     }
@@ -142,7 +162,8 @@ pub async fn run(env: &str, dry_run: bool) -> Result<()> {
 /// Offline scan of everything a push would send: local objects whose
 /// content differs from the lockfile base (edits/creates) plus tombstones
 /// (local deletes), together with any field that exceeds the API's
-/// declared `max_length`. Returns `(0, [])` when there's no lockfile yet —
+/// declared `max_length` and any queue naming more than one engine.
+/// Returns everything empty when there's no lockfile yet —
 /// nothing is tracked, so nothing is "unpushed".
 fn scan_unpushed(
     paths: &Paths,
@@ -151,10 +172,11 @@ fn scan_unpushed(
     usize,
     Vec<crate::cli::push::scan::FieldLimitViolation>,
     Vec<crate::cli::push::scan::MissingCreateField>,
+    Vec<crate::snapshot::limits::EngineSlotConflict>,
 )> {
     let lockfile_path = paths.lockfile();
     if !lockfile_path.exists() {
-        return Ok((0, Vec::new(), Vec::new()));
+        return Ok((0, Vec::new(), Vec::new(), Vec::new()));
     }
     let mut lockfile = Lockfile::load(&lockfile_path)?;
     lockfile.api_base = api_base.to_string();
@@ -163,5 +185,6 @@ fn scan_unpushed(
         changes.total() + tombstones.total(),
         changes.field_limit_violations(),
         changes.missing_create_fields(&lockfile),
+        changes.queue_engine_conflicts(),
     ))
 }

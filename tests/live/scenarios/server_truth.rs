@@ -128,6 +128,86 @@ async fn live_field_limits_match_the_server() {
     drop(teardown);
 }
 
+/// A queue's three engine-binding fields are mutually exclusive — but the
+/// server counts VALUES, not KEYS.
+///
+/// `cli::migrate::reconcile_engine_slot` leans on exactly this: it resolves a
+/// double binding by setting the losers to `null` rather than removing them,
+/// so a migrated queue keeps the shape a pulled one has (all three keys) and
+/// `git diff` stays honest. And rdc's within-env push re-serializes the whole
+/// on-disk body, so every queue PATCH carries all three keys whatever the
+/// binding. If the API ever started counting keys, both would break at once:
+/// every queue push would 400 with `Only one of dedicated_engine,
+/// generic_engine or engine can be set.` — the very error this reconcile
+/// exists to prevent — and nothing offline would notice.
+///
+/// The probe only covers the `generic_engine`-set direction, because creating
+/// an `engine` is 403 on the sandbox token. That is the load-bearing half:
+/// what is being tested is whether an explicit `null` counts as "set", and the
+/// answer cannot depend on which of the three carries the value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live: needs RDC_LIVE_* env"]
+async fn live_queue_engine_slot_counts_values_not_keys() {
+    let Some(cfg) = LiveConfig::from_env() else {
+        eprintln!("{}", LiveConfig::skip_reason());
+        return;
+    };
+    let run_id = RunId::new();
+    let client = LiveClient::connect(&cfg).expect("connect");
+    let teardown = Teardown::new(LiveClient::connect(&cfg).unwrap(), run_id.clone());
+
+    let manifest = load_manifest().expect("manifest");
+    let index = seed(&client, &run_id, &static_dir(), &manifest).await.expect("seed");
+    let queue_id = index.id("queue-invoices-main").expect("seeded queue id");
+
+    // Whatever binding the seeded queue came up with — a fresh queue is on the
+    // built-in generic engine.
+    let before = client.get_value("queues", queue_id).await.expect("GET queue");
+    let generic = before.get("generic_engine").cloned().unwrap_or(serde_json::Value::Null);
+    assert!(
+        !generic.is_null(),
+        "a freshly created queue is expected to be generic-engine bound; got {before:#}"
+    );
+
+    // The shape every rdc queue PATCH sends: all three keys, one value.
+    client
+        .patch_fields(
+            "queue",
+            queue_id,
+            serde_json::json!({
+                "engine": serde_json::Value::Null,
+                "dedicated_engine": serde_json::Value::Null,
+                "generic_engine": generic,
+            }),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "the server REFUSED a queue PATCH carrying all three engine keys with only                  one value. rdc's push sends exactly this on every queue, and                  `reconcile_engine_slot` clears a losing binding by nulling it — both now                  400 on every run. Clear the losers by REMOVING the keys instead: {e:#}"
+            )
+        });
+
+    // Two values at once is the state that must stay refused — the premise
+    // behind refusing it offline (`ChangeList::queue_engine_conflicts`).
+    // Pointing `engine` at a made-up id is enough: the mutual-exclusion check
+    // must fire before any hyperlink is resolved. Any error is a pass; what
+    // would fail this is a 200.
+    let bogus_engine = format!("{}/engines/999999999", cfg.api_base.trim_end_matches('/'));
+    let res = client
+        .patch_fields(
+            "queue",
+            queue_id,
+            serde_json::json!({ "engine": bogus_engine, "generic_engine": generic }),
+        )
+        .await;
+    assert!(
+        res.is_err(),
+        "the server ACCEPTED two engine bindings at once; rdc refuses that offline          (`queue_engine_conflicts`) and would now be blocking work the server allows"
+    );
+
+    drop(teardown);
+}
+
 /// rdc's offline pre-flight must refuse an over-long field before it opens a
 /// single connection — the property that keeps one bad field from wedging a
 /// whole project's syncs half-applied.

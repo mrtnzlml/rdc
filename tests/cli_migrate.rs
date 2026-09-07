@@ -889,6 +889,93 @@ fn migrate_carries_score_thresholds_with_flag() {
     );
 }
 
+/// A source queue bound to a custom engine, promoted onto a target queue that
+/// sits on the built-in generic engine: the shape that failed in the field.
+///
+/// `engine` is deployable and promoted; `generic_engine` is a per-env URL that
+/// the cross-env strip drops so the target's own value is restored. Before
+/// `reconcile_engine_slot` both landed, and every later `rdc sync <tgt>` died
+/// on `PATCH /queues/<id>: 400 non_field_errors: Only one of dedicated_engine,
+/// generic_engine or engine can be set.` — which, because the push phase runs
+/// before the pull, wedged the whole env.
+#[test]
+fn migrate_promoted_engine_clears_the_targets_generic_engine() {
+    let project = init_two_env_project();
+    let root = project.path().to_path_buf();
+
+    for (env, host) in [("test", "test.example"), ("prod", "prod.example")] {
+        write(
+            &root.join(format!("envs/{env}/workspaces/main/workspace.json")),
+            &serde_json::json!({ "name": "Main" }),
+        );
+        write(
+            &root.join(format!("envs/{env}/engines/sorting/engine.json")),
+            &serde_json::json!({ "name": "Sorting", "type": "extractor" }),
+        );
+        // test binds the custom engine; prod is still on the generic one.
+        let (engine, generic) = if env == "test" {
+            (serde_json::json!("rdc://engines/sorting"), serde_json::Value::Null)
+        } else {
+            (
+                serde_json::Value::Null,
+                serde_json::json!(format!("https://{host}/api/v1/generic_engines/5")),
+            )
+        };
+        write(
+            &root.join(format!("envs/{env}/workspaces/main/queues/invoices/queue.json")),
+            &serde_json::json!({
+                "name": "Invoices",
+                "workspace": "rdc://workspaces/main",
+                "schema": "rdc://schemas/invoices",
+                "engine": engine,
+                "dedicated_engine": null,
+                "generic_engine": generic,
+            }),
+        );
+        write(
+            &root.join(format!("envs/{env}/workspaces/main/queues/invoices/schema.json")),
+            &serde_json::json!({ "name": "Invoices schema", "content": [] }),
+        );
+    }
+
+    let map_dir = root.join(".rdc/map");
+    std::fs::create_dir_all(&map_dir).unwrap();
+    std::fs::write(
+        map_dir.join("test-to-prod.toml"),
+        "version = 1\n\n[workspaces]\n\"main\" = \"main\"\n\n[queues]\n\"invoices\" = \"invoices\"\n\n         [schemas]\n\"invoices\" = \"invoices\"\n\n[engines]\n\"sorting\" = \"sorting\"\n",
+    )
+    .unwrap();
+
+    let _guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(&root).unwrap();
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], false, false);
+    std::env::set_current_dir(&prev).unwrap();
+    result.expect("migrate should succeed");
+
+    let queue = read_json(&root.join("envs/prod/workspaces/main/queues/invoices/queue.json"));
+    assert_eq!(
+        queue["engine"],
+        serde_json::json!("rdc://engines/sorting"),
+        "the source's custom engine must be promoted"
+    );
+    assert_eq!(
+        queue["generic_engine"],
+        serde_json::Value::Null,
+        "the target's restored generic_engine must be cleared: the API accepts one binding"
+    );
+    // The key survives as `null` so the file keeps a pulled queue's shape.
+    assert!(
+        queue.as_object().unwrap().contains_key("generic_engine"),
+        "the key must stay, only its value is cleared"
+    );
+    assert_eq!(
+        rdc::snapshot::limits::check_queue_engine_slot(&queue),
+        Vec::<&str>::new(),
+        "the migrated queue must pass the offline pre-flight"
+    );
+}
+
 /// Helper: src+tgt inbox trees under an identity mapping, each with its own
 /// `email_prefix`. Pass `None` for `tgt_prefix` to leave the target inbox
 /// without one, or for `tgt` to omit the target inbox entirely (new object).

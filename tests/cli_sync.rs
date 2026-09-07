@@ -12906,6 +12906,136 @@ async fn sync_dry_run_reports_oversized_field() {
     );
 }
 
+/// A queue naming two engines is the same class of defect: `PATCH
+/// /queues/<id>` answers `400 non_field_errors: Only one of dedicated_engine,
+/// generic_engine or engine can be set.` — permanently, whatever the retry.
+/// This is the state a pre-`reconcile_engine_slot` `migrate` wrote
+/// into a promoted env (the source's custom `engine` beside the target's
+/// restored `generic_engine`), and because the push phase runs before the
+/// pull, the env stayed wedged until a human read the 400 and edited JSON.
+#[tokio::test]
+async fn sync_refuses_a_queue_with_two_engine_bindings_before_any_remote_write() {
+    let server = MockServer::start().await;
+    let server_uri = server.uri();
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+
+    let ws_url = format!("{server_uri}/api/v1/workspaces/810");
+    let queue_url = format!("{server_uri}/api/v1/queues/110");
+    let schema_url = format!("{server_uri}/api/v1/schemas/210");
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workspaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+            "results": [{
+                "id": 810, "url": ws_url.clone(), "name": "Main",
+                "organization": format!("{server_uri}/api/v1/organizations/1"),
+                "queues": [queue_url.clone()],
+                "modified_at": "2026-04-20T08:00:00Z"
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    // The remote queue is on the built-in generic engine, like every queue
+    // that has never been bound to a custom one.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/queues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
+            "results": [{
+                "id": 110, "url": queue_url.clone(), "name": "Invoices",
+                "workspace": ws_url.clone(), "schema": schema_url.clone(),
+                "engine": null, "dedicated_engine": null,
+                "generic_engine": format!("{server_uri}/api/v1/generic_engines/5"),
+                "modified_at": "2026-04-20T08:00:00Z"
+            }]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/schemas/210"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 210, "url": schema_url.clone(), "name": "Invoices Schema",
+            "queues": [queue_url.clone()], "content": [],
+            "modified_at": "2026-04-20T08:00:00Z"
+        })))
+        .mount(&server)
+        .await;
+    mock_empty_lists_except(&server, &["/api/v1/workspaces", "/api/v1/queues"]).await;
+
+    // No PATCH mock: if the pre-flight lets the push through, the request
+    // 404s and the write assertion below fails.
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
+        .await
+        .expect("seed sync should succeed");
+
+    // Bind a custom engine WITHOUT clearing the generic one -> LocalEdit whose
+    // PATCH the API can only ever refuse.
+    let queue_json = project.path().join("envs/dev/workspaces/main/queues/invoices/queue.json");
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&queue_json).unwrap()).unwrap();
+    v["engine"] = serde_json::json!("rdc://engines/sorting");
+    std::fs::write(
+        &queue_json,
+        format!("{}\n", serde_json::to_string_pretty(&v).unwrap()),
+    )
+    .unwrap();
+
+    let err = rdc::cli::sync::run("dev", false, false, false, false, false, None)
+        .await
+        .expect_err("sync must refuse a queue that binds two engines");
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    let msg = format!("{err:#}");
+    assert!(msg.contains("queues/invoices"), "must name the object: {msg}");
+    assert!(msg.contains("queue.json"), "must name the local file: {msg}");
+    assert!(msg.contains("engine"), "must name the fields: {msg}");
+    assert!(msg.contains("generic_engine"), "must name the fields: {msg}");
+
+    let writes: Vec<_> = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| {
+            matches!(
+                r.method,
+                http::Method::PATCH | http::Method::POST | http::Method::PUT | http::Method::DELETE
+            )
+        })
+        .filter(|r| !r.url.path().ends_with("/list"))
+        .map(|r| format!("{} {}", r.method, r.url.path()))
+        .collect();
+    assert!(
+        writes.is_empty(),
+        "refusal must happen before any remote write; saw: {writes:?}"
+    );
+}
+
 /// A brand-new inbox with no `email_prefix` is the same class of defect:
 /// `POST /inboxes` answers `400 non_field_errors: One of fields 'email_prefix'
 /// or 'email' needs to be provided`, and rdc strips the server-derived `email`,

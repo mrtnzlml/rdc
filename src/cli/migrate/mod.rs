@@ -1071,6 +1071,17 @@ fn transform_file(
         reconcile_training_enabled(&mut value, kind, &dst_path);
     }
 
+    // The queue's engine binding. `engine`/`dedicated_engine` are promoted
+    // from the source; `generic_engine` is restored from the target — and the
+    // three are mutually exclusive, so a source bound to a custom engine plus
+    // a target on the built-in generic engine produced a queue with two
+    // bindings and every later push 400'd. Runs after the restore above (the
+    // value it has to drop is the one the restore put back) and, like the
+    // other reconciles, before the overlay.
+    if let Some((kind, _)) = classify(rel) {
+        reconcile_engine_slot(&mut value, kind);
+    }
+
     // An inbox's `email_prefix`, unless the user opted to carry it. The prefix
     // is the left-hand side of the inbox's PUBLIC address, so promoting the
     // source env's value re-addresses the target's mailbox — but unlike the
@@ -1830,6 +1841,74 @@ fn reconcile_training_enabled(value: &mut serde_json::Value, kind: &str, tgt_pat
         }
         None => {
             obj.shift_remove(KEY);
+        }
+    }
+}
+
+/// Leave a migrated queue with exactly ONE engine binding.
+///
+/// A queue names its extraction engine through one of three mutually
+/// exclusive fields (`crate::snapshot::limits::QUEUE_ENGINE_FIELDS`), and
+/// `PATCH /queues/<id>` with two of them non-null answers `400
+/// non_field_errors: Only one of dedicated_engine, generic_engine or engine
+/// can be set.`
+///
+/// Migrate treats the three asymmetrically, and that is what produced an
+/// impossible body. `engine` and `dedicated_engine` are deployable content
+/// promoted from the source; `generic_engine` is a per-env URL that
+/// `strip_for_cross_env_patch` drops so `reconcile_target_identity` restores
+/// the TARGET's (its host is the target org's — see the strip's own comment).
+/// Promote a source queue bound to a custom `engine` onto a target queue
+/// sitting on the built-in generic engine and both halves fire: the source's
+/// `engine` lands, the target's `generic_engine` comes back, and the queue now
+/// names two engines. Nothing downstream noticed — the snapshot committed
+/// clean, and every subsequent `rdc sync` died on the same PATCH, wedging the
+/// env (the push phase precedes the pull, so its error aborts the whole cycle).
+///
+/// The fix is to treat the three as one SLOT rather than three fields: keep the
+/// highest-precedence value the reconciled body carries and null the rest.
+/// Precedence (`QUEUE_ENGINE_FIELDS`) puts the promoted `engine` ahead of the
+/// restored `generic_engine`, so the source's binding wins — the same rule
+/// every other deployable field follows. Concretely:
+///
+/// - source binds a custom `engine` -> `engine` survives, the target's
+///   `generic_engine` is cleared. This is exactly the payload the platform's
+///   own generic->custom conversion sends, and the server drops the generic
+///   binding itself.
+/// - source is on the generic engine -> its `engine`/`dedicated_engine` are
+///   already null, so the target's restored `generic_engine` is untouched and
+///   the queue keeps the built-in engine its own env resolved.
+/// - target has no `generic_engine` to restore (a new queue) -> one key, no
+///   work.
+///
+/// Losers are set to `null` rather than removed, because a pulled queue body
+/// always carries all three keys and the API counts VALUES, not keys — so the
+/// migrated file stays byte-identical in shape to a fresh pull and `git diff`
+/// stays honest about what changed.
+///
+/// An `overlay.toml` can still reintroduce a second binding: overlays run
+/// after every reconcile and are documented to win. That is caught offline by
+/// `cli::push::scan::ChangeList::queue_engine_conflicts` before the first
+/// remote write.
+fn reconcile_engine_slot(value: &mut serde_json::Value, kind: &str) {
+    if kind != "queues" {
+        return;
+    }
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    let mut kept = false;
+    for field in crate::snapshot::limits::QUEUE_ENGINE_FIELDS {
+        let Some(current) = obj.get(field) else {
+            continue;
+        };
+        if current.is_null() {
+            continue;
+        }
+        if kept {
+            obj.insert(field.to_string(), serde_json::Value::Null);
+        } else {
+            kept = true;
         }
     }
 }
@@ -5002,6 +5081,119 @@ mod tests {
         let (_d, tgt) = tgt_file(&serde_json::json!({ "name": "S" }));
         reconcile_training_enabled(&mut source, "schemas", &tgt);
         assert_eq!(source["training_enabled"], serde_json::json!(true));
+    }
+
+    // ---- engine-slot reconciliation ----
+
+    /// The live failure, reduced: the source queue is bound to a custom
+    /// engine, the target queue is on the built-in generic engine and
+    /// `reconcile_target_identity` has just restored that value. Both bindings
+    /// present is the body `PATCH /queues/<id>` refuses with "Only one of
+    /// dedicated_engine, generic_engine or engine can be set."
+    #[test]
+    fn reconcile_engine_slot_drops_the_restored_generic_engine() {
+        let mut value = serde_json::json!({
+            "name": "Q",
+            "engine": "rdc://engines/sorting",
+            "dedicated_engine": null,
+            "generic_engine": "https://tgt.example/api/v1/generic_engines/5",
+        });
+        reconcile_engine_slot(&mut value, "queues");
+        assert_eq!(value["engine"], serde_json::json!("rdc://engines/sorting"));
+        assert_eq!(
+            value["generic_engine"],
+            serde_json::Value::Null,
+            "the promoted custom engine wins the slot"
+        );
+        // The key stays, as `null` — a pulled queue always carries all three,
+        // and the API counts values rather than keys.
+        assert!(value.as_object().unwrap().contains_key("generic_engine"));
+    }
+
+    /// A source on the generic engine promotes nothing into the slot, so the
+    /// target keeps the `generic_engine` its own env resolved (whose host is
+    /// the target's).
+    #[test]
+    fn reconcile_engine_slot_keeps_the_generic_engine_when_nothing_outranks_it() {
+        let mut value = serde_json::json!({
+            "name": "Q",
+            "engine": null,
+            "dedicated_engine": null,
+            "generic_engine": "https://tgt.example/api/v1/generic_engines/5",
+        });
+        reconcile_engine_slot(&mut value, "queues");
+        assert_eq!(
+            value["generic_engine"],
+            serde_json::json!("https://tgt.example/api/v1/generic_engines/5")
+        );
+        assert_eq!(value["engine"], serde_json::Value::Null);
+    }
+
+    /// A queue with a single binding, or none, is already valid and must come
+    /// out byte-identical — otherwise every migrate would rewrite every queue.
+    #[test]
+    fn reconcile_engine_slot_leaves_a_valid_body_alone() {
+        for body in [
+            serde_json::json!({ "name": "Q", "engine": "rdc://engines/e", "generic_engine": null }),
+            serde_json::json!({ "name": "Q", "engine": null, "generic_engine": null }),
+            // A new queue: `strip_for_cross_env_patch` removed `generic_engine`
+            // outright, so only the promoted binding is present.
+            serde_json::json!({ "name": "Q", "engine": "rdc://engines/e" }),
+            serde_json::json!({ "name": "Q" }),
+        ] {
+            let mut value = body.clone();
+            reconcile_engine_slot(&mut value, "queues");
+            assert_eq!(value, body, "a valid engine slot must not be rewritten");
+        }
+    }
+
+    /// A source snapshot that is ITSELF invalid (two bindings — e.g. an env
+    /// migrated by an rdc that predates this reconcile, then used as a source)
+    /// is resolved by precedence rather than promoted as-is.
+    #[test]
+    fn reconcile_engine_slot_resolves_three_bindings_by_precedence() {
+        let mut value = serde_json::json!({
+            "name": "Q",
+            "generic_engine": "https://tgt.example/api/v1/generic_engines/5",
+            "dedicated_engine": "https://tgt.example/api/v1/dedicated_engines/2",
+            "engine": "rdc://engines/sorting",
+        });
+        reconcile_engine_slot(&mut value, "queues");
+        assert_eq!(value["engine"], serde_json::json!("rdc://engines/sorting"));
+        assert_eq!(value["dedicated_engine"], serde_json::Value::Null);
+        assert_eq!(value["generic_engine"], serde_json::Value::Null);
+    }
+
+    /// Precedence keeps `dedicated_engine` when there is no `engine`, so a
+    /// legacy dedicated binding is not silently swapped for the generic one.
+    #[test]
+    fn reconcile_engine_slot_prefers_dedicated_over_generic() {
+        let mut value = serde_json::json!({
+            "name": "Q",
+            "engine": null,
+            "dedicated_engine": "https://tgt.example/api/v1/dedicated_engines/2",
+            "generic_engine": "https://tgt.example/api/v1/generic_engines/5",
+        });
+        reconcile_engine_slot(&mut value, "queues");
+        assert_eq!(
+            value["dedicated_engine"],
+            serde_json::json!("https://tgt.example/api/v1/dedicated_engines/2")
+        );
+        assert_eq!(value["generic_engine"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn reconcile_engine_slot_no_op_for_non_queue() {
+        // Only queues carry an engine binding; a hook whose settings happen to
+        // name these keys is deployable content and must not be touched.
+        let body = serde_json::json!({
+            "name": "H",
+            "engine": "a",
+            "generic_engine": "b",
+        });
+        let mut value = body.clone();
+        reconcile_engine_slot(&mut value, "hooks");
+        assert_eq!(value, body);
     }
 
     // ---- email_prefix reconciliation (migrate default: ignore) ----

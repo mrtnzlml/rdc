@@ -268,10 +268,11 @@ pub(crate) async fn run_cycle(
     let missing_create_fields = changes.missing_create_fields(&lockfile);
     let settings_problems = changes.organization_settings_problems();
     let unshared_views = changes.unshared_saved_views();
+    let engine_conflicts = changes.queue_engine_conflicts();
 
     // `--no-push` is an audit mode: there is nothing to half-apply, so it
     // proceeds and merely reports. `--dry-run` proceeds too — its job is
-    // to print the COMPLETE plan, and it already surfaces all five classes
+    // to print the COMPLETE plan, and it already surfaces all six classes
     // in dedicated sections further down.
     if !no_push && !dry_run {
         refuse_on_offline_defects(
@@ -280,6 +281,7 @@ pub(crate) async fn run_cycle(
             &missing_create_fields,
             &settings_problems,
             &unshared_views,
+            &engine_conflicts,
         )?;
     }
 
@@ -606,6 +608,22 @@ pub(crate) async fn run_cycle(
             progress.block(&body);
         }
 
+        if !engine_conflicts.is_empty() {
+            progress.event(Action::Plan, "queues binding more than one engine");
+            let mut body = String::new();
+            use std::fmt::Write as _;
+            for c in &engine_conflicts {
+                let _ = writeln!(
+                    body,
+                    "- queues/{} -- {}: binds {} (the API accepts one)",
+                    c.slug,
+                    c.path.display(),
+                    c.fields.join(", "),
+                );
+            }
+            progress.block(&body);
+        }
+
         if !renderer_was_supplied {
             let parse_suffix = if parse_errors.is_empty() {
                 String::new()
@@ -652,8 +670,18 @@ pub(crate) async fn run_cycle(
                     if unshared_views.len() == 1 { "" } else { "s" }
                 )
             };
+            let engine_suffix = if engine_conflicts.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", {} queue engine conflict{}",
+                    engine_conflicts.len(),
+                    if engine_conflicts.len() == 1 { "" } else { "s" }
+                )
+            };
             let parse_suffix = format!(
-                "{parse_suffix}{limit_suffix}{missing_suffix}{settings_suffix}{unshared_suffix}"
+                "{parse_suffix}{limit_suffix}{missing_suffix}{settings_suffix}\
+                 {unshared_suffix}{engine_suffix}"
             );
             progress.event(
                 Action::Done,
@@ -1640,15 +1668,16 @@ pub fn from_catalog_scan_lockfile(
 
 /// Refuse a push over defects that are knowable from local bytes alone.
 ///
-/// All five classes are *permanent*: an unparseable file, an over-length
+/// All six classes are *permanent*: an unparseable file, an over-length
 /// field, an object missing a field the API demands (always checked on
 /// create; also on update for a kind whose PATCH body is the fully-typed
 /// model re-serialized rather than a partial diff — see
 /// `snapshot::limits::required_for_create_also_applies_to_update`), a
 /// structural problem in an organization's `settings`, and a local saved view
-/// that isn't shared can never be accepted by the server (or, for the last,
-/// would just be re-created and never recorded — see
-/// `snapshot::limits::check_saved_view_shared`), so attempting the push
+/// that isn't shared, and a queue binding two engines at once can never be
+/// accepted by the server (or, for the saved view, would just be re-created
+/// and never recorded — see `snapshot::limits::check_saved_view_shared`), so
+/// attempting the push
 /// aborts the cycle before the pull phase on every single run — wedging the
 /// project until a human notices, and (for a create) after earlier kinds are
 /// already written. Raising them here keeps the remote untouched and names
@@ -1659,6 +1688,7 @@ fn refuse_on_offline_defects(
     missing_create_fields: &[crate::cli::push::scan::MissingCreateField],
     settings_problems: &[(std::path::PathBuf, crate::snapshot::limits::SettingsProblem)],
     unshared_views: &[crate::snapshot::limits::UnsharedSavedView],
+    engine_conflicts: &[crate::snapshot::limits::EngineSlotConflict],
 ) -> Result<()> {
     use std::fmt::Write as _;
 
@@ -1755,6 +1785,32 @@ fn refuse_on_offline_defects(
                 v.path.display(),
             );
         }
+        anyhow::bail!("{msg}");
+    }
+
+    if !engine_conflicts.is_empty() {
+        let mut msg = format!(
+            "{} local queue(s) bind more than one engine; the Rossum API accepts only one of \
+             `engine`, `dedicated_engine`, `generic_engine`; refusing to push before any \
+             remote write:",
+            engine_conflicts.len()
+        );
+        for c in engine_conflicts {
+            let _ = write!(
+                msg,
+                "\n  - queues/{} -- {}: binds {}",
+                c.slug,
+                c.path.display(),
+                c.fields.join(", "),
+            );
+        }
+        // Leaving `engine` and clearing the rest is what `migrate` now
+        // produces itself, so a re-migrate is the fix for a promoted env.
+        let _ = write!(
+            msg,
+            "\n  Keep the binding you want and set the others to null (a queue bound to a \
+             custom `engine` has `generic_engine: null`), or re-run migrate."
+        );
         anyhow::bail!("{msg}");
     }
 
@@ -2337,7 +2393,7 @@ mod tests {
             path: std::path::PathBuf::from("envs/prod/workspaces/main/queues/invoices/inbox.json"),
             field: "email_prefix",
         }];
-        let err = refuse_on_offline_defects(&[], &[], &missing, &[], &[])
+        let err = refuse_on_offline_defects(&[], &[], &missing, &[], &[], &[])
             .expect_err("a doomed create must refuse the push");
         let msg = err.to_string();
         assert!(msg.contains("inboxes/invoices"), "{msg}");
@@ -2348,7 +2404,8 @@ mod tests {
     /// ...and must stay silent when there is nothing to refuse.
     #[test]
     fn refuse_on_offline_defects_passes_a_clean_change_list() {
-        refuse_on_offline_defects(&[], &[], &[], &[], &[]).expect("a clean scan must not refuse");
+        refuse_on_offline_defects(&[], &[], &[], &[], &[], &[])
+            .expect("a clean scan must not refuse");
     }
 
     /// An unshared saved view is the fifth permanent-defect class: refuse
@@ -2360,10 +2417,29 @@ mod tests {
             slug: "mine".to_string(),
             path: std::path::PathBuf::from("envs/prod/saved-views/mine.json"),
         }];
-        let err = refuse_on_offline_defects(&[], &[], &[], &[], &unshared)
+        let err = refuse_on_offline_defects(&[], &[], &[], &[], &unshared, &[])
             .expect_err("an unshared saved view must refuse the push");
         let msg = err.to_string();
         assert!(msg.contains("saved-views/mine"), "{msg}");
         assert!(msg.contains("shared"), "{msg}");
+    }
+
+    /// A queue naming two engines is the sixth class. The message has to be
+    /// actionable on its own: which queue, which file, which fields, and what
+    /// to do — the live failure named only a remote queue id.
+    #[test]
+    fn refuse_on_offline_defects_bails_on_two_engine_bindings() {
+        let conflicts = vec![crate::snapshot::limits::EngineSlotConflict {
+            slug: "invoices".to_string(),
+            path: std::path::PathBuf::from("envs/prod/workspaces/main/queues/invoices/queue.json"),
+            fields: vec!["engine", "generic_engine"],
+        }];
+        let err = refuse_on_offline_defects(&[], &[], &[], &[], &[], &conflicts)
+            .expect_err("two engine bindings must refuse the push");
+        let msg = err.to_string();
+        assert!(msg.contains("queues/invoices"), "{msg}");
+        assert!(msg.contains("queue.json"), "{msg}");
+        assert!(msg.contains("engine, generic_engine"), "{msg}");
+        assert!(msg.contains("migrate"), "must point at the fix: {msg}");
     }
 }

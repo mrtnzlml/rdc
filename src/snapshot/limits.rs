@@ -327,6 +327,45 @@ pub fn check_saved_view_shared(body: &serde_json::Value) -> bool {
     body.get("shared").and_then(|s| s.as_bool()) == Some(true)
 }
 
+/// The queue fields that name its extraction engine, in the precedence rdc
+/// keeps when a snapshot carries more than one.
+///
+/// They are **mutually exclusive**: `PATCH /queues/<id>` with two of them
+/// non-null answers `400 non_field_errors: Only one of dedicated_engine,
+/// generic_engine or engine can be set.` A body may still carry all three
+/// keys — a pulled queue always does — as long as at most one has a value;
+/// the API counts values, not keys, which is why detaching an engine is
+/// expressed as `{"engine": null, "generic_engine": "<url>"}`.
+///
+/// `engine` first because it is the modern custom-engine binding and the one
+/// rdc manages as a kind; `generic_engine` last because it is the per-env
+/// built-in every queue falls back to (and the value `migrate` restores from
+/// the target rather than promoting — see
+/// `cli::migrate::reconcile_engine_slot`).
+pub const QUEUE_ENGINE_FIELDS: [&str; 3] = ["engine", "dedicated_engine", "generic_engine"];
+
+/// A local queue file whose engine binding names more than one engine.
+#[derive(Debug, PartialEq, Eq)]
+pub struct EngineSlotConflict {
+    pub slug: String,
+    pub path: std::path::PathBuf,
+    /// Every [`QUEUE_ENGINE_FIELDS`] entry the body sets, in that order.
+    pub fields: Vec<&'static str>,
+}
+
+/// Every [`QUEUE_ENGINE_FIELDS`] entry a queue body sets, but only when it
+/// sets more than one — i.e. only when the body is a state the API refuses.
+///
+/// A queue with one binding, or none, returns empty. So does a non-object,
+/// so a malformed file is left to `json_parse_errors`.
+pub fn check_queue_engine_slot(body: &serde_json::Value) -> Vec<&'static str> {
+    let set: Vec<&'static str> = QUEUE_ENGINE_FIELDS
+        .into_iter()
+        .filter(|f| body.get(*f).is_some_and(|v| !v.is_null()))
+        .collect();
+    if set.len() > 1 { set } else { Vec::new() }
+}
+
 /// Declared `max_length` for each kind's top-level string fields.
 ///
 /// Kinds absent from this match (and fields absent from a kind's slice)
@@ -1070,5 +1109,60 @@ mod tests {
                 "must be refused: {body}"
             );
         }
+    }
+
+    #[test]
+    fn one_engine_binding_is_not_a_conflict() {
+        for field in QUEUE_ENGINE_FIELDS {
+            let body = json!({
+                "engine": null,
+                "dedicated_engine": null,
+                "generic_engine": null,
+                field: "https://x.invalid/api/v1/engines/1",
+            });
+            assert_eq!(
+                check_queue_engine_slot(&body),
+                Vec::<&str>::new(),
+                "{field} alone is the normal state of every queue"
+            );
+        }
+        // All three keys present and all null: a queue with no engine at all,
+        // which the API stores happily.
+        let body = json!({ "engine": null, "dedicated_engine": null, "generic_engine": null });
+        assert_eq!(check_queue_engine_slot(&body), Vec::<&str>::new());
+        // No keys at all (a create body).
+        assert_eq!(check_queue_engine_slot(&json!({ "name": "q" })), Vec::<&str>::new());
+    }
+
+    /// The shape a `migrate` before `reconcile_engine_slot` wrote: the
+    /// source's custom `engine` next to the target's restored
+    /// `generic_engine`.
+    #[test]
+    fn two_engine_bindings_are_reported_in_precedence_order() {
+        let body = json!({
+            "generic_engine": "https://x.invalid/api/v1/generic_engines/5",
+            "engine": "https://x.invalid/api/v1/engines/7",
+            "dedicated_engine": null,
+        });
+        assert_eq!(check_queue_engine_slot(&body), vec!["engine", "generic_engine"]);
+    }
+
+    #[test]
+    fn three_engine_bindings_are_all_reported() {
+        let body = json!({
+            "engine": "https://x.invalid/api/v1/engines/7",
+            "dedicated_engine": "https://x.invalid/api/v1/dedicated_engines/2",
+            "generic_engine": "https://x.invalid/api/v1/generic_engines/5",
+        });
+        assert_eq!(
+            check_queue_engine_slot(&body),
+            vec!["engine", "dedicated_engine", "generic_engine"]
+        );
+    }
+
+    #[test]
+    fn engine_slot_check_ignores_a_non_object() {
+        assert_eq!(check_queue_engine_slot(&json!("a string")), Vec::<&str>::new());
+        assert_eq!(check_queue_engine_slot(&json!(null)), Vec::<&str>::new());
     }
 }

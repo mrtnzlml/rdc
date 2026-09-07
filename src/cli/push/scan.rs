@@ -344,6 +344,36 @@ impl ChangeList {
         out
     }
 
+    /// Local queue files that bind more than one engine.
+    ///
+    /// See `snapshot::limits::check_queue_engine_slot`. Like an over-length
+    /// field this is a *permanent* push failure — the server answers 400
+    /// whatever the retry — so it is refused offline rather than learned
+    /// from a mid-push error naming only a remote queue id. It reaches a
+    /// snapshot when `migrate` promotes a source queue's custom `engine`
+    /// onto a target queue whose own `generic_engine` it restores, or when
+    /// an `overlay.toml` sets a second binding by hand.
+    pub fn queue_engine_conflicts(&self) -> Vec<crate::snapshot::limits::EngineSlotConflict> {
+        let mut out = Vec::new();
+        for (slug, path) in &self.queues {
+            let Ok(bytes) = std::fs::read(path) else {
+                continue; // unreadable — push surfaces I/O errors
+            };
+            let Ok(body) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                continue; // unparseable is already reported by json_parse_errors
+            };
+            let fields = crate::snapshot::limits::check_queue_engine_slot(&body);
+            if !fields.is_empty() {
+                out.push(crate::snapshot::limits::EngineSlotConflict {
+                    slug: slug.clone(),
+                    path: path.clone(),
+                    fields,
+                });
+            }
+        }
+        out
+    }
+
     /// Does this struct have a slot for `kind` at all?
     ///
     /// Distinguishes "a kind rdc does not push" from "a kind rdc pushes that
