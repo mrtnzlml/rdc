@@ -1,13 +1,13 @@
 //! Execute the classified plan. Dispatches four branches:
 //!
-//! - **Conflict (`BothDiverged`)** — runs first via [`resolve_conflicts`].
+//! - **Conflict (`BothDiverged`)** — runs first via `resolve_conflicts`.
 //!   Each conflict prompts the user (`[k]/[r]/[e]/[s]/[a]`), then routes the
 //!   outcome: keep-local / edit promote the item to LocalEdit (pushed
 //!   below); keep-remote writes the remote bytes to disk + lockfile;
 //!   skip writes a shadow file and records the local hash; abort bubbles
 //!   [`crate::cli::resolve::PullAborted`].
 //! - **Remote-delete + double-conflict + both-deleted** — handled by
-//!   [`resolve_remote_deletes`]. A clean `RemoteDelete` (local unchanged
+//!   `resolve_remote_deletes`. A clean `RemoteDelete` (local unchanged
 //!   vs base — the class's definition) AUTO-RESOLVES by mirroring the
 //!   env's deletion locally, with a visible per-item Delete event — no
 //!   prompt, interactive and non-TTY alike. The genuine conflicts

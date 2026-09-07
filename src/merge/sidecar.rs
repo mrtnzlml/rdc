@@ -21,8 +21,8 @@
 
 use super::MergeOutcome;
 
-/// `path_label` is the label used in the log line ("hook.code",
-/// "rule.trigger_condition", "schema.formula.<datapoint>") — never
+/// `path_label` is the label used in the log line (`hook.code`,
+/// `rule.trigger_condition`, `schema.formula.<datapoint>`) — never
 /// the local disk path. The merge itself doesn't care about the
 /// labeling; the caller passes it through to whatever logging
 /// surface they have.

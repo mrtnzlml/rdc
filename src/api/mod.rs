@@ -319,10 +319,11 @@ impl RossumClient {
     }
 
     /// Partial-body variant: PATCH with a hand-built `serde_json::Value`.
-    /// Deploy uses this so it can strip per-env fields like `email`
+    /// Written so a cross-env caller could strip per-env fields like `email`
     /// (auto-assigned at create, immutable in practice; sending the src
     /// env's value cross-env at best is ignored, at worst rewrites the
-    /// tgt inbox's email). Mirror of [`update_hook_value`].
+    /// tgt inbox's email). That caller was `rdc deploy`; nothing reaches
+    /// this today. Mirror of [`Self::update_hook_value`].
     pub async fn update_inbox_value(&self, id: u64, body: &serde_json::Value, progress: ProgressHandle) -> Result<Inbox> {
         self.patch_json(&format!("/inboxes/{id}"), body, progress).await
     }
@@ -375,7 +376,8 @@ impl RossumClient {
     /// Partial-body variant: PATCH with a hand-built `serde_json::Value`.
     /// Useful when the caller needs to omit immutable fields like `name`
     /// (Rossum rejects renaming an existing engine field with 400). Mirror
-    /// of [`update_hook_value`].
+    /// of [`Self::update_hook_value`]. No caller today — the engine-field
+    /// driver strips `name` through `strip_for_cross_env_patch` instead.
     pub async fn update_engine_field_value(&self, id: u64, body: &serde_json::Value, progress: ProgressHandle) -> Result<EngineField> {
         self.patch_json(&format!("/engine_fields/{id}"), body, progress).await
     }

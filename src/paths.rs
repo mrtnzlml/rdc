@@ -126,7 +126,7 @@ impl Paths {
     }
 
     /// Legacy per-pair mapping files `<root>/.rdc/map/<a>-to-<b>.toml`, if any.
-    /// Superseded by [`mapping_file`]; enumerated only to migrate them once.
+    /// Superseded by [`Self::mapping_file`]; enumerated only to migrate them once.
     pub fn legacy_mapping_files(&self) -> Vec<PathBuf> {
         let dir = self.mapping_dir();
         let Ok(entries) = std::fs::read_dir(&dir) else {

@@ -38,7 +38,7 @@ pub fn is_oid(v: &Value) -> bool {
 }
 
 /// Reduce a row to its canonical form: keys sorted recursively (via
-/// [`crate::snapshot::noise::sort_keys_recursive`], which preserves array
+/// `snapshot::noise::sort_keys_recursive`, which preserves array
 /// element order as data), a server-generated `_id` dropped.
 pub fn canonicalize_row(row: &Value) -> Value {
     let mut out = row.clone();

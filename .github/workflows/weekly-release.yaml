@@ -150,6 +150,22 @@ jobs:
         # week red for a reason unrelated to the release.
         run: cargo clippy --all-targets --locked -- -D warnings
 
+      - name: Docs
+        if: steps.plan.outputs.release == 'true'
+        # This tree's doc comments are maintainer documentation — long, and
+        # dense with `[`intra-doc links`]` between the pieces they explain.
+        # 43 of those links had rotted (a renamed target, a path that was
+        # never public, prose brackets rustdoc read as a link) with nothing
+        # watching, so `cargo doc` was answering every reader with a page of
+        # warnings and a handful of dead links.
+        #
+        # `--document-private-items` on purpose: it is the strict superset
+        # (it also checks the docs ON private items, which is most of them
+        # here) and it is how anyone reading these docs would generate them.
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --document-private-items --locked
+
       - name: Bump version
         if: steps.plan.outputs.release == 'true'
         run: .github/scripts/bump-version.sh "${{ steps.plan.outputs.version }}"

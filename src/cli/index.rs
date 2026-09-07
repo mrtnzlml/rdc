@@ -115,7 +115,7 @@ struct IndexCtx<'a> {
     queue_to_hooks: BTreeMap<String, Vec<String>>,
     /// queue_slug → [rule_slug, ...]
     queue_to_rules: BTreeMap<String, Vec<String>>,
-    /// queue_slug → [<ws>/<q>/<t> compound key, ...]
+    /// queue_slug → [`<ws>/<q>/<t>` compound key, ...]
     queue_to_email_templates: BTreeMap<String, Vec<String>>,
     /// engine_slug → [engine_field_slug, ...]
     engine_to_fields: BTreeMap<String, Vec<String>>,

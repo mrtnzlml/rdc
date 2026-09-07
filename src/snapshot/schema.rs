@@ -241,7 +241,7 @@ fn merge_formulas(node: &mut Value, formulas_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Collect the datapoint ids that [`merge_formulas`] would actually splice
+/// Collect the datapoint ids that `merge_formulas` would actually splice
 /// a sidecar into: every datapoint with **no** inline `formula` key
 /// already present. Walks the identical recursion shape — array
 /// `children` for sections and tuples, a single object `children` for a

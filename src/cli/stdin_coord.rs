@@ -60,7 +60,7 @@ pub enum PromptKind {
     DeleteDrift,
     MdhIndexDrop,
     MdhRowDelete,
-    /// A coordinated read whose site never called [`announce`]. Should be
+    /// A coordinated read whose site never called `announce`. Should be
     /// unreachable in a correctly wired build — every resolver announces
     /// before it reads — so it exists to make a missed announce loud (a
     /// visibly wrong dialog) rather than silently disguised as one of the
@@ -104,7 +104,7 @@ impl Prompt {
 /// resuming thread. A task-local value travels WITH the task across such
 /// moves, so it stays attached to the one watch that installed it
 /// regardless of which OS thread ends up polling it. The process-global
-/// [`COORD`] (below) has a single waiting slot for the same reason two
+/// `COORD` (below) has a single waiting slot for the same reason two
 /// concurrent watches can't share it — but a route is scoped per-watch, so
 /// task-local is the right granularity, not process-global.
 pub trait PromptRoute: Send + Sync {
@@ -132,13 +132,13 @@ tokio::task_local! {
 
 /// Run `f` with `route` installed as the [`PromptRoute`] for every
 /// coordinated prompt `f` (or anything it calls, including across
-/// `.await` points) issues, via [`announce`] + [`read_line_coordinated`].
+/// `.await` points) issues, via `announce` + `read_line_coordinated`.
 ///
 /// Nothing in the CLI calls this — it is the entry point a non-terminal
 /// consumer (the desktop bridge, `cli::sync::embed::watch_logged`) uses to
 /// scope one watch's prompts to its own route. Backed by `tokio::task_local!`
 /// (see [`PromptRoute`]'s doc for why), so the route (and its pending
-/// announcement — see [`PENDING`]) is visible for exactly the lifetime of
+/// announcement — see `PENDING`) is visible for exactly the lifetime of
 /// `f` and disappears the instant `f` resolves — no guard to drop, no risk
 /// of a stale route outliving its watch.
 pub async fn with_route<F: Future>(route: Arc<dyn PromptRoute>, f: F) -> F::Output {

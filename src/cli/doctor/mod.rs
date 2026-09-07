@@ -37,8 +37,12 @@ pub async fn run(env: &str, dry_run: bool) -> Result<()> {
     let log = Log::new(crate::cli::resolve::detect_color_mode());
 
     // 1. Pre-flight: local changes not yet pushed to the remote (offline).
-    let (unpushed, limit_violations, missing_create_fields, engine_conflicts) =
-        scan_unpushed(&paths, &api_base)?;
+    let Unpushed {
+        changes: unpushed,
+        limit_violations,
+        missing_create_fields,
+        engine_conflicts,
+    } = scan_unpushed(&paths, &api_base)?;
 
     // Fields the API will reject on length. Reported here — the offline
     // pre-flight — because it is the cheapest place to learn: `rdc sync`
@@ -167,26 +171,31 @@ pub async fn run(env: &str, dry_run: bool) -> Result<()> {
 /// declared `max_length` and any queue naming more than one engine.
 /// Returns everything empty when there's no lockfile yet —
 /// nothing is tracked, so nothing is "unpushed".
-fn scan_unpushed(
-    paths: &Paths,
-    api_base: &str,
-) -> Result<(
-    usize,
-    Vec<crate::cli::push::scan::FieldLimitViolation>,
-    Vec<crate::cli::push::scan::MissingCreateField>,
-    Vec<crate::snapshot::limits::EngineSlotConflict>,
-)> {
+fn scan_unpushed(paths: &Paths, api_base: &str) -> Result<Unpushed> {
     let lockfile_path = paths.lockfile();
     if !lockfile_path.exists() {
-        return Ok((0, Vec::new(), Vec::new(), Vec::new()));
+        return Ok(Unpushed::default());
     }
     let mut lockfile = Lockfile::load(&lockfile_path)?;
     lockfile.api_base = api_base.to_string();
     let (_scanned, changes, tombstones) = crate::cli::push::scan::scan(paths, &lockfile)?;
-    Ok((
-        changes.total() + tombstones.total(),
-        changes.field_limit_violations(),
-        changes.missing_create_fields(&lockfile),
-        changes.queue_engine_conflicts(),
-    ))
+    Ok(Unpushed {
+        changes: changes.total() + tombstones.total(),
+        limit_violations: changes.field_limit_violations(),
+        missing_create_fields: changes.missing_create_fields(&lockfile),
+        engine_conflicts: changes.queue_engine_conflicts(),
+    })
+}
+
+/// What [`scan_unpushed`] found. Named rather than a tuple because three of
+/// the four fields are `Vec`s of different defect kinds, and at the call site
+/// `.2` versus `.3` is the difference between reporting a missing field and
+/// reporting a double engine binding.
+#[derive(Default)]
+struct Unpushed {
+    /// Local edits/creates plus tombstones — the count a push would act on.
+    changes: usize,
+    limit_violations: Vec<crate::cli::push::scan::FieldLimitViolation>,
+    missing_create_fields: Vec<crate::cli::push::scan::MissingCreateField>,
+    engine_conflicts: Vec<crate::snapshot::limits::EngineSlotConflict>,
 }

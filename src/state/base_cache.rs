@@ -20,7 +20,7 @@
 //!                                /email-templates/<tpl>.json
 //! ```
 //!
-//! Writers (pull / push / deploy) call [`write`] every time they
+//! Writers (both phases of a sync) call [`write()`] every time they
 //! commit an authoritative snapshot to disk — alongside the env-tree
 //! file, never instead of it. Readers (sync's conflict resolver)
 //! call [`read`] to look up the base for a 3-way merge. Doctor's

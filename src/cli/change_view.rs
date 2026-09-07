@@ -83,7 +83,7 @@ pub enum RowVerb {
 }
 
 impl RowVerb {
-    /// The bare verb. [`render_row`] pads it to [`VERB_W`], so the width lives
+    /// The bare verb. [`render_row`] pads it to `VERB_W`, so the width lives
     /// in exactly one place and a future verb cannot shift the kind column.
     pub fn token(self) -> &'static str {
         match self {

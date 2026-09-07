@@ -135,7 +135,7 @@ impl Mapping {
         })
     }
 
-    /// Mutable sibling of [`kind_map`], used by [`GenericMapping::orient`] to
+    /// Mutable sibling of [`Self::kind_map`], used by [`GenericMapping::orient`] to
     /// populate a fresh oriented `Mapping`. Same kind set; `None` for
     /// non-deployable kinds.
     pub fn kind_map_mut(&mut self, kind: &str) -> Option<&mut BTreeMap<String, String>> {
@@ -159,7 +159,8 @@ impl Mapping {
 /// On-disk, direction-free slug map for a whole project. Each entry is a
 /// logical object; each environment names its own slug. Only objects whose
 /// slug DIFFERS across envs are stored — identical slugs map 1:1 by default.
-/// Oriented into a per-pair [`Mapping`] via [`orient`] for `migrate`.
+/// Oriented into a per-pair [`Mapping`] via [`GenericMapping::orient`] for
+/// `migrate`.
 /// Default for [`GenericMapping::version`] when a hand-authored
 /// `mapping.toml` omits the field entirely.
 fn default_generic_mapping_version() -> u32 {

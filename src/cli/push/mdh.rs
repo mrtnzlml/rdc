@@ -781,7 +781,6 @@ fn prompt_confirm_index_drops(
         let mut q = progress.writer();
         write!(q, "Proceed with the drop(s)? [y/N] ").ok();
         q.flush().ok();
-        drop(q);
         let ans = crate::cli::stdin_coord::read_line_coordinated()?
             .unwrap_or_default()
             .trim()

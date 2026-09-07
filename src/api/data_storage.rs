@@ -48,7 +48,8 @@ pub struct DataStorageClient {
 /// Generic envelope wrapping every Data Storage response. Write
 /// endpoints (`*/create`, `*/drop`) return `{code, message}` without a
 /// `result` field, so we model `result` as optional and use
-/// [`post_envelope_void`] for those, leaving [`post_envelope`] for the
+/// [`DataStorageClient::post_envelope_void`] for those, leaving
+/// [`DataStorageClient::post_envelope`] for the
 /// read paths that need to decode the body.
 #[derive(Debug, Deserialize)]
 struct Envelope<T> {
@@ -120,7 +121,8 @@ impl DataStorageClient {
     /// collection (no indexes beyond the implicit `_id_`, no documents). Used to
     /// materialize an index-less "data-only" collection on a target env: such a
     /// collection has no index schema for the normal create-via-indexes path
-    /// ([`push_dataset`]) to act on, so without this it would never appear on the
+    /// ([`crate::cli::push::mdh::push_dataset`]) to act on, so without this it
+    /// would never appear on the
     /// target. Response body is the resultless `{success: true}` envelope.
     pub async fn create_collection(
         &self,
@@ -165,7 +167,7 @@ impl DataStorageClient {
     ///
     /// A missing collection returns `{"code":"ok","result":[]}` — NOT a 404 — so
     /// an empty result never implies the collection is gone. Existence comes
-    /// from [`list_collections`].
+    /// from [`Self::list_collections`].
     pub async fn find_all(
         &self,
         collection: &str,
@@ -404,7 +406,7 @@ impl DataStorageClient {
         Ok(typed)
     }
 
-    /// Write-endpoint companion to [`post_envelope`]: still validates
+    /// Write-endpoint companion to [`Self::post_envelope`]: still validates
     /// the envelope's `code == "ok"` invariant, but accepts the
     /// resultless `{code, message}` body that the create/drop verbs
     /// return.

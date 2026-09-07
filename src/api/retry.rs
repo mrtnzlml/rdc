@@ -16,7 +16,7 @@
 //!
 //! - CONNECT failures (DNS resolution, connection refused/reset before the
 //!   request is on the wire) get the same exponential backoff. See
-//!   [`is_retriable_transport`] for why only connect-class errors qualify.
+//!   `is_retriable_transport` for why only connect-class errors qualify.
 //!
 //! Status codes NOT retried (returned to caller as-is):
 //! - 4xx other than 429: auth/permission/not-found/method — retrying

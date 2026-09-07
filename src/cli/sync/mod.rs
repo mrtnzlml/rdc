@@ -32,7 +32,7 @@
 //!
 //! ## Layer 2 — Resolver
 //!
-//! [`execute::resolve_conflicts`] processes every `BothDiverged` item
+//! `execute::resolve_conflicts` processes every `BothDiverged` item
 //! and, for combined-hash kinds, MUST NOT rely on
 //! [`crate::cli::resolve::prompt_resolve`]'s `local_canonical ==
 //! remote_canonical` short-circuit. That short-circuit only compares
@@ -55,17 +55,10 @@
 //!
 //! ## Layer 3 — Push-side drift check (`resolve_push_drift`)
 //!
-//! Every per-kind push driver
-//! ([`crate::cli::push::hooks::push`],
-//! [`crate::cli::push::rules::push`],
-//! [`crate::cli::push::schemas::push`],
-//! [`crate::cli::push::labels::push`],
-//! [`crate::cli::push::workspaces::push`],
-//! [`crate::cli::push::engines::push`],
-//! [`crate::cli::push::engine_fields::push`],
-//! [`crate::cli::push::queues::push`],
-//! [`crate::cli::push::inboxes::push`],
-//! [`crate::cli::push::email_templates::push`])
+//! Every per-kind push driver — the `push` fn of `cli::push::hooks`,
+//! `rules`, `schemas`, `labels`, `workspaces`, `engines`, `engine_fields`,
+//! `queues`, `inboxes` and `email_templates` (those modules are private to
+//! `cli::push`, so these are source references, not doc links) —
 //! re-fetches the remote object just before issuing the PATCH/POST,
 //! re-serializes it through the canonical form, and compares its
 //! combined hash against the lockfile-recorded `content_hash`. If

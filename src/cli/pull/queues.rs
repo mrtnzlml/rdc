@@ -3,7 +3,7 @@
 //!
 //! Schema + inbox remote bytes are supplied by the caller via the
 //! `schemas_by_queue_id` / `inboxes_by_queue_id` maps that
-//! [`crate::cli::pull::common::prefetch_queue_children`] populates during
+//! `pull::common::prefetch_queue_children` populates during
 //! Phase 1 of sync. There is only one fetch round per cycle; the per-queue
 //! write decisions stay sequential because they touch shared state
 //! (lockfile, queue_locations, conflict counts).
@@ -115,7 +115,7 @@ pub fn locate_queues(ctx: &mut PullCtx<'_>, queues: &[Queue]) {
 ///
 /// `schemas_by_queue_id` and `inboxes_by_queue_id` are the catalog's
 /// pre-fetched per-queue children populated by
-/// [`crate::cli::pull::common::prefetch_queue_children`] during Phase 1.
+/// `pull::common::prefetch_queue_children` during Phase 1.
 /// A queue whose entry is missing from a given map (no schema URL, no
 /// inbox URL, or a malformed URL that the prefetch silently dropped)
 /// simply does not get the corresponding write here — the same outcome

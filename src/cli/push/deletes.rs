@@ -157,7 +157,6 @@ pub fn confirm_or_refuse(
     let mut q = progress.writer();
     write!(q, "Proceed with deletion? [y/N] ").ok();
     q.flush().ok();
-    drop(q);
     // Route via the stdin coordinator so this prompt cooperates with the
     // `rdc sync --watch` Enter-trigger reader instead of fighting it for
     // the terminal. Outside watch it reads stdin directly.
@@ -399,7 +398,6 @@ fn resolve_delete_drift(
     .ok();
     write!(q, "[k]eep delete  [r]estore  [s]kip  [a]bort > ").ok();
     q.flush().ok();
-    drop(q);
     let ans = crate::cli::stdin_coord::read_line_coordinated()?
         .unwrap_or_default()
         .trim()

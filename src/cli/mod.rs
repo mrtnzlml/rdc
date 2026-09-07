@@ -253,7 +253,7 @@ pub enum Command {
     ///
     /// Provide credentials via one of:
     /// * `--token <T>` — explicit token (CI-friendly).
-    /// * `--username <U>` — exchanges <U> + password (stdin or TTY
+    /// * `--username <U>` — exchanges `<U>` + password (stdin or TTY
     ///   prompt) for a token via POST /v1/auth/login; the token and
     ///   computed expiry (162h from now) are written to the secrets file.
     /// * Neither — read a token from stdin (back-compat with today).

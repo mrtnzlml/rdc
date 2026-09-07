@@ -45,7 +45,7 @@ pub struct PullCtx<'a> {
     /// and consumed by drivers for queue-nested kinds (currently
     /// email_templates). Empty until queues run.
     pub queue_locations: BTreeMap<String, (String, String)>,
-    /// When true, conflicts trigger an interactive [k]/[r]/[e]/[s]/[a]
+    /// When true, conflicts trigger an interactive `[k]`/`[r]`/`[e]`/`[s]`/`[a]`
     /// prompt (spec §8.3). False on non-TTY or when `--yes` was passed —
     /// in that case `apply_pull_action` falls back to the legacy
     /// shadow-file behavior. Drivers consult `ctx.interactive` and pass

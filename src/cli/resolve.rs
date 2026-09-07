@@ -81,12 +81,12 @@ pub enum Resolution {
     /// committed bytes are still recorded in the lockfile by hash, so a
     /// follow-up pull sees the partial resolution as the new base.
     EditWithMarkers(Vec<u8>),
-    /// User chose "[K] keep local for ALL remaining conflicts" and confirmed.
+    /// User chose `[K]` — keep local for ALL remaining conflicts — and confirmed.
     /// The executor normalizes this to `KeepLocal` for the current item and
     /// records a sticky `BulkChoice::AllLocal` so the rest of the run skips
     /// prompting. Never reaches the executor's `match resolution` arms.
     KeepLocalAll,
-    /// User chose "[R] use {env} for ALL remaining conflicts" and confirmed.
+    /// User chose `[R]` — use {env} for ALL remaining conflicts — and confirmed.
     /// Normalized to `KeepRemote` + sticky `BulkChoice::AllRemote`.
     KeepRemoteAll,
     /// Treat this as the legacy shadow-file behavior — write

@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use std::path::Path;
 
 /// Write a workflow as `<workflow_dir>/workflow.json`. Mirrors the
-/// workspaces/<ws>/workspace.json pattern: the workflow's own JSON sits
+/// `workspaces/<ws>/workspace.json` pattern: the workflow's own JSON sits
 /// beside the `steps/` subdir that contains its workflow steps.
 pub fn write_workflow(workflow_dir: &Path, w: &Workflow) -> Result<Vec<u8>> {
     let path = workflow_dir.join("workflow.json");
