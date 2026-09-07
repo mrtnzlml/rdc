@@ -122,13 +122,19 @@ pub async fn push_dataset(
     // visible to the diff (and, being absent from base, preserved).
     //
     // A collection that does not exist YET has no indexes, and saying so is the
-    // only sensible answer here — this function is also the create-when-absent
-    // path, so it is reached precisely when there is nothing to list. Data
-    // Storage is asymmetric about it: listing REGULAR indexes on a missing
-    // collection returns an empty list, while listing SEARCH indexes 404s. Left
-    // unhandled, that 404 aborts the push before a single index is created,
-    // which broke creating a dataset from scratch outright. `create_index`
-    // auto-creates the collection, so an empty remote set is exactly right.
+    // only sensible answer here — this function also serves the sync's
+    // create-when-absent path, so it is reached precisely when there is nothing
+    // to list. Data Storage is asymmetric about it: listing REGULAR indexes on a
+    // missing collection returns an empty list, while listing SEARCH indexes
+    // 404s. Left unhandled, that 404 aborts the push before a single index is
+    // created, which broke creating a dataset from scratch outright. An empty
+    // remote set is exactly right: every local index is then a create, and
+    // `indexes/create` auto-creates the collection it names.
+    //
+    // That auto-create is NOT something a caller may lean on, because
+    // `search_indexes/create` does not do it (it 404s "Dataset not found").
+    // A dataset with no regular index has its collection created explicitly by
+    // the caller first — see the stage-2 arm in `crate::cli::sync::execute`.
     let remote_regular = empty_if_absent(
         client
             .list_indexes(collection_name, Some(progress.clone()))

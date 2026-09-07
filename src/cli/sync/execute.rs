@@ -4048,27 +4048,52 @@ pub async fn run(
                         Ok(b) => b,
                         Err(_) => continue,
                     };
-                    // An index-less ("data-only") source collection has no index
-                    // schema for the create-via-indexes path (`push_dataset`) to
-                    // act on — `push_dataset` would be a no-op and the collection
-                    // would never appear on the target. Create the bare collection
-                    // explicitly (`POST /v1/collections/create`) so a full mirror
-                    // includes it, then record its (empty) index set as the base so
-                    // the next sync sees it Clean. Row data follows only for a
+                    let local_set =
+                        serde_json::from_slice::<crate::model::IndexSet>(&local_bytes).ok();
+                    // `push_dataset` does not create collections; it relies on
+                    // `indexes/create` auto-creating one, and orders regular
+                    // creates ahead of search creates so the first of them does
+                    // it. A dataset with NO regular index therefore issues
+                    // nothing that would bring its collection into existence:
+                    //
+                    //   regular [] + search []  -> `push_dataset` is a no-op and
+                    //                              the collection never appears
+                    //   regular [] + search [_] -> `search_indexes/create` (which,
+                    //                              unlike `indexes/create`, does
+                    //                              NOT auto-create) answers
+                    //                              404 "Dataset not found" and
+                    //                              aborts the whole sync
+                    //
+                    // Both are ordinary shapes — a data-only lookup table and a
+                    // full-text-search dataset — so create the bare collection
+                    // explicitly (`POST /v1/collections/create`) first. Safe
+                    // unconditionally here: this arm runs only for a dataset the
+                    // remote listing does not have.
+                    let created_collection = match &local_set {
+                        Some(s) if s.regular.is_empty() => {
+                            catalog
+                                .mdh
+                                .client
+                                .create_collection(&name, Some(progress.clone()))
+                                .await
+                                .with_context(|| {
+                                    format!(
+                                        "creating empty mdh collection '{name}' for mdh/{slug}"
+                                    )
+                                })?;
+                            true
+                        }
+                        _ => false,
+                    };
+                    // Nothing further to reconcile for a wholly index-less
+                    // dataset: record its (empty) index set as the base so the
+                    // next sync sees it Clean. Row data follows only for a
                     // dataset that opted in (`"data": "manual"`); rdc never
                     // touches the rows of a metadata-only collection.
-                    if let Ok(s) = serde_json::from_slice::<crate::model::IndexSet>(&local_bytes)
+                    if let Some(s) = &local_set
                         && s.regular.is_empty()
                         && s.search.is_empty()
                     {
-                        catalog
-                            .mdh
-                            .client
-                            .create_collection(&name, Some(progress.clone()))
-                            .await
-                            .with_context(|| {
-                                format!("creating empty mdh collection '{name}' for mdh/{slug}")
-                            })?;
                         let hash = crate::state::content_hash(
                             &local_bytes,
                             &crate::state::Lockfile::default(),
@@ -4105,6 +4130,13 @@ pub async fn run(
                         .await?;
                         created_local_only.push(slug);
                         continue;
+                    }
+                    if created_collection {
+                        progress.event(
+                            Action::Post,
+                            &format!("mdh/{slug} created collection '{name}'"),
+                        );
+                        outcome.items_pushed += 1;
                     }
                     outcome.items_pushed += crate::cli::push::mdh::push_dataset(
                         &catalog.mdh.client,

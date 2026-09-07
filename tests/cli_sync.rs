@@ -13528,3 +13528,160 @@ async fn sync_refuses_an_unshared_saved_view() {
         "dry-run summary should mention the unshared-view count: {all}"
     );
 }
+
+/// Stage 2 of the MDH push ("create collections absent on this env yet") must
+/// create the COLLECTION itself for a dataset whose index set has no REGULAR
+/// index, not just for a wholly index-less one.
+///
+/// Regression shape: rdc never issued `collections/create` on that path except
+/// for a dataset with neither regular nor search indexes. Everything else
+/// relied on a side effect — `indexes/create` auto-creates its collection — to
+/// bring the collection into existence, and ordered regular creates ahead of
+/// search creates so the first regular create would do it. A SEARCH-ONLY
+/// dataset (`"regular": []` plus one Atlas Search index, the shape a
+/// full-text-lookup dataset naturally has) issues no regular create at all, so
+/// nothing created the collection and `search_indexes/create` answered
+/// `404 Dataset '<name>' not found` — aborting the whole sync, not just that
+/// dataset.
+#[tokio::test]
+async fn sync_creates_the_collection_for_a_search_only_mdh_dataset() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+    mock_empty_lists_except(&server, &[]).await;
+
+    use wiremock::matchers::body_partial_json;
+
+    // The dataset is absent on this env — that is what puts it through stage 2.
+    Mock::given(method("POST"))
+        .and(path("/svc/data-storage/api/v1/collections/list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "ok", "message": "", "result": []
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/svc/data-storage/api/v1/collections/create"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "ok", "message": ""
+        })))
+        .mount(&server)
+        .await;
+    // Listing regular indexes on a collection that does not exist answers an
+    // empty list (the API's asymmetry with search indexes, which 404).
+    Mock::given(method("POST"))
+        .and(path("/svc/data-storage/api/v1/indexes/list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "ok", "message": "", "result": []
+        })))
+        .mount(&server)
+        .await;
+    // First search_indexes/list (the push driver's remote leg): nothing yet.
+    Mock::given(method("POST"))
+        .and(path("/svc/data-storage/api/v1/search_indexes/list"))
+        .and(body_partial_json(
+            serde_json::json!({"collectionName": "_ext__assets"}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "ok", "message": "", "result": []
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    // Every later one (materialization verify + stage-3 pull-back): present,
+    // in the raw shape `search_indexes/list` really returns.
+    Mock::given(method("POST"))
+        .and(path("/svc/data-storage/api/v1/search_indexes/list"))
+        .and(body_partial_json(
+            serde_json::json!({"collectionName": "_ext__assets"}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "ok", "message": "", "result": [{
+                "name": "default",
+                "type": "search",
+                "status": "PENDING",
+                "queryable": false,
+                "latest_definition": { "mappings": { "dynamic": true }, "analyzers": [] }
+            }]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/svc/data-storage/api/v1/search_indexes/create"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "ok", "message": ""
+        })))
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    // Local-only, search-only dataset. `collection.json` carries the real
+    // collection name (the slug is lossy and cannot recover it).
+    let ds_dir = project.path().join("envs/dev/mdh/ext-assets");
+    std::fs::create_dir_all(&ds_dir).unwrap();
+    std::fs::write(
+        ds_dir.join("collection.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({ "name": "_ext__assets" })).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        ds_dir.join("indexes.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "regular": [],
+            "search": [{ "name": "default", "mappings": { "dynamic": true } }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    let result = rdc::cli::sync::run(
+        "dev", /* interactive = */ false, /* dry_run = */ false,
+        /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+        None,
+    )
+    .await;
+    std::env::set_current_dir(&prev_cwd).unwrap();
+
+    let outcome = result.expect("a search-only MDH dataset must not abort the sync");
+
+    let reqs = server.received_requests().await.unwrap();
+    let pos = |suffix: &str| {
+        reqs.iter()
+            .position(|r| r.url.path().ends_with(suffix))
+    };
+    let created = pos("/collections/create");
+    assert!(
+        created.is_some(),
+        "rdc must create the collection explicitly when no regular index will \
+         auto-create it; requests were: {:?}",
+        reqs.iter().map(|r| r.url.path().to_string()).collect::<Vec<_>>()
+    );
+    let searched = pos("/search_indexes/create").expect("the search index must be created");
+    assert!(
+        created.unwrap() < searched,
+        "the collection must exist BEFORE search_indexes/create, or the API 404s"
+    );
+    assert_eq!(
+        outcome.items_pushed, 2,
+        "one collection create plus one search-index create"
+    );
+}
