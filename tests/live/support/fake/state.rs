@@ -157,6 +157,7 @@ impl OrgState {
         (spec.defaults)(obj, &ctx);
         self.next_id += 1;
         self.objects.entry(kind).or_default().insert(id, body.clone());
+        self.relink(kind, id);
         Ok(body)
     }
 
@@ -175,19 +176,23 @@ impl OrgState {
             return Err(ApiError::not_found());
         }
         let stamp = self.now();
-        let slot = self
-            .objects
-            .get_mut(kind)
-            .and_then(|m| m.get_mut(&id))
-            .expect("presence checked above");
-        if let (Some(dst), Some(src)) = (slot.as_object_mut(), patch.as_object()) {
-            for (k, v) in src {
-                // A Rossum PATCH is a shallow merge of the keys it carries.
-                dst.insert(k.clone(), v.clone());
+        let result = {
+            let slot = self
+                .objects
+                .get_mut(kind)
+                .and_then(|m| m.get_mut(&id))
+                .expect("presence checked above");
+            if let (Some(dst), Some(src)) = (slot.as_object_mut(), patch.as_object()) {
+                for (k, v) in src {
+                    // A Rossum PATCH is a shallow merge of the keys it carries.
+                    dst.insert(k.clone(), v.clone());
+                }
+                dst.insert("modified_at".into(), json!(stamp));
             }
-            dst.insert("modified_at".into(), json!(stamp));
-        }
-        Ok(slot.clone())
+            slot.clone()
+        };
+        self.relink(kind, id);
+        Ok(result)
     }
 
     pub fn delete(&mut self, kind: &'static str, id: u64) -> Result<Deletion, ApiError> {
@@ -195,6 +200,7 @@ impl OrgState {
         if self.get(kind, id).is_none() {
             return Err(ApiError::not_found());
         }
+        self.unlink(kind, id);
         if kind == "queues" {
             // `202 deletion_requested`: still listed for one more request.
             self.pending_delete.insert(id, 1);
@@ -253,6 +259,7 @@ impl OrgState {
         }
         for id in done {
             self.pending_delete.remove(&id);
+            self.unlink("queues", id);
             self.objects.get_mut("queues").map(|m| m.remove(&id));
         }
     }
@@ -262,6 +269,155 @@ impl OrgState {
             .get(kind)
             .map(|m| m.keys().copied().collect())
             .unwrap_or_default()
+    }
+
+    /// Push `child_url` into `parent.<field>` if it is not already there.
+    fn add_ref(
+        &mut self,
+        parent_kind: &'static str,
+        parent_url: &str,
+        field: &str,
+        child_url: &str,
+    ) {
+        let Some(id) = parent_url.rsplit('/').next().and_then(|s| s.parse::<u64>().ok()) else {
+            return;
+        };
+        let Some(parent) = self.objects.get_mut(parent_kind).and_then(|m| m.get_mut(&id)) else {
+            return;
+        };
+        let Some(obj) = parent.as_object_mut() else { return };
+        let arr = obj.entry(field.to_string()).or_insert_with(|| json!([]));
+        if let Some(list) = arr.as_array_mut() {
+            let v = json!(child_url);
+            if !list.contains(&v) {
+                list.push(v);
+            }
+        }
+    }
+
+    /// The inverse of `add_ref`.
+    fn remove_ref(
+        &mut self,
+        parent_kind: &'static str,
+        parent_url: &str,
+        field: &str,
+        child_url: &str,
+    ) {
+        let Some(id) = parent_url.rsplit('/').next().and_then(|s| s.parse::<u64>().ok()) else {
+            return;
+        };
+        let Some(parent) = self.objects.get_mut(parent_kind).and_then(|m| m.get_mut(&id)) else {
+            return;
+        };
+        if let Some(list) = parent.get_mut(field).and_then(|v| v.as_array_mut()) {
+            list.retain(|v| v != &json!(child_url));
+        }
+    }
+
+    /// Set `<kind>/<id from url>.<field>` to `value`.
+    fn set_field(&mut self, kind: &'static str, url: &str, field: &str, value: Value) {
+        let Some(id) = url.rsplit('/').next().and_then(|s| s.parse::<u64>().ok()) else {
+            return;
+        };
+        if let Some(obj) = self
+            .objects
+            .get_mut(kind)
+            .and_then(|m| m.get_mut(&id))
+            .and_then(|v| v.as_object_mut())
+        {
+            obj.insert(field.to_string(), value);
+        }
+    }
+
+    /// The inverse of `set_field` — vacates the key entirely rather than
+    /// setting it to `null`. Some Rossum fields (e.g. `queue.inbox`, see
+    /// `src/model/queue.rs`) are `Option<T>` with
+    /// `skip_serializing_if = "Option::is_none"` because the real API
+    /// rejects `null` on PATCH ("This field may not be null."); the fake
+    /// must vacate the key the same way the real server does, or a re-fetch
+    /// would hand back a shape the real API never emits.
+    fn remove_field(&mut self, kind: &'static str, url: &str, field: &str) {
+        let Some(id) = url.rsplit('/').next().and_then(|s| s.parse::<u64>().ok()) else {
+            return;
+        };
+        if let Some(obj) = self
+            .objects
+            .get_mut(kind)
+            .and_then(|m| m.get_mut(&id))
+            .and_then(|v| v.as_object_mut())
+        {
+            obj.remove(field);
+        }
+    }
+
+    /// Grow every back-reference this object's own refs imply. The real API
+    /// maintains these server-side; `pull::queues::refresh_backrefs` exists
+    /// because they change under rdc's feet.
+    fn relink(&mut self, kind: &'static str, id: u64) {
+        let Some(me) = self.get(kind, id) else { return };
+        let my_url = self.url(kind, id);
+        match kind {
+            "queues" => {
+                if let Some(ws) = me.get("workspace").and_then(|v| v.as_str()) {
+                    self.add_ref("workspaces", ws, "queues", &my_url);
+                }
+                if let Some(sc) = me.get("schema").and_then(|v| v.as_str()) {
+                    self.add_ref("schemas", sc, "queues", &my_url);
+                }
+            }
+            "inboxes" => {
+                let empty = Vec::new();
+                for q in me.get("queues").and_then(|v| v.as_array()).unwrap_or(&empty) {
+                    if let Some(q) = q.as_str() {
+                        self.set_field("queues", q, "inbox", json!(my_url));
+                    }
+                }
+            }
+            "hooks" | "rules" => {
+                let field = if kind == "hooks" { "hooks" } else { "rules" };
+                let empty = Vec::new();
+                for q in me.get("queues").and_then(|v| v.as_array()).unwrap_or(&empty) {
+                    if let Some(q) = q.as_str() {
+                        self.add_ref("queues", q, field, &my_url);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The inverse, so a delete leaves no dangling back-reference.
+    fn unlink(&mut self, kind: &'static str, id: u64) {
+        let Some(me) = self.get(kind, id) else { return };
+        let my_url = self.url(kind, id);
+        match kind {
+            "queues" => {
+                if let Some(ws) = me.get("workspace").and_then(|v| v.as_str()) {
+                    self.remove_ref("workspaces", ws, "queues", &my_url);
+                }
+                if let Some(sc) = me.get("schema").and_then(|v| v.as_str()) {
+                    self.remove_ref("schemas", sc, "queues", &my_url);
+                }
+            }
+            "inboxes" => {
+                let empty = Vec::new();
+                for q in me.get("queues").and_then(|v| v.as_array()).unwrap_or(&empty) {
+                    if let Some(q) = q.as_str() {
+                        self.remove_field("queues", q, "inbox");
+                    }
+                }
+            }
+            "hooks" | "rules" => {
+                let field = if kind == "hooks" { "hooks" } else { "rules" };
+                let empty = Vec::new();
+                for q in me.get("queues").and_then(|v| v.as_array()).unwrap_or(&empty) {
+                    if let Some(q) = q.as_str() {
+                        self.remove_ref("queues", q, field, &my_url);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -392,5 +548,74 @@ mod tests {
     fn an_unmodelled_kind_is_a_404() {
         let mut s = st();
         assert_eq!(s.create("penguins", json!({})).unwrap_err().status, 404);
+    }
+
+    fn seeded_graph(s: &mut OrgState) -> (u64, u64, u64) {
+        let ws = s.create("workspaces", json!({ "name": "Main" })).unwrap();
+        let sc = s.create("schemas", json!({ "name": "Invoices" })).unwrap();
+        let q = s
+            .create(
+                "queues",
+                json!({ "name": "Invoices", "workspace": ws["url"], "schema": sc["url"] }),
+            )
+            .unwrap();
+        (
+            ws["id"].as_u64().unwrap(),
+            sc["id"].as_u64().unwrap(),
+            q["id"].as_u64().unwrap(),
+        )
+    }
+
+    #[test]
+    fn creating_a_queue_grows_its_workspace_and_schema() {
+        let mut s = st();
+        let (ws, sc, q) = seeded_graph(&mut s);
+        let q_url = s.url("queues", q);
+        assert_eq!(s.get("workspaces", ws).unwrap()["queues"], json!([q_url]));
+        assert_eq!(
+            s.get("schemas", sc).unwrap()["queues"],
+            json!([q_url]),
+            "schema.queues gains the queue on create (pull/queues.rs refresh_backrefs)"
+        );
+    }
+
+    #[test]
+    fn creating_an_inbox_sets_its_queues_inbox() {
+        let mut s = st();
+        let (_, _, q) = seeded_graph(&mut s);
+        let inbox = s
+            .create(
+                "inboxes",
+                json!({ "name": "In", "email_prefix": "p", "queues": [s.url("queues", q)] }),
+            )
+            .unwrap();
+        assert_eq!(s.get("queues", q).unwrap()["inbox"], inbox["url"]);
+    }
+
+    #[test]
+    fn creating_a_hook_or_rule_grows_its_queues_back_ref() {
+        let mut s = st();
+        let (_, _, q) = seeded_graph(&mut s);
+        let q_url = s.url("queues", q);
+        let hook = s
+            .create("hooks", json!({ "name": "H", "queues": [q_url.clone()] }))
+            .unwrap();
+        let rule = s
+            .create("rules", json!({ "name": "R", "queues": [q_url.clone()] }))
+            .unwrap();
+        assert_eq!(s.get("queues", q).unwrap()["hooks"], json!([hook["url"]]));
+        assert_eq!(s.get("queues", q).unwrap()["rules"], json!([rule["url"]]));
+    }
+
+    #[test]
+    fn deleting_a_child_shrinks_the_back_ref() {
+        let mut s = st();
+        let (_, _, q) = seeded_graph(&mut s);
+        let q_url = s.url("queues", q);
+        let hook = s
+            .create("hooks", json!({ "name": "H", "queues": [q_url] }))
+            .unwrap();
+        s.delete("hooks", hook["id"].as_u64().unwrap()).unwrap();
+        assert_eq!(s.get("queues", q).unwrap()["hooks"], json!([]));
     }
 }
