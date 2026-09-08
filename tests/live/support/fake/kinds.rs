@@ -12,7 +12,6 @@ pub struct OrgCtx {
     pub org_url: String,
 }
 
-#[allow(dead_code)]
 pub struct KindSpec {
     /// The path segment, e.g. `"queues"` in `/api/v1/queues`.
     pub path: &'static str,

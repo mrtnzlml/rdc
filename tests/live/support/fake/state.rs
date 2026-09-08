@@ -10,14 +10,12 @@ use std::collections::BTreeMap;
 use super::kinds::{self, OrgCtx};
 
 /// A rejection, shaped like the real API's.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ApiError {
     pub status: u16,
     pub body: Value,
 }
 
-#[allow(dead_code)]
 impl ApiError {
     pub fn bad_request(detail: impl Into<String>) -> ApiError {
         ApiError { status: 400, body: json!({ "detail": detail.into() }) }
@@ -25,6 +23,9 @@ impl ApiError {
 
     /// The shape Rossum uses for cross-field refusals — the form
     /// `src/cli/push/mod.rs:88-96` quotes for the engine-field check.
+    /// Not yet produced by anything the router routes to (a later stage's
+    /// quirks/validation work).
+    #[allow(dead_code)]
     pub fn non_field(msg: impl Into<String>) -> ApiError {
         ApiError { status: 400, body: json!({ "non_field_errors": [msg.into()] }) }
     }
@@ -53,7 +54,6 @@ pub struct ListQuery {
     pub page_size: u64,
 }
 
-#[allow(dead_code)]
 pub struct OrgState {
     api_base: String,
     org_id: u64,
@@ -70,7 +70,6 @@ pub struct OrgState {
     org: Value,
 }
 
-#[allow(dead_code)]
 impl OrgState {
     pub fn new(api_base: String, org_id: u64) -> OrgState {
         let api_base = api_base.trim_end_matches('/').to_string();
@@ -102,6 +101,10 @@ impl OrgState {
         format!("{}/organizations/{}", self.api_base, self.org_id)
     }
 
+    /// `FakeOrg` keeps its own copy of the org id (so `creds()` need not lock
+    /// the store) rather than calling this — kept for a caller that only
+    /// holds an `OrgState`.
+    #[allow(dead_code)]
     pub fn org_id(&self) -> u64 {
         self.org_id
     }
