@@ -650,8 +650,16 @@ mod tests {
     /// The whole point of the exercise: a real `rdc sync` against a stateful
     /// backend, asserted to have settled. Before this existed, convergence
     /// could only be checked against a live org.
+    ///
+    /// Settling is necessary but not sufficient: `assert_converged`'s own
+    /// non-vacuousness guard requires only ONE captured file under this run's
+    /// prefix, so a silent partial pull — an entire kind dropped — would
+    /// still pass it. The block after `assert_converged` closes that gap by
+    /// checking the pulled lockfile actually carries a row for every kind the
+    /// manifest seeds.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_pull_from_the_fake_converges() {
+        use crate::support::assert_local::{load_lockfile, lockfile_keys};
         use crate::support::client::LiveClient;
         use crate::support::converge::assert_converged;
         use crate::support::project::ProjectFixture;
@@ -676,5 +684,104 @@ mod tests {
         );
 
         assert_converged(&project, "test", &run_id.list_prefix(), "after a pull from the fake");
+
+        // Completeness floor, not a golden: every kind the manifest seeds
+        // (`testdata/live/manifest.toml`) must show up as at least one
+        // lockfile row for THIS run — `email_templates` excluded, because
+        // those five-per-queue server defaults (`quirks.rs`) keep their
+        // fixed, unprefixed names and so never carry the run's prefix.
+        let prefix = run_id.list_prefix();
+        let lockfile = load_lockfile(project.path(), "test").expect("load lockfile");
+        for kind in ["labels", "workspaces", "queues", "schemas", "inboxes", "hooks", "rules"] {
+            let present = lockfile_keys(&lockfile, kind).iter().any(|slug| slug.contains(&prefix));
+            assert!(
+                present,
+                "pull produced no '{kind}' row for this run's prefix '{prefix}' — a \
+                 silent partial pull (one whole kind dropped) would otherwise still \
+                 pass `assert_converged`"
+            );
+        }
+    }
+
+    /// The falsifiability pin for [`crate::support::converge::assert_converged`]:
+    /// proof that it can actually FAIL, not just pass.
+    ///
+    /// During the task that added `a_pull_from_the_fake_converges` above, the
+    /// discriminating power of `assert_converged` was demonstrated by hand —
+    /// PATCH a seeded label out of band, watch the assertion panic, then
+    /// delete the probe. That evidence lived only in a report. Without a
+    /// permanent version, a change that quietly defeated the run's prefix
+    /// filter (so it matched nothing) — or any other part of the
+    /// byte-identical check — would leave every fake-backed test green and
+    /// nobody would notice.
+    ///
+    /// Shape: seed and sync exactly like the milestone test, then mutate one
+    /// seeded label straight through the fake's own store — never through
+    /// `rdc` — so the remote drifts behind rdc's back. `assert_converged`
+    /// panics on failure, so the check runs inside `catch_unwind`; a no-op
+    /// panic hook keeps the deliberate panic from spewing a backtrace into an
+    /// otherwise-passing suite.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn assert_converged_actually_fails_when_the_remote_drifts() {
+        use crate::support::client::LiveClient;
+        use crate::support::converge::assert_converged;
+        use crate::support::project::ProjectFixture;
+        use crate::support::run_id::RunId;
+        use crate::support::seeder::seed;
+        use crate::support::staticdir::{load_manifest, static_dir};
+
+        let fake = FakeOrg::start().await;
+        let cfg = fake.config();
+        let client = LiveClient::connect(&cfg).expect("connect");
+        let run_id = RunId::new();
+        let manifest = load_manifest().expect("manifest");
+        let index = seed(&client, &run_id, &static_dir(), &manifest).await.expect("seed");
+
+        let project = ProjectFixture::init(&cfg, &["test", "prod"]).expect("init");
+        let out = project.run_rdc(&["sync", "test", "--no-push"]);
+        assert!(
+            out.status.success(),
+            "sync --no-push failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // Out-of-band drift: straight through the fake's store, never
+        // through `rdc`. This is exactly the shape a real convergence
+        // regression takes — the remote moves and nothing in `rdc`'s own
+        // request path ever saw it happen.
+        let label_id = index.id("label-priority").expect("label-priority was seeded");
+        fake.state()
+            .patch("labels", label_id, &serde_json::json!({ "color": "#123456" }))
+            .expect("out-of-band patch");
+
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_converged(
+                &project,
+                "test",
+                &run_id.list_prefix(),
+                "after an out-of-band drift",
+            );
+        }));
+        std::panic::set_hook(previous_hook);
+
+        let payload = result
+            .expect_err("assert_converged must fail once the remote has drifted behind rdc's back");
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        // The label's local slug is the run's prefix plus its slugified name
+        // (`src/slug.rs` lowercases), so this is exactly the substring a
+        // convergence failure would name it by — in a plan line, a changed
+        // file path, or a changed lockfile key.
+        let needle = format!("{}priority", run_id.list_prefix());
+        assert!(
+            message.contains(&needle),
+            "failure message should name the drifted label ('{needle}'): {message}"
+        );
     }
 }
