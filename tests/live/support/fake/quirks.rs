@@ -200,6 +200,17 @@ mod tests {
     /// test, just not the same one, which the split check could never catch.
     /// Reading the pair together is what makes the citation trustworthy: a
     /// reader who follows it must land on the actual proof.
+    ///
+    /// The `file` half is validated as a plain filename BEFORE it is ever
+    /// joined onto `root`, rather than joined and sandboxed after the fact:
+    /// `Path::join` does not confine its result to `root` — a segment
+    /// carrying `..` walks upward out of it, and an absolute segment
+    /// replaces `root` outright. Without this check, a citation like
+    /// `"../../../src/main.rs::main"` reads `src/main.rs` instead of a
+    /// scenario file and "proves" itself against `async fn main()`, which
+    /// happens to contain the substring `fn main(` — a self-proving citation
+    /// is exactly the false-confidence hole this guard exists to close, so
+    /// the shape check fails loudly rather than trusting the path.
     #[test]
     fn every_quirk_names_a_live_scenario_that_proves_it() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/live/scenarios");
@@ -208,13 +219,24 @@ mod tests {
                 .proven_by
                 .split_once("::")
                 .unwrap_or_else(|| panic!("quirk '{}' has a malformed citation: {}", q.name, q.proven_by));
+            let is_plain_filename = !file.is_empty()
+                && file.ends_with(".rs")
+                && !file.contains('/')
+                && !file.contains('\\')
+                && !file.contains("..");
+            assert!(
+                is_plain_filename,
+                "quirk '{}' cites '{file}', which is not a plain scenario filename \
+                 (no path separators, no `..`, must end in `.rs`)",
+                q.name
+            );
             let path = root.join(file);
             let src = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-                panic!("quirk '{}' cites {file}, which cannot be read: {e}", q.name)
+                panic!("quirk '{}' cites '{file}', which cannot be read: {e}", q.name)
             });
             assert!(
                 src.contains(&format!("fn {test}(")),
-                "quirk '{}' cites '{test}', which {file} does not define",
+                "quirk '{}' cites '{test}', which '{file}' does not define",
                 q.name
             );
         }
