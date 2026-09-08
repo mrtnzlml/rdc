@@ -768,9 +768,19 @@ mod tests {
         // still show FAILED, just with no diagnostic. So the hook below
         // checks WHICH thread is panicking: it suppresses only the one panic
         // this test is about to provoke on ITS OWN thread, and forwards
-        // every other thread's panic to the real hook untouched. That closes
-        // the race rather than narrowing it, at the cost of ten lines instead
-        // of one.
+        // every other thread's panic to the real hook untouched. Against a
+        // FOREIGN panic — any unrelated test that never swaps a hook itself —
+        // this closes the race completely. It only NARROWS the race against
+        // another copy of THIS SAME pattern running concurrently: `set_hook`
+        // is a plain global overwrite with no compare-and-swap, so one such
+        // test's restore can clobber another's still-live suppression, and
+        // that other test's own expected panic then lands on a hook with no
+        // thread check and prints a spurious backtrace into an otherwise
+        // green run. Closing that sibling case needs a shared serialization
+        // primitive — a `static Mutex<()>` held across the whole install ->
+        // catch_unwind -> restore span — which thread-id filtering alone
+        // cannot provide; add it once a second caller of this pattern
+        // actually exists to serialize against.
         let this_thread = std::thread::current().id();
         let previous_hook = std::sync::Arc::new(std::panic::take_hook());
         {
