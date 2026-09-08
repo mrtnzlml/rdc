@@ -139,7 +139,25 @@ impl OrgState {
         OrgCtx { org_url: self.org_url() }
     }
 
-    pub fn create(&mut self, kind: &'static str, mut body: Value) -> Result<Value, ApiError> {
+    pub fn create(&mut self, kind: &'static str, body: Value) -> Result<Value, ApiError> {
+        // Before an id is allocated: a refused create must not consume one,
+        // or the ids stop matching creation order and the round_trip golden
+        // stops being reproducible.
+        super::validate::on_write(self, kind, &body)?;
+        self.create_unchecked(kind, body)
+    }
+
+    /// The store half of [`Self::create`], with no validation.
+    ///
+    /// `quirks` materializes the server's OWN objects through this: they are
+    /// created by the server, not POSTed by a client, so the checks a client
+    /// POST answers to do not apply — and the unique-typed-template rule
+    /// would refuse the very defaults it exists to compare against.
+    pub(super) fn create_unchecked(
+        &mut self,
+        kind: &'static str,
+        mut body: Value,
+    ) -> Result<Value, ApiError> {
         let spec = kinds::spec(kind).ok_or_else(ApiError::not_found)?;
         if !spec.creatable {
             return Err(ApiError::bad_request(format!("/{kind} is read-only")));
@@ -562,6 +580,56 @@ impl OrgState {
             _ => {}
         }
     }
+
+    /// Whether `url` names an object this org holds.
+    pub fn resolves(&self, url: &str) -> bool {
+        let mut parts = url.trim_end_matches('/').rsplit('/');
+        let Some(id) = parts.next().and_then(|s| s.parse::<u64>().ok()) else {
+            return false;
+        };
+        let Some(kind) = parts.next() else { return false };
+        if kind == "organizations" {
+            return id == self.org_id;
+        }
+        kinds::spec(kind)
+            .and_then(|k| self.objects.get(k.path))
+            .map(|m| m.contains_key(&id))
+            .unwrap_or(false)
+    }
+
+    /// Any object addressed by its url, whatever its kind.
+    pub fn get_by_url(&self, url: &str) -> Option<Value> {
+        let mut parts = url.trim_end_matches('/').rsplit('/');
+        let id = parts.next()?.parse::<u64>().ok()?;
+        let kind = kinds::spec(parts.next()?)?.path;
+        self.get(kind, id)
+    }
+
+    /// The `name` of every engine field bound to `engine_url`. An engine
+    /// field's name is what a schema datapoint's `id` is matched against.
+    pub fn engine_field_names(&self, engine_url: &str) -> Vec<String> {
+        self.objects
+            .get("engine_fields")
+            .map(|m| {
+                m.values()
+                    .filter(|f| f.get("engine").and_then(Value::as_str) == Some(engine_url))
+                    .filter_map(|f| f.get("name").and_then(Value::as_str).map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn has_template_of_type(&self, queue_url: &str, ty: &str) -> bool {
+        self.objects
+            .get("email_templates")
+            .map(|m| {
+                m.values().any(|t| {
+                    t.get("queue").and_then(Value::as_str) == Some(queue_url)
+                        && t.get("type").and_then(Value::as_str) == Some(ty)
+                })
+            })
+            .unwrap_or(false)
+    }
 }
 
 #[cfg(test)]
@@ -958,5 +1026,168 @@ mod tests {
             "wrong body: {:?}",
             err.body
         );
+    }
+
+    #[test]
+    fn a_ref_that_matches_no_object_is_an_invalid_hyperlink() {
+        let mut s = st();
+        let err = s
+            .create(
+                "queues",
+                json!({ "name": "Q", "schema": "http://127.0.0.1:9/api/v1/schemas/404" }),
+            )
+            .expect_err("must be refused");
+        assert_eq!(err.status, 400);
+        assert!(
+            format!("{:?}", err.body).contains("Invalid hyperlink - No URL match"),
+            "wrong body: {:?}",
+            err.body
+        );
+    }
+
+    #[test]
+    fn a_queue_needs_a_schema() {
+        let mut s = st();
+        let ws = s.create("workspaces", json!({ "name": "W" })).unwrap();
+        let err = s
+            .create("queues", json!({ "name": "Q", "workspace": ws["url"] }))
+            .expect_err("must be refused");
+        assert_eq!(err.status, 400);
+    }
+
+    #[test]
+    fn a_queue_carries_one_engine_slot_at_most() {
+        let mut s = st();
+        let ws = s.create("workspaces", json!({ "name": "W" })).unwrap();
+        let sc = s.create("schemas", json!({ "name": "S" })).unwrap();
+        let e1 = s.create("engines", json!({ "name": "E" })).unwrap();
+        let err = s
+            .create(
+                "queues",
+                json!({
+                    "name": "Q",
+                    "workspace": ws["url"],
+                    "schema": sc["url"],
+                    "engine": e1["url"],
+                    "generic_engine": e1["url"],
+                }),
+            )
+            .expect_err("must be refused");
+        assert_eq!(err.status, 400);
+    }
+
+    #[test]
+    fn an_over_length_field_is_refused_after_a_trailing_whitespace_trim() {
+        let mut s = st();
+        // A hook description is capped at 2000; the server trims trailing
+        // whitespace BEFORE validating, so a value that fits once trimmed is
+        // accepted. `field_caps` is pinned independently of
+        // `crate::snapshot::limits::field_limits` — see the comment on it in
+        // `validate.rs` — so this reads the cap from `validate`, not `limits`.
+        let cap = crate::support::fake::validate::field_caps("hooks")
+            .iter()
+            .find(|(field, _)| *field == "description")
+            .map(|(_, cap)| *cap)
+            .expect("hooks/description has a cap");
+        let fits = format!("{}{}", "x".repeat(cap), "   ");
+        assert!(s
+            .create("hooks", json!({ "name": "H", "description": fits }))
+            .is_ok());
+        let over = "x".repeat(cap + 1);
+        let err = s
+            .create("hooks", json!({ "name": "H2", "description": over }))
+            .expect_err("must be refused");
+        assert_eq!(err.status, 400);
+    }
+
+    #[test]
+    fn a_queue_is_refused_when_its_schema_outruns_the_bound_engine() {
+        // The refusal that forced `push_classified` to create engines and
+        // their fields BEFORE queues (`src/cli/push/mod.rs:88-96`). An engine
+        // field's `name` is matched against a schema datapoint's `id` — see
+        // the seeded pair in `testdata/live/snapshot/engines/**`.
+        let mut s = st();
+        let ws = s.create("workspaces", json!({ "name": "W" })).unwrap();
+        let engine = s.create("engines", json!({ "name": "E" })).unwrap();
+        s.create(
+            "engine_fields",
+            json!({ "name": "invoice_id", "engine": engine["url"] }),
+        )
+        .unwrap();
+        let sc = s
+            .create(
+                "schemas",
+                json!({
+                    "name": "S",
+                    "content": [{
+                        "category": "section",
+                        "id": "header",
+                        "children": [
+                            { "category": "datapoint", "id": "invoice_id", "type": "string" },
+                            { "category": "datapoint", "id": "amount_due", "type": "number" },
+                        ],
+                    }],
+                }),
+            )
+            .unwrap();
+        let err = s
+            .create(
+                "queues",
+                json!({
+                    "name": "Q",
+                    "workspace": ws["url"],
+                    "schema": sc["url"],
+                    "engine": engine["url"],
+                }),
+            )
+            .expect_err("amount_due has no engine field");
+        assert_eq!(err.status, 400);
+        assert!(
+            format!("{:?}", err.body).contains("amount_due"),
+            "the refusal must name the offending field: {:?}",
+            err.body
+        );
+
+        // Add the missing field and the same create succeeds.
+        s.create(
+            "engine_fields",
+            json!({ "name": "amount_due", "engine": engine["url"] }),
+        )
+        .unwrap();
+        assert!(s
+            .create(
+                "queues",
+                json!({
+                    "name": "Q2",
+                    "workspace": ws["url"],
+                    "schema": sc["url"],
+                    "engine": engine["url"],
+                })
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn a_blind_post_of_an_auto_created_typed_default_is_refused() {
+        let mut s = st();
+        let ws = s.create("workspaces", json!({ "name": "W" })).unwrap();
+        let sc = s.create("schemas", json!({ "name": "S" })).unwrap();
+        let q = s
+            .create("queues", json!({ "name": "Q", "workspace": ws["url"], "schema": sc["url"] }))
+            .unwrap();
+        let err = s
+            .create(
+                "email_templates",
+                json!({ "name": "Mine", "type": "rejection_default", "queue": q["url"] }),
+            )
+            .expect_err("the queue already has one");
+        assert_eq!(err.status, 400);
+        // `custom` is not unique-typed, so a second one is fine.
+        assert!(s
+            .create(
+                "email_templates",
+                json!({ "name": "Mine", "type": "custom", "queue": q["url"] })
+            )
+            .is_ok());
     }
 }

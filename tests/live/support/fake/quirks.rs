@@ -120,9 +120,30 @@ pub fn materialize_queue_defaults(st: &mut OrgState, queue_url: &str) {
             "queue": queue_url,
             "automate": false,
         });
-        // `create` here is the store's own path, so ids stay monotonic.
-        let _ = st.create("email_templates", body);
+        // `create_unchecked`, not `create`: these are the server's OWN
+        // objects, materialized as a side effect of `POST /queues`, not
+        // POSTed by a client — the checks a client POST answers to must not
+        // apply here, and in particular the unique-typed-template rule would
+        // otherwise refuse the very defaults it exists to compare against.
+        let _ = st.create_unchecked("email_templates", body);
     }
+}
+
+/// Whether `file` is safe to join onto the scenarios root: a plain filename
+/// with no path separators and no `..` component, ending in `.rs`.
+///
+/// Extracted out of `every_quirk_names_a_live_scenario_that_proves_it` so the
+/// shape check itself is unit-testable — before this split, its three
+/// failure modes (nonexistent test, wrong file, path-traversing citation)
+/// were each proven only by a manual edit-run-restore cycle, so a regression
+/// here would not be caught by CI. See that test's doc comment for why the
+/// check runs on the raw `file` string, before it is ever joined onto `root`.
+fn is_plain_scenario_filename(file: &str) -> bool {
+    !file.is_empty()
+        && file.ends_with(".rs")
+        && !file.contains('/')
+        && !file.contains('\\')
+        && !file.contains("..")
 }
 
 #[cfg(test)]
@@ -219,13 +240,8 @@ mod tests {
                 .proven_by
                 .split_once("::")
                 .unwrap_or_else(|| panic!("quirk '{}' has a malformed citation: {}", q.name, q.proven_by));
-            let is_plain_filename = !file.is_empty()
-                && file.ends_with(".rs")
-                && !file.contains('/')
-                && !file.contains('\\')
-                && !file.contains("..");
             assert!(
-                is_plain_filename,
+                is_plain_scenario_filename(file),
                 "quirk '{}' cites '{file}', which is not a plain scenario filename \
                  (no path separators, no `..`, must end in `.rs`)",
                 q.name
@@ -240,5 +256,27 @@ mod tests {
                 q.name
             );
         }
+    }
+
+    /// Pins `is_plain_scenario_filename`'s three failure modes directly,
+    /// against synthetic strings, so `every_quirk_names_a_live_scenario_that_proves_it`
+    /// above cannot regress silently — see its doc comment for the incident
+    /// this guards against (`"../../../src/main.rs::main"` "proving" itself
+    /// against `async fn main()`).
+    #[test]
+    fn scenario_filename_shape_is_checked_before_it_is_joined_onto_root() {
+        assert!(is_plain_scenario_filename("email_templates.rs"), "a plain filename is fine");
+        assert!(!is_plain_scenario_filename(""), "an empty segment");
+        assert!(!is_plain_scenario_filename(".."), "a bare ..");
+        assert!(
+            !is_plain_scenario_filename("../../../src/main.rs"),
+            "a path-traversing citation"
+        );
+        assert!(!is_plain_scenario_filename("/etc/passwd.rs"), "an absolute path");
+        assert!(
+            !is_plain_scenario_filename("..\\src\\main.rs"),
+            "a Windows-style path-traversing citation"
+        );
+        assert!(!is_plain_scenario_filename("sub/dir.rs"), "a nested path");
     }
 }
