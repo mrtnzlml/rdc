@@ -179,9 +179,20 @@ impl OrgState {
         // refs first, a patch that re-parents an object (e.g. a hook's
         // `queues` from [q1] to [q2], or a queue's `workspace` from A to B)
         // would leave the stale parent still pointing at it — a shape the
-        // real API cannot produce. When a patch touches no refs this is a
-        // no-op round trip: `add_ref` dedupes and `remove_ref`'s `retain` on
-        // an already-absent entry does nothing.
+        // real API cannot produce. This round trip preserves MEMBERSHIP —
+        // `add_ref` dedupes and `remove_ref`'s `retain` on an already-absent
+        // entry does nothing — but NOT order: unlink-then-relink moves a
+        // still-present ref to the end of the parent's array (e.g. patching
+        // one of two hooks on a queue can turn `queue.hooks` from [H1, H2]
+        // into [H2, H1]). That is deliberately not a property this fake
+        // gives you: `snapshot::noise::sort_url_arrays` (routed through
+        // `canonicalize_for_hash`, so every content hash and drift check
+        // sees it) sorts any array whose elements are all refs — its
+        // `is_url` helper accepts both `https://…` and portable
+        // `rdc://<kind>/<slug>` forms precisely so these back-ref arrays
+        // stay order-insensitive — because the real Rossum API's array
+        // order is itself non-deterministic per env/endpoint. A fake that
+        // kept insertion order here would be less faithful, not more.
         self.unlink(kind, id);
         let stamp = self.now();
         let result = {
@@ -704,5 +715,42 @@ mod tests {
         s.tick_deletions();
         assert_eq!(s.get("workspaces", ws).unwrap()["queues"], json!([]));
         assert_eq!(s.get("schemas", sc).unwrap()["queues"], json!([]));
+    }
+
+    /// `patch`'s unlink-then-relink round trip preserves MEMBERSHIP, not
+    /// order — see the comment on the `self.unlink(kind, id)` call in
+    /// `patch`. This pins the property that actually matters: patching one
+    /// child does not evict its siblings from the shared parent back-ref.
+    /// Compared as a sorted set on purpose, so this does not accidentally
+    /// re-assert an order guarantee the fake deliberately does not make.
+    #[test]
+    fn patching_one_child_keeps_every_sibling_back_ref() {
+        let mut s = st();
+        let (_, _, q) = seeded_graph(&mut s);
+        let q_url = s.url("queues", q);
+        let h1 = s
+            .create("hooks", json!({ "name": "H1", "queues": [q_url.clone()] }))
+            .unwrap();
+        let h2 = s.create("hooks", json!({ "name": "H2", "queues": [q_url] })).unwrap();
+        let h1_id = h1["id"].as_u64().unwrap();
+        let h1_url = s.url("hooks", h1_id);
+        let h2_url = s.url("hooks", h2["id"].as_u64().unwrap());
+        // A drift-repair PATCH that never touches `queues` at all (the shape
+        // `src/cli/push/hooks.rs:544` sends whenever ANY field of a hook has
+        // drifted, not only its `queues`).
+        s.patch("hooks", h1_id, &json!({ "name": "H1 renamed" })).unwrap();
+        let mut got: Vec<String> = s.get("queues", q).unwrap()["hooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        got.sort();
+        let mut want = vec![h1_url, h2_url];
+        want.sort();
+        assert_eq!(
+            got, want,
+            "both siblings must survive a patch to just one of them, order aside"
+        );
     }
 }
