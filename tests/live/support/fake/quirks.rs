@@ -1,12 +1,38 @@
 //! The learned-facts layer: behaviors of the real Rossum API that `rdc` had to
 //! discover in a live org, expressed once, executably.
 //!
-//! Every entry in [`QUIRKS`] carries the live scenario that proves it, and
-//! `every_quirk_names_a_live_scenario_that_proves_it` enforces the citation.
-//! The rule this encodes: the fake invents nothing. When a `fake_*` test and
-//! its `live_*` twin disagree, exactly one of two things is true — the model
-//! here is wrong, or `rdc` is wrong. Weakening the scenario is not a third
-//! option.
+//! Every entry in [`QUIRKS`] carries evidence for the fact it names, in one
+//! of two shapes distinguished by [`Quirk::proven_by`]'s own syntax:
+//!
+//! - A LIVE citation, `<scenario file>::<test fn>` (a double colon) — a live
+//!   scenario actually asserts the fact. Checked by
+//!   `every_live_citation_actually_proves_it`, which reads the cited file and
+//!   confirms the cited test exists in it — not that the test proves the
+//!   RIGHT thing, which is a human judgment call this guard cannot make, but
+//!   at least that the citation cannot rot into a dangling reference.
+//! - A SOURCE citation, `<repo file>:<line>` (a single colon) — no live
+//!   scenario proves this fact; the evidence is a repo comment, a captured
+//!   fixture, or (for `modelled: false` entries) the description of a gap.
+//!   Checked by `every_source_citation_names_a_real_file`, which confirms the
+//!   cited file exists.
+//!
+//! [`Quirk::modelled`] is orthogonal to which citation shape is used: it says
+//! whether the fake actually IMPLEMENTS the fact. Most quirks are `modelled:
+//! true` with a live citation. A `modelled: true` quirk with a SOURCE
+//! citation means "the fake does this, but no live scenario proves it yet."
+//! A `modelled: false` quirk means "the fake does NOT do this yet" — recorded
+//! here anyway, so a known gap is visible in the same table as everything the
+//! fake gets right, rather than living only in a doc comment somewhere a
+//! reader has to already know to check.
+//!
+//! The rule this encodes: the fake invents nothing, and neither does this
+//! registry — an entry's citation must point at real, checkable evidence, and
+//! its shape must not overstate what that evidence proves. When a `fake_*`
+//! test and its `live_*` twin disagree on a LIVE-cited fact, exactly one of
+//! two things is true — the model here is wrong, or `rdc` is wrong. Weakening
+//! a citation to make a test pass is not a third option; downgrading it to an
+//! honestly-labeled SOURCE citation, when that is what the evidence actually
+//! supports, is not weakening — it's correcting an overclaim.
 
 use serde_json::{json, Value};
 
@@ -14,34 +40,90 @@ use super::state::OrgState;
 
 pub struct Quirk {
     pub name: &'static str,
-    /// `<scenario file>::<test fn>`.
+    /// Whether the fake actually implements this behavior. `false` marks a
+    /// real API fact this registry records but the fake does not yet
+    /// reproduce.
+    pub modelled: bool,
+    /// See the module doc comment: `<scenario file>::<test fn>` (live proof)
+    /// or `<repo file>:<line>` (documented, not live-proven).
     pub proven_by: &'static str,
 }
 
 pub const QUIRKS: &[Quirk] = &[
     Quirk {
         name: "queue_create_materializes_typed_email_template_defaults",
+        modelled: true,
         proven_by: "email_templates.rs::live_email_templates_round_trip",
     },
     Quirk {
         name: "queue_delete_is_async_and_cascades",
-        proven_by: "conflicts_deletes.rs::live_conflicts_deletes",
+        modelled: true,
+        // This citation proves only the ASYNC half: `live_push_create_ordering`
+        // asserts `status == "deletion_requested"` at `ordering.rs:348`. The
+        // CASCADE half (the queue's auto-created email templates and inbox
+        // disappearing with it) has NO live assertion anywhere in the tree —
+        // it is documented only in `state.rs::delete()`'s and
+        // `state.rs::cascade_queue_delete`'s doc comments, and pinned
+        // offline by `state.rs::a_queue_delete_cascades_to_its_templates_and_inbox`,
+        // which exercises the fake's OWN implementation of the rule, not the
+        // real API. The previous citation here,
+        // `conflicts_deletes.rs::live_conflicts_deletes`, proved neither
+        // half: that scenario's delete branch deletes a RULE, never a
+        // queue, and never observes a 202 or a cascade.
+        proven_by: "ordering.rs::live_push_create_ordering",
     },
     Quirk {
         name: "engine_delete_refused_while_a_queue_awaits_deletion",
+        modelled: true,
+        // `live_push_create_ordering` proves the CONSEQUENCE `rdc` draws from
+        // this refusal — it warns by slug (the `expected_warning` assertion)
+        // and keeps the lockfile entry so a later sync retries it (the
+        // `lf_after` assertion) — but it never asserts the specific error
+        // code the fake emits here, `engine_attached_to_queues_waiting_for_deletion`.
+        // That exact string is repo-documented, not live-asserted, at
+        // `tests/live/support/teardown.rs:62`.
         proven_by: "ordering.rs::live_push_create_ordering",
     },
     Quirk {
         name: "unresolvable_ref_is_an_invalid_hyperlink",
-        proven_by: "cross_refs.rs::live_cross_refs",
+        modelled: true,
+        // No live scenario provokes an unresolvable ref:
+        // `cross_refs.rs::live_cross_refs` has no negative path, and the
+        // only other mention of this exact string, `ordering.rs:110-112`,
+        // documents why correct creation ORDER prevents the 400 from ever
+        // firing live — it is never triggered, let alone asserted. The
+        // evidence for the exact message is `src/snapshot/refs.rs:159`: the
+        // refusal `rdc`'s whole deferred-relink path is built around.
+        // `validate::on_write` matches it, and it is offline-tested at
+        // `state.rs::a_ref_that_matches_no_object_is_an_invalid_hyperlink`.
+        proven_by: "src/snapshot/refs.rs:159",
     },
     Quirk {
         name: "over_length_field_is_refused_after_trailing_whitespace_trim",
+        modelled: true,
         proven_by: "server_truth.rs::live_field_limits_match_the_server",
     },
     Quirk {
         name: "queue_carries_one_engine_slot_only",
+        modelled: true,
         proven_by: "server_truth.rs::live_queue_engine_slot_counts_values_not_keys",
+    },
+    Quirk {
+        name: "organization_patch_response_is_not_get_shaped",
+        modelled: false,
+        // `OrgState::patch_organization` merges the patch and returns the
+        // whole organization — i.e. the fake answers GET and PATCH with the
+        // SAME body. The real API does not: see the doc comment on
+        // `patch_organization` and the four differences documented at
+        // `src/cli/push/organization.rs:161-177`, which is also the
+        // deficiency this whole stateful-fake exercise was motivated by
+        // (`src/cli/push/organization.rs:161`). Nothing in stage 1 pushes
+        // the organization, so this gap is inert today — but any stage-2
+        // work that ports the organization scenario onto this fake must
+        // model those four differences FIRST, or a green fake-backed test
+        // would bless exactly the naive write-back that caused the original
+        // incident.
+        proven_by: "src/cli/push/organization.rs:161",
     },
 ];
 
@@ -130,20 +212,36 @@ pub fn materialize_queue_defaults(st: &mut OrgState, queue_url: &str) {
 }
 
 /// Whether `file` is safe to join onto the scenarios root: a plain filename
-/// with no path separators and no `..` component, ending in `.rs`.
+/// with no path separators and no `..` component, ending in `.rs`. For a LIVE
+/// citation (`<file>::<fn>`) only — a scenario file always sits flat under
+/// `tests/live/scenarios`, so a path separator here is already suspicious.
 ///
-/// Extracted out of `every_quirk_names_a_live_scenario_that_proves_it` so the
-/// shape check itself is unit-testable — before this split, its three
-/// failure modes (nonexistent test, wrong file, path-traversing citation)
-/// were each proven only by a manual edit-run-restore cycle, so a regression
-/// here would not be caught by CI. See that test's doc comment for why the
-/// check runs on the raw `file` string, before it is ever joined onto `root`.
+/// Extracted out of `every_live_citation_actually_proves_it` so the shape
+/// check itself is unit-testable — before this split, its three failure modes
+/// (nonexistent test, wrong file, path-traversing citation) were each proven
+/// only by a manual edit-run-restore cycle, so a regression here would not be
+/// caught by CI. See that test's doc comment for why the check runs on the
+/// raw `file` string, before it is ever joined onto `root`.
 fn is_plain_scenario_filename(file: &str) -> bool {
     !file.is_empty()
         && file.ends_with(".rs")
         && !file.contains('/')
         && !file.contains('\\')
         && !file.contains("..")
+}
+
+/// The equivalent safety check for a SOURCE citation (`<file>:<line>`): these
+/// legitimately span directories (`src/cli/push/organization.rs`), so `/` is
+/// allowed — only escaping the repo root is not. Same reasoning as
+/// `is_plain_scenario_filename`'s doc comment: checked on the raw string,
+/// before it is ever joined onto the crate root, because `Path::join` does
+/// not confine its result to that root.
+fn is_safe_repo_relative_path(file: &str) -> bool {
+    !file.is_empty()
+        && file.ends_with(".rs")
+        && !file.starts_with('/')
+        && !file.contains('\\')
+        && !file.split('/').any(|seg| seg == "..")
 }
 
 #[cfg(test)]
@@ -212,6 +310,10 @@ mod tests {
     /// invented. Written in the same spirit as `tests/command_references.rs`:
     /// the check is mechanical so the citation cannot rot silently.
     ///
+    /// Runs only on LIVE citations (`proven_by` containing `::`) — see the
+    /// module doc comment for the other shape, checked by
+    /// `every_source_citation_names_a_real_file` below.
+    ///
     /// Deliberately reads only the CITED file per quirk, rather than
     /// concatenating every scenario file into one blob and checking file
     /// existence and function existence as two independent facts. The
@@ -232,10 +334,19 @@ mod tests {
     /// happens to contain the substring `fn main(` — a self-proving citation
     /// is exactly the false-confidence hole this guard exists to close, so
     /// the shape check fails loudly rather than trusting the path.
+    ///
+    /// This still only checks that the cited function EXISTS, not that it
+    /// proves the right thing — that is exactly the gap that let
+    /// `queue_delete_is_async_and_cascades` and
+    /// `unresolvable_ref_is_an_invalid_hyperlink` cite scenarios that never
+    /// exercised the fact they were attached to. Closing that gap needs a
+    /// human reading the cited test, which is why every entry above also
+    /// carries a doc comment saying exactly what its citation does and does
+    /// not prove.
     #[test]
-    fn every_quirk_names_a_live_scenario_that_proves_it() {
+    fn every_live_citation_actually_proves_it() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/live/scenarios");
-        for q in QUIRKS {
+        for q in QUIRKS.iter().filter(|q| q.proven_by.contains("::")) {
             let (file, test) = q
                 .proven_by
                 .split_once("::")
@@ -258,8 +369,37 @@ mod tests {
         }
     }
 
+    /// The other citation shape: a SOURCE citation (`<file>:<line>`, no
+    /// `::`), used when no live scenario proves the fact — including every
+    /// `modelled: false` entry, which by definition can have no live proof.
+    /// Weaker than the live check (there is no line-number or content
+    /// verification, only that the file exists), but that asymmetry is
+    /// honest: a source citation was never claiming live proof in the first
+    /// place, only that a reader who follows it lands on a real file.
+    #[test]
+    fn every_source_citation_names_a_real_file() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for q in QUIRKS.iter().filter(|q| !q.proven_by.contains("::")) {
+            let (file, _loc) = q
+                .proven_by
+                .split_once(':')
+                .unwrap_or_else(|| panic!("quirk '{}' has a malformed citation: {}", q.name, q.proven_by));
+            assert!(
+                is_safe_repo_relative_path(file),
+                "quirk '{}' cites '{file}', which is not a safe repo-relative path \
+                 (no absolute path, no `..` segment, must end in `.rs`)",
+                q.name
+            );
+            assert!(
+                root.join(file).is_file(),
+                "quirk '{}' cites '{file}', which is not a file in this repo",
+                q.name
+            );
+        }
+    }
+
     /// Pins `is_plain_scenario_filename`'s three failure modes directly,
-    /// against synthetic strings, so `every_quirk_names_a_live_scenario_that_proves_it`
+    /// against synthetic strings, so `every_live_citation_actually_proves_it`
     /// above cannot regress silently — see its doc comment for the incident
     /// this guards against (`"../../../src/main.rs::main"` "proving" itself
     /// against `async fn main()`).
@@ -278,5 +418,49 @@ mod tests {
             "a Windows-style path-traversing citation"
         );
         assert!(!is_plain_scenario_filename("sub/dir.rs"), "a nested path");
+    }
+
+    /// The same pin for `is_safe_repo_relative_path`, which deliberately
+    /// allows `/` (a source citation legitimately spans directories) but
+    /// must still reject the same escapes.
+    #[test]
+    fn source_path_shape_is_checked_before_it_is_joined_onto_root() {
+        assert!(
+            is_safe_repo_relative_path("src/cli/push/organization.rs"),
+            "a nested repo-relative path is fine"
+        );
+        assert!(!is_safe_repo_relative_path(""), "an empty segment");
+        assert!(!is_safe_repo_relative_path(".."), "a bare ..");
+        assert!(
+            !is_safe_repo_relative_path("../../../etc/passwd.rs"),
+            "a path-traversing citation"
+        );
+        assert!(!is_safe_repo_relative_path("/etc/passwd.rs"), "an absolute path");
+        assert!(
+            !is_safe_repo_relative_path("src/../../../etc/passwd.rs"),
+            "a `..` segment buried mid-path"
+        );
+        assert!(
+            !is_safe_repo_relative_path("..\\src\\main.rs"),
+            "a Windows-style path-traversing citation"
+        );
+        assert!(!is_safe_repo_relative_path("src/main"), "must end in .rs");
+    }
+
+    /// Every quirk is visible and self-consistent: `modelled: false` can
+    /// never pair with a LIVE citation, because an unimplemented behavior
+    /// cannot have live proof of the fake's own conduct — a `false` entry
+    /// making that claim would be lying about strength of evidence, exactly
+    /// what this whole registry exists to prevent.
+    #[test]
+    fn an_unmodelled_quirk_never_claims_a_live_citation() {
+        for q in QUIRKS.iter().filter(|q| !q.modelled) {
+            assert!(
+                !q.proven_by.contains("::"),
+                "quirk '{}' is unmodelled but cites '{}' as if a live scenario proved it",
+                q.name,
+                q.proven_by
+            );
+        }
     }
 }

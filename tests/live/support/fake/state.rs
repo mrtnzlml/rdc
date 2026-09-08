@@ -112,6 +112,20 @@ impl OrgState {
         self.org.clone()
     }
 
+    /// Returns a GET-shaped body — the whole organization, patch merged in.
+    /// The real API does NOT: quirk `organization_patch_response_is_not_get_shaped`
+    /// (`quirks.rs`, `modelled: false`) records that this is a known,
+    /// deliberate gap, not an oversight. The four documented differences,
+    /// spelled out at `src/cli/push/organization.rs:161-177`, are: the real
+    /// PATCH response carries `rir_key`, which `GET /organizations/{id}`
+    /// omits entirely; it returns `users` in a different order; and it
+    /// normalizes values inside `settings` (`width: 140` comes back
+    /// `140.0`; `annotation_list_table: {}` comes back `columns: []`).
+    /// Nothing in stage 1 pushes the organization, so this never bites
+    /// today — but any stage-2 work that touches organization push on this
+    /// fake MUST model these four differences first, or a green fake-backed
+    /// test would bless the exact naive write-back that caused the original
+    /// incident this whole stateful-fake exercise was motivated by.
     pub fn patch_organization(&mut self, patch: &Value) -> Value {
         let stamp = self.now();
         if let (Some(dst), Some(src)) = (self.org.as_object_mut(), patch.as_object()) {
@@ -704,10 +718,26 @@ mod tests {
 
     #[test]
     fn page_size_is_capped_at_a_hundred() {
+        // 101 objects, not 1: with a single object, `1.div_ceil(100).max(1)`
+        // and `1.div_ceil(5000).max(1)` are both `1` — deleting the
+        // `clamp(1, 100)` in `list()` entirely would leave this test green.
+        // 101 objects makes the cap and no-cap answers diverge (2 pages vs.
+        // 1), so this actually exercises the clamp.
         let mut s = st();
-        s.create("labels", json!({ "name": "L" })).unwrap();
+        for i in 0..101 {
+            s.create("labels", json!({ "name": format!("L{i}") })).unwrap();
+        }
         let out = s.list("labels", &ListQuery { page: 1, page_size: 5000 });
-        assert_eq!(out["pagination"]["total_pages"], json!(1));
+        assert_eq!(
+            out["pagination"]["total_pages"],
+            json!(2),
+            "101 results at a page_size capped to 100 must be 2 pages"
+        );
+        assert_eq!(
+            out["results"].as_array().unwrap().len(),
+            100,
+            "the capped page must hold exactly 100 results, not all 101"
+        );
     }
 
     #[test]

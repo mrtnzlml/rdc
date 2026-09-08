@@ -2,7 +2,7 @@ use crate::support::assert_local::{field, load_lockfile, lockfile_keys, queue_fi
 use crate::support::client::LiveClient;
 use crate::support::config::LiveConfig;
 use crate::support::converge::assert_converged;
-use crate::support::expected::{load_or_compare, CapturedState};
+use crate::support::expected::{capture_mode, load_or_compare, CapturedState};
 use crate::support::project::ProjectFixture;
 use crate::support::run_id::RunId;
 use crate::support::seeder::seed;
@@ -13,6 +13,23 @@ use crate::support::teardown::Teardown;
 /// `crate::support::fake`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fake_round_trip_core() {
+    // `round_trip_core` calls `load_or_compare` on the same golden path for
+    // both backends, and `capture_mode()` reads the process-global
+    // `RDC_LIVE_CAPTURE` env var. The documented capture command passes
+    // `--ignored`, which excludes this test — but anyone with that variable
+    // exported in their shell who runs a plain `cargo test` would have THIS
+    // test rewrite `testdata/live/expected/round_trip.toml` from the fake
+    // instead (the "CAPTURED golden" notice goes to stderr, which cargo
+    // swallows without `--nocapture`, so nothing would even look wrong).
+    // That golden is an artifact captured from a real organization; blessing
+    // a fake divergence into it would corrupt the live oracle silently. So:
+    // refuse outright rather than ever letting this backend write it.
+    assert!(
+        !capture_mode(),
+        "RDC_LIVE_CAPTURE is set: a fake-backed run must never capture a golden. \
+         Capture only from the live invocation, e.g. \
+         `RDC_LIVE_CAPTURE=1 cargo test --test live -- --ignored live_round_trip_core`."
+    );
     let fake = crate::support::fake::FakeOrg::start().await;
     round_trip_core(&fake.config()).await;
 }

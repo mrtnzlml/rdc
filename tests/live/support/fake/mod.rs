@@ -159,6 +159,15 @@ fn route(st: &mut OrgState, req: &Request) -> ResponseTemplate {
         return err_response(ApiError::not_found());
     };
     let tail = segs.next().map(|s| s.to_string());
+    // Whether a segment survives PAST the tail — checked once, here, because
+    // both the `organizations` branch and the per-kind branch below must
+    // apply exactly the same rule: a tail that doesn't parse as a plain id,
+    // OR any further segment beyond it, is not a route. It used to be
+    // checked only in the `organizations` branch, while the kind branch's
+    // `Some(seg)` arm parsed `seg` as an id and never consulted `segs`
+    // again — so `GET /hooks/5/secrets_keys` was served as `GET /hooks/5`,
+    // 200 with the hook body instead of an honest 404.
+    let extra_segment = segs.next().is_some();
     let method = req.method.as_str().to_string();
 
     if head == "organizations" {
@@ -168,7 +177,7 @@ fn route(st: &mut OrgState, req: &Request) -> ResponseTemplate {
         // segment beyond it, is not a route and must not fall through to
         // returning the org body anyway.
         let is_bare_id = tail.as_deref().is_some_and(|t| t.parse::<u64>().is_ok());
-        if !is_bare_id || segs.next().is_some() {
+        if !is_bare_id || extra_segment {
             return err_response(ApiError::not_found());
         }
         return match method.as_str() {
@@ -199,6 +208,17 @@ fn route(st: &mut OrgState, req: &Request) -> ResponseTemplate {
             let Ok(id) = seg.parse::<u64>() else {
                 return err_response(ApiError::not_found());
             };
+            if extra_segment {
+                // A real sub-resource endpoint exists here for at least one
+                // kind — `GET /hooks/<id>/secrets_keys`
+                // (`get_hook_secrets_keys`, `src/api/mod.rs:223`), which
+                // `rdc` calls on the deploy path — and stage 2 may model it.
+                // But answering it with the parent object, the way this used
+                // to fall through and do, is worse than a 404: a caller
+                // expecting a list of key names would get a hook object
+                // instead of an honest failure.
+                return err_response(ApiError::not_found());
+            }
             match method.as_str() {
                 "GET" => {
                     let detail = kinds::spec(kind).map(|k| k.detail_get).unwrap_or(false);
@@ -364,6 +384,23 @@ mod tests {
         let status = authed_request(reqwest::Method::POST, &url).await.status();
         assert_eq!(status, 404);
         assert!(fake.state().ids("hooks").is_empty(), "no hook must have been created");
+    }
+
+    /// The companion case: the tail here parses fine, but a segment survives
+    /// PAST it. `GET /hooks/<id>/secrets_keys` is the real endpoint this
+    /// protects (`get_hook_secrets_keys`, `src/api/mod.rs:223`), which `rdc`
+    /// calls on the deploy path — a stage-2 fake may eventually model it as a
+    /// list of key names, but until then answering it with the parent hook
+    /// object would be a confusing decode error where a caller expects an
+    /// honest 404.
+    #[tokio::test]
+    async fn a_segment_past_the_id_is_not_a_route() {
+        let fake = FakeOrg::start().await;
+        let c = client(&fake);
+        let hook = c.create_hook(&json!({ "name": "H" }), None).await.expect("hook");
+        let url = format!("{}/secrets_keys", fake.state().url("hooks", hook.id));
+        let status = authed_request(reqwest::Method::GET, &url).await.status();
+        assert_eq!(status, 404, "a segment past the id must not fall through to the parent object");
     }
 
     /// `route()` reads `head == "organizations"` and used to answer the org

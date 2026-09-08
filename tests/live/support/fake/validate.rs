@@ -3,6 +3,27 @@
 //! Strict on purpose: a mid-run 400 that wedges a real env is one of the three
 //! symptoms this whole exercise exists to make reproducible offline. A
 //! permissive fake would model the state and miss the failure.
+//!
+//! ## Known-unmodelled rejections
+//!
+//! Declared here, the same way the PATCH-validation gap is declared on
+//! `on_write` below, rather than left to be discovered by a stage-2 author
+//! the hard way:
+//!
+//! - `on_delete` implements only `engine_attached_to_queues_waiting_for_deletion`
+//!   (an engine bound to a DRAINING queue). The sibling refusal,
+//!   `engine_attached_to_active_queues` (an engine bound to a LIVE queue),
+//!   is documented by the same repo comment that names the one this fake
+//!   does implement — `tests/live/support/teardown.rs:59-61` — and is not
+//!   modelled: the fake permits deleting an engine still bound to a live
+//!   queue.
+//! - A schema DELETE is never refused for being referenced by a queue. The
+//!   real API answers `409 conflict_referenced`
+//!   (`tests/live/support/teardown.rs:36-44`, `tests/live/scenarios/ordering.rs:298-301`)
+//!   while a queue still points at the schema; the fake has no such check.
+//! - PATCH validation in general is unmodelled — see the doc comment on
+//!   `on_write` for why and for the exact scope (create-only) of what IS
+//!   checked.
 
 use serde_json::Value;
 
