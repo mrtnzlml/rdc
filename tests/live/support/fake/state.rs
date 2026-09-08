@@ -580,34 +580,13 @@ impl OrgState {
         }
     }
 
-    /// Whether `url` names an object this org holds, of ANY kind — kind-blind.
-    /// `resolves_kind` below is what `on_write` actually uses, now that a
-    /// well-formed ref of the WRONG kind needs catching too; kept, like
-    /// `org_id` above, for a caller that only cares whether something
-    /// resolves at all.
-    #[allow(dead_code)]
-    pub fn resolves(&self, url: &str) -> bool {
-        let mut parts = url.trim_end_matches('/').rsplit('/');
-        let Some(id) = parts.next().and_then(|s| s.parse::<u64>().ok()) else {
-            return false;
-        };
-        let Some(kind) = parts.next() else { return false };
-        if kind == "organizations" {
-            return id == self.org_id;
-        }
-        kinds::spec(kind)
-            .and_then(|k| self.objects.get(k.path))
-            .map(|m| m.contains_key(&id))
-            .unwrap_or(false)
-    }
-
     /// Whether `url` names an object this org holds of EXACTLY `expected_kind`.
     ///
-    /// Stricter than `resolves`: a well-formed url of a DIFFERENT kind (e.g.
-    /// a queue's `schema` field carrying a `workspace` url) is refused,
-    /// matching the real API's ref-type checking — `resolves` alone would
-    /// accept it, because it only checks that an object of the url's OWN
-    /// kind exists, never that the kind matches what the field expects.
+    /// A well-formed url of a DIFFERENT kind (e.g. a queue's `schema` field
+    /// carrying a `workspace` url) is refused, matching the real API's
+    /// ref-type checking — checking only that an object of the url's OWN
+    /// kind exists, without checking that kind against what the field
+    /// expects, is exactly the hole this method exists to close.
     pub fn resolves_kind(&self, url: &str, expected_kind: &str) -> bool {
         let mut parts = url.trim_end_matches('/').rsplit('/');
         let Some(id) = parts.next().and_then(|s| s.parse::<u64>().ok()) else {
@@ -626,21 +605,9 @@ impl OrgState {
             .unwrap_or(false)
     }
 
-    /// Any object addressed by its url, whatever its kind — kind-blind.
-    /// `get_by_url_kind` below is what `on_write` actually uses; kept for a
-    /// caller that doesn't care which kind it gets back.
-    #[allow(dead_code)]
-    pub fn get_by_url(&self, url: &str) -> Option<Value> {
-        let mut parts = url.trim_end_matches('/').rsplit('/');
-        let id = parts.next()?.parse::<u64>().ok()?;
-        let kind = kinds::spec(parts.next()?)?.path;
-        self.get(kind, id)
-    }
-
-    /// The kind-checked counterpart to `get_by_url` — `None` if `url`'s own
-    /// kind segment is not `expected_kind`, even if an object of ITS kind
-    /// exists at that id. Used where a caller needs the object itself
-    /// rather than just proof of existence, so it cannot silently walk a
+    /// Any object addressed by its url, but only when `url`'s own kind
+    /// segment is `expected_kind` — `None` otherwise, even if an object of
+    /// ITS kind exists at that id. So a caller cannot silently walk a
     /// wrong-kind object even if an earlier ref check were ever bypassed.
     pub fn get_by_url_kind(&self, url: &str, expected_kind: &str) -> Option<Value> {
         let mut parts = url.trim_end_matches('/').rsplit('/');
