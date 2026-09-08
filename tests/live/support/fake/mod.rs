@@ -646,4 +646,35 @@ mod tests {
             "the seeder inlines bodies/hooks/validator.py into config.code"
         );
     }
+
+    /// The whole point of the exercise: a real `rdc sync` against a stateful
+    /// backend, asserted to have settled. Before this existed, convergence
+    /// could only be checked against a live org.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pull_from_the_fake_converges() {
+        use crate::support::client::LiveClient;
+        use crate::support::converge::assert_converged;
+        use crate::support::project::ProjectFixture;
+        use crate::support::run_id::RunId;
+        use crate::support::seeder::seed;
+        use crate::support::staticdir::{load_manifest, static_dir};
+
+        let fake = FakeOrg::start().await;
+        let cfg = fake.config();
+        let client = LiveClient::connect(&cfg).expect("connect");
+        let run_id = RunId::new();
+        let manifest = load_manifest().expect("manifest");
+        seed(&client, &run_id, &static_dir(), &manifest).await.expect("seed");
+
+        let project = ProjectFixture::init(&cfg, &["test", "prod"]).expect("init");
+        let out = project.run_rdc(&["sync", "test", "--no-push"]);
+        assert!(
+            out.status.success(),
+            "sync --no-push failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        assert_converged(&project, "test", &run_id.list_prefix(), "after a pull from the fake");
+    }
 }
