@@ -9,9 +9,16 @@ use crate::support::seeder::seed;
 use crate::support::staticdir::{load_manifest, static_dir};
 use crate::support::teardown::Teardown;
 
-/// Full round-trip: seed the graph on the remote, `rdc sync test` pulls it
-/// down, assert the local snapshot/lockfile, edit a label locally, push it,
-/// and assert the remote reflects the edit. Teardown deletes everything.
+/// The fake-backed twin. Runs in a plain `cargo test`; see
+/// `crate::support::fake`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fake_round_trip_core() {
+    let fake = crate::support::fake::FakeOrg::start().await;
+    round_trip_core(&fake.config()).await;
+}
+
+/// The live twin. Unchanged: same `#[ignore]`, same env gate, so
+/// `cargo test --test live -- --ignored` still selects exactly the live set.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live: needs RDC_LIVE_* env"]
 async fn live_round_trip_core() {
@@ -19,12 +26,18 @@ async fn live_round_trip_core() {
         eprintln!("{}", LiveConfig::skip_reason());
         return;
     };
+    round_trip_core(&cfg).await;
+}
 
+/// Full round-trip: seed the graph on the remote, `rdc sync test` pulls it
+/// down, assert the local snapshot/lockfile, edit a label locally, push it,
+/// and assert the remote reflects the edit. Teardown deletes everything.
+async fn round_trip_core(cfg: &LiveConfig) {
     let run_id = RunId::new();
-    let client = LiveClient::connect(&cfg).expect("connect");
+    let client = LiveClient::connect(cfg).expect("connect");
     // Teardown guard FIRST so a panic anywhere still cleans up.
     let teardown = Teardown::new(
-        LiveClient::connect(&cfg).expect("connect (teardown)"),
+        LiveClient::connect(cfg).expect("connect (teardown)"),
         run_id.clone(),
     );
 
@@ -36,7 +49,7 @@ async fn live_round_trip_core() {
     assert!(index.id("queue-invoices-main").is_some());
 
     // --- pull into a fresh local project ---
-    let project = ProjectFixture::init(&cfg, &["test", "prod"]).expect("init project");
+    let project = ProjectFixture::init(cfg, &["test", "prod"]).expect("init project");
     let out = project.run_rdc(&["sync", "test", "--no-push"]);
     assert!(
         out.status.success(),
