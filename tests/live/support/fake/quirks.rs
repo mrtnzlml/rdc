@@ -57,28 +57,52 @@ pub const QUIRKS: &[Quirk] = &[
 /// evidence that defaults exist and are matched by type, not evidence of
 /// which five they are.
 ///
-/// The exact set below — these five names, types and subjects, no more and
-/// no fewer — comes instead from `testdata/live/snapshot/**/email-templates/`:
-/// the five files with no run-id prefix in a tree captured from a real org,
-/// i.e. the ones the harness never seeded. That is real evidence, but a
-/// captured fixture rather than a live assertion — nothing in the suite
-/// today would fail if a live org grew a sixth default or renamed one of
-/// these five. A live scenario that pins the default set by name, rather
-/// than filtering it away, is the thing that would upgrade this half of the
-/// quirk from fixture to proof.
+/// The exact set below — these five names, types, subjects and messages, no
+/// more and no fewer — comes instead from
+/// `testdata/live/snapshot/**/email-templates/`: the five files with no
+/// run-id prefix in a tree captured from a real org, i.e. the ones the
+/// harness never seeded. That is real evidence, but a captured fixture
+/// rather than a live assertion — nothing in the suite today would fail if a
+/// live org grew a sixth default or renamed one of these five. A live
+/// scenario that pins the default set by name, rather than filtering it
+/// away, is the thing that would upgrade this half of the quirk from fixture
+/// to proof. `message` is copied verbatim from the same fixture files rather
+/// than invented, per this task's own standard: a real value already sitting
+/// in a file we read is never a reason to make one up.
 ///
 /// Three are `custom`; only `rejection_default` and
 /// `email_with_no_processable_attachments` are unique-typed, which is what
 /// makes the adopt-by-type path in `push::email_templates` meaningful.
-const QUEUE_DEFAULT_TEMPLATES: &[(&str, &str, &str)] = &[
-    ("Annotation status change - confirmed", "custom", "Document confirmed"),
-    ("Annotation status change - exported", "custom", "Document exported"),
-    ("Annotation status change - received", "custom", "Document received"),
-    ("Default rejection template", "rejection_default", "Document rejected"),
+const QUEUE_DEFAULT_TEMPLATES: &[(&str, &str, &str, &str)] = &[
+    (
+        "Annotation status change - confirmed",
+        "custom",
+        "Document confirmed",
+        "<p>Your document has been confirmed.</p>",
+    ),
+    (
+        "Annotation status change - exported",
+        "custom",
+        "Document exported",
+        "<p>Your document has been exported.</p>",
+    ),
+    (
+        "Annotation status change - received",
+        "custom",
+        "Document received",
+        "<p>Your document has been received.</p>",
+    ),
+    (
+        "Default rejection template",
+        "rejection_default",
+        "Document rejected",
+        "<p>Your document has been rejected.</p>",
+    ),
     (
         "Email with no processable attachments",
         "email_with_no_processable_attachments",
         "No processable documents",
+        "<p>No processable documents were found in this email.</p>",
     ),
 ];
 
@@ -87,12 +111,12 @@ const QUEUE_DEFAULT_TEMPLATES: &[(&str, &str, &str)] = &[
 /// `POST /queues` on the real API creates these server-side; a blind POST of
 /// one afterwards is refused (`src/cli/push/email_templates.rs:97`).
 pub fn materialize_queue_defaults(st: &mut OrgState, queue_url: &str) {
-    for (name, ty, subject) in QUEUE_DEFAULT_TEMPLATES {
+    for (name, ty, subject, message) in QUEUE_DEFAULT_TEMPLATES {
         let body: Value = json!({
             "name": name,
             "type": ty,
             "subject": subject,
-            "message": "<p>Fake default.</p>",
+            "message": message,
             "queue": queue_url,
             "automate": false,
         });
@@ -166,29 +190,31 @@ mod tests {
     /// A quirk nobody can prove against a real org is a quirk someone
     /// invented. Written in the same spirit as `tests/command_references.rs`:
     /// the check is mechanical so the citation cannot rot silently.
+    ///
+    /// Deliberately reads only the CITED file per quirk, rather than
+    /// concatenating every scenario file into one blob and checking file
+    /// existence and function existence as two independent facts. The
+    /// concatenated version let `"server_truth.rs::live_conflicts_deletes"`
+    /// pass even though `live_conflicts_deletes` is defined in
+    /// `conflicts_deletes.rs` — the citation named a real file and a real
+    /// test, just not the same one, which the split check could never catch.
+    /// Reading the pair together is what makes the citation trustworthy: a
+    /// reader who follows it must land on the actual proof.
     #[test]
     fn every_quirk_names_a_live_scenario_that_proves_it() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/live/scenarios");
-        let mut sources = String::new();
-        for entry in std::fs::read_dir(&root).expect("scenarios dir") {
-            let path = entry.expect("dir entry").path();
-            if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                sources.push_str(&std::fs::read_to_string(&path).expect("read scenario"));
-            }
-        }
         for q in QUIRKS {
             let (file, test) = q
                 .proven_by
                 .split_once("::")
                 .unwrap_or_else(|| panic!("quirk '{}' has a malformed citation: {}", q.name, q.proven_by));
+            let path = root.join(file);
+            let src = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                panic!("quirk '{}' cites {file}, which cannot be read: {e}", q.name)
+            });
             assert!(
-                root.join(file.rsplit('/').next().expect("file name")).exists(),
-                "quirk '{}' cites a scenario file that does not exist: {file}",
-                q.name
-            );
-            assert!(
-                sources.contains(&format!("fn {test}(")),
-                "quirk '{}' cites '{test}', which no scenario defines",
+                src.contains(&format!("fn {test}(")),
+                "quirk '{}' cites '{test}', which {file} does not define",
                 q.name
             );
         }
