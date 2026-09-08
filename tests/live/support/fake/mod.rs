@@ -755,8 +755,32 @@ mod tests {
             .patch("labels", label_id, &serde_json::json!({ "color": "#123456" }))
             .expect("out-of-band patch");
 
-        let previous_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
+        // A caught panic still prints via the installed hook, and hooks are
+        // PROCESS-GLOBAL — there is no per-thread hook API on stable Rust.
+        // The test suite deliberately runs with the default thread count
+        // (no `--test-threads=1`), so other tests are executing concurrently
+        // on other OS threads for the entire window this hook is installed —
+        // and that window is not an instant: `assert_converged` spawns two
+        // real `rdc` subprocesses (a dry run, then a real sync) inside it. A
+        // hook that unconditionally swallows every panic would, for that
+        // whole window, silently eat the message and backtrace of any
+        // unrelated test that genuinely panics on another thread — it would
+        // still show FAILED, just with no diagnostic. So the hook below
+        // checks WHICH thread is panicking: it suppresses only the one panic
+        // this test is about to provoke on ITS OWN thread, and forwards
+        // every other thread's panic to the real hook untouched. That closes
+        // the race rather than narrowing it, at the cost of ten lines instead
+        // of one.
+        let this_thread = std::thread::current().id();
+        let previous_hook = std::sync::Arc::new(std::panic::take_hook());
+        {
+            let previous_hook = previous_hook.clone();
+            std::panic::set_hook(Box::new(move |info| {
+                if std::thread::current().id() != this_thread {
+                    previous_hook(info);
+                }
+            }));
+        }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             assert_converged(
                 &project,
@@ -765,7 +789,12 @@ mod tests {
                 "after an out-of-band drift",
             );
         }));
-        std::panic::set_hook(previous_hook);
+        // Restore unconditionally (forwarding to the real hook for every
+        // thread) rather than reinstalling the plain original hook directly:
+        // another thread could be mid-panic against the swap above, and
+        // dropping straight back to the un-wrapped original here would be a
+        // second, needless place this test reasons about hook identity.
+        std::panic::set_hook(Box::new(move |info| previous_hook(info)));
 
         let payload = result
             .expect_err("assert_converged must fail once the remote has drifted behind rdc's back");
