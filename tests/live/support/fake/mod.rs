@@ -533,9 +533,13 @@ mod tests {
         let label = c.create_label(&json!({ "name": "L" }), None).await.expect("label");
         assert_eq!(label.name, "L");
 
-        // `Inbox::email` and `Inbox::queues` both have no serde default;
-        // `inbox_defaults` must supply both — the body below omits `queues`
-        // entirely, unlike `every_core_kind_creates_and_deserializes`'s.
+        // `Inbox::email` DOES have a serde default (`src/model/inbox.rs:18`,
+        // `#[serde(default, skip_serializing_if = "String::is_empty")]`) —
+        // dropping it from `inbox_defaults` would surface here as a wrong
+        // `assert_eq!` on the address, not a deserialization error. Only
+        // `Inbox::queues` has no serde default; `inbox_defaults` must supply
+        // it — the body below omits `queues` entirely, unlike
+        // `every_core_kind_creates_and_deserializes`'s.
         let inbox = c
             .create_inbox(&json!({ "name": "I", "email_prefix": "p" }), None)
             .await
@@ -577,5 +581,69 @@ mod tests {
         // Gone on the request after that.
         let status = authed_request(reqwest::Method::GET, &queue_url).await.status();
         assert_eq!(status, 404, "gone after one more request");
+    }
+
+    /// The real seeder, the real manifest, the real typed client — against the
+    /// fake. Also pins the creation ORDER, because
+    /// `testdata/live/expected/round_trip.toml` records the secondary
+    /// workspace/schema/queue winning the bare slugs, and that outcome follows
+    /// from `Manifest::topo_order` plus monotonic ids.
+    #[tokio::test]
+    async fn the_manifest_seeds_against_the_fake_in_topo_order() {
+        use crate::support::client::LiveClient;
+        use crate::support::run_id::RunId;
+        use crate::support::seeder::seed;
+        use crate::support::staticdir::{load_manifest, static_dir};
+
+        let fake = FakeOrg::start().await;
+        let cfg = fake.config();
+        let client = LiveClient::connect(&cfg).expect("connect");
+        let run_id = RunId::new();
+        let manifest = load_manifest().expect("manifest");
+        let index = seed(&client, &run_id, &static_dir(), &manifest)
+            .await
+            .expect("seed");
+
+        // Eleven objects, every one addressable by its manifest key.
+        for key in [
+            "label-priority",
+            "ws-main",
+            "ws-secondary",
+            "schema-invoices-main",
+            "schema-invoices-secondary",
+            "queue-invoices-main",
+            "queue-invoices-secondary",
+            "inbox-invoices-main",
+            "hook-validator",
+            "hook-post-validator",
+            "rule-totals",
+        ] {
+            assert!(index.id(key).is_some(), "manifest key not seeded: {key}");
+        }
+
+        // The order the golden depends on: secondary before main.
+        assert!(
+            index.id("ws-secondary").unwrap() < index.id("ws-main").unwrap(),
+            "ws-secondary must take the lower id"
+        );
+        assert!(
+            index.id("schema-invoices-secondary").unwrap()
+                < index.id("schema-invoices-main").unwrap()
+        );
+        assert!(
+            index.id("queue-invoices-secondary").unwrap()
+                < index.id("queue-invoices-main").unwrap()
+        );
+
+        // Two queues means ten server-made email templates.
+        assert_eq!(fake.state().ids("email_templates").len(), 10);
+
+        // The hook's code sidecar was inlined by the seeder and stored.
+        let hook_id = index.id("hook-validator").unwrap();
+        let hook = fake.state().get("hooks", hook_id).expect("hook");
+        assert!(
+            hook["config"]["code"].as_str().unwrap_or("").contains("def "),
+            "the seeder inlines bodies/hooks/validator.py into config.code"
+        );
     }
 }
