@@ -153,6 +153,15 @@ fn route(st: &mut OrgState, req: &Request) -> ResponseTemplate {
     let method = req.method.as_str().to_string();
 
     if head == "organizations" {
+        // The real endpoint is `GET`/`PATCH /organizations/{id}` and nothing
+        // else — no bare collection, no sub-path. Same rule as the kind
+        // branch below: a tail that doesn't parse as a plain id, or a
+        // segment beyond it, is not a route and must not fall through to
+        // returning the org body anyway.
+        let is_bare_id = tail.as_deref().is_some_and(|t| t.parse::<u64>().is_ok());
+        if !is_bare_id || segs.next().is_some() {
+            return err_response(ApiError::not_found());
+        }
         return match method.as_str() {
             "GET" => json_response(200, &st.organization()),
             "PATCH" => json_response(200, &st.patch_organization(&body_of(req))),
@@ -226,6 +235,18 @@ mod tests {
         RossumClient::new(c.api_base, c.token).expect("client")
     }
 
+    /// A raw (non-typed-client) request against the fake, with its token
+    /// attached — every test below that steps outside `RossumClient` to
+    /// probe routing behavior directly builds one of these.
+    async fn authed_request(method: reqwest::Method, url: &str) -> reqwest::Response {
+        reqwest::Client::new()
+            .request(method, url)
+            .header("Authorization", format!("token {TOKEN}"))
+            .send()
+            .await
+            .expect("request")
+    }
+
     #[tokio::test]
     async fn a_label_round_trips_over_http() {
         let fake = FakeOrg::start().await;
@@ -269,6 +290,18 @@ mod tests {
         assert!(anyhow_has_status(&err, 401), "expected a 401: {err:#}");
     }
 
+    /// `a_bad_token_is_rejected` covers a *wrong* token; `data_storage_paths_are_404`
+    /// sends no header at all but targets a path outside the `/api/v1` prefix,
+    /// so it never reaches the auth check. Neither exercises a missing header
+    /// against a real, in-prefix path — this does.
+    #[tokio::test]
+    async fn a_missing_auth_header_is_rejected() {
+        let fake = FakeOrg::start().await;
+        let url = fake.state().org_url();
+        let status = reqwest::Client::new().get(&url).send().await.expect("request").status();
+        assert_eq!(status, 401);
+    }
+
     /// Data Storage sits at the same host and port (`src/config/mod.rs:29`),
     /// and a 404 there is how an MDH-less org looks — which the pull driver
     /// tolerates (`src/config/mod.rs:33`).
@@ -295,13 +328,7 @@ mod tests {
         let created = c.create_label(&json!({ "name": "One" }), None).await.expect("create");
 
         let url = fake.state().url("labels", created.id);
-        let status = reqwest::Client::new()
-            .get(&url)
-            .header("Authorization", format!("token {TOKEN}"))
-            .send()
-            .await
-            .expect("request")
-            .status();
+        let status = authed_request(reqwest::Method::GET, &url).await.status();
         assert_eq!(status, 404, "labels have no detail-GET endpoint");
 
         let listed = c.list_labels(None).await.expect("still listed");
@@ -323,15 +350,22 @@ mod tests {
     async fn a_non_numeric_sub_path_is_not_a_create() {
         let fake = FakeOrg::start().await;
         let url = format!("{}/hooks/create", fake.api_base());
-        let status = reqwest::Client::new()
-            .post(&url)
-            .header("Authorization", format!("token {TOKEN}"))
-            .send()
-            .await
-            .expect("request")
-            .status();
+        let status = authed_request(reqwest::Method::POST, &url).await.status();
         assert_eq!(status, 404);
         assert!(fake.state().ids("hooks").is_empty(), "no hook must have been created");
+    }
+
+    /// `route()` reads `head == "organizations"` and used to answer the org
+    /// body (or accept a PATCH) for ANY tail, ignoring it entirely — so a
+    /// path like `/organizations/{id}/queues` fell through to the same
+    /// branch as the real `/organizations/{id}` endpoint. The real API has
+    /// no such sub-path; it must 404 like any other unmodelled route.
+    #[tokio::test]
+    async fn organizations_sub_paths_are_not_a_route() {
+        let fake = FakeOrg::start().await;
+        let url = format!("{}/queues", fake.state().org_url());
+        let status = authed_request(reqwest::Method::GET, &url).await.status();
+        assert_eq!(status, 404);
     }
 
     #[tokio::test]
@@ -346,5 +380,88 @@ mod tests {
         let cfg = a.paired_config(&b);
         assert_eq!(cfg.org_id, 1);
         assert_eq!(cfg.target.expect("target").org_id, 2);
+    }
+
+    /// Every kind the round-trip manifest seeds, created through the same
+    /// typed client `LiveClient::create` uses. A missing required field shows
+    /// up here as a deserialization error naming the field.
+    #[tokio::test]
+    async fn every_core_kind_creates_and_deserializes() {
+        let fake = FakeOrg::start().await;
+        let c = client(&fake);
+        let org = fake.state().org_url();
+
+        let ws = c
+            .create_workspace(&json!({ "name": "Main", "organization": org }), None)
+            .await
+            .expect("workspace");
+        assert_eq!(ws.name, "Main");
+
+        let schema = c
+            .create_schema(
+                &json!({ "name": "Invoices", "content": [{ "category": "section", "id": "header" }] }),
+                None,
+            )
+            .await
+            .expect("schema");
+        assert_eq!(schema.content.len(), 1);
+
+        let queue = c
+            .create_queue(
+                &json!({ "name": "Invoices", "workspace": ws.url, "schema": schema.url }),
+                None,
+            )
+            .await
+            .expect("queue");
+        assert_eq!(queue.workspace.as_deref(), Some(ws.url.as_str()));
+
+        let inbox = c
+            .create_inbox(
+                &json!({ "name": "Inbox", "email_prefix": "invoices", "queues": [queue.url] }),
+                None,
+            )
+            .await
+            .expect("inbox");
+        assert_eq!(
+            inbox.email, "invoices@fake.rossum.invalid",
+            "email is server-assigned"
+        );
+
+        let hook = c
+            .create_hook(
+                &json!({
+                    "name": "Validator",
+                    "type": "function",
+                    "events": ["annotation_content"],
+                    "queues": [queue.url],
+                    "config": { "runtime": "python3.12", "code": "pass\n" },
+                }),
+                None,
+            )
+            .await
+            .expect("hook");
+        assert_eq!(hook.hook_type, "function");
+
+        let rule = c
+            .create_rule(
+                &json!({ "name": "Totals", "queues": [queue.url], "trigger_condition": "True\n" }),
+                None,
+            )
+            .await
+            .expect("rule");
+        assert_eq!(rule.queues, vec![queue.url.clone()]);
+
+        let label = c
+            .create_label(&json!({ "name": "Priority", "organization": org, "color": "#ff0000" }), None)
+            .await
+            .expect("label");
+        assert_eq!(label.name, "Priority");
+
+        // A detail GET must work for every kind rdc fetches by id — schemas
+        // above all, because the list omits `content`.
+        assert_eq!(
+            c.get_schema(schema.id, None).await.expect("get schema").content.len(),
+            1
+        );
     }
 }
