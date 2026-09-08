@@ -175,6 +175,14 @@ impl OrgState {
         if self.get(kind, id).is_none() {
             return Err(ApiError::not_found());
         }
+        // `relink` only ever adds. Without unlinking against the PRE-merge
+        // refs first, a patch that re-parents an object (e.g. a hook's
+        // `queues` from [q1] to [q2], or a queue's `workspace` from A to B)
+        // would leave the stale parent still pointing at it — a shape the
+        // real API cannot produce. When a patch touches no refs this is a
+        // no-op round trip: `add_ref` dedupes and `remove_ref`'s `retain` on
+        // an already-absent entry does nothing.
+        self.unlink(kind, id);
         let stamp = self.now();
         let result = {
             let slot = self
@@ -617,5 +625,84 @@ mod tests {
             .unwrap();
         s.delete("hooks", hook["id"].as_u64().unwrap()).unwrap();
         assert_eq!(s.get("queues", q).unwrap()["hooks"], json!([]));
+    }
+
+    #[test]
+    fn patching_a_hooks_queues_moves_the_back_ref() {
+        let mut s = st();
+        let (_, _, q1) = seeded_graph(&mut s);
+        let q1_obj = s.get("queues", q1).unwrap();
+        let q2 = s
+            .create(
+                "queues",
+                json!({ "name": "Q2", "workspace": q1_obj["workspace"], "schema": q1_obj["schema"] }),
+            )
+            .unwrap();
+        let q2_id = q2["id"].as_u64().unwrap();
+        let q1_url = s.url("queues", q1);
+        let q2_url = s.url("queues", q2_id);
+        let hook = s
+            .create("hooks", json!({ "name": "H", "queues": [q1_url] }))
+            .unwrap();
+        let hook_id = hook["id"].as_u64().unwrap();
+        s.patch("hooks", hook_id, &json!({ "queues": [q2_url] })).unwrap();
+        assert_eq!(
+            s.get("queues", q1).unwrap()["hooks"],
+            json!([]),
+            "the old parent must lose the back-ref, not just the new one gain it"
+        );
+        assert_eq!(s.get("queues", q2_id).unwrap()["hooks"], json!([s.url("hooks", hook_id)]));
+    }
+
+    #[test]
+    fn patching_a_queues_workspace_moves_the_back_ref() {
+        let mut s = st();
+        let a = s.create("workspaces", json!({ "name": "A" })).unwrap();
+        let b = s.create("workspaces", json!({ "name": "B" })).unwrap();
+        let sc = s.create("schemas", json!({ "name": "S" })).unwrap();
+        let a_id = a["id"].as_u64().unwrap();
+        let b_id = b["id"].as_u64().unwrap();
+        let q = s
+            .create("queues", json!({ "name": "Q", "workspace": a["url"], "schema": sc["url"] }))
+            .unwrap();
+        let q_id = q["id"].as_u64().unwrap();
+        s.patch("queues", q_id, &json!({ "workspace": b["url"] })).unwrap();
+        assert_eq!(
+            s.get("workspaces", a_id).unwrap()["queues"],
+            json!([]),
+            "the queue must not still be listed under its old workspace"
+        );
+        assert_eq!(
+            s.get("workspaces", b_id).unwrap()["queues"],
+            json!([s.url("queues", q_id)])
+        );
+    }
+
+    #[test]
+    fn deleting_an_inbox_removes_its_queues_inbox_key() {
+        let mut s = st();
+        let (_, _, q) = seeded_graph(&mut s);
+        let inbox = s
+            .create(
+                "inboxes",
+                json!({ "name": "In", "email_prefix": "p", "queues": [s.url("queues", q)] }),
+            )
+            .unwrap();
+        s.delete("inboxes", inbox["id"].as_u64().unwrap()).unwrap();
+        let queue = s.get("queues", q).unwrap();
+        assert!(
+            !queue.as_object().unwrap().contains_key("inbox"),
+            "the key must be vacated (real API rejects inbox: null), not set to null: {queue:?}"
+        );
+    }
+
+    #[test]
+    fn deleting_a_queue_shrinks_its_workspace_and_schema() {
+        let mut s = st();
+        let (ws, sc, q) = seeded_graph(&mut s);
+        assert_eq!(s.delete("queues", q).unwrap(), Deletion::Requested);
+        s.tick_deletions();
+        assert_eq!(s.get("workspaces", ws).unwrap()["queues"], json!([]));
+        assert_eq!(s.get("schemas", sc).unwrap()["queues"], json!([]));
     }
 }
