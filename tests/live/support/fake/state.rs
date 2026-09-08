@@ -23,9 +23,8 @@ impl ApiError {
 
     /// The shape Rossum uses for cross-field refusals — the form
     /// `src/cli/push/mod.rs:88-96` quotes for the engine-field check.
-    /// Not yet produced by anything the router routes to (a later stage's
-    /// quirks/validation work).
-    #[allow(dead_code)]
+    /// Produced by `validate::on_write`'s queue-engine-slot and
+    /// schema-vs-engine-fields rules.
     pub fn non_field(msg: impl Into<String>) -> ApiError {
         ApiError { status: 400, body: json!({ "non_field_errors": [msg.into()] }) }
     }
@@ -581,7 +580,12 @@ impl OrgState {
         }
     }
 
-    /// Whether `url` names an object this org holds.
+    /// Whether `url` names an object this org holds, of ANY kind — kind-blind.
+    /// `resolves_kind` below is what `on_write` actually uses, now that a
+    /// well-formed ref of the WRONG kind needs catching too; kept, like
+    /// `org_id` above, for a caller that only cares whether something
+    /// resolves at all.
+    #[allow(dead_code)]
     pub fn resolves(&self, url: &str) -> bool {
         let mut parts = url.trim_end_matches('/').rsplit('/');
         let Some(id) = parts.next().and_then(|s| s.parse::<u64>().ok()) else {
@@ -597,12 +601,55 @@ impl OrgState {
             .unwrap_or(false)
     }
 
-    /// Any object addressed by its url, whatever its kind.
+    /// Whether `url` names an object this org holds of EXACTLY `expected_kind`.
+    ///
+    /// Stricter than `resolves`: a well-formed url of a DIFFERENT kind (e.g.
+    /// a queue's `schema` field carrying a `workspace` url) is refused,
+    /// matching the real API's ref-type checking — `resolves` alone would
+    /// accept it, because it only checks that an object of the url's OWN
+    /// kind exists, never that the kind matches what the field expects.
+    pub fn resolves_kind(&self, url: &str, expected_kind: &str) -> bool {
+        let mut parts = url.trim_end_matches('/').rsplit('/');
+        let Some(id) = parts.next().and_then(|s| s.parse::<u64>().ok()) else {
+            return false;
+        };
+        let Some(kind) = parts.next() else { return false };
+        if kind != expected_kind {
+            return false;
+        }
+        if kind == "organizations" {
+            return id == self.org_id;
+        }
+        kinds::spec(kind)
+            .and_then(|k| self.objects.get(k.path))
+            .map(|m| m.contains_key(&id))
+            .unwrap_or(false)
+    }
+
+    /// Any object addressed by its url, whatever its kind — kind-blind.
+    /// `get_by_url_kind` below is what `on_write` actually uses; kept for a
+    /// caller that doesn't care which kind it gets back.
+    #[allow(dead_code)]
     pub fn get_by_url(&self, url: &str) -> Option<Value> {
         let mut parts = url.trim_end_matches('/').rsplit('/');
         let id = parts.next()?.parse::<u64>().ok()?;
         let kind = kinds::spec(parts.next()?)?.path;
         self.get(kind, id)
+    }
+
+    /// The kind-checked counterpart to `get_by_url` — `None` if `url`'s own
+    /// kind segment is not `expected_kind`, even if an object of ITS kind
+    /// exists at that id. Used where a caller needs the object itself
+    /// rather than just proof of existence, so it cannot silently walk a
+    /// wrong-kind object even if an earlier ref check were ever bypassed.
+    pub fn get_by_url_kind(&self, url: &str, expected_kind: &str) -> Option<Value> {
+        let mut parts = url.trim_end_matches('/').rsplit('/');
+        let id = parts.next()?.parse::<u64>().ok()?;
+        let kind = parts.next()?;
+        if kind != expected_kind {
+            return None;
+        }
+        self.get(kinds::spec(kind)?.path, id)
     }
 
     /// The `name` of every engine field bound to `engine_url`. An engine
@@ -1189,5 +1236,45 @@ mod tests {
                 json!({ "name": "Mine", "type": "custom", "queue": q["url"] })
             )
             .is_ok());
+    }
+
+    #[test]
+    fn a_ref_of_the_wrong_kind_is_refused_even_though_it_resolves() {
+        // A well-formed, EXISTING url of the wrong resource kind must be
+        // refused, not just a url that resolves to nothing — the real API
+        // checks ref TYPE, not just presence. This also protects rule 5's
+        // schema lookup: `get_by_url_kind` there refuses to walk a non-schema
+        // object, so the engine-field-name check cannot pass vacuously
+        // against a mismatched ref that slipped past this one.
+        let mut s = st();
+        let ws = s.create("workspaces", json!({ "name": "W" })).unwrap();
+        let err = s
+            .create(
+                "queues",
+                json!({ "name": "Q", "workspace": ws["url"], "schema": ws["url"] }),
+            )
+            .expect_err("a workspace url is not a valid schema ref");
+        assert_eq!(err.status, 400);
+        assert!(
+            format!("{:?}", err.body).contains("Invalid hyperlink - No URL match"),
+            "wrong body: {:?}",
+            err.body
+        );
+    }
+
+    #[test]
+    fn a_label_color_at_the_cap_is_accepted_and_one_over_is_refused() {
+        // The cap that matters most: the seed fixture's label sits exactly
+        // at it. `an_over_length_field_is_refused_after_a_trailing_whitespace_trim`
+        // above already proves inclusivity for `hooks`/`description`; this
+        // proves it as a property of `field_caps` in general, not one entry.
+        let mut s = st();
+        assert!(s
+            .create("labels", json!({ "name": "L1", "color": "#ff0000" }))
+            .is_ok());
+        let err = s
+            .create("labels", json!({ "name": "L2", "color": "#ff00000" }))
+            .expect_err("must be refused");
+        assert_eq!(err.status, 400);
     }
 }

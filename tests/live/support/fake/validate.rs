@@ -66,13 +66,19 @@ pub fn field_caps(kind: &str) -> &'static [(&'static str, usize)] {
 const UNIQUE_TEMPLATE_TYPES: &[&str] =
     &["rejection_default", "email_with_no_processable_attachments"];
 
-/// Fields whose value is a url that must resolve to a live object.
-const REF_FIELDS: &[(&str, &str)] = &[
-    ("queues", "workspace"),
-    ("queues", "schema"),
-    ("queues", "engine"),
-    ("queues", "generic_engine"),
-    ("email_templates", "queue"),
+/// Fields whose value is a url that must resolve to a live object of the
+/// third element's kind — not just resolve to SOMETHING. A well-formed,
+/// existing url of the wrong resource kind (e.g. a queue's `schema` field
+/// carrying a `workspace` url) is refused, matching the real API's ref-type
+/// checking; see `OrgState::resolves_kind`.
+const REF_FIELDS: &[(&str, &str, &str)] = &[
+    ("queues", "workspace", "workspaces"),
+    ("queues", "schema", "schemas"),
+    ("queues", "engine", "engines"),
+    ("queues", "generic_engine", "engines"),
+    ("email_templates", "queue", "queues"),
+    ("labels", "organization", "organizations"),
+    ("workspaces", "organization", "organizations"),
 ];
 
 /// Refuse a create the real API refuses.
@@ -87,23 +93,29 @@ const REF_FIELDS: &[(&str, &str)] = &[
 /// any scenario sends are a valid label colour and a hook rename — so this
 /// leaves stage 2 a documented limitation instead of a silent one.
 pub fn on_write(st: &OrgState, kind: &'static str, body: &Value) -> Result<(), ApiError> {
-    // 1. Every ref must resolve. This is the refusal rdc's whole
-    //    deferred-relink path is built around (`src/snapshot/refs.rs:159`).
-    for &(k, field) in REF_FIELDS {
+    // 1. Every ref must resolve, AND resolve to the right kind. This is the
+    //    refusal rdc's whole deferred-relink path is built around
+    //    (`src/snapshot/refs.rs:159`).
+    for &(k, field, expected_kind) in REF_FIELDS {
         if k != kind {
             continue;
         }
         if let Some(url) = body.get(field).and_then(Value::as_str)
-            && !st.resolves(url)
+            && !st.resolves_kind(url, expected_kind)
         {
             return Err(ApiError::bad_request("Invalid hyperlink - No URL match"));
         }
     }
-    for field in ["queues", "run_after"] {
+    // Unlike `REF_FIELDS` above, this is intentionally NOT scoped per kind:
+    // `queues` and `run_after` mean the same thing (a list of queue urls, a
+    // list of hook urls) on whichever kind carries them, so there is
+    // nothing to gain from re-listing them per kind the way `REF_FIELDS`'s
+    // single-url fields differ per kind.
+    for (field, expected_kind) in [("queues", "queues"), ("run_after", "hooks")] {
         if let Some(list) = body.get(field).and_then(Value::as_array) {
             for v in list {
                 if let Some(url) = v.as_str()
-                    && !st.resolves(url)
+                    && !st.resolves_kind(url, expected_kind)
                 {
                     return Err(ApiError::bad_request("Invalid hyperlink - No URL match"));
                 }
@@ -170,7 +182,11 @@ pub fn on_write(st: &OrgState, kind: &'static str, body: &Value) -> Result<(), A
     {
         let known = st.engine_field_names(engine_url);
         let mut extracted = Vec::new();
-        if let Some(schema) = st.get_by_url(schema_url) {
+        // Kind-checked on purpose, not `get_by_url`: a mismatched `schema`
+        // ref must not silently walk a non-schema object and extract
+        // nothing from it, which would let this rule pass vacuously even if
+        // rule 1 above were ever bypassed.
+        if let Some(schema) = st.get_by_url_kind(schema_url, "schemas") {
             extracted_field_ids(schema.get("content").unwrap_or(&Value::Null), &mut extracted);
         }
         if let Some(missing) = extracted.iter().find(|f| !known.contains(*f)) {
