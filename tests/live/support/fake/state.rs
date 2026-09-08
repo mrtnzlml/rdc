@@ -223,9 +223,40 @@ impl OrgState {
         if self.get(kind, id).is_none() {
             return Err(ApiError::not_found());
         }
+        super::validate::on_delete(self, kind, id)?;
+        // Unlinking happens here, before the 202 branch below, for a queue
+        // exactly as for anything else — not premature. The real API itself
+        // nulls a `deletion_requested` queue's `workspace` right away (the
+        // null-out below mirrors that), so `workspace.queues` /
+        // `schema.queues` must already be clean by the time anyone can next
+        // observe either parent. See `src/cli/sync/mod.rs:861-864`.
         self.unlink(kind, id);
         if kind == "queues" {
-            // `202 deletion_requested`: still listed for one more request.
+            // `202 deletion_requested`: still listed for one more request,
+            // but not unchanged. The real `GET /queues` answers with
+            // `workspace: null`, `schema: null` and `status:
+            // "deletion_requested"` for a queue in this state — see the
+            // comment and fixture at `src/cli/sync/mod.rs:861-864` and
+            // `:1934-1944`, and the regression this shape exists to keep
+            // reproducible offline, `tests/cli_sync.rs:4388-4400` ("Bug #1":
+            // seeding a workspace-less queue into the classifier's working
+            // lockfile made a referencing hook re-pull forever). This is
+            // repo-documented and offline-regression-tested, NOT
+            // live-asserted — no live scenario checks that `workspace` /
+            // `schema` go null, only that `status` becomes
+            // `deletion_requested` (`ordering.rs:348`). Only these three
+            // fields are touched: nothing is known either way about
+            // `hooks`/`rules`/anything else on a draining queue.
+            if let Some(obj) = self
+                .objects
+                .get_mut(kind)
+                .and_then(|m| m.get_mut(&id))
+                .and_then(|v| v.as_object_mut())
+            {
+                obj.insert("workspace".into(), Value::Null);
+                obj.insert("schema".into(), Value::Null);
+                obj.insert("status".into(), json!("deletion_requested"));
+            }
             self.pending_delete.insert(id, 1);
             return Ok(Deletion::Requested);
         }
@@ -270,11 +301,49 @@ impl OrgState {
         })
     }
 
-    /// Charge every pending queue delete one request. Called by the router
-    /// after each response, so a 202 is followed by exactly one more sighting.
+    /// Charge every pending queue delete one request, unconditionally. What a
+    /// caller driving `OrgState` directly wants — `delete()` sets a fresh
+    /// entry's grace with NO tick attached, so a single explicit call here
+    /// afterward is "one more request" and removes it. The router wants
+    /// something narrower; see `tick_pending_from`.
     pub fn tick_deletions(&mut self) {
+        self.tick_matching(|_id| true);
+    }
+
+    /// Ids on the grace clock right now. The router snapshots this BEFORE
+    /// routing a request and hands it to `tick_pending_from` AFTER, so a
+    /// request's own `delete()` call — if this request is one — never
+    /// charges the grace it just created.
+    pub fn pending_delete_ids(&self) -> Vec<u64> {
+        self.pending_delete.keys().copied().collect()
+    }
+
+    /// Charge one request's worth of grace, but only to ids present in
+    /// `before` (a snapshot from `pending_delete_ids`, taken before this
+    /// request was routed). `tick_deletions` above charges everything
+    /// unconditionally, which is right for a caller ticking by hand — but
+    /// the router calls a tick once per HTTP request, and a queue `DELETE`
+    /// inserts its own fresh entry INSIDE that same request's `route()`
+    /// call. Charging that entry too would consume `delete()`'s single unit
+    /// of grace immediately: the `202` response would be followed by ZERO
+    /// further sightings, not the one `Deletion::Requested`'s doc comment
+    /// promises. Caught by
+    /// `a_deleted_queue_is_202_then_nulled_then_gone_over_http`
+    /// (`tests/live/support/fake/mod.rs`) — a state-level test alone can't
+    /// see this, because it never goes through the router's tick placement.
+    /// An id NOT in `before` (i.e., inserted by the request just routed) is
+    /// left untouched; it gets its first tick on the NEXT request instead.
+    pub fn tick_pending_from(&mut self, before: &[u64]) {
+        let keep: std::collections::BTreeSet<u64> = before.iter().copied().collect();
+        self.tick_matching(|id| keep.contains(&id));
+    }
+
+    fn tick_matching(&mut self, keep: impl Fn(u64) -> bool) {
         let mut done = Vec::new();
         for (id, left) in self.pending_delete.iter_mut() {
+            if !keep(*id) {
+                continue;
+            }
             match left.checked_sub(1) {
                 Some(0) | None => done.push(*id),
                 Some(n) => *left = n,
@@ -282,9 +351,60 @@ impl OrgState {
         }
         for id in done {
             self.pending_delete.remove(&id);
-            self.unlink("queues", id);
-            self.objects.get_mut("queues").map(|m| m.remove(&id));
+            self.cascade_queue_delete(id);
         }
+    }
+
+    /// Queues that have answered `202` but not yet vanished.
+    pub fn queues_awaiting_deletion(&self) -> Vec<Value> {
+        self.pending_delete.keys().filter_map(|id| self.get("queues", *id)).collect()
+    }
+
+    /// Remove a queue and everything the server removes with it: its
+    /// auto-created email templates and its inbox. The SCHEMA survives —
+    /// teardown deletes it explicitly, and needs a retry precisely because it
+    /// outlives the queue's purge (`tests/live/support/teardown.rs:38`).
+    ///
+    /// No `unlink("queues", queue_id)` call here: `delete()` already severed
+    /// `workspace.queues` / `schema.queues` at request time, before this
+    /// queue was nulled out and put on the grace clock — see the comment
+    /// there.
+    fn cascade_queue_delete(&mut self, queue_id: u64) {
+        let queue_url = self.url("queues", queue_id);
+        let doomed_templates: Vec<u64> = self
+            .objects
+            .get("email_templates")
+            .map(|m| {
+                m.iter()
+                    .filter(|(_, t)| {
+                        t.get("queue").and_then(Value::as_str) == Some(queue_url.as_str())
+                    })
+                    .map(|(id, _)| *id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let doomed_inboxes: Vec<u64> = self
+            .objects
+            .get("inboxes")
+            .map(|m| {
+                m.iter()
+                    .filter(|(_, i)| {
+                        i.get("queues")
+                            .and_then(Value::as_array)
+                            .map(|a| a.iter().any(|q| q.as_str() == Some(queue_url.as_str())))
+                            .unwrap_or(false)
+                    })
+                    .map(|(id, _)| *id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        for id in doomed_templates {
+            self.objects.get_mut("email_templates").and_then(|m| m.remove(&id));
+        }
+        for id in doomed_inboxes {
+            self.objects.get_mut("inboxes").and_then(|m| m.remove(&id));
+        }
+        self.objects.get_mut("queues").and_then(|m| m.remove(&queue_id));
     }
 
     pub fn ids(&self, kind: &str) -> Vec<u64> {
@@ -755,6 +875,88 @@ mod tests {
         assert_eq!(
             got, want,
             "both siblings must survive a patch to just one of them, order aside"
+        );
+    }
+
+    #[test]
+    fn a_queue_delete_is_requested_then_takes_effect_one_request_later() {
+        let mut s = st();
+        let (_, _, q) = seeded_graph(&mut s);
+        assert_eq!(s.delete("queues", q).unwrap(), Deletion::Requested);
+        // Still there, exactly as `202 deletion_requested` promises.
+        assert!(s.get("queues", q).is_some());
+        s.tick_deletions();
+        assert!(s.get("queues", q).is_none(), "gone after one more request");
+    }
+
+    /// The real `GET /queues` does not just leave a `deletion_requested`
+    /// queue unchanged for its one extra sighting — it nulls `workspace` and
+    /// `schema` and flips `status`. Repo-documented, not live-asserted: see
+    /// the comment on `delete()`.
+    #[test]
+    fn a_queue_awaiting_deletion_has_workspace_and_schema_nulled() {
+        let mut s = st();
+        let (_, _, q) = seeded_graph(&mut s);
+        s.delete("queues", q).unwrap();
+        let seen = s.get("queues", q).expect("still listed for one more request");
+        assert_eq!(seen["workspace"], Value::Null);
+        assert_eq!(seen["schema"], Value::Null);
+        assert_eq!(seen["status"], json!("deletion_requested"));
+    }
+
+    #[test]
+    fn a_queue_delete_cascades_to_its_templates_and_inbox() {
+        let mut s = st();
+        let (_, _, q) = seeded_graph(&mut s);
+        let q_url = s.url("queues", q);
+        s.create("inboxes", json!({ "name": "In", "email_prefix": "p", "queues": [q_url] }))
+            .unwrap();
+        assert_eq!(s.ids("email_templates").len(), 5);
+        assert_eq!(s.ids("inboxes").len(), 1);
+        s.delete("queues", q).unwrap();
+        s.tick_deletions();
+        assert!(s.ids("email_templates").is_empty(), "templates go with the queue");
+        assert!(s.ids("inboxes").is_empty(), "so does the inbox");
+    }
+
+    #[test]
+    fn a_cascaded_queue_delete_leaves_its_schema_for_the_caller() {
+        // Teardown deletes schemas explicitly, with a retry, because the
+        // schema outlives the queue's purge (`tests/live/support/teardown.rs:38`).
+        let mut s = st();
+        let (_, sc, q) = seeded_graph(&mut s);
+        s.delete("queues", q).unwrap();
+        s.tick_deletions();
+        assert!(s.get("schemas", sc).is_some());
+        assert_eq!(s.delete("schemas", sc).unwrap(), Deletion::Gone);
+    }
+
+    #[test]
+    fn an_engine_cannot_be_deleted_while_a_queue_awaits_deletion() {
+        let mut s = st();
+        let engine = s.create("engines", json!({ "name": "E" })).unwrap();
+        let ws = s.create("workspaces", json!({ "name": "W" })).unwrap();
+        let sc = s.create("schemas", json!({ "name": "S" })).unwrap();
+        let q = s
+            .create(
+                "queues",
+                json!({
+                    "name": "Q",
+                    "workspace": ws["url"],
+                    "schema": sc["url"],
+                    "engine": engine["url"],
+                }),
+            )
+            .unwrap();
+        s.delete("queues", q["id"].as_u64().unwrap()).unwrap();
+        let err = s
+            .delete("engines", engine["id"].as_u64().unwrap())
+            .expect_err("must be refused");
+        assert_eq!(err.status, 400);
+        assert!(
+            format!("{:?}", err.body).contains("engine_attached_to_queues_waiting_for_deletion"),
+            "wrong body: {:?}",
+            err.body
         );
     }
 }

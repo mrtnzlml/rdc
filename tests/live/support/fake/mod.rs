@@ -10,6 +10,7 @@
 pub mod kinds;
 pub mod quirks;
 pub mod state;
+pub mod validate;
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -48,10 +49,17 @@ impl FakeOrg {
         Mock::given(any())
             .respond_with(move |req: &Request| {
                 let mut st = handler.lock().unwrap_or_else(|p| p.into_inner());
+                // Snapshot BEFORE routing: if THIS request is itself a queue
+                // `DELETE`, `route()` below inserts its fresh grace entry
+                // during this very call — and that entry must not be
+                // charged by the tick that follows, or a 202 would be
+                // followed by zero more sightings instead of one. See
+                // `OrgState::tick_pending_from`.
+                let already_pending = st.pending_delete_ids();
                 let out = route(&mut st, req);
                 // Charge pending queue deletes for this request, so a 202 is
                 // followed by exactly one more sighting.
-                st.tick_deletions();
+                st.tick_pending_from(&already_pending);
                 out
             })
             .mount(&server)
@@ -534,5 +542,40 @@ mod tests {
             .expect("inbox");
         assert_eq!(inbox.email, "p@fake.rossum.invalid");
         assert!(inbox.queues.is_empty());
+    }
+
+    /// `state.rs`'s cascade/grace tests call `tick_deletions()` directly; what
+    /// a real caller actually observes depends on WHERE the router calls it —
+    /// once per request, in `FakeOrg::start`'s responder, after every
+    /// response including the delete's own. Drive the whole 202 arc over real
+    /// HTTP to pin that observable sequence end to end, including the nulled
+    /// shape from `state.rs::delete()`'s comment.
+    #[tokio::test]
+    async fn a_deleted_queue_is_202_then_nulled_then_gone_over_http() {
+        let fake = FakeOrg::start().await;
+        let c = client(&fake);
+        let schema = c.create_schema(&json!({ "name": "S" }), None).await.expect("schema");
+        let queue = c
+            .create_queue(&json!({ "name": "Q", "schema": schema.url }), None)
+            .await
+            .expect("queue");
+        let queue_url = queue.url.clone();
+
+        let del = authed_request(reqwest::Method::DELETE, &queue_url).await;
+        assert_eq!(del.status(), 202);
+
+        // One more sighting, with the nulled shape.
+        let seen: Value = authed_request(reqwest::Method::GET, &queue_url)
+            .await
+            .json()
+            .await
+            .expect("still listed for one more request");
+        assert_eq!(seen["workspace"], Value::Null);
+        assert_eq!(seen["schema"], Value::Null);
+        assert_eq!(seen["status"], json!("deletion_requested"));
+
+        // Gone on the request after that.
+        let status = authed_request(reqwest::Method::GET, &queue_url).await.status();
+        assert_eq!(status, 404, "gone after one more request");
     }
 }
