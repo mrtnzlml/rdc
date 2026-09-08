@@ -158,6 +158,10 @@ impl OrgState {
         self.next_id += 1;
         self.objects.entry(kind).or_default().insert(id, body.clone());
         self.relink(kind, id);
+        if kind == "queues" {
+            let url = self.url("queues", id);
+            super::quirks::materialize_queue_defaults(self, &url);
+        }
         Ok(body)
     }
 

@@ -8,6 +8,7 @@
 //! something a human notices in a customer env.
 
 pub mod kinds;
+pub mod quirks;
 pub mod state;
 
 use std::sync::{Arc, Mutex, MutexGuard};
