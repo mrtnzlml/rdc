@@ -235,9 +235,11 @@ mod tests {
         RossumClient::new(c.api_base, c.token).expect("client")
     }
 
-    /// A raw (non-typed-client) request against the fake, with its token
-    /// attached — every test below that steps outside `RossumClient` to
-    /// probe routing behavior directly builds one of these.
+    /// A raw (non-typed-client), authenticated request against the fake —
+    /// for a raw-request test that needs the token header attached.
+    /// `a_missing_auth_header_is_rejected` and `data_storage_paths_are_404`
+    /// deliberately send no header at all and build their requests directly
+    /// instead of going through this helper.
     async fn authed_request(method: reqwest::Method, url: &str) -> reqwest::Response {
         reqwest::Client::new()
             .request(method, url)
@@ -383,8 +385,17 @@ mod tests {
     }
 
     /// Every kind the round-trip manifest seeds, created through the same
-    /// typed client `LiveClient::create` uses. A missing required field shows
-    /// up here as a deserialization error naming the field.
+    /// typed client `LiveClient::create` uses, with a REALISTIC body — the
+    /// shape a real client actually sends. Proves the fake's responses to
+    /// such a body deserialize into `crate::model::*`.
+    ///
+    /// This does NOT prove `kinds.rs`'s `defaults()` are complete: every body
+    /// below already supplies each model-required field directly, and
+    /// `state.rs::create()` fills defaults with `Map::entry().or_insert()`,
+    /// which never overwrites a caller-supplied key — so a wrong or missing
+    /// `ensure(...)` here would go undetected.
+    /// `defaults_supply_every_field_the_models_require` below is the one
+    /// that exercises `defaults()` for real, with minimal bodies.
     #[tokio::test]
     async fn every_core_kind_creates_and_deserializes() {
         let fake = FakeOrg::start().await;
@@ -463,5 +474,64 @@ mod tests {
             c.get_schema(schema.id, None).await.expect("get schema").content.len(),
             1
         );
+    }
+
+    /// `every_core_kind_creates_and_deserializes` above supplies every
+    /// model-required field directly, so it cannot tell a present
+    /// `ensure(...)` in `kinds.rs` from a deleted one. This test creates each
+    /// kind with a MINIMAL body — only what a real client actually sends —
+    /// leaving every server-assigned or defaulted field for `defaults()` to
+    /// fill in. Drop the wrong `ensure(...)` line and it is THIS test, not
+    /// the one above, that fails to deserialize.
+    #[tokio::test]
+    async fn defaults_supply_every_field_the_models_require() {
+        let fake = FakeOrg::start().await;
+        let c = client(&fake);
+
+        // `Workspace::organization` has no serde default; `org_owned` must
+        // supply it.
+        let ws = c.create_workspace(&json!({ "name": "W" }), None).await.expect("workspace");
+        assert_eq!(ws.name, "W");
+
+        // `Schema::content` has no serde default; `schema_defaults` must
+        // supply it.
+        let schema = c.create_schema(&json!({ "name": "S" }), None).await.expect("schema");
+        assert!(schema.content.is_empty());
+
+        // Queue requires only `name` — nothing in `queue_defaults` is
+        // deserialization-critical the way the fields above are. Included
+        // for completeness, not because it proves anything about
+        // `defaults()`. A real `schema` is still supplied: a schema-less
+        // `POST /queues` becomes a 400 from Task 7 on, and this test should
+        // not need to change when that lands.
+        let queue = c
+            .create_queue(&json!({ "name": "Q", "schema": schema.url }), None)
+            .await
+            .expect("queue");
+        assert_eq!(queue.schema.as_deref(), Some(schema.url.as_str()));
+
+        // Rule requires only `name` too — same caveat as queues above.
+        let rule = c.create_rule(&json!({ "name": "R" }), None).await.expect("rule");
+        assert_eq!(rule.name, "R");
+
+        // `Hook::hook_type` (wire name `type`) has no serde default;
+        // `hook_defaults` must supply it.
+        let hook = c.create_hook(&json!({ "name": "H" }), None).await.expect("hook");
+        assert_eq!(hook.hook_type, "function");
+
+        // `Label::organization` has no serde default; `org_owned` must
+        // supply it.
+        let label = c.create_label(&json!({ "name": "L" }), None).await.expect("label");
+        assert_eq!(label.name, "L");
+
+        // `Inbox::email` and `Inbox::queues` both have no serde default;
+        // `inbox_defaults` must supply both — the body below omits `queues`
+        // entirely, unlike `every_core_kind_creates_and_deserializes`'s.
+        let inbox = c
+            .create_inbox(&json!({ "name": "I", "email_prefix": "p" }), None)
+            .await
+            .expect("inbox");
+        assert_eq!(inbox.email, "p@fake.rossum.invalid");
+        assert!(inbox.queues.is_empty());
     }
 }
