@@ -146,6 +146,16 @@ pub struct Edge {
     pub field: &'static str,
     pub shape: RefShape,
     pub target: &'static str,
+    /// Only meaningful when `owner` is `Some` — back-references are
+    /// inherently owner-specific (the same `queues` field means three
+    /// different things on `inboxes`, `hooks` and `rules`), which is exactly
+    /// why the universal rows exist for the ref-TYPE check alone and never
+    /// for back-reference maintenance. `edges_for` — the only thing
+    /// `graph::relink`/`unlink` consult — filters on `owner == Some(...)`,
+    /// so a universal row's `back_ref` is never read by anything: setting
+    /// one produces no compiler error and no behavior change, just a value
+    /// nobody looks at. `no_universal_row_carries_a_back_ref` below turns
+    /// that dead-state possibility into an enforced invariant.
     pub back_ref: Option<BackRef>,
 }
 
@@ -230,6 +240,22 @@ mod tests {
                 "edge table is missing {owner}.{field} -> {target}"
             );
         }
+    }
+
+    /// A universal row's `back_ref` is dead: `edges_for` — the only thing
+    /// `graph::relink`/`unlink` consult — filters on `owner == Some(...)`,
+    /// so nothing ever reads a `back_ref` set on an `owner: None` row.
+    /// Setting one anyway would compile clean and change nothing, which is
+    /// precisely the kind of silent trap a future edge-adder would not
+    /// notice — so this enforces the invariant the doc comment on
+    /// `Edge::back_ref` only describes.
+    #[test]
+    fn no_universal_row_carries_a_back_ref() {
+        assert!(
+            universal_edges().all(|e| e.back_ref.is_none()),
+            "a universal row's back_ref is never read by any consumer \
+             (see the doc comment on Edge::back_ref) — drop it"
+        );
     }
 
     /// The two universal rows are deliberate, not an oversight: `queues` and
