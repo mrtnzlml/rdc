@@ -170,9 +170,10 @@ pub const EDGES: &[Edge] = &[
     Edge { owner: None, field: "run_after", shape: RefShape::Array, target: "hooks", back_ref: None },
 ];
 
-/// Owner-scoped edges declared on `owner` — used to check its single-url
-/// refs and to drive `graph::relink`/`unlink`'s back-reference maintenance.
-/// Excludes the universal rows; see [`universal_edges`].
+/// Owner-scoped edges declared on `owner` (single-url or array fields
+/// alike) — used to check its refs and to drive `graph::relink`/`unlink`'s
+/// back-reference maintenance. Excludes the universal rows; see
+/// [`universal_edges`].
 pub fn edges_for(owner: &str) -> impl Iterator<Item = &'static Edge> {
     EDGES.iter().filter(move |e| e.owner == Some(owner))
 }
