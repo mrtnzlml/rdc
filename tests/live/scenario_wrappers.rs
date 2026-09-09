@@ -25,12 +25,6 @@
 //! tradeoff `command_references.rs` makes for backticked verbs: a narrow rule
 //! with no false positives beats a clever one that has them, and every
 //! signature in this codebase today is short enough not to wrap.
-//!
-//! This module's own name contains "fake" on purpose, even though none of
-//! its tests start a `FakeOrg`: `cargo test -- --skip fake` skips a test by
-//! matching "fake" as a substring of its full path, and naming the module
-//! this way keeps that count exactly where it was before this guard existed
-//! (see the stage-2 task-4 report for the full reasoning).
 
 use std::path::{Path, PathBuf};
 
@@ -103,7 +97,7 @@ fn ignore_attr_count(text: &str) -> usize {
 }
 
 #[test]
-fn every_scenario_core_has_a_fake_and_a_live_wrapper() {
+fn every_scenario_core_has_both_wrappers() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let files = scenario_files();
     assert!(
