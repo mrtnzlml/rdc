@@ -336,12 +336,12 @@ async fn defaults_supply_every_field_the_models_require() {
     assert!(inbox.queues.is_empty());
 }
 
-/// `state.rs`'s cascade/grace tests call `tick_deletions()` directly; what
-/// a real caller actually observes depends on WHERE the router calls it —
-/// once per request, in `FakeOrg::start`'s responder, after every
-/// response including the delete's own. Drive the whole 202 arc over real
-/// HTTP to pin that observable sequence end to end, including the nulled
-/// shape from `state.rs::delete()`'s comment.
+/// `state.rs`'s grace tests and `graph.rs`'s cascade tests call
+/// `tick_deletions()` directly; what a real caller actually observes depends
+/// on WHERE the router calls it — once per request, in `FakeOrg::start`'s
+/// responder, after every response including the delete's own. Drive the
+/// whole 202 arc over real HTTP to pin that observable sequence end to end,
+/// including the nulled shape from `state.rs::delete()`'s comment.
 #[tokio::test]
 async fn a_deleted_queue_is_202_then_nulled_then_gone_over_http() {
     let fake = FakeOrg::start().await;

@@ -63,8 +63,8 @@ pub const QUIRKS: &[Quirk] = &[
         // CASCADE half (the queue's auto-created email templates and inbox
         // disappearing with it) has NO live assertion anywhere in the tree —
         // it is documented only in `state.rs::delete()`'s and
-        // `state.rs::cascade_queue_delete`'s doc comments, and pinned
-        // offline by `state.rs::a_queue_delete_cascades_to_its_templates_and_inbox`,
+        // `graph.rs::cascade_queue_delete`'s doc comments, and pinned
+        // offline by `graph.rs::a_queue_delete_cascades_to_its_templates_and_inbox`,
         // which exercises the fake's OWN implementation of the rule, not the
         // real API. The previous citation here,
         // `conflicts_deletes.rs::live_conflicts_deletes`, proved neither

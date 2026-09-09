@@ -360,7 +360,7 @@ impl OrgState {
     /// further sightings, not the one `Deletion::Requested`'s doc comment
     /// promises. Caught by
     /// `a_deleted_queue_is_202_then_nulled_then_gone_over_http`
-    /// (`tests/live/support/fake/mod.rs`) — a state-level test alone can't
+    /// (`tests/live/support/fake/tests.rs`) — a state-level test alone can't
     /// see this, because it never goes through the router's tick placement.
     /// An id NOT in `before` (i.e., inserted by the request just routed) is
     /// left untouched; it gets its first tick on the NEXT request instead.
