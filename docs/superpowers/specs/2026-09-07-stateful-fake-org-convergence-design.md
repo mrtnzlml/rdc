@@ -347,7 +347,7 @@ which is the first offline coverage the promotion chain has ever had.
   the 28 endpoints `rdc` calls and only the fields it reads or writes, and by
   the provenance guard refusing unprovable quirks.
 - **False confidence from a wrong model.** Bounded by dual-backend scenarios
-  and the two oracles already in `testdata/`.
+  and the run-agnostic goldens at `testdata/live/expected/*.toml`.
 - **A flaky fake blocks the weekly release.** Bounded by per-test instances, a
   logical clock instead of the wall clock, zero sleeps, and no randomness
   beyond the existing `RunId`.
