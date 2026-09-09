@@ -38,6 +38,80 @@ use serde_json::{json, Value};
 
 use super::state::OrgState;
 
+/// The response-shaping seam. `route()` (`mod.rs`) passes every response
+/// body it builds through here, keyed by `(kind, method)` — `kind` is the
+/// canonical path a `kinds::Spec` is keyed by (e.g. `"queues"`), or
+/// `"organizations"` for the one endpoint that sits outside that registry.
+/// So far exactly one pair has a rule: `("organizations", "PATCH")`, which
+/// implements quirk `organization_patch_response_is_not_get_shaped` below.
+/// Every other `(kind, method)` passes through unchanged — this function is a
+/// no-op for them, not merely untested for them: `route()` calls it
+/// unconditionally for every kind and method, so a rule added here for one
+/// pair can never silently apply to another.
+pub fn shape_response(kind: &str, method: &str, body: &mut Value) {
+    if (kind, method) == ("organizations", "PATCH") {
+        shape_organization_patch_response(body);
+    }
+}
+
+/// Quirk `organization_patch_response_is_not_get_shaped`. Models two of the
+/// three real differences documented at
+/// `src/cli/push/organization.rs:161-177` between a real
+/// `PATCH /organizations/{id}` response and what `GET` on the same id
+/// returns:
+///
+/// - the PATCH response carries `rir_key`, which GET omits entirely;
+/// - it normalizes values inside `settings` (`width: 140` comes back
+///   `140.0`; an empty `annotation_list_table` comes back
+///   `{ "columns": [] }`).
+///
+/// The third documented difference — `users` returned in a different order —
+/// is deliberately NOT modelled: this fake's organization always carries
+/// `users: []` (`state.rs::OrgState::new`), so reversing an empty list is a
+/// no-op and an assertion on it would be vacuous. Seeding synthetic users
+/// just to make the reorder observable would change the organization body
+/// every pull sees, for a purely cosmetic difference — and the two
+/// differences modelled above already make a naive write-back of this
+/// response detectably wrong on the next pull, which is the property this
+/// whole exercise exists to protect.
+fn shape_organization_patch_response(body: &mut Value) {
+    let Some(obj) = body.as_object_mut() else { return };
+    // Presence is what matters, not the value — see the quirk's doc comment
+    // above and `organization_patch_response_is_not_get_shaped`'s citation.
+    obj.entry("rir_key").or_insert_with(|| json!("fake-rir-key"));
+    if let Some(settings) = obj.get_mut("settings") {
+        normalize_settings(settings);
+    }
+}
+
+/// Recurses through the whole `settings` subtree — an object, an array, or a
+/// leaf at any depth — because the real server's normalization isn't scoped
+/// to one fixed key path; it applies wherever `width` or an empty
+/// `annotation_list_table` appear underneath `settings`.
+fn normalize_settings(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            if map.get("annotation_list_table") == Some(&json!({})) {
+                map.insert("annotation_list_table".into(), json!({ "columns": [] }));
+            }
+            if let Some(width) = map.get_mut("width")
+                && let Some(i) = width.as_i64()
+            {
+                *width = json!(i as f64);
+            }
+            for v in map.values_mut() {
+                normalize_settings(v);
+            }
+        }
+        Value::Array(items) => {
+            for v in items.iter_mut() {
+                normalize_settings(v);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub struct Quirk {
     pub name: &'static str,
     /// Whether the fake actually implements this behavior. `false` marks a
@@ -110,19 +184,40 @@ pub const QUIRKS: &[Quirk] = &[
     },
     Quirk {
         name: "organization_patch_response_is_not_get_shaped",
-        modelled: false,
-        // `OrgState::patch_organization` merges the patch and returns the
-        // whole organization — i.e. the fake answers GET and PATCH with the
-        // SAME body. The real API does not: see the doc comment on
-        // `patch_organization` and the four differences documented at
-        // `src/cli/push/organization.rs:161-177`, which is also the
-        // deficiency this whole stateful-fake exercise was motivated by
-        // (`src/cli/push/organization.rs:161`). Nothing in stage 1 pushes
-        // the organization, so this gap is inert today — but any stage-2
-        // work that ports the organization scenario onto this fake must
-        // model those four differences FIRST, or a green fake-backed test
-        // would bless exactly the naive write-back that caused the original
-        // incident.
+        modelled: true,
+        // `quirks::shape_response` now models two of the three differences
+        // documented at `src/cli/push/organization.rs:161-177` between a
+        // real `PATCH /organizations/{id}` response and what `GET` on the
+        // same id returns: the PATCH response carries `rir_key`, which GET
+        // omits entirely, and it normalizes `settings` (`width: 140` comes
+        // back `140.0`; an empty `annotation_list_table` comes back
+        // `{ "columns": [] }`). See `shape_organization_patch_response`'s
+        // doc comment for why the third difference — `users` reordering —
+        // is deliberately left unmodelled (this org's `users` is always
+        // `[]`, so reversing it is vacuous).
+        //
+        // This is a SOURCE citation, not a LIVE one, and that is a
+        // deliberate choice, not an oversight. The live scenario that
+        // touches organization push, `organization.rs::live_organization_
+        // settings_push`, asserts that a pushed column persists remotely
+        // and that a second sync converges to zero pulls — it never asserts
+        // the PATCH-vs-GET shape difference itself (no check that a raw
+        // PATCH response carries `rir_key`, or that `settings` comes back
+        // normalized): that assertion would have to happen against the raw
+        // HTTP response, and this test only ever looks at the org through
+        // rdc's own file on disk. Citing it here would repeat the mistake
+        // stage 1's reviews already caught twice — a citation pointing at a
+        // plausible-sounding test that never actually exercises the fact.
+        // The real evidence is this file (`src/cli/push/organization.rs:161-
+        // 177`, the comment the incident is recorded in) plus an OFFLINE
+        // integration test that reproduces the asymmetry on purpose with a
+        // hand-built mock and asserts on it directly — `rir_key` never
+        // reaching disk, `settings` picking up the server's normalization,
+        // and a third sync pulling zero items:
+        // `tests/cli_sync.rs::sync_organization_write_back_keeps_the_shape_a_pull_would_produce`.
+        // That test predates this fake and doesn't run through it, so it
+        // cannot serve as this quirk's citation either — hence the SOURCE
+        // form, naming the fact's original documentation.
         proven_by: "src/cli/push/organization.rs:161",
     },
 ];

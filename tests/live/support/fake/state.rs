@@ -113,19 +113,21 @@ impl OrgState {
     }
 
     /// Returns a GET-shaped body — the whole organization, patch merged in.
-    /// The real API does NOT: quirk `organization_patch_response_is_not_get_shaped`
-    /// (`quirks.rs`, `modelled: false`) records that this is a known,
-    /// deliberate gap, not an oversight. The four documented differences,
-    /// spelled out at `src/cli/push/organization.rs:161-177`, are: the real
-    /// PATCH response carries `rir_key`, which `GET /organizations/{id}`
-    /// omits entirely; it returns `users` in a different order; and it
-    /// normalizes values inside `settings` (`width: 140` comes back
-    /// `140.0`; `annotation_list_table: {}` comes back `columns: []`).
-    /// Nothing in stage 1 pushes the organization, so this never bites
-    /// today — but any stage-2 work that touches organization push on this
-    /// fake MUST model these four differences first, or a green fake-backed
-    /// test would bless the exact naive write-back that caused the original
-    /// incident this whole stateful-fake exercise was motivated by.
+    /// This is what actually goes on the wire: `mod.rs::kind_response` runs
+    /// the result through `quirks::shape_response` before the caller ever
+    /// sees it, so the value THIS function returns is not, by itself, what a
+    /// client observes. Quirk `organization_patch_response_is_not_get_shaped`
+    /// (`quirks.rs`) is now `modelled: true`; it models two of the three
+    /// real differences documented at `src/cli/push/organization.rs:161-177`
+    /// between a real PATCH response and what GET returns — the PATCH
+    /// response carries `rir_key`, which `GET /organizations/{id}` omits
+    /// entirely, and it normalizes values inside `settings` (`width: 140`
+    /// comes back `140.0`; `annotation_list_table: {}` comes back
+    /// `columns: []`). Still NOT modelled: the real `users`-reorder
+    /// difference — this fake's organization always carries `users: []`
+    /// (`OrgState::new` below), so reversing an empty list is a no-op; see
+    /// `quirks::shape_organization_patch_response`'s doc comment for why
+    /// that is a deliberate omission, not a gap.
     pub fn patch_organization(&mut self, patch: &Value) -> Value {
         let stamp = self.now();
         if let (Some(dst), Some(src)) = (self.org.as_object_mut(), patch.as_object()) {

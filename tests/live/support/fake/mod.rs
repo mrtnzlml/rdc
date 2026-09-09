@@ -113,6 +113,21 @@ fn err_response(e: ApiError) -> ResponseTemplate {
     json_response(e.status, &e.body)
 }
 
+/// The seam: every response body `route()` builds for a real `(kind,
+/// method)` pair — organizations included, even though it sits outside the
+/// `kinds` registry — passes through `quirks::shape_response` here before it
+/// goes over the wire, so a per-endpoint asymmetry between the real API's
+/// GET and PATCH shapes has exactly one place to attach. Error bodies do
+/// NOT come through here: they go straight through `json_response`, because
+/// they are never GET/PATCH-shaped kind bodies, and shaping one would be
+/// meaningless — see `quirks::shape_response`'s doc comment for what the one
+/// rule it carries actually does.
+fn kind_response(kind: &str, method: &str, status: u16, body: &Value) -> ResponseTemplate {
+    let mut shaped = body.clone();
+    quirks::shape_response(kind, method, &mut shaped);
+    json_response(status, &shaped)
+}
+
 fn authorized(req: &Request) -> bool {
     req.headers
         .get("authorization")
@@ -182,8 +197,8 @@ fn route(st: &mut OrgState, req: &Request) -> ResponseTemplate {
             return err_response(ApiError::not_found());
         }
         return match method.as_str() {
-            "GET" => json_response(200, &st.organization()),
-            "PATCH" => json_response(200, &st.patch_organization(&body_of(req))),
+            "GET" => kind_response(head, &method, 200, &st.organization()),
+            "PATCH" => kind_response(head, &method, 200, &st.patch_organization(&body_of(req))),
             _ => err_response(ApiError::not_found()),
         };
     }
@@ -198,9 +213,9 @@ fn route(st: &mut OrgState, req: &Request) -> ResponseTemplate {
     // and get misread as a plain `POST /hooks`.
     match tail {
         None => match method.as_str() {
-            "GET" => json_response(200, &st.list(kind, &list_query(req))),
+            "GET" => kind_response(kind, &method, 200, &st.list(kind, &list_query(req))),
             "POST" => match st.create(kind, body_of(req)) {
-                Ok(v) => json_response(201, &v),
+                Ok(v) => kind_response(kind, &method, 201, &v),
                 Err(e) => err_response(e),
             },
             _ => err_response(ApiError::not_found()),
@@ -229,17 +244,19 @@ fn route(st: &mut OrgState, req: &Request) -> ResponseTemplate {
                         return err_response(ApiError::not_found());
                     }
                     match st.get(kind, id) {
-                        Some(v) => json_response(200, &v),
+                        Some(v) => kind_response(kind, &method, 200, &v),
                         None => err_response(ApiError::not_found()),
                     }
                 }
                 "PATCH" => match st.patch(kind, id, &body_of(req)) {
-                    Ok(v) => json_response(200, &v),
+                    Ok(v) => kind_response(kind, &method, 200, &v),
                     Err(e) => err_response(e),
                 },
                 "DELETE" => match st.delete(kind, id) {
                     Ok(Deletion::Gone) => ResponseTemplate::new(204),
-                    Ok(Deletion::Requested) => json_response(
+                    Ok(Deletion::Requested) => kind_response(
+                        kind,
+                        &method,
                         202,
                         &serde_json::json!({ "detail": "deletion_requested" }),
                     ),

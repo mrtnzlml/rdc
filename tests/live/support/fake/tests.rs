@@ -29,6 +29,20 @@ async fn authed_request(method: reqwest::Method, url: &str) -> reqwest::Response
         .expect("request")
 }
 
+/// `authed_request`'s body-carrying sibling: it sends immediately too, but
+/// can attach a JSON payload first, which `authed_request` has no way to do
+/// (it takes no body parameter and sends on the spot). Needed for any raw
+/// (non-typed-client) PATCH/POST test that must control the exact wire body.
+async fn authed_json(method: reqwest::Method, url: &str, body: &Value) -> reqwest::Response {
+    reqwest::Client::new()
+        .request(method, url)
+        .header("Authorization", format!("token {TOKEN}"))
+        .json(body)
+        .send()
+        .await
+        .expect("request")
+}
+
 #[tokio::test]
 async fn a_label_round_trips_over_http() {
     let fake = FakeOrg::start().await;
@@ -165,6 +179,53 @@ async fn organizations_sub_paths_are_not_a_route() {
     let url = format!("{}/queues", fake.state().org_url());
     let status = authed_request(reqwest::Method::GET, &url).await.status();
     assert_eq!(status, 404);
+}
+
+/// The fact the whole design exists for. `src/cli/push/organization.rs:161`
+/// records what it cost: rdc wrote the PATCH response to disk, the response
+/// was not GET-shaped, and every sync afterwards re-pulled the org to
+/// correct itself — "one phantom '1 changed' cycle after every settings
+/// push". A fake that answers both the same way would BLESS that bug.
+#[tokio::test]
+async fn the_organization_patch_response_is_not_get_shaped() {
+    let fake = FakeOrg::start().await;
+    let base = fake.api_base();
+    let get_body: Value = authed_request(reqwest::Method::GET, &format!("{base}/organizations/1"))
+        .await
+        .json()
+        .await
+        .expect("json");
+    assert!(
+        get_body.get("rir_key").is_none(),
+        "GET /organizations/{{id}} omits rir_key entirely"
+    );
+
+    let patched: Value = authed_json(
+        reqwest::Method::PATCH,
+        &format!("{base}/organizations/1"),
+        &json!({ "settings": {
+            "annotation_list_table": {},
+            "some_width": { "width": 140 },
+        }}),
+    )
+    .await
+    .json()
+    .await
+    .expect("json");
+    assert!(
+        patched.get("rir_key").is_some(),
+        "the PATCH response carries rir_key, which GET omits"
+    );
+    assert_eq!(
+        patched["settings"]["annotation_list_table"],
+        json!({ "columns": [] }),
+        "the server normalizes an empty annotation_list_table to columns: []"
+    );
+    assert_eq!(
+        patched["settings"]["some_width"]["width"],
+        json!(140.0),
+        "the server normalizes an integer width to a float"
+    );
 }
 
 #[tokio::test]
