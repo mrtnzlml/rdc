@@ -108,6 +108,80 @@ pub fn spec(path: &str) -> Option<&'static KindSpec> {
     MODELLED.iter().find(|k| k.path == path)
 }
 
+/// Whether an edge's field holds a single url or an array of them —
+/// determines how `validate` and `graph` pull urls out of the body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefShape {
+    Single,
+    Array,
+}
+
+/// The back-reference an edge's owner maintains on its target when the edge
+/// is created or dropped. `Push` grows/shrinks an array field on the target
+/// (`workspace.queues`, `queue.hooks`, `queue.rules`); `Set` is a scalar
+/// field the real API also vacates entirely on removal rather than nulling
+/// (`queue.inbox` — see `graph::remove_field`). Both carry the TARGET's field
+/// name, which is not always the same string as the edge's own `field`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackRef {
+    Push(&'static str),
+    Set(&'static str),
+}
+
+/// One edge of the fake's object graph: a field that must resolve to a
+/// specific target KIND, and the back-reference (if any) its owner maintains
+/// on that target.
+///
+/// `owner: None` marks a UNIVERSAL edge — `queues` and `run_after` mean the
+/// same thing (a list of queue urls, a list of hook urls) on whichever kind
+/// carries them, so the ref-type check applies to every kind, not just ones
+/// with a row of their own. A universal edge never carries a `back_ref`:
+/// back-reference maintenance IS owner-specific (the whole reason
+/// `inboxes`/`hooks`/`rules` each get their own `queues` row below, alongside
+/// the universal one), so folding it into the universal row would either
+/// apply a back-ref to owners that never had one, or require re-narrowing the
+/// universal row per owner — the exact mistake this table exists to prevent.
+pub struct Edge {
+    pub owner: Option<&'static str>,
+    pub field: &'static str,
+    pub shape: RefShape,
+    pub target: &'static str,
+    pub back_ref: Option<BackRef>,
+}
+
+/// The complete edge table: ten owner-scoped edges plus the two universal
+/// ones. Adding an edge — including the `saved_views.queues_filter` one
+/// stage 2 needs next — is a one-line addition here; nothing else should ever
+/// need touching.
+pub const EDGES: &[Edge] = &[
+    Edge { owner: Some("queues"), field: "workspace", shape: RefShape::Single, target: "workspaces", back_ref: Some(BackRef::Push("queues")) },
+    Edge { owner: Some("queues"), field: "schema", shape: RefShape::Single, target: "schemas", back_ref: Some(BackRef::Push("queues")) },
+    Edge { owner: Some("queues"), field: "engine", shape: RefShape::Single, target: "engines", back_ref: None },
+    Edge { owner: Some("queues"), field: "generic_engine", shape: RefShape::Single, target: "engines", back_ref: None },
+    Edge { owner: Some("email_templates"), field: "queue", shape: RefShape::Single, target: "queues", back_ref: None },
+    Edge { owner: Some("labels"), field: "organization", shape: RefShape::Single, target: "organizations", back_ref: None },
+    Edge { owner: Some("workspaces"), field: "organization", shape: RefShape::Single, target: "organizations", back_ref: None },
+    Edge { owner: Some("inboxes"), field: "queues", shape: RefShape::Array, target: "queues", back_ref: Some(BackRef::Set("inbox")) },
+    Edge { owner: Some("hooks"), field: "queues", shape: RefShape::Array, target: "queues", back_ref: Some(BackRef::Push("hooks")) },
+    Edge { owner: Some("rules"), field: "queues", shape: RefShape::Array, target: "queues", back_ref: Some(BackRef::Push("rules")) },
+    // Universal: checked for every kind, never back-ref'd — see the doc
+    // comment on `Edge::owner`.
+    Edge { owner: None, field: "queues", shape: RefShape::Array, target: "queues", back_ref: None },
+    Edge { owner: None, field: "run_after", shape: RefShape::Array, target: "hooks", back_ref: None },
+];
+
+/// Owner-scoped edges declared on `owner` — used to check its single-url
+/// refs and to drive `graph::relink`/`unlink`'s back-reference maintenance.
+/// Excludes the universal rows; see [`universal_edges`].
+pub fn edges_for(owner: &str) -> impl Iterator<Item = &'static Edge> {
+    EDGES.iter().filter(move |e| e.owner == Some(owner))
+}
+
+/// The edges that apply regardless of owner kind.
+pub fn universal_edges() -> impl Iterator<Item = &'static Edge> {
+    EDGES.iter().filter(|e| e.owner.is_none())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,5 +205,58 @@ mod tests {
         for k in MODELLED {
             assert!(seen.insert(k.path), "duplicate kind row: {}", k.path);
         }
+    }
+
+    /// The edge table must cover every edge the two derived behaviors used to
+    /// hand-write, or one of them silently stops working. These are the ten
+    /// owner-scoped edges as they stood at c47b3fe.
+    #[test]
+    fn the_edge_table_covers_every_edge_the_fake_used_to_hand_write() {
+        for (owner, field, target) in [
+            ("queues", "workspace", "workspaces"),
+            ("queues", "schema", "schemas"),
+            ("queues", "engine", "engines"),
+            ("queues", "generic_engine", "engines"),
+            ("email_templates", "queue", "queues"),
+            ("labels", "organization", "organizations"),
+            ("workspaces", "organization", "organizations"),
+            ("inboxes", "queues", "queues"),
+            ("hooks", "queues", "queues"),
+            ("rules", "queues", "queues"),
+        ] {
+            assert!(
+                edges_for(owner).any(|e| e.field == field && e.target == target),
+                "edge table is missing {owner}.{field} -> {target}"
+            );
+        }
+    }
+
+    /// The two universal rows are deliberate, not an oversight: `queues` and
+    /// `run_after` mean the same thing on whatever kind carries them, so the
+    /// TYPE check must still apply to a kind with no row of its own.
+    #[test]
+    fn the_universal_ref_fields_are_still_universal() {
+        for (field, target) in [("queues", "queues"), ("run_after", "hooks")] {
+            assert!(
+                universal_edges().any(|e| e.field == field && e.target == target),
+                "the universal type check lost {field} -> {target}"
+            );
+        }
+    }
+
+    /// Only the four owners that maintained a back-reference before may carry
+    /// one now — an accidental extra back-ref would mutate objects the real
+    /// server does not touch.
+    #[test]
+    fn only_the_documented_owners_maintain_a_back_reference() {
+        let with_back_ref: std::collections::BTreeSet<&str> = EDGES
+            .iter()
+            .filter(|e| e.back_ref.is_some() && e.owner.is_some())
+            .map(|e| e.owner.unwrap())
+            .collect();
+        assert_eq!(
+            with_back_ref,
+            ["hooks", "inboxes", "queues", "rules"].into_iter().collect(),
+        );
     }
 }

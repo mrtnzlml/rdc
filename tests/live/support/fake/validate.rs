@@ -27,6 +27,7 @@
 
 use serde_json::Value;
 
+use super::kinds::{self, RefShape};
 use super::state::{ApiError, OrgState};
 
 /// Refuse a delete the real API refuses.
@@ -87,21 +88,6 @@ pub fn field_caps(kind: &str) -> &'static [(&'static str, usize)] {
 const UNIQUE_TEMPLATE_TYPES: &[&str] =
     &["rejection_default", "email_with_no_processable_attachments"];
 
-/// Fields whose value is a url that must resolve to a live object of the
-/// third element's kind — not just resolve to SOMETHING. A well-formed,
-/// existing url of the wrong resource kind (e.g. a queue's `schema` field
-/// carrying a `workspace` url) is refused, matching the real API's ref-type
-/// checking; see `OrgState::resolves_kind`.
-const REF_FIELDS: &[(&str, &str, &str)] = &[
-    ("queues", "workspace", "workspaces"),
-    ("queues", "schema", "schemas"),
-    ("queues", "engine", "engines"),
-    ("queues", "generic_engine", "engines"),
-    ("email_templates", "queue", "queues"),
-    ("labels", "organization", "organizations"),
-    ("workspaces", "organization", "organizations"),
-];
-
 /// Refuse a create the real API refuses.
 ///
 /// Wired into `create` only — **PATCH validation is a deliberate, documented
@@ -116,29 +102,31 @@ const REF_FIELDS: &[(&str, &str, &str)] = &[
 pub fn on_write(st: &OrgState, kind: &'static str, body: &Value) -> Result<(), ApiError> {
     // 1. Every ref must resolve, AND resolve to the right kind. This is the
     //    refusal rdc's whole deferred-relink path is built around
-    //    (`src/snapshot/refs.rs:159`).
-    for &(k, field, expected_kind) in REF_FIELDS {
-        if k != kind {
-            continue;
-        }
-        if let Some(url) = body.get(field).and_then(Value::as_str)
-            && !st.resolves_kind(url, expected_kind)
-        {
-            return Err(ApiError::bad_request("Invalid hyperlink - No URL match"));
-        }
-    }
-    // Unlike `REF_FIELDS` above, this is intentionally NOT scoped per kind:
-    // `queues` and `run_after` mean the same thing (a list of queue urls, a
-    // list of hook urls) on whichever kind carries them, so there is
-    // nothing to gain from re-listing them per kind the way `REF_FIELDS`'s
-    // single-url fields differ per kind.
-    for (field, expected_kind) in [("queues", "queues"), ("run_after", "hooks")] {
-        if let Some(list) = body.get(field).and_then(Value::as_array) {
-            for v in list {
-                if let Some(url) = v.as_str()
-                    && !st.resolves_kind(url, expected_kind)
+    //    (`src/snapshot/refs.rs:159`). Walks `kinds::EDGES`: an edge with an
+    //    owner is checked only against a body of that kind; a universal edge
+    //    (no owner) is checked against every kind, because `queues` and
+    //    `run_after` mean the same thing (a list of queue urls, a list of
+    //    hook urls) on whichever kind carries them — narrowing them to
+    //    declared owners would silently stop validating refs on a kind with
+    //    no row of its own.
+    for edge in kinds::EDGES.iter().filter(|e| e.owner.is_none_or(|o| o == kind)) {
+        match edge.shape {
+            RefShape::Single => {
+                if let Some(url) = body.get(edge.field).and_then(Value::as_str)
+                    && !st.resolves_kind(url, edge.target)
                 {
                     return Err(ApiError::bad_request("Invalid hyperlink - No URL match"));
+                }
+            }
+            RefShape::Array => {
+                if let Some(list) = body.get(edge.field).and_then(Value::as_array) {
+                    for v in list {
+                        if let Some(url) = v.as_str()
+                            && !st.resolves_kind(url, edge.target)
+                        {
+                            return Err(ApiError::bad_request("Invalid hyperlink - No URL match"));
+                        }
+                    }
                 }
             }
         }

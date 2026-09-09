@@ -11,7 +11,23 @@
 
 use serde_json::{json, Value};
 
+use super::kinds::{self, BackRef, RefShape};
 use super::state::{Deletion, OrgState};
+
+/// The urls an edge's field carries on `obj` — one for `RefShape::Single`,
+/// as many as the array holds for `RefShape::Array`. The single shared
+/// extraction `relink`/`unlink` walk, so neither has to know the shape
+/// itself.
+fn ref_urls<'a>(obj: &'a Value, edge: &kinds::Edge) -> Vec<&'a str> {
+    match edge.shape {
+        RefShape::Single => obj.get(edge.field).and_then(Value::as_str).into_iter().collect(),
+        RefShape::Array => obj
+            .get(edge.field)
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default(),
+    }
+}
 
 impl OrgState {
     /// Remove a queue and everything the server removes with it: its
@@ -142,37 +158,24 @@ impl OrgState {
 
     /// Grow every back-reference this object's own refs imply. The real API
     /// maintains these server-side; `pull::queues::refresh_backrefs` exists
-    /// because they change under rdc's feet.
+    /// because they change under rdc's feet. Walks `kinds::edges_for(kind)`
+    /// — only OWNER-scoped edges, never the universal ones, because a
+    /// back-reference is owner-specific (a queue's `workspace`/`schema` push
+    /// onto the target's `queues`, an inbox's `queues` sets a scalar
+    /// `inbox`, a hook's/rule's `queues` push onto `hooks`/`rules` — same
+    /// field name, three different behaviors) and an edge with no
+    /// `back_ref` (e.g. `queues.engine`) is skipped entirely.
     pub(super) fn relink(&mut self, kind: &'static str, id: u64) {
         let Some(me) = self.get(kind, id) else { return };
         let my_url = self.url(kind, id);
-        match kind {
-            "queues" => {
-                if let Some(ws) = me.get("workspace").and_then(|v| v.as_str()) {
-                    self.add_ref("workspaces", ws, "queues", &my_url);
-                }
-                if let Some(sc) = me.get("schema").and_then(|v| v.as_str()) {
-                    self.add_ref("schemas", sc, "queues", &my_url);
-                }
-            }
-            "inboxes" => {
-                let empty = Vec::new();
-                for q in me.get("queues").and_then(|v| v.as_array()).unwrap_or(&empty) {
-                    if let Some(q) = q.as_str() {
-                        self.set_field("queues", q, "inbox", json!(my_url));
-                    }
+        for edge in kinds::edges_for(kind) {
+            let Some(back_ref) = edge.back_ref else { continue };
+            for url in ref_urls(&me, edge) {
+                match back_ref {
+                    BackRef::Push(field) => self.add_ref(edge.target, url, field, &my_url),
+                    BackRef::Set(field) => self.set_field(edge.target, url, field, json!(my_url)),
                 }
             }
-            "hooks" | "rules" => {
-                let field = if kind == "hooks" { "hooks" } else { "rules" };
-                let empty = Vec::new();
-                for q in me.get("queues").and_then(|v| v.as_array()).unwrap_or(&empty) {
-                    if let Some(q) = q.as_str() {
-                        self.add_ref("queues", q, field, &my_url);
-                    }
-                }
-            }
-            _ => {}
         }
     }
 
@@ -180,33 +183,14 @@ impl OrgState {
     pub(super) fn unlink(&mut self, kind: &'static str, id: u64) {
         let Some(me) = self.get(kind, id) else { return };
         let my_url = self.url(kind, id);
-        match kind {
-            "queues" => {
-                if let Some(ws) = me.get("workspace").and_then(|v| v.as_str()) {
-                    self.remove_ref("workspaces", ws, "queues", &my_url);
-                }
-                if let Some(sc) = me.get("schema").and_then(|v| v.as_str()) {
-                    self.remove_ref("schemas", sc, "queues", &my_url);
-                }
-            }
-            "inboxes" => {
-                let empty = Vec::new();
-                for q in me.get("queues").and_then(|v| v.as_array()).unwrap_or(&empty) {
-                    if let Some(q) = q.as_str() {
-                        self.remove_field("queues", q, "inbox");
-                    }
+        for edge in kinds::edges_for(kind) {
+            let Some(back_ref) = edge.back_ref else { continue };
+            for url in ref_urls(&me, edge) {
+                match back_ref {
+                    BackRef::Push(field) => self.remove_ref(edge.target, url, field, &my_url),
+                    BackRef::Set(field) => self.remove_field(edge.target, url, field),
                 }
             }
-            "hooks" | "rules" => {
-                let field = if kind == "hooks" { "hooks" } else { "rules" };
-                let empty = Vec::new();
-                for q in me.get("queues").and_then(|v| v.as_array()).unwrap_or(&empty) {
-                    if let Some(q) = q.as_str() {
-                        self.remove_ref("queues", q, field, &my_url);
-                    }
-                }
-            }
-            _ => {}
         }
     }
 }
