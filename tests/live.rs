@@ -71,3 +71,5 @@
 mod support;
 #[path = "live/scenarios/mod.rs"]
 mod scenarios;
+#[path = "live/fake_and_live_wrappers.rs"]
+mod fake_and_live_wrappers;
