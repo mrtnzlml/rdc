@@ -186,6 +186,18 @@ async fn organizations_sub_paths_are_not_a_route() {
 /// was not GET-shaped, and every sync afterwards re-pulled the org to
 /// correct itself — "one phantom '1 changed' cycle after every settings
 /// push". A fake that answers both the same way would BLESS that bug.
+///
+/// Two genuinely different facts, at two different layers, and this test
+/// pins both:
+///
+/// - `rir_key` is a RESPONSE-only difference: it appears on the PATCH
+///   answer and on NO GET, before or after.
+/// - `settings` normalization is a STORAGE fact: the real server normalizes
+///   `settings` when it is WRITTEN, so the normalized shape persists and a
+///   GET taken AFTER the PATCH returns it too — not just the PATCH response
+///   itself. Asserting only the PATCH response's shape (as an earlier
+///   version of this test did) cannot catch a build that normalizes the
+///   response but not the stored value; only a GET-after-PATCH check can.
 #[tokio::test]
 async fn the_organization_patch_response_is_not_get_shaped() {
     let fake = FakeOrg::start().await;
@@ -225,6 +237,31 @@ async fn the_organization_patch_response_is_not_get_shaped() {
         patched["settings"]["some_width"]["width"],
         json!(140.0),
         "the server normalizes an integer width to a float"
+    );
+
+    // The discriminating check: a GET taken AFTER the PATCH must return the
+    // NORMALIZED settings (the server normalized on write, so it stuck) and
+    // must NOT carry `rir_key` (that part is response-only, never stored).
+    // A build that normalizes only the PATCH response — not what's stored —
+    // passes every assertion above and fails only this one.
+    let get_after: Value = authed_request(reqwest::Method::GET, &format!("{base}/organizations/1"))
+        .await
+        .json()
+        .await
+        .expect("json");
+    assert!(
+        get_after.get("rir_key").is_none(),
+        "a GET taken after the PATCH must still omit rir_key: {get_after}"
+    );
+    assert_eq!(
+        get_after["settings"]["annotation_list_table"],
+        json!({ "columns": [] }),
+        "the normalized annotation_list_table must have been PERSISTED, not just echoed in the PATCH response: {get_after}"
+    );
+    assert_eq!(
+        get_after["settings"]["some_width"]["width"],
+        json!(140.0),
+        "the normalized width must have been PERSISTED, not just echoed in the PATCH response: {get_after}"
     );
 }
 

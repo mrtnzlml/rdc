@@ -43,52 +43,64 @@ use super::state::OrgState;
 /// canonical path a `kinds::Spec` is keyed by (e.g. `"queues"`), or
 /// `"organizations"` for the one endpoint that sits outside that registry.
 /// So far exactly one pair has a rule: `("organizations", "PATCH")`, which
-/// implements quirk `organization_patch_response_is_not_get_shaped` below.
-/// Every other `(kind, method)` passes through unchanged — this function is a
-/// no-op for them, not merely untested for them: `route()` calls it
-/// unconditionally for every kind and method, so a rule added here for one
-/// pair can never silently apply to another.
+/// implements the response-only half of quirk
+/// `organization_patch_response_is_not_get_shaped` below — inserting
+/// `rir_key`. Every other `(kind, method)` passes through unchanged — this
+/// function is a no-op for them, not merely untested for them: `route()`
+/// calls it unconditionally for every kind and method, so a rule added here
+/// for one pair can never silently apply to another.
+///
+/// `settings` normalization is deliberately NOT here, even though it is the
+/// same quirk's other documented difference — see
+/// `normalize_organization_settings`'s doc comment below for why that half
+/// belongs at the write path (`state.rs::patch_organization`) instead of the
+/// response seam. A first version of this seam put both halves here, which
+/// a review caught: it made a PATCH response's `settings` look normalized
+/// while the STORED value stayed raw, so a GET taken right after the PATCH
+/// would still hand back the unnormalized shape — the opposite of what the
+/// real server does.
 pub fn shape_response(kind: &str, method: &str, body: &mut Value) {
     if (kind, method) == ("organizations", "PATCH") {
-        shape_organization_patch_response(body);
+        insert_organization_rir_key(body);
     }
 }
 
-/// Quirk `organization_patch_response_is_not_get_shaped`. Models two of the
-/// three real differences documented at
-/// `src/cli/push/organization.rs:161-177` between a real
-/// `PATCH /organizations/{id}` response and what `GET` on the same id
-/// returns:
+/// Quirk `organization_patch_response_is_not_get_shaped`'s response-only
+/// half: a real `PATCH /organizations/{id}` response carries `rir_key`,
+/// which `GET /organizations/{id}` — before OR after that PATCH — never
+/// returns. See `src/cli/push/organization.rs:161-177`.
 ///
-/// - the PATCH response carries `rir_key`, which GET omits entirely;
-/// - it normalizes values inside `settings` (`width: 140` comes back
-///   `140.0`; an empty `annotation_list_table` comes back
-///   `{ "columns": [] }`).
-///
-/// The third documented difference — `users` returned in a different order —
-/// is deliberately NOT modelled: this fake's organization always carries
-/// `users: []` (`state.rs::OrgState::new`), so reversing an empty list is a
-/// no-op and an assertion on it would be vacuous. Seeding synthetic users
-/// just to make the reorder observable would change the organization body
-/// every pull sees, for a purely cosmetic difference — and the two
-/// differences modelled above already make a naive write-back of this
-/// response detectably wrong on the next pull, which is the property this
-/// whole exercise exists to protect.
-fn shape_organization_patch_response(body: &mut Value) {
+/// The third documented difference in that source comment — `users`
+/// returned in a different order — is deliberately NOT modelled: this
+/// fake's organization always carries `users: []`
+/// (`state.rs::OrgState::new`), so reversing an empty list is a no-op and an
+/// assertion on it would be vacuous. Seeding synthetic users just to make
+/// the reorder observable would change the organization body every pull
+/// sees, for a purely cosmetic difference — and `rir_key` plus
+/// `normalize_organization_settings` below already make a naive write-back
+/// of a PATCH response detectably wrong on the next pull, which is the
+/// property this whole exercise exists to protect.
+fn insert_organization_rir_key(body: &mut Value) {
     let Some(obj) = body.as_object_mut() else { return };
-    // Presence is what matters, not the value — see the quirk's doc comment
-    // above and `organization_patch_response_is_not_get_shaped`'s citation.
+    // Presence is what matters, not the value.
     obj.entry("rir_key").or_insert_with(|| json!("fake-rir-key"));
-    if let Some(settings) = obj.get_mut("settings") {
-        normalize_settings(settings);
-    }
 }
 
+/// Quirk `organization_patch_response_is_not_get_shaped`'s `settings` half —
+/// called from `state.rs::patch_organization` as it merges an incoming
+/// patch into STORED state, not from `shape_response` above. This is a fact
+/// about what the real server persists, not about how one response differs
+/// from what's stored: `tests/cli_sync.rs:1996`'s mock comment records it
+/// directly — "A real GET reflects the PATCH afterwards" with the
+/// NORMALIZED `settings` already in place — so the normalized shape must be
+/// written into state at merge time, or a GET taken after the PATCH would
+/// hand back the raw, unnormalized value the real API never would.
+///
 /// Recurses through the whole `settings` subtree — an object, an array, or a
 /// leaf at any depth — because the real server's normalization isn't scoped
 /// to one fixed key path; it applies wherever `width` or an empty
 /// `annotation_list_table` appear underneath `settings`.
-fn normalize_settings(value: &mut Value) {
+pub(super) fn normalize_organization_settings(value: &mut Value) {
     match value {
         Value::Object(map) => {
             if map.get("annotation_list_table") == Some(&json!({})) {
@@ -100,12 +112,12 @@ fn normalize_settings(value: &mut Value) {
                 *width = json!(i as f64);
             }
             for v in map.values_mut() {
-                normalize_settings(v);
+                normalize_organization_settings(v);
             }
         }
         Value::Array(items) => {
             for v in items.iter_mut() {
-                normalize_settings(v);
+                normalize_organization_settings(v);
             }
         }
         _ => {}
@@ -185,16 +197,31 @@ pub const QUIRKS: &[Quirk] = &[
     Quirk {
         name: "organization_patch_response_is_not_get_shaped",
         modelled: true,
-        // `quirks::shape_response` now models two of the three differences
-        // documented at `src/cli/push/organization.rs:161-177` between a
-        // real `PATCH /organizations/{id}` response and what `GET` on the
-        // same id returns: the PATCH response carries `rir_key`, which GET
-        // omits entirely, and it normalizes `settings` (`width: 140` comes
-        // back `140.0`; an empty `annotation_list_table` comes back
-        // `{ "columns": [] }`). See `shape_organization_patch_response`'s
-        // doc comment for why the third difference — `users` reordering —
-        // is deliberately left unmodelled (this org's `users` is always
-        // `[]`, so reversing it is vacuous).
+        // Two of the three differences documented at
+        // `src/cli/push/organization.rs:161-177` between a real
+        // `PATCH /organizations/{id}` response and what `GET` on the same
+        // id returns are now modelled, at two different layers, because
+        // they are two different KINDS of fact:
+        //
+        // - `rir_key` is RESPONSE-only — it appears on the PATCH answer and
+        //   on no GET, before or after. Modelled in `quirks::shape_response`
+        //   (`insert_organization_rir_key`).
+        // - `settings` normalization (`width: 140` comes back `140.0`; an
+        //   empty `annotation_list_table` comes back `{ "columns": [] }`)
+        //   is a STORAGE fact: the real server normalizes `settings` when
+        //   it is WRITTEN, so the normalized value persists and a GET taken
+        //   AFTER the PATCH returns it too. Modelled in
+        //   `state.rs::patch_organization`, via
+        //   `quirks::normalize_organization_settings`, NOT in the response
+        //   seam — an earlier version of this quirk put it there, which a
+        //   review caught: it made the PATCH response look normalized while
+        //   the stored value stayed raw, so a GET right after the PATCH
+        //   would still hand back the unnormalized shape.
+        //
+        // See `quirks::insert_organization_rir_key`'s doc comment for why
+        // the third documented difference — `users` reordering — is
+        // deliberately left unmodelled (this org's `users` is always `[]`,
+        // so reversing it is vacuous).
         //
         // This is a SOURCE citation, not a LIVE one, and that is a
         // deliberate choice, not an oversight. The live scenario that

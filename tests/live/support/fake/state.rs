@@ -112,27 +112,44 @@ impl OrgState {
         self.org.clone()
     }
 
-    /// Returns a GET-shaped body — the whole organization, patch merged in.
-    /// This is what actually goes on the wire: `mod.rs::kind_response` runs
-    /// the result through `quirks::shape_response` before the caller ever
-    /// sees it, so the value THIS function returns is not, by itself, what a
-    /// client observes. Quirk `organization_patch_response_is_not_get_shaped`
-    /// (`quirks.rs`) is now `modelled: true`; it models two of the three
-    /// real differences documented at `src/cli/push/organization.rs:161-177`
-    /// between a real PATCH response and what GET returns — the PATCH
-    /// response carries `rir_key`, which `GET /organizations/{id}` omits
-    /// entirely, and it normalizes values inside `settings` (`width: 140`
-    /// comes back `140.0`; `annotation_list_table: {}` comes back
-    /// `columns: []`). Still NOT modelled: the real `users`-reorder
-    /// difference — this fake's organization always carries `users: []`
-    /// (`OrgState::new` below), so reversing an empty list is a no-op; see
-    /// `quirks::shape_organization_patch_response`'s doc comment for why
-    /// that is a deliberate omission, not a gap.
+    /// Merges `patch` into stored state and returns the result. What comes
+    /// back from THIS function is not, by itself, what a client observes on
+    /// the wire: `mod.rs::kind_response` runs it through
+    /// `quirks::shape_response` afterward, which inserts `rir_key` — the one
+    /// difference that belongs at the response layer. See
+    /// `quirks::insert_organization_rir_key`'s doc comment for why.
+    ///
+    /// `settings` normalization, by contrast, happens HERE, as the merge —
+    /// not at the response seam. Quirk
+    /// `organization_patch_response_is_not_get_shaped` (`quirks.rs`) is
+    /// `modelled: true`, and the real fact it models for `settings`
+    /// (`width: 140` comes back `140.0`; an empty `annotation_list_table`
+    /// comes back `{ "columns": [] }`) is that the real server normalizes
+    /// `settings` when it is WRITTEN — so the normalized value is what's
+    /// STORED, and a `GET` taken after this PATCH returns it too, same as a
+    /// real org. Normalizing only the response returned by THIS call (an
+    /// earlier version of this fake did exactly that) would leave stored
+    /// state holding the raw, unnormalized value, so a later `GET` would
+    /// hand back something no real org ever would — the review that caught
+    /// this called it out directly. `quirks::normalize_organization_settings`
+    /// is applied below only to the incoming `settings` key, not the whole
+    /// patch, matching the real endpoint (`push::organization` sends the
+    /// whole `settings` subtree in one PATCH, never a partial one).
+    ///
+    /// Still NOT modelled: the real `users`-reorder difference — this fake's
+    /// organization always carries `users: []` (`OrgState::new` below), so
+    /// reversing an empty list is a no-op; see
+    /// `quirks::insert_organization_rir_key`'s doc comment for why that is a
+    /// deliberate omission, not a gap.
     pub fn patch_organization(&mut self, patch: &Value) -> Value {
         let stamp = self.now();
         if let (Some(dst), Some(src)) = (self.org.as_object_mut(), patch.as_object()) {
             for (k, v) in src {
-                dst.insert(k.clone(), v.clone());
+                let mut v = v.clone();
+                if k == "settings" {
+                    super::quirks::normalize_organization_settings(&mut v);
+                }
+                dst.insert(k.clone(), v);
             }
             dst.insert("modified_at".into(), json!(stamp));
         }
