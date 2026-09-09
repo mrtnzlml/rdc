@@ -113,7 +113,7 @@ fixes across 1199 commits sit in the sync pipeline.
 | goldens are id-free and run-agnostic | `CapturedState` = lockfile slugs with the run-id stripped + `rdc://` refs (`tests/live/support/expected.rs`) |
 | the convergence assertion is backend-agnostic | `assert_converged` drives the CLI, not the API |
 | the binary is spawned as a subprocess | `assert_cmd::Command::cargo_bin("rdc")` in `ProjectFixture::run_rdc` — so the fake must be **real TCP**, not an in-process stub |
-| a full expected pulled tree already exists | `testdata/live/snapshot/**` |
+| `testdata/live/snapshot/**` is a hand-written INPUT fixture (unseeded, `rdc sync` POSTs it whole) — not an expected-pulled-output tree | `tests/live/support/snapshot.rs:1-12` |
 | the seed graph is data-driven | `testdata/live/manifest.toml` + `testdata/live/bodies/**` |
 
 ### Server behaviors already documented in-tree
@@ -324,9 +324,14 @@ which is the first offline coverage the promotion chain has ever had.
 
 - `fake_round_trip_core` asserts convergence twice — after the initial pull and
   after the label push — via the existing `assert_converged`.
-- `testdata/live/snapshot/**` is a byte-level oracle for what a pull from the
-  fake must produce; `testdata/live/expected/*.toml` are the run-agnostic
-  goldens both backends share.
+- `testdata/live/snapshot/**` is a hand-written INPUT fixture, not an
+  expected-output oracle: it is not seeded through the API and pulled, but
+  written straight to disk with no lockfile entries, so `rdc sync` classifies
+  every object as a `LocalCreate` and POSTs the whole graph
+  (`tests/live/support/snapshot.rs:1-12`). No expected-pulled-tree fixture
+  exists yet, byte-level or otherwise — a field-level oracle for what a pull
+  must produce is unbuilt work. `testdata/live/expected/*.toml` are the
+  run-agnostic goldens both backends share.
 - The provenance guard test (§C) covers the quirk registry.
 - `OrgState` gets direct unit tests for pagination (including the
   `total_pages == 0` fallback), id/url minting, the logical clock, and each

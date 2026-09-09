@@ -29,10 +29,12 @@
 use std::path::{Path, PathBuf};
 
 /// The exact live-binary `--ignored` count this repo's suite reports today:
-/// `cargo test --test live -- --ignored --list | grep -c ': test'`,
-/// documented at README.md:522. Bump this only alongside a real change to
-/// that count (a scenario added or removed), and re-verify with that same
-/// command — never by guessing.
+/// `cargo test --test live -- --ignored --list | grep -c ': test'`. That
+/// command is documented at README.md:522; the count itself is not — it is
+/// derived from this repository's current scenario set, not read out of
+/// README. Bump this only alongside a real change to that count (a scenario
+/// added or removed), and re-verify with that same command — never by
+/// guessing.
 const EXPECTED_IGNORED_LIVE_TESTS: usize = 23;
 
 /// `tests/live/scenarios/*.rs`, direct children only — matches how
@@ -177,10 +179,12 @@ fn every_scenario_core_has_both_wrappers() {
          not-yet-ported ignored scenario(s) = {total_ignored} ignored \
          test(s) under tests/live/scenarios, want \
          {EXPECTED_IGNORED_LIVE_TESTS} (what `cargo test --test live -- \
-         --ignored --list | grep -c ': test'` reports, documented at \
-         README.md:522). If this changed on purpose (a scenario added or \
-         removed), update EXPECTED_IGNORED_LIVE_TESTS and re-verify with \
-         that command."
+         --ignored --list | grep -c ': test'` reports; that command is \
+         documented at README.md:522, the count itself is not — it is \
+         derived from this repo's current scenario set). If this changed \
+         on purpose (a scenario added or removed), update \
+         EXPECTED_IGNORED_LIVE_TESTS to match and re-verify with that \
+         same command."
     );
 }
 

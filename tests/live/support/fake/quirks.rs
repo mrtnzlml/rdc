@@ -247,6 +247,38 @@ pub const QUIRKS: &[Quirk] = &[
         // form, naming the fact's original documentation.
         proven_by: "src/cli/push/organization.rs:161",
     },
+    Quirk {
+        name: "inbox_patch_response_omits_fields_the_get_response_includes",
+        modelled: false,
+        // A real `PATCH /inboxes/{id}` response omits fields that `GET
+        // /inboxes/{id}` on the same id includes — `bounce_email_to: null`
+        // is the one example the source comment names, introduced with
+        // "e.g.", so the full omitted-field set is not documented anywhere
+        // in this repo. This is exactly why `push::inboxes::send_patch`
+        // discards the PATCH response and re-baselines from a fresh GET
+        // instead of trusting it: recording the PATCH-derived shape would
+        // make the recorded base differ from what the next sync's
+        // classifier reads off the GET, producing a spurious RemoteEdit.
+        // See `src/cli/push/inboxes.rs:377` (the comment recording the
+        // asymmetry) and `:725` (the offline mock test that reproduces it
+        // on purpose,
+        // `push_inboxes_records_the_refetched_body_not_the_patch_response`).
+        //
+        // NOT modelled here, on purpose. `quirks::shape_response` is called
+        // from `mod.rs::kind_response` with only `(kind, method, body)` —
+        // it never sees the incoming request payload — so it has no way to
+        // know which fields a real partial PATCH response would have
+        // omitted; and since the source only documents one example field
+        // rather than an exhaustive list, shaping this now would mean
+        // either inventing the rest of the set or narrowly modelling just
+        // `bounce_email_to`, both of which risk the fake claiming more
+        // precision than the evidence supports. Consequence for a stage-2
+        // inbox port: a fake-backed inbox test will NOT reproduce this
+        // asymmetry, so a test that ought to catch a naive write-back of an
+        // inbox PATCH response will not catch it via the fake — only the
+        // existing offline mock test above does, today.
+        proven_by: "src/cli/push/inboxes.rs:377",
+    },
 ];
 
 /// The five typed defaults `POST /queues` materializes.
