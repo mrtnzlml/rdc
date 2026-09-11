@@ -202,7 +202,6 @@ pub async fn push(
 /// distinct ids are fetched concurrently into `remote_cache` first, and the
 /// concurrent stage then only reads it. Same request count as the sequential
 /// `remote_cache`, now overlapped instead of serialized.
-#[allow(clippy::too_many_arguments)]
 async fn push_update_batch(
     paths: &Paths,
     client: &RossumClient,
@@ -466,7 +465,6 @@ fn write_back(
 /// interleave with another item's. `remote_cache` is the batch's prefetched
 /// drift bodies, so this path costs no extra request. Returns
 /// `(pushed, skipped)` deltas.
-#[allow(clippy::too_many_arguments)]
 async fn push_one_drifted(
     paths: &Paths,
     client: &RossumClient,

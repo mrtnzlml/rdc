@@ -136,7 +136,6 @@ pub async fn sync_logged(
 /// (its in-place countdown line is TTY-only and needs no callback); an
 /// embedder with no such line of its own passes one to learn when a watch
 /// goes idle and render its own countdown.
-#[allow(clippy::too_many_arguments)]
 pub async fn watch_logged(
     cwd: &Path,
     env: &str,

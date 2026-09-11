@@ -189,7 +189,6 @@ enum FieldPatched {
 /// The third return value is the 405 stop signal: `true` once a PATCH has come
 /// back "read-only on this plan", which the caller turns back into the old
 /// loop's `break`.
-#[allow(clippy::too_many_arguments)]
 async fn push_update_batch(
     paths: &Paths,
     client: &RossumClient,
@@ -493,7 +492,6 @@ fn write_back(
 /// same `update_engine_field` + `write_back`), adopt the remote, or skip. It
 /// runs only on the sequential stage, so `resolve_push_drift`'s prompt can never
 /// interleave with another item's. Returns `(pushed, skipped, read_only)`.
-#[allow(clippy::too_many_arguments)]
 async fn push_one_drifted(
     paths: &Paths,
     client: &RossumClient,

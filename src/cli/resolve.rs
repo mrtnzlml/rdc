@@ -281,7 +281,6 @@ fn confirm_bulk<R: BufRead, W: Write>(
 /// `[e]dit`/`[h]` plumbing with [`prompt_resolve_with_color`]; the
 /// only difference is that local bytes come from the caller, not
 /// from `local_path`.
-#[allow(clippy::too_many_arguments)]
 pub fn prompt_resolve_with_bytes_and_color<R: BufRead, W: Write>(
     mut input: R,
     mut output: W,
@@ -969,7 +968,6 @@ fn append_lines(out: &mut String, lines: &[&str]) {
 /// file. Equal lines are taken from `local_lines` and follow the
 /// unified-diff convention (leading space); the hunk's removed / added
 /// lines use `-` / `+`.
-#[allow(clippy::too_many_arguments)]
 fn prompt_single_hunk<R: BufRead, W: Write>(
     input: &mut R,
     output: &mut W,

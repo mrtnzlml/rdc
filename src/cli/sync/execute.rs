@@ -127,7 +127,6 @@ fn build_bulk_prompt(
 /// `resolve_one_conflict`'s `sticky_now` seeding. `None` preserves the
 /// existing behavior (interactive prompt on a TTY, shadow-file skip
 /// otherwise).
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn resolve_conflicts<R: BufRead>(
     ctx: &mut PullCtx<'_>,
     catalog: &RemoteCatalog,
@@ -846,7 +845,6 @@ type AutoMergeResult = (String, Vec<String>, Vec<String>);
 ///   resolve cleanly.
 /// * `Schema` — `merge3_json` for the schema body + strict
 ///   `merge3_sidecar` for each formula `.py`. All must resolve.
-#[allow(clippy::too_many_arguments)]
 fn try_auto_merge(
     ctx: &mut PullCtx<'_>,
     kind: &str,
@@ -1163,7 +1161,6 @@ fn try_auto_merge(
 ///   doesn't" cases).
 /// - Records the canonical combined hash on every Resolution arm so
 ///   the lockfile stays consistent with the classifier's view.
-#[allow(clippy::too_many_arguments)]
 fn resolve_one_conflict<R: BufRead>(
     ctx: &mut PullCtx<'_>,
     it: &ClassifiedItem,
@@ -3401,7 +3398,6 @@ fn find_engine_field_engine_slug(paths: &crate::paths::Paths, field_slug: &str) 
 /// `interactive` flows through to the conflict resolver and the push
 /// driver's drift prompt; on the pull side each per-kind driver consults
 /// `ctx.interactive` (set by the caller to the same value).
-#[allow(clippy::too_many_arguments)]
 pub async fn run(
     ctx: &mut PullCtx<'_>,
     catalog: &RemoteCatalog,

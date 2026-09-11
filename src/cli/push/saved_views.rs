@@ -154,7 +154,6 @@ pub async fn push(
 /// `drift_saved_views` is the caller's one-per-push cache of the fresh saved-view list, so
 /// several runs still cost a single `GET /saved_views` — and a push whose updates all
 /// lack a `content_hash` still costs none.
-#[allow(clippy::too_many_arguments)]
 async fn push_update_batch(
     paths: &Paths,
     client: &RossumClient,
@@ -456,7 +455,6 @@ fn write_back(
 /// stage — that is the invariant that matters: `resolve_push_drift` blocks on
 /// stdin, so a concurrent call site would interleave two prompts on one
 /// terminal. Returns `(pushed, skipped)` deltas.
-#[allow(clippy::too_many_arguments)]
 async fn push_one_drifted(
     paths: &Paths,
     client: &RossumClient,

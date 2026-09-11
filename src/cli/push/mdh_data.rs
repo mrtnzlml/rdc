@@ -151,7 +151,6 @@ const WRITE_CHUNK: usize = 500;
 /// dataset looking locally-diverged, so the next sync re-reads and re-diffs —
 /// which is the correct recovery given that a failed `insert_many` is
 /// partially applied.
-#[allow(clippy::too_many_arguments)]
 pub async fn push_dataset_data(
     client: &DataStorageClient,
     lockfile: &mut Lockfile,

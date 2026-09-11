@@ -446,7 +446,6 @@ fn write_back(
 /// with another item's. `remote_inbox` is the body the concurrent stage already
 /// fetched, so this path costs no extra request. Returns `(pushed, skipped)`
 /// deltas.
-#[allow(clippy::too_many_arguments)]
 async fn push_one_drifted(
     paths: &Paths,
     client: &RossumClient,

@@ -319,7 +319,6 @@ pub async fn push(
 /// adopt-or-create branch, so several runs plus any number of adoptions still
 /// cost a single `GET /email_templates` — and a push whose updates all lack a
 /// `content_hash` and whose creates all adopt nothing still costs none.
-#[allow(clippy::too_many_arguments)]
 async fn push_update_batch(
     paths: &Paths,
     client: &RossumClient,
@@ -591,7 +590,6 @@ fn write_back(
 /// same `update_email_template` + `write_back`), adopt the remote, or skip. It
 /// runs only on the sequential stage, so `resolve_push_drift`'s prompt can never
 /// interleave with another item's. Returns `(pushed, skipped)` deltas.
-#[allow(clippy::too_many_arguments)]
 async fn push_one_drifted(
     paths: &Paths,
     client: &RossumClient,

@@ -188,7 +188,6 @@ pub async fn run(
 /// All three current callers — `cli::sync::run`, `cli::sync::watch::run_watch`,
 /// and `cli::sync::embed::sync_no_push` — acquire it before invoking. New
 /// callers must do the same.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_cycle(
     env: &str,
     interactive: bool,

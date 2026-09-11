@@ -214,7 +214,6 @@ enum EnginePatched {
 /// The third return value is the 405 stop signal: `true` once a PATCH has come
 /// back "read-only on this plan", which the caller turns back into the old
 /// loop's `break`.
-#[allow(clippy::too_many_arguments)]
 async fn push_update_batch(
     paths: &Paths,
     client: &RossumClient,
@@ -477,7 +476,6 @@ fn remote_artifact(remote: &crate::model::Engine) -> Result<crate::snapshot::cod
 /// `let codec = ...` down to and including the `relink.push(...)`, with
 /// `updated` taken by reference and the `progress.event(Action::Patch, ...)`
 /// line left behind at the call site so the caller controls when it fires.
-#[allow(clippy::too_many_arguments)]
 fn write_back(
     paths: &Paths,
     lockfile: &mut Lockfile,
@@ -534,7 +532,6 @@ fn write_back(
 /// `write_back`), adopt the remote, or skip. It runs only on the sequential
 /// stage, so `resolve_push_drift`'s prompt can never interleave with another
 /// item's. Returns `(pushed, skipped, read_only)`.
-#[allow(clippy::too_many_arguments)]
 async fn push_one_drifted(
     paths: &Paths,
     client: &RossumClient,

@@ -865,7 +865,6 @@ fn overlay_for<'a>(
 ///
 /// `rel` is relative to the source env root; the destination is `remap_relative`
 /// joined onto `tgt_root`.
-#[allow(clippy::too_many_arguments)]
 fn transform_file(
     rel: &Path,
     src_root: &Path,

@@ -164,7 +164,6 @@ pub async fn push(
 /// `drift_rules` is the caller's one-per-push cache of the fresh rule list, so
 /// several runs still cost a single `GET /rules` — and a push whose updates all
 /// lack a `content_hash` still costs none.
-#[allow(clippy::too_many_arguments)]
 async fn push_update_batch(
     paths: &Paths,
     client: &RossumClient,
@@ -430,7 +429,6 @@ fn write_back(
 /// the same `update_rule` + `write_back`), adopt the remote, or skip. It runs
 /// only on the sequential stage, so `resolve_push_drift`'s prompt can never
 /// interleave with another item's. Returns `(pushed, skipped)` deltas.
-#[allow(clippy::too_many_arguments)]
 async fn push_one_drifted(
     paths: &Paths,
     client: &RossumClient,
