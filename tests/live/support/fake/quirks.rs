@@ -283,13 +283,34 @@ pub const QUIRKS: &[Quirk] = &[
     Quirk {
         name: "engine_delete_refused_while_a_queue_awaits_deletion",
         modelled: true,
-        // `live_push_create_ordering` proves the CONSEQUENCE `rdc` draws from
-        // this refusal — it warns by slug (the `expected_warning` assertion)
-        // and keeps the lockfile entry so a later sync retries it (the
-        // `lf_after` assertion) — but it never asserts the specific error
-        // code the fake emits here, `engine_attached_to_queues_waiting_for_deletion`.
-        // That exact string is repo-documented, not live-asserted, at
-        // `tests/live/support/teardown.rs:62`.
+        // NOT what `ordering.rs`'s cascade hits: `push::deletes` orders
+        // engines BEFORE queues, so by the time an engine delete is
+        // attempted there, its bound queue has not been asked to delete yet
+        // — that is the SIBLING quirk below,
+        // `engine_attached_to_active_queues`. This one only fires when an
+        // engine outlives its queue's own `DELETE` — e.g. a later run's
+        // `teardown.rs` best-effort sweep (`tests/live/support/teardown.rs:62`,
+        // fired only after that run's queue delete already landed), which
+        // asserts nothing about the outcome. No live scenario in this repo
+        // exercises this branch over HTTP; the state-level proof is
+        // `state.rs::an_engine_cannot_be_deleted_while_a_queue_awaits_deletion`,
+        // which deletes the queue first and is not itself a `live_*` test.
+        proven_by: "tests/live/support/teardown.rs:62",
+    },
+    Quirk {
+        name: "engine_attached_to_active_queues",
+        modelled: true,
+        // This IS what `ordering.rs`'s cascade hits: `push::deletes` orders
+        // engines BEFORE queues, so the fixture queue is still fully live —
+        // never asked to delete — when its engine's `DELETE` is attempted.
+        // `live_push_create_ordering` proves the CONSEQUENCE `rdc` draws
+        // from the refusal (warns by slug, the `expected_warning`
+        // assertion; keeps the lockfile entry for retry, the `lf_after`
+        // assertion) but never asserts this literal string — that exact
+        // code is repo-documented, not live-asserted, at
+        // `tests/live/support/teardown.rs:61`. State-level proof of the
+        // fake's own rule:
+        // `state.rs::an_engine_cannot_be_deleted_while_bound_to_an_active_queue`.
         proven_by: "ordering.rs::live_push_create_ordering",
     },
     Quirk {

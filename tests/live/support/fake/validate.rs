@@ -10,13 +10,6 @@
 //! `on_write` below, rather than left to be discovered by a stage-2 author
 //! the hard way:
 //!
-//! - `on_delete` implements only `engine_attached_to_queues_waiting_for_deletion`
-//!   (an engine bound to a DRAINING queue). The sibling refusal,
-//!   `engine_attached_to_active_queues` (an engine bound to a LIVE queue),
-//!   is documented by the same repo comment that names the one this fake
-//!   does implement — `tests/live/support/teardown.rs:59-61` — and is not
-//!   modelled: the fake permits deleting an engine still bound to a live
-//!   queue.
 //! - A schema DELETE is never refused for being referenced by a queue. The
 //!   real API answers `409 conflict_referenced`
 //!   (`tests/live/support/teardown.rs:36-44`, `tests/live/scenarios/ordering.rs:298-301`)
@@ -34,14 +27,28 @@ use super::state::{ApiError, OrgState};
 pub fn on_delete(st: &OrgState, kind: &'static str, id: u64) -> Result<(), ApiError> {
     if kind == "engines" {
         let engine_url = st.url("engines", id);
-        let blocked = st
+        // Two distinct refusals, told apart by whether the bound queue has
+        // already been asked to delete (`tests/live/support/teardown.rs:59-61`):
+        // a DRAINING queue (answered its own `202`, not yet actually gone)
+        // refuses with "waiting_for_deletion"; a still-LIVE queue refuses
+        // with "active_queues". Checked in that order because `push::deletes`
+        // cascades engines BEFORE queues — an engine bound to this run's
+        // queue is refused with the ACTIVE message every time this fires
+        // from that cascade, since the queue's own `DELETE` hasn't landed
+        // yet. The draining branch exists for the case an engine is deleted
+        // AFTER its queue already got a `202` (e.g. a later run's janitor
+        // sweep, `teardown.rs`'s own engine cleanup).
+        if st
             .queues_awaiting_deletion()
             .iter()
-            .any(|q| q.get("engine").and_then(Value::as_str) == Some(engine_url.as_str()));
-        if blocked {
+            .any(|q| q.get("engine").and_then(Value::as_str) == Some(engine_url.as_str()))
+        {
             // "after up to 24 hours" with no unbind escape hatch — see
             // `tests/live/support/teardown.rs:62`.
             return Err(ApiError::bad_request("engine_attached_to_queues_waiting_for_deletion"));
+        }
+        if !st.queues_bound_to_engine(&engine_url).is_empty() {
+            return Err(ApiError::bad_request("engine_attached_to_active_queues"));
         }
     }
     Ok(())

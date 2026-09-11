@@ -8,6 +8,26 @@ use crate::support::run_id::RunId;
 use crate::support::snapshot::write_snapshot;
 use crate::support::teardown::Teardown;
 
+/// The fake-backed twin. Runs in a plain `cargo test`; see
+/// `crate::support::fake`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fake_push_create_ordering() {
+    let fake = crate::support::fake::FakeOrg::start().await;
+    push_create_ordering(&fake.config()).await;
+}
+
+/// The live twin. Unchanged: same `#[ignore]`, same env gate, so
+/// `cargo test --test live -- --ignored` still selects exactly the live set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live: needs RDC_LIVE_* env"]
+async fn live_push_create_ordering() {
+    let Some(cfg) = LiveConfig::from_env() else {
+        eprintln!("{}", LiveConfig::skip_reason());
+        return;
+    };
+    push_create_ordering(&cfg).await;
+}
+
 /// Dependency-ordered CREATE of a whole object graph, against a real org, from
 /// a hand-authored snapshot with no lockfile entries.
 ///
@@ -43,18 +63,12 @@ use crate::support::teardown::Teardown;
 /// marker, and the janitor collects them on a later run. Do NOT "fix" this by
 /// dropping the binding — that would leave only the trace oracle, which mostly
 /// restates what the code does.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "live: needs RDC_LIVE_* env"]
-async fn live_push_create_ordering() {
-    let Some(cfg) = LiveConfig::from_env() else {
-        eprintln!("{}", LiveConfig::skip_reason());
-        return;
-    };
+async fn push_create_ordering(cfg: &LiveConfig) {
     let run_id = RunId::new();
-    let client = LiveClient::connect(&cfg).expect("connect");
-    let teardown = Teardown::new(LiveClient::connect(&cfg).unwrap(), run_id.clone());
+    let client = LiveClient::connect(cfg).expect("connect");
+    let teardown = Teardown::new(LiveClient::connect(cfg).unwrap(), run_id.clone());
 
-    let project = ProjectFixture::init(&cfg, &["test"]).expect("init");
+    let project = ProjectFixture::init(cfg, &["test"]).expect("init");
     write_snapshot(&project, "test", &run_id, &client.org_url);
 
     // One sync: pushes the whole graph, then pulls the org back.

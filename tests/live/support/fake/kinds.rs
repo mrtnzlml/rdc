@@ -22,6 +22,32 @@ pub struct KindSpec {
     pub detail_get: bool,
     /// Keys stripped from LIST responses only.
     pub list_omits: &'static [&'static str],
+    /// Whether the fake should stamp `modified_at` when it creates or
+    /// patches an object of this kind. `false` only for `engines` and
+    /// `engine_fields` — NOT because this fake has observed that the real
+    /// API omits the field on those two (it hasn't; that's unobserved
+    /// here), but because `push::deletes::fetch_remote_modified_at`
+    /// (`src/cli/push/deletes.rs`) deliberately DISCARDS whatever these two
+    /// kinds' bodies carry: its `"engines"`/`"engine_fields"` arms end
+    /// `.map(|_| None)` (lines 486/492), throwing the value away, where
+    /// every other arm — e.g. `"labels"`/`"saved_views"` at lines 458/464 —
+    /// keeps it via `.map(|x| x.modified_at()...)`. So rdc's own drift
+    /// signal for these two kinds is existence-only BY CONSTRUCTION,
+    /// regardless of what the wire actually sends. A fake that stamped a
+    /// timestamp anyway would make `push::deletes::delete_one`'s comparison
+    /// see `(None, Some(_))` — "one side has a timestamp the other
+    /// doesn't" — and skip a delete this scenario expects to reach the
+    /// server and be refused there instead. `has_modified_at: false` matches
+    /// rdc's comparison contract, not a claim about the real response body.
+    ///
+    /// Deliberately not a `quirks::QUIRKS` entry: that registry is for
+    /// behaviors of the real API (`quirks.rs`'s own module doc), each
+    /// backed by real, checkable evidence. This flag encodes an
+    /// internal-consistency requirement between the fake and rdc's own
+    /// drift-check code, not an observed server fact — there is no live
+    /// citation or repo-documented server behavior to point a `proven_by`
+    /// at without overstating what is actually known.
+    pub has_modified_at: bool,
     /// Fill in server-assigned and required-but-absent fields.
     pub defaults: fn(&mut Map<String, Value>, &OrgCtx),
 }
@@ -104,21 +130,21 @@ fn queues_owned(o: &mut Map<String, Value>, _c: &OrgCtx) {
 /// Every kind the fake answers for. Kinds with `creatable: false` exist so a
 /// sync's list of them returns an empty envelope instead of a 404.
 pub const MODELLED: &[KindSpec] = &[
-    KindSpec { path: "workspaces", creatable: true, detail_get: true, list_omits: &[], defaults: workspace_defaults },
-    KindSpec { path: "queues", creatable: true, detail_get: true, list_omits: &[], defaults: queue_defaults },
-    KindSpec { path: "schemas", creatable: true, detail_get: true, list_omits: &["content"], defaults: schema_defaults },
-    KindSpec { path: "inboxes", creatable: true, detail_get: true, list_omits: &[], defaults: inbox_defaults },
-    KindSpec { path: "hooks", creatable: true, detail_get: true, list_omits: &[], defaults: hook_defaults },
-    KindSpec { path: "rules", creatable: true, detail_get: true, list_omits: &[], defaults: queues_owned },
-    KindSpec { path: "labels", creatable: true, detail_get: false, list_omits: &[], defaults: org_owned },
-    KindSpec { path: "email_templates", creatable: true, detail_get: true, list_omits: &[], defaults: no_defaults },
-    KindSpec { path: "engines", creatable: true, detail_get: true, list_omits: &[], defaults: no_defaults },
-    KindSpec { path: "engine_fields", creatable: true, detail_get: true, list_omits: &[], defaults: no_defaults },
-    KindSpec { path: "saved_views", creatable: true, detail_get: true, list_omits: &[], defaults: no_defaults },
-    KindSpec { path: "workflows", creatable: false, detail_get: true, list_omits: &[], defaults: no_defaults },
-    KindSpec { path: "workflow_steps", creatable: false, detail_get: true, list_omits: &[], defaults: no_defaults },
-    KindSpec { path: "users", creatable: false, detail_get: true, list_omits: &[], defaults: no_defaults },
-    KindSpec { path: "hook_templates", creatable: false, detail_get: true, list_omits: &[], defaults: no_defaults },
+    KindSpec { path: "workspaces", creatable: true, detail_get: true, list_omits: &[], has_modified_at: true, defaults: workspace_defaults },
+    KindSpec { path: "queues", creatable: true, detail_get: true, list_omits: &[], has_modified_at: true, defaults: queue_defaults },
+    KindSpec { path: "schemas", creatable: true, detail_get: true, list_omits: &["content"], has_modified_at: true, defaults: schema_defaults },
+    KindSpec { path: "inboxes", creatable: true, detail_get: true, list_omits: &[], has_modified_at: true, defaults: inbox_defaults },
+    KindSpec { path: "hooks", creatable: true, detail_get: true, list_omits: &[], has_modified_at: true, defaults: hook_defaults },
+    KindSpec { path: "rules", creatable: true, detail_get: true, list_omits: &[], has_modified_at: true, defaults: queues_owned },
+    KindSpec { path: "labels", creatable: true, detail_get: false, list_omits: &[], has_modified_at: true, defaults: org_owned },
+    KindSpec { path: "email_templates", creatable: true, detail_get: true, list_omits: &[], has_modified_at: true, defaults: no_defaults },
+    KindSpec { path: "engines", creatable: true, detail_get: true, list_omits: &[], has_modified_at: false, defaults: no_defaults },
+    KindSpec { path: "engine_fields", creatable: true, detail_get: true, list_omits: &[], has_modified_at: false, defaults: no_defaults },
+    KindSpec { path: "saved_views", creatable: true, detail_get: true, list_omits: &[], has_modified_at: true, defaults: no_defaults },
+    KindSpec { path: "workflows", creatable: false, detail_get: true, list_omits: &[], has_modified_at: true, defaults: no_defaults },
+    KindSpec { path: "workflow_steps", creatable: false, detail_get: true, list_omits: &[], has_modified_at: true, defaults: no_defaults },
+    KindSpec { path: "users", creatable: false, detail_get: true, list_omits: &[], has_modified_at: true, defaults: no_defaults },
+    KindSpec { path: "hook_templates", creatable: false, detail_get: true, list_omits: &[], has_modified_at: true, defaults: no_defaults },
 ];
 
 pub fn spec(path: &str) -> Option<&'static KindSpec> {

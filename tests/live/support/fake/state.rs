@@ -222,7 +222,9 @@ impl OrgState {
             .ok_or_else(|| ApiError::bad_request("body must be a JSON object"))?;
         obj.insert("id".into(), json!(id));
         obj.insert("url".into(), json!(url));
-        obj.insert("modified_at".into(), json!(stamp));
+        if spec.has_modified_at {
+            obj.insert("modified_at".into(), json!(stamp));
+        }
         (spec.defaults)(obj, &ctx);
         super::quirks::normalize_write(kind, &mut body);
         self.next_id += 1;
@@ -245,7 +247,7 @@ impl OrgState {
         id: u64,
         patch: &Value,
     ) -> Result<Value, ApiError> {
-        kinds::spec(kind).ok_or_else(ApiError::not_found)?;
+        let spec = kinds::spec(kind).ok_or_else(ApiError::not_found)?;
         if self.get(kind, id).is_none() {
             return Err(ApiError::not_found());
         }
@@ -284,7 +286,9 @@ impl OrgState {
                     // `patch_persists_client_sent_id_and_url` (`quirks.rs`).
                     dst.insert(k.clone(), v.clone());
                 }
-                dst.insert("modified_at".into(), json!(stamp));
+                if spec.has_modified_at {
+                    dst.insert("modified_at".into(), json!(stamp));
+                }
             }
             // The write-path seam, symmetric with `create_unchecked`'s call
             // and `shape_response`'s response-side one — run AFTER the
@@ -438,6 +442,24 @@ impl OrgState {
     /// Queues that have answered `202` but not yet vanished.
     pub fn queues_awaiting_deletion(&self) -> Vec<Value> {
         self.pending_delete.keys().filter_map(|id| self.get("queues", *id)).collect()
+    }
+
+    /// Every queue currently bound to `engine_url` — active or draining
+    /// alike. `validate::on_delete` intersects this with
+    /// [`Self::queues_awaiting_deletion`] to tell the two real refusals
+    /// apart (`engine_attached_to_active_queues` vs
+    /// `engine_attached_to_queues_waiting_for_deletion`,
+    /// `tests/live/support/teardown.rs:59-61`).
+    pub fn queues_bound_to_engine(&self, engine_url: &str) -> Vec<Value> {
+        self.objects
+            .get("queues")
+            .map(|m| {
+                m.values()
+                    .filter(|q| q.get("engine").and_then(Value::as_str) == Some(engine_url))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub fn ids(&self, kind: &str) -> Vec<u64> {
@@ -724,6 +746,41 @@ mod tests {
         assert_eq!(err.status, 400);
         assert!(
             format!("{:?}", err.body).contains("engine_attached_to_queues_waiting_for_deletion"),
+            "wrong body: {:?}",
+            err.body
+        );
+    }
+
+    /// The sibling refusal: an engine bound to a queue that is still fully
+    /// live — never asked to delete at all — is refused with a DIFFERENT
+    /// code than the draining case above
+    /// (`tests/live/support/teardown.rs:59-61`). This is the branch
+    /// `ordering.rs`'s cascade actually hits: `push::deletes` orders engines
+    /// before queues, so the bound queue is always still active when its
+    /// engine's delete is attempted.
+    #[test]
+    fn an_engine_cannot_be_deleted_while_bound_to_an_active_queue() {
+        let mut s = st();
+        let engine = s.create("engines", json!({ "name": "E" })).unwrap();
+        let ws = s.create("workspaces", json!({ "name": "W" })).unwrap();
+        let sc = s.create("schemas", json!({ "name": "S" })).unwrap();
+        s.create(
+            "queues",
+            json!({
+                "name": "Q",
+                "workspace": ws["url"],
+                "schema": sc["url"],
+                "engine": engine["url"],
+            }),
+        )
+        .unwrap();
+        // No `delete("queues", ...)` here — the queue is untouched.
+        let err = s
+            .delete("engines", engine["id"].as_u64().unwrap())
+            .expect_err("must be refused");
+        assert_eq!(err.status, 400);
+        assert!(
+            format!("{:?}", err.body).contains("engine_attached_to_active_queues"),
             "wrong body: {:?}",
             err.body
         );
