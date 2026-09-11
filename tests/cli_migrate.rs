@@ -1075,6 +1075,146 @@ fn migrate_automation_reconcile_is_idempotent() {
     );
 }
 
+/// Helper: like [`setup_automation_project`], but the queue/schema also carry
+/// score-threshold fields — a datapoint `score_threshold` and a queue
+/// `default_score_threshold` — so one project exercises two `--carry` groups
+/// at once. `(enabled, level, spot_check)` per env for automation;
+/// `(datapoint_threshold, queue_default)` per env for thresholds.
+fn setup_automation_and_threshold_project(
+    src_automation: (bool, &str, f64),
+    tgt_automation: (bool, &str, f64),
+    src_thresholds: (f64, f64),
+    tgt_thresholds: (f64, f64),
+) -> TempDir {
+    let project = init_two_env_project();
+    let root = project.path().to_path_buf();
+    let schema = |th: f64| {
+        serde_json::json!({
+            "name": "Invoices schema",
+            "content": [{
+                "category": "section", "id": "header",
+                "children": [
+                    { "category": "datapoint", "id": "amount", "type": "number", "score_threshold": th }
+                ]
+            }]
+        })
+    };
+    let queue = |a: (bool, &str, f64), def: f64| {
+        serde_json::json!({
+            "name": "Invoices",
+            "workspace": "rdc://workspaces/main",
+            "schema": "rdc://schemas/invoices",
+            "automation_enabled": a.0,
+            "automation_level": a.1,
+            "quality_spot_check_percentage": a.2,
+            "settings": { "default_score_threshold": def },
+        })
+    };
+    for (env, a, th) in [
+        ("test", src_automation, src_thresholds),
+        ("prod", tgt_automation, tgt_thresholds),
+    ] {
+        let base = root.join(format!("envs/{env}/workspaces/main/queues/invoices"));
+        write(&base.join("schema.json"), &schema(th.0));
+        write(&base.join("queue.json"), &queue(a, th.1));
+        write(
+            &root.join(format!("envs/{env}/workspaces/main/workspace.json")),
+            &serde_json::json!({ "name": "Main" }),
+        );
+    }
+    let map_dir = root.join(".rdc/map");
+    std::fs::create_dir_all(&map_dir).unwrap();
+    std::fs::write(
+        map_dir.join("test-to-prod.toml"),
+        "version = 1\n\n[workspaces]\n\"main\" = \"main\"\n\n[queues]\n\"invoices\" = \"invoices\"\n\n[schemas]\n\"invoices\" = \"invoices\"\n",
+    )
+    .unwrap();
+    project
+}
+
+/// `--carry all` is the CLI entry point for "every group at once" — unlike the
+/// other carry tests above, which build a `Carry` value in-process, this runs
+/// the actual binary so clap really parses the string `"all"`, and proves both
+/// groups' source values land together in one migrate.
+#[test]
+fn migrate_carry_all_carries_every_group_end_to_end() {
+    let project = setup_automation_and_threshold_project(
+        (true, "always", 0.02),
+        (false, "never", 0.0),
+        (0.5, 0.5),
+        (0.9, 0.85),
+    );
+    let root = project.path();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(root)
+        .args(["migrate", "test", "prod", "--carry", "all"])
+        .assert()
+        .success();
+
+    let base = root.join("envs/prod/workspaces/main/queues/invoices");
+    let queue = read_json(&base.join("queue.json"));
+    assert_eq!(queue["automation_enabled"], serde_json::json!(true), "{queue}");
+    assert_eq!(queue["automation_level"], serde_json::json!("always"), "{queue}");
+    assert_eq!(queue["quality_spot_check_percentage"], serde_json::json!(0.02), "{queue}");
+    assert_eq!(
+        queue["settings"]["default_score_threshold"],
+        serde_json::json!(0.5),
+        "--carry all must carry the source queue default_score_threshold too: {queue}"
+    );
+    let schema = read_json(&base.join("schema.json"));
+    assert_eq!(
+        schema["content"][0]["children"][0]["score_threshold"],
+        serde_json::json!(0.5),
+        "--carry all must carry the source per-datapoint threshold too: {schema}"
+    );
+}
+
+/// The `--carry` groups are independent: naming `automation` must not carry
+/// score thresholds along with it. Without this, a single test proving
+/// `automation` was carried could pass even if `from_groups` accidentally set
+/// every field (the bug finding 1 in this review targets), since nothing else
+/// would notice the extra field flipped on.
+#[test]
+fn migrate_carry_automation_leaves_score_thresholds_target_owned() {
+    let project = setup_automation_and_threshold_project(
+        (true, "always", 0.02),
+        (false, "never", 0.0),
+        (0.5, 0.5),
+        (0.9, 0.85),
+    );
+    let root = project.path();
+
+    let carry = Carry { automation: true, ..Carry::NONE };
+    let _guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], carry);
+    std::env::set_current_dir(&prev).unwrap();
+    result.expect("migrate should succeed");
+
+    let base = root.join("envs/prod/workspaces/main/queues/invoices");
+    let queue = read_json(&base.join("queue.json"));
+    assert_eq!(
+        queue["automation_enabled"], serde_json::json!(true),
+        "--carry automation must still carry automation: {queue}"
+    );
+    assert_eq!(
+        queue["settings"]["default_score_threshold"],
+        serde_json::json!(0.85),
+        "--carry automation must leave the queue's own default_score_threshold \
+         target-owned: {queue}"
+    );
+    let schema = read_json(&base.join("schema.json"));
+    assert_eq!(
+        schema["content"][0]["children"][0]["score_threshold"],
+        serde_json::json!(0.9),
+        "--carry automation must leave the datapoint's own score_threshold \
+         target-owned: {schema}"
+    );
+}
+
 /// `--only queues/<slug>` for a queue the target has never deployed writes a
 /// `queue.json` naming a schema that was never migrated — `POST /queues`
 /// answers `400 schema: This field is required.` and the env is half-built by

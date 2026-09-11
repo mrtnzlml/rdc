@@ -1,3 +1,4 @@
+use crate::cli::migrate::CarryGroup;
 use crate::cli::resolve::ConflictStrategy;
 use clap::builder::styling::{AnsiColor, Color, Effects, RgbColor, Style, Styles};
 use clap::{Parser, Subcommand};
@@ -240,13 +241,16 @@ pub enum Command {
         ///
         /// * `score-thresholds` — a datapoint's `score_threshold` and a
         ///   queue's `default_score_threshold`.
+        ///
         /// * `email-prefixes` — an inbox's `email_prefix`, the left-hand side
         ///   of its public address (`<email_prefix>-<hash>@<host>`): carrying
         ///   it re-addresses the target's mailbox, so mail to the old address
         ///   stops arriving. A brand-new inbox keeps the source's regardless,
         ///   because the field is mandatory on create.
+        ///
         /// * `automation` — a queue's `automation_enabled`,
         ///   `automation_level` and `quality_spot_check_percentage`.
+        ///
         /// * `all` — every group above.
         ///
         /// To give a target env its own value deliberately, declare it in that
@@ -259,7 +263,7 @@ pub enum Command {
             value_delimiter = ',',
             action = clap::ArgAction::Append
         )]
-        carry: Vec<crate::cli::migrate::CarryGroup>,
+        carry: Vec<CarryGroup>,
     },
     /// Set or refresh an env's API token. Validates the token before
     /// writing to `secrets/<env>.secrets.json` (mode 0600 on Unix).

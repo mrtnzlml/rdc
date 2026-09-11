@@ -209,6 +209,13 @@ aliased.
   whether `quality_spot_check_percentage` is writable, and its declared type and
   bounds. Needs a sandbox token. The design holds either way (see above); only
   the README sentence depends on the answer.
+  - **2026-09-11: not run.** No `RDC_LIVE_*` credentials were available in this
+    environment, so the probe was skipped rather than answered — this gate is
+    still open, not resolved, by absence of a result rather than a finding. If
+    the field turns out read-only, the default (target-owned) path is already
+    safe since the reconcile never writes it, but `--carry automation` writes
+    the source's value unconditionally, so an opt-in user would reproduce the
+    exact phantom diff no sync can converge that this design otherwise avoids.
 - **Live promotion scenario** (needs the two-org `RDC_LIVE_TGT_*` setup): a
   source queue with automation on and a target with it off → migrate → the
   target keeps its own values; then `--carry automation` → the source's are

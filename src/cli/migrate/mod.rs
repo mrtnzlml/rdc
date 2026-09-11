@@ -1864,11 +1864,10 @@ fn reconcile_target_owned_keys(
         return;
     }
     // Check before reading: a queue body carrying none of the keys needs no
-    // target file at all, and `transform_file` runs this per file.
-    let Some(obj) = value.as_object() else {
-        return;
-    };
-    if !keys.iter().any(|k| obj.contains_key(*k)) {
+    // target file at all, and `transform_file` runs this per file. `Value::get`
+    // answers `None` for a non-object value too, so this one check covers both
+    // "not an object" and "object without any of the keys".
+    if !keys.iter().any(|k| value.get(*k).is_some()) {
         return;
     }
     // Absent/unparseable target => brand-new queue => every key drops.
@@ -2707,30 +2706,44 @@ impl Carry {
         automation: false,
     };
 
-    /// Carry only the score thresholds. Most migrate tests want this: it is the
-    /// behavior that predates the threshold reconcile, so a test asserting on
-    /// some unrelated field is not perturbed by threshold handling.
+    /// Carry only the score thresholds — a schema datapoint's
+    /// `score_threshold` and a queue's `default_score_threshold` — leaving the
+    /// other groups target-owned. This is the behavior that predates the
+    /// threshold reconcile, which is why most migrate tests use it: a test
+    /// asserting on some unrelated field is not perturbed by threshold
+    /// handling.
     pub const SCORE_THRESHOLDS: Carry = Carry {
         score_thresholds: true,
         email_prefixes: false,
         automation: false,
     };
 
+    /// Turn on the single group `group` names.
+    fn set(&mut self, group: CarryGroup) {
+        match group {
+            CarryGroup::ScoreThresholds => self.score_thresholds = true,
+            CarryGroup::EmailPrefixes => self.email_prefixes = true,
+            CarryGroup::Automation => self.automation = true,
+            // `All` is literally every other variant, read off the enum rather
+            // than hand-listed — so a group added later widens it for free,
+            // which is what its doc comment promises. Recurses exactly one
+            // level: every variant it forwards to is a non-`All` leaf.
+            CarryGroup::All => {
+                for variant in <CarryGroup as clap::ValueEnum>::value_variants() {
+                    if !matches!(variant, CarryGroup::All) {
+                        self.set(*variant);
+                    }
+                }
+            }
+        }
+    }
+
     /// Resolve the repeated / comma-separated `--carry` values. Unknown values
     /// never reach here — clap rejects them against the [`CarryGroup`] enum.
     pub fn from_groups(groups: &[CarryGroup]) -> Self {
         let mut carry = Carry::NONE;
         for group in groups {
-            match group {
-                CarryGroup::ScoreThresholds => carry.score_thresholds = true,
-                CarryGroup::EmailPrefixes => carry.email_prefixes = true,
-                CarryGroup::Automation => carry.automation = true,
-                CarryGroup::All => {
-                    carry.score_thresholds = true;
-                    carry.email_prefixes = true;
-                    carry.automation = true;
-                }
-            }
+            carry.set(*group);
         }
         carry
     }
@@ -5884,9 +5897,19 @@ mod tests {
             Carry::from_groups(&[CarryGroup::Automation, CarryGroup::Automation]),
             Carry { score_thresholds: false, email_prefixes: false, automation: true }
         );
+        // Derive the expectation from the enum itself rather than hand-listing
+        // it a second time: `all` must equal "every non-`All` variant",
+        // structurally, so a variant added after this test was written is
+        // covered without editing this test.
+        let every_other_group: Vec<CarryGroup> =
+            <CarryGroup as clap::ValueEnum>::value_variants()
+                .iter()
+                .copied()
+                .filter(|g| !matches!(g, CarryGroup::All))
+                .collect();
         assert_eq!(
             Carry::from_groups(&[CarryGroup::All]),
-            Carry { score_thresholds: true, email_prefixes: true, automation: true }
+            Carry::from_groups(&every_other_group)
         );
     }
 

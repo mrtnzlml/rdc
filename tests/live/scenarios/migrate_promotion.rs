@@ -294,6 +294,18 @@ async fn live_migrate_overlay_and_mirror() {
         "migrate promoted the source org's automation level over the target's"
     );
 
+    // Guard: the final assertion below only proves `--carry automation` did
+    // something if the source's level is not already "confident" — that is
+    // the value just patched into the target, so if the seed happened to
+    // match it the comparison would pass whether or not `--carry` worked.
+    let src_automation_level = automation_level(&project, "test", &q_slug);
+    assert_ne!(
+        src_automation_level.as_deref(),
+        Some("confident"),
+        "the seeded source queue must not already be \"confident\", or the \
+         --carry automation assertion below would pass vacuously"
+    );
+
     let m6 = project.run_rdc(&[
         "migrate", "test", "prod", "--only", &only, "--carry", "automation",
     ]);
