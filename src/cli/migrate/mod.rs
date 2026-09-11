@@ -1985,7 +1985,7 @@ fn reconcile_engine_slot(value: &mut serde_json::Value, kind: &str) {
 ///   address untouched.
 ///
 /// The create case is not symmetric with [`reconcile_score_thresholds`] /
-/// [`reconcile_training_enabled`], which this originally copied: those fields
+/// [`reconcile_target_owned_keys`], which this originally copied: those fields
 /// are OPTIONAL on create, so dropping them lets the server apply its default.
 /// `email_prefix` is not — `POST /inboxes` answers
 /// `400 non_field_errors: One of fields 'email_prefix' or 'email' needs to be
