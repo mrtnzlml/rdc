@@ -420,25 +420,37 @@ Scoped to deployable content: env/identity fields (`id`, `url`, `organization`, 
 
 An overlay pin beats the remap, which is the escape hatch both for a large integer that is not a reference and for a deliberate per-env divergence (a target env routing a feed to a *different* queue than the source does).
 
-### Score thresholds
+### Fields the target env owns
 
-Confidence thresholds are tuned per queue/organization and expected to differ across envs, so migrate **ignores them by default**: a datapoint's `score_threshold` (in a schema) and a queue's `default_score_threshold` are taken from the *target* when the object already exists there, and dropped (falling back to the queue/server default) for brand-new objects. Pass `--migrate-score-thresholds` to carry the source env's values instead.
+Some fields are tuned per organization rather than promoted with the solution, so migrate leaves them to the **target** env: a matched target keeps its own value, and a brand-new object drops the field so the server's default applies. Name a group with `--carry` to promote the source env's values instead:
+
+| group | fields |
+| --- | --- |
+| `score-thresholds` | a schema datapoint's `score_threshold`, a queue's `default_score_threshold` |
+| `email-prefixes` | an inbox's `email_prefix` |
+| `automation` | a queue's `automation_enabled`, `automation_level`, `quality_spot_check_percentage` |
+| `all` | every group above |
 
 ```sh
-rdc migrate test prod                            # thresholds stay the target's
-rdc migrate test prod --migrate-score-thresholds # promote thresholds too
+rdc migrate test prod                                    # every group stays the target's
+rdc migrate test prod --carry automation
+rdc migrate test prod --carry score-thresholds,automation
+rdc migrate test prod --carry all
 ```
 
-### Inbox email prefixes
+`--carry` is repeatable as well as comma-separated, and an unknown group is rejected with the valid set named.
 
-An inbox's `email_prefix` is the left-hand side of its **public address** — Rossum derives `email` as `<email_prefix>-<hash>@<host>` — so promoting the source env's value re-addresses the target's mailbox and mail sent to the old address stops arriving. migrate therefore **ignores it by default**: a target that already has a prefix keeps its own. Pass `--migrate-email-prefixes` to carry the source env's value instead.
+A queue's `training_enabled` is always the target's, with no group and no opt-in: Rossum resets it to `false` when a queue is created, so carrying the source's value would make every migrate+sync conflict.
+
+#### Score thresholds
+
+Confidence thresholds are tuned per queue/organization and expected to differ across envs. A datapoint's `score_threshold` and a queue's `default_score_threshold` are therefore taken from the *target* when the object already exists there, and dropped (falling back to the queue/server default) for brand-new objects.
+
+#### Inbox email prefixes
+
+An inbox's `email_prefix` is the left-hand side of its **public address** — Rossum derives `email` as `<email_prefix>-<hash>@<host>` — so promoting the source env's value re-addresses the target's mailbox and mail sent to the old address stops arriving. A target that already has a prefix keeps its own.
 
 A **brand-new** inbox is the exception, because the field is mandatory on create: `POST /inboxes` rejects a body with neither `email_prefix` nor `email`, and rdc strips the server-derived `email`. Such an inbox keeps the source's prefix — nobody is sending to a mailbox that does not exist yet, so there is no address to strand — and migrate `warn`s for each one, naming the overlay key that overrides it. The warning repeats on every migrate until the inbox is deployed or you change the value.
-
-```sh
-rdc migrate test prod                           # prod keeps its own inbox address
-rdc migrate test prod --migrate-email-prefixes  # promote the prefix too
-```
 
 To set a target env's prefix deliberately, declare it in that env's `overlay.toml`:
 
@@ -447,7 +459,13 @@ To set a target env's prefix deliberately, declare it in that env's `overlay.tom
 email_prefix = "acme-prod"
 ```
 
-An overlay value always wins over these reconciles — that is the documented precedence (per-object override > kind-wide `"*"` default > reconciled value), and it applies to `score_threshold` / `default_score_threshold` / `training_enabled` too.
+#### Queue automation
+
+`automation_enabled` and `automation_level` decide whether a queue auto-exports documents without human review, and `quality_spot_check_percentage` sets how many automated documents are sampled back for QA. Those are operational decisions a team takes in one organization after watching that organization's accuracy — so a matched target keeps its own three values, and a brand-new queue drops them: `POST /queues` requires only `name` and `schema`, and Rossum's own defaults are `automation_enabled: false` / `automation_level: "never"`. A fresh env therefore starts with automation off and is switched on deliberately, rather than inheriting whatever the source env happened to have.
+
+This stops *future* promotions from overwriting the target's configuration. It cannot undo a past one: where an earlier migrate + sync already pushed the source's values, the target organization genuinely holds them now, and migrate reads the target snapshot — so it faithfully keeps what is there. Set the value you want in the target env (or its `overlay.toml`) once, and it survives from then on.
+
+An overlay value always wins over these reconciles — that is the documented precedence (per-object override > kind-wide `"*"` default > reconciled value), and it applies to `score_threshold` / `default_score_threshold` / `training_enabled` / `automation_level` alike.
 
 ### Hook secrets
 
