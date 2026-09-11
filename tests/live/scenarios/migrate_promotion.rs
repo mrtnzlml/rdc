@@ -49,6 +49,20 @@ fn locale(project: &ProjectFixture, env: &str, q_slug: &str) -> Option<String> {
     v.get("locale").and_then(|l| l.as_str()).map(str::to_string)
 }
 
+/// The queue's `automation_level` as it stands on disk.
+///
+/// A valid probe where `training_enabled` is not: `automation_level` is absent
+/// from `snapshot::noise::NOISE_FIELDS`, so rdc hashes it, pushes it, and a
+/// difference is a real diff — which is precisely why migrate carrying it
+/// across organizations was worth fixing.
+fn automation_level(project: &ProjectFixture, env: &str, q_slug: &str) -> Option<String> {
+    let path = queue_file_path(project.path(), env, q_slug, "queue.json")
+        .unwrap_or_else(|| panic!("queue.json not found for {env}/{q_slug}"));
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    v.get("automation_level").and_then(|l| l.as_str()).map(str::to_string)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live: needs RDC_LIVE_* env"]
 async fn live_migrate_overlay_and_mirror() {
@@ -248,6 +262,47 @@ async fn live_migrate_overlay_and_mirror() {
         "the mirrored deletion must reach the prod remote (hook id {prod_hook_id})"
     );
     assert_converged(&project, "prod", &prefix, "after promoting the deletion to prod");
+
+    // -------------------------------------------------------------------------
+    // Queue automation belongs to the target organization.
+    // -------------------------------------------------------------------------
+    // Turn automation on in the TARGET org only — the shape of a real prod env
+    // that has earned automation its source env has not. Only a real pull can
+    // produce the target snapshot the reconcile reads, which is why this is not
+    // provable offline.
+    tgt_client
+        .patch_fields(
+            "queue",
+            prod_qid,
+            serde_json::json!({ "automation_enabled": true, "automation_level": "confident" }),
+        )
+        .await
+        .expect("enable automation on the target queue");
+    let pull_prod = project.run_rdc(&["sync", "prod", "--no-push"]);
+    assert!(pull_prod.status.success(), "pulling prod failed: {}", combined(&pull_prod));
+    assert_eq!(
+        automation_level(&project, "prod", &q_slug).as_deref(),
+        Some("confident"),
+        "the pull must bring the target org's automation level onto disk"
+    );
+
+    let m5 = project.run_rdc(&["migrate", "test", "prod", "--only", &only]);
+    assert!(m5.status.success(), "automation migrate failed: {}", combined(&m5));
+    assert_eq!(
+        automation_level(&project, "prod", &q_slug).as_deref(),
+        Some("confident"),
+        "migrate promoted the source org's automation level over the target's"
+    );
+
+    let m6 = project.run_rdc(&[
+        "migrate", "test", "prod", "--only", &only, "--carry", "automation",
+    ]);
+    assert!(m6.status.success(), "--carry automation failed: {}", combined(&m6));
+    assert_eq!(
+        automation_level(&project, "prod", &q_slug).as_deref(),
+        automation_level(&project, "test", &q_slug).as_deref(),
+        "--carry automation must promote the source org's value"
+    );
 
     drop(teardown_tgt);
     drop(teardown_src);
