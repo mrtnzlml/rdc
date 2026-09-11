@@ -88,6 +88,20 @@ pub fn shape_response(kind: &str, method: &str, body: &mut Value) {
 /// one kind can never silently apply to another, and a future third rule has
 /// exactly one place to be added rather than a choice of three call sites to
 /// hand-wire it into.
+///
+/// One structural limit, for whoever adds that third rule: unlike
+/// `shape_response`, this signature carries no phase distinguisher —
+/// `shape_response` gets `method` and can tell a `GET` from a `PATCH`
+/// response; `normalize_write` gets only `(kind, body)`, the ALREADY-MERGED
+/// result, with no way to tell a create from a patch or to see the
+/// pre-merge value. Today's two rules don't need either: settings
+/// normalization and email re-derivation are both pure functions of the
+/// post-merge body. A rule that must act differently create-vs-patch, or
+/// that needs what the body looked like BEFORE this write — e.g. a real fix
+/// for quirk `patch_persists_client_sent_id_and_url` below, which would
+/// need to know the id/url that stood in `patch`'s `slot` before the merge,
+/// in order to restore them — will not fit this signature and needs a
+/// different seam, not a third `match` arm here.
 pub fn normalize_write(kind: &str, body: &mut Value) {
     match kind {
         "organizations" => {
@@ -119,10 +133,24 @@ pub fn normalize_write(kind: &str, body: &mut Value) {
 /// (`src/snapshot/limits.rs:466`: "`email` cannot satisfy it from rdc's
 /// side... because it is server-derived"; `src/snapshot/create.rs:57`:
 /// `strip_for_create` removes `email` for inboxes for the same reason). So
-/// prefix-winning is what the real server would do too, given both. This
-/// is also an input shape `rdc` itself can never produce — `strip_for_create`
-/// means a hand-written `email` never reaches the wire — so it's a fidelity
-/// choice at a shape nothing depends on, not a behavior anything relies on.
+/// prefix-winning is what the real server would do too, given both.
+///
+/// This IS reachable in practice, not just a create-time corner: unlike
+/// `POST`, an ordinary (non-migrate) `PATCH /inboxes/{id}` push routinely
+/// sends `email` alongside `email_prefix` — `Inbox.email` is a plain
+/// `String` that serializes whenever non-empty
+/// (`src/cli/push/inboxes.rs:241-243`, `:363-370`). What makes prefix-wins
+/// harmless rather than merely untested is a narrower fact: whenever `rdc`
+/// sends `email_prefix`, any `email` it sends alongside is ALREADY
+/// consistent with it — both are read off the same prior baseline. The one
+/// path where `email_prefix` actually CHANGES is migrate's
+/// `reconcile_email_prefix`, and that pipeline strips the source-host
+/// `email` before it ever runs, so `email` ends up blank and therefore
+/// OMITTED from the body entirely (`Inbox`'s
+/// `skip_serializing_if = "String::is_empty"`, `src/model/inbox.rs:62-90`).
+/// So this rule is reachable — a routine PATCH really does carry both
+/// fields together — it just never has to arbitrate a genuine conflict
+/// against what `rdc` sends today.
 ///
 /// `kinds::inbox_defaults` still owns exactly one thing this rule
 /// deliberately does not: a create-only fallback for a body sent with
