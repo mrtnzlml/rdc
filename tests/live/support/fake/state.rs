@@ -131,10 +131,19 @@ impl OrgState {
     /// earlier version of this fake did exactly that) would leave stored
     /// state holding the raw, unnormalized value, so a later `GET` would
     /// hand back something no real org ever would — the review that caught
-    /// this called it out directly. `quirks::normalize_organization_settings`
-    /// is applied below only to the incoming `settings` key, not the whole
-    /// patch, matching the real endpoint (`push::organization` sends the
-    /// whole `settings` subtree in one PATCH, never a partial one).
+    /// this called it out directly.
+    ///
+    /// This is `patch_organization`'s call into the write-path seam,
+    /// `quirks::normalize_write`, made AFTER the raw shallow merge above —
+    /// it runs against the fully-merged `self.org`, and its `"organizations"`
+    /// rule only touches the `settings` field it finds there
+    /// (`quirks::normalize_write`'s doc comment), so a patch that never
+    /// mentions `settings` at all leaves it untouched (already-normalized
+    /// input is a no-op: re-normalizing an idempotent shape changes
+    /// nothing). This used to be a hand-wired `if k == "settings"` check on
+    /// the incoming patch, right here — moved so this fact and the inbox
+    /// one below (`create_unchecked`, `patch`) share one seam instead of
+    /// each getting its own bespoke wiring.
     ///
     /// Still NOT modelled: the real `users`-reorder difference — this fake's
     /// organization always carries `users: []` (`OrgState::new` below), so
@@ -145,14 +154,11 @@ impl OrgState {
         let stamp = self.now();
         if let (Some(dst), Some(src)) = (self.org.as_object_mut(), patch.as_object()) {
             for (k, v) in src {
-                let mut v = v.clone();
-                if k == "settings" {
-                    super::quirks::normalize_organization_settings(&mut v);
-                }
-                dst.insert(k.clone(), v);
+                dst.insert(k.clone(), v.clone());
             }
             dst.insert("modified_at".into(), json!(stamp));
         }
+        super::quirks::normalize_write("organizations", &mut self.org);
         self.org.clone()
     }
 
@@ -185,6 +191,19 @@ impl OrgState {
     /// created by the server, not POSTed by a client, so the checks a client
     /// POST answers to do not apply — and the unique-typed-template rule
     /// would refuse the very defaults it exists to compare against.
+    ///
+    /// `quirks::normalize_write` runs AFTER `defaults` and AFTER `id`/`url`
+    /// are already assigned — never before, and never in [`Self::create`]
+    /// above, which only validates. Validation must see the RAW body (a
+    /// derived field appearing early could hide a refusal the real API
+    /// would still issue against the client's actual input), and a refused
+    /// create must not have touched `next_id` at all, which is why this
+    /// whole function only runs once [`Self::create`] has already accepted
+    /// the body. Once here, though, deriving before or after `defaults`
+    /// makes no observable difference for today's one write-time rule
+    /// (`inboxes`: `defaults` only fills in `queues`), so it runs right
+    /// after for readability — everything that shapes the body happens
+    /// together, before the persist step below.
     pub(super) fn create_unchecked(
         &mut self,
         kind: &'static str,
@@ -205,6 +224,7 @@ impl OrgState {
         obj.insert("url".into(), json!(url));
         obj.insert("modified_at".into(), json!(stamp));
         (spec.defaults)(obj, &ctx);
+        super::quirks::normalize_write(kind, &mut body);
         self.next_id += 1;
         self.objects.entry(kind).or_default().insert(id, body.clone());
         self.relink(kind, id);
@@ -257,11 +277,21 @@ impl OrgState {
                 .expect("presence checked above");
             if let (Some(dst), Some(src)) = (slot.as_object_mut(), patch.as_object()) {
                 for (k, v) in src {
-                    // A Rossum PATCH is a shallow merge of the keys it carries.
+                    // A Rossum PATCH is a shallow merge of the keys it
+                    // carries. Not modelled: nothing here protects
+                    // read-only server-owned keys like `id`/`url` from a
+                    // body that happens to carry them — see quirk
+                    // `patch_persists_client_sent_id_and_url` (`quirks.rs`).
                     dst.insert(k.clone(), v.clone());
                 }
                 dst.insert("modified_at".into(), json!(stamp));
             }
+            // The write-path seam, symmetric with `create_unchecked`'s call
+            // and `shape_response`'s response-side one — run AFTER the
+            // merge above, against the fully-merged object, so a rule like
+            // the inbox one (re-derive `email` from `email_prefix`) sees
+            // whatever the PATCH just changed, not the pre-merge body.
+            super::quirks::normalize_write(kind, slot);
             slot.clone()
         };
         self.relink(kind, id);

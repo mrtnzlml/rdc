@@ -53,7 +53,7 @@ use super::state::OrgState;
 /// `settings` normalization is deliberately NOT here, even though it is the
 /// same quirk's other documented difference — see
 /// `normalize_organization_settings`'s doc comment below for why that half
-/// belongs at the write path (`state.rs::patch_organization`) instead of the
+/// belongs at the write path (`normalize_write`, below) instead of the
 /// response seam. A first version of this seam put both halves here, which
 /// a review caught: it made a PATCH response's `settings` look normalized
 /// while the STORED value stayed raw, so a GET taken right after the PATCH
@@ -63,6 +63,76 @@ pub fn shape_response(kind: &str, method: &str, body: &mut Value) {
     if (kind, method) == ("organizations", "PATCH") {
         insert_organization_rir_key(body);
     }
+}
+
+/// The write-path seam, symmetric with `shape_response` above: that function
+/// is reached from `mod.rs::kind_response`, the ONE place `route()` builds a
+/// response body; this one is reached from every place `state.rs` produces
+/// or updates a STORED object body — `create_unchecked`, `patch`, and
+/// `patch_organization` (organizations keep their own write function because
+/// the org isn't stored in the generic `objects` map, but it is still a
+/// write entrance and gets the same call). Before this existed, every "the
+/// server does X when it writes" fact had to be hand-wired into whichever of
+/// those functions discovered it first — `patch_organization`'s
+/// `if k == "settings"` was exactly that. Two rules live here now:
+///
+/// - `("organizations", _)`: `settings` normalization
+///   (`normalize_organization_settings`), moved out of `patch_organization`.
+/// - `("inboxes", _)`: `email` re-derivation from `email_prefix`
+///   (`derive_inbox_email`) — see that function's doc comment for why
+///   `kinds::inbox_defaults` no longer derives `email` itself and keeps only
+///   a narrower fallback for a body this rule has nothing to derive from.
+///
+/// Called unconditionally for every kind at every write, exactly like
+/// `shape_response` is called for every response — so a rule added here for
+/// one kind can never silently apply to another, and a future third rule has
+/// exactly one place to be added rather than a choice of three call sites to
+/// hand-wire it into.
+pub fn normalize_write(kind: &str, body: &mut Value) {
+    match kind {
+        "organizations" => {
+            if let Some(settings) = body.get_mut("settings") {
+                normalize_organization_settings(settings);
+            }
+        }
+        "inboxes" => derive_inbox_email(body),
+        _ => {}
+    }
+}
+
+/// Quirk `inbox_email_is_re_derived_on_write`'s implementation:
+/// `email` is server-derived from `email_prefix`
+/// (`src/snapshot/limits.rs:468`), so a body that carries `email_prefix`
+/// gets `email` (re-)computed from it — on create AND on every later PATCH.
+/// A body with no `email_prefix` (the real API also accepts a direct
+/// `email`, per the same `400 non_field_errors` this fake does not yet
+/// enforce) is left untouched: this rule only ever DERIVES, it never
+/// invents a fallback prefix.
+///
+/// `kinds::inbox_defaults` still owns exactly one thing this rule
+/// deliberately does not: a create-only fallback for a body sent with
+/// NEITHER `email` nor `email_prefix` (a case the real API refuses, but
+/// this fake doesn't enforce that yet either). That fallback calls
+/// `inbox_email_for` below too, so the address FORMAT is defined in
+/// exactly one place even though it now has two triggers — this rule
+/// (re-derive whenever `email_prefix` is present) and that one
+/// (invent `email_prefix: "inbox"` only when the body has nothing to
+/// derive from at all).
+fn derive_inbox_email(body: &mut Value) {
+    let Some(obj) = body.as_object_mut() else { return };
+    let Some(prefix) = obj.get("email_prefix").and_then(Value::as_str).map(str::to_string) else {
+        return;
+    };
+    obj.insert("email".into(), json!(inbox_email_for(&prefix)));
+}
+
+/// The one formula behind a fake inbox's address, shared by
+/// `derive_inbox_email` above (the write-path rule) and
+/// `kinds::inbox_defaults`'s narrower create-only fallback, so the two
+/// trigger conditions can never drift into computing different addresses
+/// for the same prefix.
+pub(super) fn inbox_email_for(prefix: &str) -> String {
+    format!("{prefix}@fake.rossum.invalid")
 }
 
 /// Quirk `organization_patch_response_is_not_get_shaped`'s response-only
@@ -87,14 +157,15 @@ fn insert_organization_rir_key(body: &mut Value) {
 }
 
 /// Quirk `organization_patch_response_is_not_get_shaped`'s `settings` half —
-/// called from `state.rs::patch_organization` as it merges an incoming
-/// patch into STORED state, not from `shape_response` above. This is a fact
-/// about what the real server persists, not about how one response differs
-/// from what's stored: `tests/cli_sync.rs:1996`'s mock comment records it
-/// directly — "A real GET reflects the PATCH afterwards" with the
-/// NORMALIZED `settings` already in place — so the normalized shape must be
-/// written into state at merge time, or a GET taken after the PATCH would
-/// hand back the raw, unnormalized value the real API never would.
+/// called from `normalize_write` above, itself called from
+/// `state.rs::patch_organization` AFTER it merges an incoming patch into
+/// STORED state, not from `shape_response` above. This is a fact about what
+/// the real server persists, not about how one response differs from what's
+/// stored: `tests/cli_sync.rs:1996`'s mock comment records it directly — "A
+/// real GET reflects the PATCH afterwards" with the NORMALIZED `settings`
+/// already in place — so the normalized shape must be written into state at
+/// merge time, or a GET taken after the PATCH would hand back the raw,
+/// unnormalized value the real API never would.
 ///
 /// Recurses through the whole `settings` subtree — an object, an array, or a
 /// leaf at any depth — because the real server's normalization isn't scoped
@@ -211,12 +282,18 @@ pub const QUIRKS: &[Quirk] = &[
         //   is a STORAGE fact: the real server normalizes `settings` when
         //   it is WRITTEN, so the normalized value persists and a GET taken
         //   AFTER the PATCH returns it too. Modelled in
-        //   `state.rs::patch_organization`, via
-        //   `quirks::normalize_organization_settings`, NOT in the response
-        //   seam — an earlier version of this quirk put it there, which a
-        //   review caught: it made the PATCH response look normalized while
-        //   the stored value stayed raw, so a GET right after the PATCH
-        //   would still hand back the unnormalized shape.
+        //   `quirks::normalize_write` (the write-path seam, symmetric with
+        //   `shape_response`), called from `state.rs::patch_organization`
+        //   after it merges the patch — NOT in the response seam. An
+        //   earlier version of this quirk put the normalization in the
+        //   response seam, which a review caught: it made the PATCH
+        //   response look normalized while the stored value stayed raw, so
+        //   a GET right after the PATCH would still hand back the
+        //   unnormalized shape. A later version hand-wired it as
+        //   `if k == "settings"` directly inside `patch_organization`,
+        //   which worked but meant every future "the server does X when it
+        //   writes" fact needed its own hand-wiring; `normalize_write` is
+        //   that fact's permanent home now.
         //
         // See `quirks::insert_organization_rir_key`'s doc comment for why
         // the third documented difference — `users` reordering — is
@@ -246,6 +323,66 @@ pub const QUIRKS: &[Quirk] = &[
         // cannot serve as this quirk's citation either — hence the SOURCE
         // form, naming the fact's original documentation.
         proven_by: "src/cli/push/organization.rs:161",
+    },
+    Quirk {
+        name: "inbox_email_is_re_derived_on_write",
+        modelled: true,
+        // `email` is server-derived from `email_prefix`
+        // (`<email_prefix>-<hash>@<host>`) — `src/snapshot/limits.rs:468`
+        // records this directly, and it's why `strip_for_create` removes a
+        // hand-written `email` before every `POST /inboxes`. `rdc` DOES
+        // PATCH `email_prefix` (migrate's `reconcile_email_prefix`), so a
+        // fake that only derived `email` at create time would leave a
+        // stale address after that PATCH, forever — the exact phantom-drift
+        // shape this whole instrument exists to catch, and precisely why
+        // this fact was named the DISCRIMINATING one when the missing
+        // write-path seam was found. Modelled in `quirks::normalize_write`
+        // (`derive_inbox_email`), called from both `state.rs::create_unchecked`
+        // and `state.rs::patch` — the same seam the organization `settings`
+        // rule above lives in.
+        //
+        // SOURCE, not LIVE: no live scenario patches an inbox's
+        // `email_prefix` against a real org and re-reads `email` afterward
+        // (a stage-2 inbox port may add one). The offline pin is
+        // `an_inbox_email_is_re_derived_when_its_prefix_changes`
+        // (`tests.rs`), which — like the organization quirk's offline pin
+        // above — proves the FAKE's own behavior, not the real API's, so it
+        // cannot serve as this quirk's citation either.
+        proven_by: "src/snapshot/limits.rs:468",
+    },
+    Quirk {
+        name: "back_reference_growth_leaves_modified_at_unbumped",
+        modelled: false,
+        // `graph.rs`'s `add_ref`/`set_field` — the functions `relink` calls
+        // to grow a back-reference (e.g. a new hook pushing itself onto
+        // `queue.hooks`) — touch only the target's own field, never
+        // `modified_at`; only `state.rs`'s `create`/`patch`/`patch_organization`
+        // stamp the clock, and only for the object THEY write, not for a
+        // target that merely gained a back-ref as a side effect.
+        //
+        // This is recorded, not modelled, because the real API's behavior
+        // here is UNKNOWN — nothing in this repo says whether a real
+        // `queue.modified_at` moves when a hook that names it is created.
+        // That is the defect this entry names: an unrecorded choice, not a
+        // wrong one. The fake picked "no" silently; this entry is what
+        // makes that a visible, deliberate placeholder instead of a fact
+        // nobody could tell was ever decided.
+        proven_by: "tests/live/support/fake/graph.rs:82",
+    },
+    Quirk {
+        name: "patch_persists_client_sent_id_and_url",
+        modelled: false,
+        // `state.rs`'s `patch` is an unconditional shallow merge of every
+        // key the request body carries (`dst.insert(k.clone(), v.clone())`
+        // for each key, no exclusion list) — a PATCH body that happens to
+        // carry `id` or `url` (both read-only, server-assigned fields)
+        // would silently overwrite the stored ones. `rdc` DOES PATCH full
+        // objects that carry both: `push`'s update paths serialize the
+        // whole typed model, id and url included, trusting the real API to
+        // ignore or reject them. Not modelled: the fake does not protect
+        // these keys, so a hand-built request that sent a bogus `id` would
+        // corrupt the store in a way no real org would ever allow.
+        proven_by: "tests/live/support/fake/state.rs:280",
     },
     Quirk {
         name: "inbox_patch_response_omits_fields_the_get_response_includes",

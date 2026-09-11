@@ -265,6 +265,44 @@ async fn the_organization_patch_response_is_not_get_shaped() {
     );
 }
 
+/// `inbox.email` is SERVER-DERIVED from `email_prefix`
+/// (`src/snapshot/limits.rs:468`, which is why `strip_for_create` removes
+/// it). So a PATCH that changes the prefix must change the address — in
+/// the STORE, not just in the response. A fake that derives it only on
+/// create leaves a stale address that every later GET repeats, and an
+/// inbox port would then converge where a real org produces exactly the
+/// phantom-drift cycle this instrument exists to catch.
+#[tokio::test]
+async fn an_inbox_email_is_re_derived_when_its_prefix_changes() {
+    let fake = FakeOrg::start().await;
+    let mut st = fake.state();
+    let ws = st.create("workspaces", json!({ "name": "W" })).unwrap();
+    let sc = st.create("schemas", json!({ "name": "S" })).unwrap();
+    let q = st
+        .create("queues", json!({ "name": "Q", "workspace": ws["url"], "schema": sc["url"] }))
+        .unwrap();
+    let inbox = st
+        .create(
+            "inboxes",
+            json!({ "name": "In", "email_prefix": "before", "queues": [q["url"]] }),
+        )
+        .unwrap();
+    assert_eq!(inbox["email"], json!("before@fake.rossum.invalid"));
+
+    let id = inbox["id"].as_u64().unwrap();
+    let patched = st.patch("inboxes", id, &json!({ "email_prefix": "after" })).unwrap();
+    assert_eq!(
+        patched["email"],
+        json!("after@fake.rossum.invalid"),
+        "a prefix change must re-derive the address"
+    );
+    assert_eq!(
+        st.get("inboxes", id).unwrap()["email"],
+        json!("after@fake.rossum.invalid"),
+        "and the STORE must hold the new address, not just the response"
+    );
+}
+
 #[tokio::test]
 async fn two_fakes_are_independent_orgs() {
     let a = FakeOrg::start().await;

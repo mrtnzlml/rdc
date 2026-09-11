@@ -78,6 +78,15 @@ impl OrgState {
     }
 
     /// Push `child_url` into `parent.<field>` if it is not already there.
+    ///
+    /// Note what this does NOT do: touch `parent`'s `modified_at`. Neither
+    /// this nor `set_field` below stamps the clock — only `state.rs`'s
+    /// `create`/`patch`/`patch_organization` do, and only for the object
+    /// THEY write, not for a target that merely gained a back-reference as
+    /// a side effect of someone else's write. Whether a real
+    /// `queue.modified_at` moves when, say, a new hook names it is unknown
+    /// either way; recorded as quirk `back_reference_growth_leaves_modified_at_unbumped`
+    /// (`quirks.rs`) rather than left as a silent, undocumented choice.
     fn add_ref(
         &mut self,
         parent_kind: &'static str,

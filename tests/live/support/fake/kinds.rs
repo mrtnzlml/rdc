@@ -58,18 +58,35 @@ fn queue_defaults(o: &mut Map<String, Value>, _c: &OrgCtx) {
     ensure(o, "locale", json!("en_GB"));
 }
 
-/// `email` is server-assigned. The real address is globally unique; the fake
-/// derives it from `email_prefix` so it is unique per run for free (the seeder
-/// prefixes `email_prefix` with the run id).
+/// `email` is server-assigned: the real address is globally unique, and the
+/// fake derives it from `email_prefix` so it is unique per run for free (the
+/// seeder prefixes `email_prefix` with the run id). The DERIVATION — turning
+/// an `email_prefix` that's actually present into an `email` — now lives
+/// only in `quirks::normalize_write` (`derive_inbox_email`), called right
+/// after this function by `state.rs::create_unchecked`, and again on every
+/// `patch`. Keeping that derivation here too, the shape this function used
+/// to have, is exactly the duplication the seam exists to close: a PATCH
+/// that changed `email_prefix` would leave the create-time value stale
+/// forever, which is what
+/// `an_inbox_email_is_re_derived_when_its_prefix_changes` (`tests.rs`) pins
+/// against.
+///
+/// What's left here is narrower: a body sent with NEITHER `email` nor
+/// `email_prefix` has nothing for `derive_inbox_email` to derive FROM (it
+/// deliberately never invents a prefix), so without this fallback such a
+/// create would silently end up with no `email` at all — a real change in
+/// behavior from before this seam existed, for a case nothing in this repo
+/// currently tests but that the create-path-must-not-change requirement
+/// still covers. This calls the same `quirks::inbox_email_for` formula
+/// `derive_inbox_email` uses, so the two triggers (re-derive when a prefix
+/// IS present; invent a fixed one when neither field is) can never disagree
+/// on what an address for a given prefix looks like.
 fn inbox_defaults(o: &mut Map<String, Value>, _c: &OrgCtx) {
     ensure(o, "queues", json!([]));
-    if o.get("email").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
-        let prefix = o
-            .get("email_prefix")
-            .and_then(|v| v.as_str())
-            .unwrap_or("inbox")
-            .to_string();
-        o.insert("email".into(), json!(format!("{prefix}@fake.rossum.invalid")));
+    let has_email = o.get("email").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty());
+    let has_prefix = o.get("email_prefix").and_then(|v| v.as_str()).is_some();
+    if !has_email && !has_prefix {
+        o.insert("email".into(), json!(super::quirks::inbox_email_for("inbox")));
     }
 }
 
