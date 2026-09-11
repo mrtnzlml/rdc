@@ -9,6 +9,7 @@
 //! `rdc://` portable refs, run the transform, and assert the target snapshot's
 //! files land at remapped paths with remapped refs + applied overlays.
 
+use rdc::cli::migrate::Carry;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use tempfile::TempDir;
 
@@ -146,7 +147,7 @@ version = 1
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], true, false);
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::SCORE_THRESHOLDS);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed offline");
 
@@ -211,7 +212,7 @@ fn migrate_dry_run_writes_nothing() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, true, vec![], true, false);
+    let result = rdc::cli::migrate::run("test", "prod", false, true, vec![], Carry::SCORE_THRESHOLDS);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("dry-run migrate should succeed");
 
@@ -253,7 +254,7 @@ fn migrate_converts_legacy_mapping_unmatched_rename_is_harmless() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], true, false);
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::SCORE_THRESHOLDS);
     std::env::set_current_dir(&prev).unwrap();
 
     // Migrate SUCCEEDS despite the unmatched entry.
@@ -308,7 +309,7 @@ fn migrate_dry_run_does_not_convert_or_delete_legacy_mapping_file() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, true, vec![], true, false);
+    let result = rdc::cli::migrate::run("test", "prod", false, true, vec![], Carry::SCORE_THRESHOLDS);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("dry-run migrate should succeed");
 
@@ -347,7 +348,14 @@ fn migrate_only_restricts_to_selected_object() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec!["hooks/keeper".into()], true, false);
+    let result = rdc::cli::migrate::run(
+        "test",
+        "prod",
+        false,
+        false,
+        vec!["hooks/keeper".into()],
+        Carry::SCORE_THRESHOLDS,
+    );
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate --only should succeed");
 
@@ -418,8 +426,7 @@ fn migrate_only_includes_sidecars_of_selected_objects() {
             "rules/validation".into(),
             "schemas/cost-invoices".into(),
         ],
-        true,
-        false,
+        Carry::SCORE_THRESHOLDS,
     );
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate --only should succeed");
@@ -466,8 +473,7 @@ fn migrate_only_unknown_selector_errors() {
         false,
         false,
         vec!["hooks/does-not-exist".into()],
-        true,
-        false,
+        Carry::SCORE_THRESHOLDS,
     );
     std::env::set_current_dir(&prev).unwrap();
 
@@ -505,7 +511,7 @@ fn migrate_carries_manual_mdh_dataset_rows() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], true, false);
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::SCORE_THRESHOLDS);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -556,8 +562,7 @@ fn migrate_only_selects_a_whole_mdh_dataset() {
         false,
         false,
         vec!["mdh/gl-codes".into()],
-        true,
-        false,
+        Carry::SCORE_THRESHOLDS,
     );
     std::env::set_current_dir(&prev).unwrap();
     result.expect("--only mdh/<slug> should succeed");
@@ -675,7 +680,7 @@ fn migrate_preserves_target_identity_for_matched_object() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], true, false);
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::SCORE_THRESHOLDS);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -759,12 +764,12 @@ fn migrate_inbox_byte_deterministic_across_create_then_update() {
     std::env::set_current_dir(root).unwrap();
 
     // First migrate: target inbox does not exist yet → CREATE path.
-    rdc::cli::migrate::run("test", "prod", false, false, vec![], true, false)
+    rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::SCORE_THRESHOLDS)
         .expect("first migrate should succeed");
     let after_create = std::fs::read(&inbox).expect("inbox written by first migrate");
 
     // Second migrate: target inbox now exists → MATCHED/UPDATE path.
-    rdc::cli::migrate::run("test", "prod", false, false, vec![], true, false)
+    rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::SCORE_THRESHOLDS)
         .expect("second migrate should succeed");
     let after_update = std::fs::read(&inbox).expect("inbox present after second migrate");
 
@@ -830,7 +835,7 @@ fn setup_threshold_project(
     project
 }
 
-/// By default (no `--migrate-score-thresholds`), migrate ignores the source's
+/// By default (no `--carry score-thresholds`), migrate ignores the source's
 /// thresholds: a matched target keeps its OWN per-datapoint `score_threshold`
 /// and queue `default_score_threshold`.
 #[test]
@@ -841,7 +846,7 @@ fn migrate_ignores_score_thresholds_by_default() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], false, false);
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::NONE);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -860,7 +865,7 @@ fn migrate_ignores_score_thresholds_by_default() {
     );
 }
 
-/// With `--migrate-score-thresholds`, migrate carries the SOURCE's thresholds
+/// With `--carry score-thresholds`, migrate carries the SOURCE's thresholds
 /// verbatim (the pre-existing behavior).
 #[test]
 fn migrate_carries_score_thresholds_with_flag() {
@@ -870,7 +875,7 @@ fn migrate_carries_score_thresholds_with_flag() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], true, false);
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::SCORE_THRESHOLDS);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -908,8 +913,7 @@ fn migrate_only_refuses_a_new_queue_whose_schema_is_not_selected() {
         false,
         false,
         vec!["queues/invoices".to_string()],
-        false,
-        false,
+        Carry::NONE,
     );
     std::env::set_current_dir(&prev).unwrap();
 
@@ -939,8 +943,7 @@ fn migrate_only_accepts_a_new_queue_when_its_schema_is_selected_too() {
         false,
         false,
         vec!["queues/invoices".to_string(), "schemas/invoices".to_string()],
-        false,
-        false,
+        Carry::NONE,
     );
     std::env::set_current_dir(&prev).unwrap();
     result.expect("queue + schema together must migrate");
@@ -963,7 +966,7 @@ fn migrate_whole_snapshot_creates_a_new_queue_with_its_schema() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], false, false);
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::NONE);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("a whole-snapshot migrate must succeed");
 
@@ -1064,7 +1067,7 @@ fn migrate_promoted_engine_clears_the_targets_generic_engine() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(&root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], false, false);
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::NONE);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -1131,7 +1134,7 @@ fn setup_inbox_prefix_project(src_prefix: &str, tgt_prefix: Option<Option<&str>>
     project
 }
 
-/// Default (no `--migrate-email-prefixes`): a matched target inbox keeps its
+/// Default (no `--carry email-prefixes`): a matched target inbox keeps its
 /// OWN `email_prefix`. Carrying the source's would re-address the target's
 /// public mailbox (`email` is `<email_prefix>-<hash>@<host>`) and break mail
 /// sent to the old address.
@@ -1143,7 +1146,7 @@ fn migrate_ignores_inbox_email_prefix_by_default() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], false, false);
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::NONE);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -1170,7 +1173,7 @@ fn migrate_keeps_source_inbox_email_prefix_for_new_object() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], false, false);
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::NONE);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -1194,7 +1197,7 @@ fn migrate_fills_missing_email_prefix_on_an_undeployed_target_inbox() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], false, false);
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::NONE);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -1206,7 +1209,7 @@ fn migrate_fills_missing_email_prefix_on_an_undeployed_target_inbox() {
     );
 }
 
-/// With `--migrate-email-prefixes`, migrate carries the SOURCE's prefix
+/// With `--carry email-prefixes`, migrate carries the SOURCE's prefix
 /// verbatim (the pre-existing behavior, now opt-in).
 #[test]
 fn migrate_carries_inbox_email_prefix_with_flag() {
@@ -1216,7 +1219,7 @@ fn migrate_carries_inbox_email_prefix_with_flag() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], false, true);
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry { email_prefixes: true, ..Carry::NONE });
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -1244,7 +1247,7 @@ fn migrate_inbox_email_prefix_overlay_wins() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], false, false);
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::NONE);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -1275,7 +1278,7 @@ fn migrate_overlay_wins_over_score_threshold_reconcile() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], false, false);
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::NONE);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -1314,7 +1317,7 @@ fn migrate_overlay_wins_over_training_enabled_reconcile() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], false, false);
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::NONE);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -1356,7 +1359,7 @@ fn migrate_strips_identity_for_new_object() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    rdc::cli::migrate::run("test", "prod", false, false, vec![], true, false).expect("migrate ok");
+    rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::SCORE_THRESHOLDS).expect("migrate ok");
     std::env::set_current_dir(&prev).unwrap();
 
     let h = read_json(&root.join("envs/prod/hooks/brand-new.json"));
@@ -1402,7 +1405,7 @@ fn migrate_overlay_shadow_replaces_formula_sidecar() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], true, false);
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::SCORE_THRESHOLDS);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -1439,7 +1442,7 @@ fn migrate_overlay_shadow_replaces_hook_and_rule_code_and_leaves_others() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], true, false);
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::SCORE_THRESHOLDS);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -1466,7 +1469,7 @@ fn migrate_overlay_dangling_shadow_is_a_hard_error_and_writes_nothing() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], true, false);
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::SCORE_THRESHOLDS);
     std::env::set_current_dir(&prev).unwrap();
 
     let err = result.unwrap_err().to_string();
@@ -1491,7 +1494,7 @@ fn migrate_overlay_json_shadow_is_rejected() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], true, false);
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::SCORE_THRESHOLDS);
     std::env::set_current_dir(&prev).unwrap();
 
     let err = result.unwrap_err().to_string();
@@ -1516,7 +1519,14 @@ fn migrate_overlay_only_excluded_shadow_does_not_error() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec!["hooks/a".to_string()], true, false);
+    let result = rdc::cli::migrate::run(
+        "test",
+        "prod",
+        false,
+        false,
+        vec!["hooks/a".to_string()],
+        Carry::SCORE_THRESHOLDS,
+    );
     std::env::set_current_dir(&prev).unwrap();
     result.expect("a valid shadow for an --only-excluded sidecar must not error");
 
@@ -1569,7 +1579,7 @@ fn migrate_overlay_shadow_applies_at_renamed_target_path() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], true, false);
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::SCORE_THRESHOLDS);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -1603,7 +1613,7 @@ fn migrate_overlay_shadow_replaces_nodejs_hook_js_sidecar() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], true, false);
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::SCORE_THRESHOLDS);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -1679,7 +1689,7 @@ fn migrate_mirror_skips_second_unique_typed_template_per_queue() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", true, false, vec![], true, false);
+    let result = rdc::cli::migrate::run("test", "prod", true, false, vec![], Carry::SCORE_THRESHOLDS);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate --mirror should succeed");
 
@@ -1714,7 +1724,7 @@ fn migrate_keeps_unique_typed_duplicates_that_exist_on_target() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", true, false, vec![], true, false);
+    let result = rdc::cli::migrate::run("test", "prod", true, false, vec![], Carry::SCORE_THRESHOLDS);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate --mirror should succeed");
 
@@ -1742,7 +1752,7 @@ fn migrate_keeps_lowest_id_unique_typed_duplicate_on_fresh_target() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", true, false, vec![], true, false);
+    let result = rdc::cli::migrate::run("test", "prod", true, false, vec![], Carry::SCORE_THRESHOLDS);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate --mirror should succeed");
 
@@ -1769,7 +1779,7 @@ fn migrate_leaves_custom_type_duplicates_alone() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", true, false, vec![], true, false);
+    let result = rdc::cli::migrate::run("test", "prod", true, false, vec![], Carry::SCORE_THRESHOLDS);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate --mirror should succeed");
 

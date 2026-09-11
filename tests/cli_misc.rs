@@ -44,3 +44,84 @@ fn sync_watch_accepts_poll_interval() {
         panic!("expected Sync variant");
     }
 }
+
+#[test]
+fn migrate_carry_accepts_a_single_group() {
+    let cli = rdc::cli::Cli::try_parse_from([
+        "rdc", "migrate", "test", "prod", "--carry", "automation",
+    ]);
+    assert!(cli.is_ok(), "--carry automation must parse: {:?}", cli.err());
+}
+
+#[test]
+fn migrate_carry_accepts_comma_separated_groups() {
+    let cli = rdc::cli::Cli::try_parse_from([
+        "rdc", "migrate", "test", "prod", "--carry", "score-thresholds,automation",
+    ]);
+    assert!(
+        cli.is_ok(),
+        "one --carry may name several groups: {:?}",
+        cli.err()
+    );
+}
+
+#[test]
+fn migrate_carry_accepts_a_repeated_flag() {
+    let cli = rdc::cli::Cli::try_parse_from([
+        "rdc", "migrate", "test", "prod", "--carry", "score-thresholds", "--carry", "automation",
+    ]);
+    assert!(cli.is_ok(), "--carry must be repeatable: {:?}", cli.err());
+}
+
+#[test]
+fn migrate_carry_rejects_an_unknown_group() {
+    // Names the valid set for the reader rather than failing anonymously —
+    // clap's ValueEnum error does this for free, which is why the option is a
+    // value enum instead of a hand-parsed string.
+    let err = rdc::cli::Cli::try_parse_from([
+        "rdc", "migrate", "test", "prod", "--carry", "thresholds",
+    ])
+    .expect_err("an unknown group must be rejected");
+    let msg = format!("{err}");
+    assert!(msg.contains("score-thresholds"), "{msg}");
+}
+
+/// `--migrate-score-thresholds` was removed in favour of `--carry
+/// score-thresholds`. A pipeline that bumps `RDC_VERSION` and still passes it
+/// must fail at argument parse — before any file is written — not silently
+/// migrate thresholds it meant to keep.
+#[test]
+fn migrate_rejects_the_removed_score_threshold_flag() {
+    let result = rdc::cli::Cli::try_parse_from([
+        "rdc", "migrate", "test", "prod", "--migrate-score-thresholds",
+    ]);
+    assert!(result.is_err(), "the removed flag must not parse");
+}
+
+/// The email-prefix half of the same removal.
+#[test]
+fn migrate_rejects_the_removed_email_prefix_flag() {
+    let result = rdc::cli::Cli::try_parse_from([
+        "rdc", "migrate", "test", "prod", "--migrate-email-prefixes",
+    ]);
+    assert!(result.is_err(), "the removed flag must not parse");
+}
+
+#[test]
+fn migrate_carry_parses_into_the_named_groups() {
+    let cli = rdc::cli::Cli::try_parse_from([
+        "rdc", "migrate", "test", "prod", "--carry", "score-thresholds,automation",
+    ])
+    .expect("valid CLI");
+    let Some(rdc::cli::Command::Migrate { carry, .. }) = cli.command else {
+        panic!("expected Migrate variant");
+    };
+    assert_eq!(
+        rdc::cli::migrate::Carry::from_groups(&carry),
+        rdc::cli::migrate::Carry {
+            score_thresholds: true,
+            email_prefixes: false,
+            automation: true,
+        }
+    );
+}

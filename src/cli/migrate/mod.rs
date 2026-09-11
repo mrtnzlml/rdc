@@ -874,11 +874,10 @@ fn transform_file(
     subst: &BTreeMap<String, String>,
     overlay: Option<&Overlay>,
     tgt_org_url: &str,
-    migrate_score_thresholds: bool,
+    carry: Carry,
     src_lockfile: &crate::state::Lockfile,
     tgt_lockfile: &crate::state::Lockfile,
     dry_run: bool,
-    migrate_email_prefixes: bool,
     id_remap: &IdRemap,
     id_hits: &mut Vec<(String, u64, u64)>,
     carried_prefixes: &mut Vec<(String, String)>,
@@ -1056,7 +1055,7 @@ fn transform_file(
     // (per queue) are tuned per queue/organization and expected to differ across
     // envs, so by default a matched target keeps its own values and a brand-new
     // object drops them (falling back to the queue/server default).
-    if !migrate_score_thresholds
+    if !carry.score_thresholds
         && let Some((kind, _)) = classify(rel)
     {
         reconcile_score_thresholds(&mut value, kind, &dst_path);
@@ -1097,7 +1096,7 @@ fn transform_file(
     // env's address. It is confirmed further down, once the final value is
     // known, so the warning never names a prefix the user has already overridden.
     let mut provisional_carry: Option<(String, String)> = None;
-    if !migrate_email_prefixes
+    if !carry.email_prefixes
         && let Some((kind, src_slug)) = classify(rel)
         && kind == "inboxes"
     {
@@ -1742,7 +1741,7 @@ fn walk_remap_ids(
 }
 
 /// Reconcile per-org confidence thresholds so migrate does not carry them from
-/// the source env (see the module-level flag `--migrate-score-thresholds`).
+/// the source env (see `--carry score-thresholds`).
 ///
 /// The affected keys are `score_threshold` (on each schema datapoint, inside
 /// `content`) and `default_score_threshold` (on a queue). Both are tuned per
@@ -1919,7 +1918,7 @@ fn reconcile_engine_slot(value: &mut serde_json::Value, kind: &str) {
 }
 
 /// Reconcile an inbox's `email_prefix` so migrate never re-addresses the
-/// target's mailbox (see the module-level flag `--migrate-email-prefixes`).
+/// target's mailbox (see `--carry email-prefixes`).
 ///
 /// `email_prefix` is the left-hand side of an inbox's PUBLIC address: Rossum
 /// derives `email` as `<email_prefix>-<hash>@<host>`. rdc already treats the
@@ -2618,6 +2617,81 @@ fn unique_template_skips(
     skips
 }
 
+/// One group of fields the TARGET env owns on migrate, as named on the CLI by
+/// `--carry <GROUP>`.
+///
+/// Every value is a field — or a small set of fields — that migrate leaves to
+/// the target env by default, because it is tuned per organization rather than
+/// promoted with the solution. Naming the group carries the SOURCE env's
+/// values instead, which is the pre-reconcile behavior.
+///
+/// `training_enabled` is deliberately absent. It is always the target's, with
+/// no opt-in: Rossum resets it to `false` on queue creation, so carrying it
+/// would make every migrate+sync conflict, and there is no case for blindly
+/// propagating a training toggle across orgs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum CarryGroup {
+    /// A schema datapoint's `score_threshold` and a queue's
+    /// `default_score_threshold`.
+    ScoreThresholds,
+    /// An inbox's `email_prefix`.
+    EmailPrefixes,
+    /// A queue's `automation_enabled`, `automation_level` and
+    /// `quality_spot_check_percentage`.
+    Automation,
+    /// Every group above. A group added later widens it, which is the intended
+    /// reading of "carry everything the target normally owns".
+    All,
+}
+
+/// The resolved set of [`CarryGroup`]s for one migrate run.
+///
+/// [`Carry::NONE`] — every group left to the target — is the default, and what
+/// an unflagged `rdc migrate` uses.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Carry {
+    pub score_thresholds: bool,
+    pub email_prefixes: bool,
+    pub automation: bool,
+}
+
+impl Carry {
+    /// Carry nothing: the target env owns every group.
+    pub const NONE: Carry = Carry {
+        score_thresholds: false,
+        email_prefixes: false,
+        automation: false,
+    };
+
+    /// Carry only the score thresholds. Most migrate tests want this: it is the
+    /// behavior that predates the threshold reconcile, so a test asserting on
+    /// some unrelated field is not perturbed by threshold handling.
+    pub const SCORE_THRESHOLDS: Carry = Carry {
+        score_thresholds: true,
+        email_prefixes: false,
+        automation: false,
+    };
+
+    /// Resolve the repeated / comma-separated `--carry` values. Unknown values
+    /// never reach here — clap rejects them against the [`CarryGroup`] enum.
+    pub fn from_groups(groups: &[CarryGroup]) -> Self {
+        let mut carry = Carry::NONE;
+        for group in groups {
+            match group {
+                CarryGroup::ScoreThresholds => carry.score_thresholds = true,
+                CarryGroup::EmailPrefixes => carry.email_prefixes = true,
+                CarryGroup::Automation => carry.automation = true,
+                CarryGroup::All => {
+                    carry.score_thresholds = true;
+                    carry.email_prefixes = true;
+                    carry.automation = true;
+                }
+            }
+        }
+        carry
+    }
+}
+
 /// `rdc migrate <src> <tgt>` — pure-local snapshot→snapshot transform.
 ///
 /// Copies `envs/<src>/` into `envs/<tgt>/`, renaming slugs per the hand-authored,
@@ -2636,20 +2710,10 @@ pub fn run(
     mirror: bool,
     dry_run: bool,
     only: Vec<String>,
-    migrate_score_thresholds: bool,
-    migrate_email_prefixes: bool,
+    carry: Carry,
 ) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
-    run_at(
-        &cwd,
-        src,
-        tgt,
-        mirror,
-        dry_run,
-        only,
-        migrate_score_thresholds,
-        migrate_email_prefixes,
-    )
+    run_at(&cwd, src, tgt, mirror, dry_run, only, carry)
 }
 
 /// Like [`run`], but takes the project root explicitly instead of reading
@@ -2663,8 +2727,7 @@ pub fn run_at(
     mirror: bool,
     dry_run: bool,
     only: Vec<String>,
-    migrate_score_thresholds: bool,
-    migrate_email_prefixes: bool,
+    carry: Carry,
 ) -> Result<()> {
     if src == tgt {
         anyhow::bail!(
@@ -2951,11 +3014,10 @@ pub fn run_at(
             &subst,
             tgt_overlay.as_ref(),
             &tgt_org_url,
-            migrate_score_thresholds,
+            carry,
             &src_lockfile,
             &tgt_lockfile,
             dry_run,
-            migrate_email_prefixes,
             &id_remap,
             &mut id_hits,
             &mut carried_prefixes,
@@ -3373,7 +3435,7 @@ mod tests {
         // regardless).
         std::fs::create_dir_all(root.join("envs/dev/workspaces")).unwrap();
 
-        let result = run_at(root, "dev", "prod", false, true /* dry_run */, vec![], false, false);
+        let result = run_at(root, "dev", "prod", false, true /* dry_run */, vec![], Carry::NONE);
 
         assert!(result.is_ok(), "run_at should succeed: {result:?}");
         assert_eq!(
@@ -3852,10 +3914,9 @@ mod tests {
             &subst,
             Some(&overlay),
             "https://tgt.example/api/v1/organizations/2",
-            true,
+            Carry::SCORE_THRESHOLDS,
             &src_lock,
             &crate::state::Lockfile::default(),
-            false,
             false,
             &remap,
             &mut hits,
@@ -4092,10 +4153,9 @@ mod tests {
                 &subst,
                 None,
                 &tgt_org,
-                true,
+                Carry::SCORE_THRESHOLDS,
                 &src_lf,
                 &crate::state::Lockfile::default(),
-                false,
                 false,
                 &IdRemap::default(),
                 &mut Vec::new(),
@@ -4232,10 +4292,9 @@ mod tests {
                 &subst,
                 None,
                 &format!("{HOST}/organizations/2"),
-                true,
+                Carry::SCORE_THRESHOLDS,
                 &src_lf,
                 &crate::state::Lockfile::default(),
-                false,
                 false,
                 &IdRemap::default(),
                 &mut Vec::new(),
@@ -4348,10 +4407,9 @@ mod tests {
                 &subst,
                 None,
                 "https://acme.rossum.app/api/v1/organizations/2",
-                true,
+                Carry::SCORE_THRESHOLDS,
                 &crate::state::Lockfile::default(),
                 &crate::state::Lockfile::default(),
-                false,
                 false,
                 &IdRemap::default(),
                 &mut Vec::new(),
@@ -4416,7 +4474,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new(), "tgt", &mut Vec::new(), &mut Vec::new()).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2", Carry::SCORE_THRESHOLDS, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new(), "tgt", &mut Vec::new(), &mut Vec::new()).unwrap();
 
         // File landed at the remapped path.
         let dst = tgt
@@ -4483,10 +4541,9 @@ mod tests {
             &subst,
             None,
             "https://tgt.example/api/v1/organizations/2",
-            true,
+            Carry::SCORE_THRESHOLDS,
             &src_lock,
             &crate::state::Lockfile::default(),
-            false,
             false,
             &IdRemap::default(),
             &mut Vec::new(),
@@ -4537,7 +4594,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new(), "tgt", &mut Vec::new(), &mut Vec::new()).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", Carry::SCORE_THRESHOLDS, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new(), "tgt", &mut Vec::new(), &mut Vec::new()).unwrap();
 
         let dst = tgt.path().join("hooks/extractor-prod.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -4579,7 +4636,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new(), "tgt", &mut Vec::new(), &mut Vec::new()).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", Carry::SCORE_THRESHOLDS, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new(), "tgt", &mut Vec::new(), &mut Vec::new()).unwrap();
 
         let dst = tgt.path().join("hooks/any-hook.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -4627,7 +4684,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new(), "tgt", &mut Vec::new(), &mut Vec::new()).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", Carry::SCORE_THRESHOLDS, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new(), "tgt", &mut Vec::new(), &mut Vec::new()).unwrap();
 
         let dst = tgt.path().join("hooks/special-hook.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -4668,7 +4725,7 @@ mod tests {
         .unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new(), "tgt", &mut Vec::new(), &mut Vec::new()).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, Some(&overlay), "https://tgt.example/api/v1/organizations/2", Carry::SCORE_THRESHOLDS, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new(), "tgt", &mut Vec::new(), &mut Vec::new()).unwrap();
 
         let dst = tgt.path().join("rules/some-rule.json");
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&dst).unwrap()).unwrap();
@@ -4741,10 +4798,9 @@ mod tests {
             &subst,
             None,
             "https://acme-test.rossum.app/api/v1/organizations/2",
-            true,
+            Carry::SCORE_THRESHOLDS,
             &crate::state::Lockfile::default(),
             &crate::state::Lockfile::default(),
-            false,
             false,
             &IdRemap::default(),
             &mut Vec::new(),
@@ -4800,7 +4856,7 @@ mod tests {
         fs::write(&src_file, code).unwrap();
 
         let subst = build_subst(&m);
-        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2", true, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new(), "tgt", &mut Vec::new(), &mut Vec::new()).unwrap();
+        transform_file(rel, src.path(), tgt.path(), &m, &subst, None, "https://tgt.example/api/v1/organizations/2", Carry::SCORE_THRESHOLDS, &crate::state::Lockfile::default(), &crate::state::Lockfile::default(), false, &IdRemap::default(), &mut Vec::new(), &mut Vec::new(), "tgt", &mut Vec::new(), &mut Vec::new()).unwrap();
 
         let dst = tgt.path().join("hooks/extractor-prod.py");
         assert_eq!(
@@ -5401,10 +5457,9 @@ mod tests {
             &subst,
             overlay,
             "https://tgt.example/api/v1/organizations/2",
-            false,
+            Carry::NONE,
             &crate::state::Lockfile::default(),
             &crate::state::Lockfile::default(), // empty tgt lockfile => a create
-            false,
             false,
             &IdRemap::default(),
             &mut Vec::new(),
@@ -5560,9 +5615,9 @@ mod tests {
 
     #[test]
     fn transform_file_carries_thresholds_when_opted_in() {
-        // With --migrate-score-thresholds (the `true` arg), the source's
-        // per-datapoint threshold survives verbatim even against a matched
-        // target that tuned it differently.
+        // With `Carry::SCORE_THRESHOLDS`, the source's per-datapoint threshold
+        // survives verbatim even against a matched target that tuned it
+        // differently.
         use std::fs;
         let src = tempfile::TempDir::new().unwrap();
         let tgt = tempfile::TempDir::new().unwrap();
@@ -5598,11 +5653,10 @@ mod tests {
         transform_file(
             rel, src.path(), tgt.path(), &m, &subst, None,
             "https://tgt.example/api/v1/organizations/2",
-            /* migrate_score_thresholds = */ true,
+            /* carry = */ Carry::SCORE_THRESHOLDS,
             &crate::state::Lockfile::default(),
             &crate::state::Lockfile::default(),
             false,
-            /* migrate_email_prefixes = */ false,
             &IdRemap::default(),
             &mut Vec::new(),
             &mut Vec::new(),
@@ -5658,11 +5712,10 @@ mod tests {
         transform_file(
             rel, src.path(), tgt.path(), &m, &subst, None,
             "https://tgt.example/api/v1/organizations/2",
-            /* migrate_score_thresholds = */ false,
+            /* carry = */ Carry::NONE,
             &crate::state::Lockfile::default(),
             &crate::state::Lockfile::default(),
             false,
-            /* migrate_email_prefixes = */ false,
             &IdRemap::default(),
             &mut Vec::new(),
             &mut Vec::new(),
@@ -5678,6 +5731,33 @@ mod tests {
             out["content"][0]["score_threshold"],
             serde_json::json!(0.9),
             "default must preserve the TARGET's tuned threshold"
+        );
+    }
+
+    #[test]
+    fn carry_from_groups_resolves_each_group() {
+        assert_eq!(Carry::from_groups(&[]), Carry::NONE);
+        assert_eq!(
+            Carry::from_groups(&[CarryGroup::ScoreThresholds]),
+            Carry::SCORE_THRESHOLDS
+        );
+        assert_eq!(
+            Carry::from_groups(&[CarryGroup::Automation]),
+            Carry { score_thresholds: false, email_prefixes: false, automation: true }
+        );
+    }
+
+    #[test]
+    fn carry_from_groups_unions_repeats_and_expands_all() {
+        // Repeating a group is idempotent, and `all` means every group —
+        // including any group added after this test was written.
+        assert_eq!(
+            Carry::from_groups(&[CarryGroup::Automation, CarryGroup::Automation]),
+            Carry { score_thresholds: false, email_prefixes: false, automation: true }
+        );
+        assert_eq!(
+            Carry::from_groups(&[CarryGroup::All]),
+            Carry { score_thresholds: true, email_prefixes: true, automation: true }
         );
     }
 
@@ -5937,7 +6017,7 @@ mod tests {
             }),
         );
 
-        run_at(root, "dev", "prod", false, false, vec![], false, false)
+        run_at(root, "dev", "prod", false, false, vec![], Carry::NONE)
             .expect("a saved view whose refs all resolve must promote");
 
         let promoted: Value = serde_json::from_slice(
@@ -5975,7 +6055,7 @@ mod tests {
             }),
         );
 
-        let err = run_at(root, "dev", "prod", false, false, vec![], false, false)
+        let err = run_at(root, "dev", "prod", false, false, vec![], Carry::NONE)
             .expect_err("an unresolvable queues_filter ref must refuse, never defer");
         let msg = format!("{err:#}");
         for want in [
@@ -6012,7 +6092,7 @@ mod tests {
             }),
         );
 
-        let err = run_at(root, "dev", "prod", false, false, vec![], false, false)
+        let err = run_at(root, "dev", "prod", false, false, vec![], Carry::NONE)
             .expect_err("a user ref must refuse on an api_base with no /api/v1/ segment");
         let msg = format!("{err:#}");
         for want in [
@@ -6047,7 +6127,7 @@ mod tests {
         );
         let before = std::fs::read(&target_only).unwrap();
 
-        run_at(root, "dev", "prod", false, false, vec![], false, false)
+        run_at(root, "dev", "prod", false, false, vec![], Carry::NONE)
             .expect("a target-native saved view must not block a migration that skips it");
 
         assert_eq!(
@@ -6123,7 +6203,7 @@ mod tests {
         );
 
         // 5th positional arg is `dry_run`.
-        let err = run_at(root, "dev", "prod", false, true, vec![], false, false)
+        let err = run_at(root, "dev", "prod", false, true, vec![], Carry::NONE)
             .expect_err("--dry-run must forecast the refusal");
         let msg = format!("{err:#}");
         for want in ["saved-views/scoped", "queues_filter[0]", "not-in-target"] {
@@ -6154,7 +6234,7 @@ mod tests {
             }),
         );
 
-        run_at(root, "dev", "prod", false, true, vec![], false, false)
+        run_at(root, "dev", "prod", false, true, vec![], Carry::NONE)
             .expect("a ref to a queue this run would create must not be refused");
     }
 
@@ -6179,7 +6259,7 @@ mod tests {
                     "organization": "https://dev.example/api/v1/organizations/1"
                 }),
             );
-            run_at(root, "dev", "prod", false, dry, vec![], false, false)
+            run_at(root, "dev", "prod", false, dry, vec![], Carry::NONE)
                 .unwrap_or_else(|e| panic!("dry_run={dry} must accept, got: {e:#}"));
         }
 
@@ -6198,7 +6278,7 @@ mod tests {
                     "organization": "https://dev.example/api/v1/organizations/1"
                 }),
             );
-            let err = run_at(root, "dev", "prod", false, dry, vec![], false, false)
+            let err = run_at(root, "dev", "prod", false, dry, vec![], Carry::NONE)
                 .unwrap_err();
             let msg = format!("{err:#}");
             assert!(

@@ -229,24 +229,37 @@ pub enum Command {
         /// Without any `--only`, migrate operates on the whole snapshot.
         #[arg(long = "only", value_name = "SELECTOR", action = clap::ArgAction::Append)]
         only: Vec<String>,
-        /// Carry `score_threshold` (per-datapoint, in schemas) and
-        /// `default_score_threshold` (per-queue) from the source env. By
-        /// default these are IGNORED: they are tuned per queue/organization and
-        /// expected to differ, so a matched target keeps its own values and a
-        /// brand-new object drops them (falling back to the queue/server
-        /// default). Pass this flag to migrate the thresholds too.
-        #[arg(long = "migrate-score-thresholds")]
-        migrate_score_thresholds: bool,
-        /// Carry an inbox's `email_prefix` from the source env. By default it
-        /// is IGNORED: the prefix is the left-hand side of the inbox's public
-        /// address (`<email_prefix>-<hash>@<host>`), so promoting the source's
-        /// value re-addresses the target's mailbox and breaks mail sent to the
-        /// old address. A matched target keeps its own prefix and a brand-new
-        /// inbox drops the field (the server derives the target's address).
-        /// Set one deliberately per env with `[inboxes.<queue-slug>]` in the
-        /// target's `overlay.toml`. Pass this flag to migrate the prefix too.
-        #[arg(long = "migrate-email-prefixes")]
-        migrate_email_prefixes: bool,
+        /// Carry a group of the target env's own fields from the source env
+        /// instead. Repeatable and comma-separated:
+        /// `--carry score-thresholds,automation`.
+        ///
+        /// By default migrate leaves each group to the TARGET env, because
+        /// these are tuned per organization rather than promoted with the
+        /// solution: a matched target keeps its own values, and a brand-new
+        /// object drops the fields so the server's defaults apply.
+        ///
+        /// * `score-thresholds` — a datapoint's `score_threshold` and a
+        ///   queue's `default_score_threshold`.
+        /// * `email-prefixes` — an inbox's `email_prefix`, the left-hand side
+        ///   of its public address (`<email_prefix>-<hash>@<host>`): carrying
+        ///   it re-addresses the target's mailbox, so mail to the old address
+        ///   stops arriving. A brand-new inbox keeps the source's regardless,
+        ///   because the field is mandatory on create.
+        /// * `automation` — a queue's `automation_enabled`,
+        ///   `automation_level` and `quality_spot_check_percentage`.
+        /// * `all` — every group above.
+        ///
+        /// To give a target env its own value deliberately, declare it in that
+        /// env's `overlay.toml`: an overlay wins over both the reconcile and
+        /// this flag.
+        #[arg(
+            long = "carry",
+            value_name = "GROUP",
+            value_enum,
+            value_delimiter = ',',
+            action = clap::ArgAction::Append
+        )]
+        carry: Vec<crate::cli::migrate::CarryGroup>,
     },
     /// Set or refresh an env's API token. Validates the token before
     /// writing to `secrets/<env>.secrets.json` (mode 0600 on Unix).
@@ -374,8 +387,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             mirror,
             dry_run,
             only,
-            migrate_score_thresholds,
-            migrate_email_prefixes,
+            carry,
         }) => {
             let src = crate::cli::env_picker::pick_env("Migrate from which env (source)?", src)?;
             let tgt = crate::cli::env_picker::pick_env_excluding(
@@ -390,8 +402,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 mirror,
                 dry_run,
                 only,
-                migrate_score_thresholds,
-                migrate_email_prefixes,
+                crate::cli::migrate::Carry::from_groups(&carry),
             )
         }
         Some(Command::Auth { env, token, username }) => {
