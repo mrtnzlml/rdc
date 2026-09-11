@@ -1061,15 +1061,21 @@ fn transform_file(
         reconcile_score_thresholds(&mut value, kind, &dst_path);
     }
 
-    // The per-queue `training_enabled` flag. Engine auto-training is a per-env
-    // policy (train in dev, not in a test clone) and Rossum resets the flag to
-    // `false` on queue creation, so carrying the source's value would make every
-    // migrate+sync conflict (source `true` vs deployed `false`). Like the score
-    // thresholds, a matched target keeps its own value and a brand-new queue
-    // drops the field. Unconditional (no flag): there is no case for blindly
-    // propagating a training toggle across orgs.
+    // The per-queue `training_enabled` flag — unconditional, no carry group.
     if let Some((kind, _)) = classify(rel) {
-        reconcile_training_enabled(&mut value, kind, &dst_path);
+        reconcile_target_owned_keys(&mut value, kind, &dst_path, &["training_enabled"]);
+    }
+
+    // The queue's automation configuration, unless the user opted to carry it.
+    // Unlike `training_enabled` these are NOT in `snapshot::noise::NOISE_FIELDS`
+    // — rdc hashes and pushes them — so promoting the source's values is a real
+    // change that the following `rdc sync` really applies to the target org.
+    // That is the whole bug: a promotion silently switched a target queue's
+    // automation to whatever the source env happened to have.
+    if !carry.automation
+        && let Some((kind, _)) = classify(rel)
+    {
+        reconcile_target_owned_keys(&mut value, kind, &dst_path, AUTOMATION_KEYS);
     }
 
     // The queue's engine binding. `engine`/`dedicated_engine` are promoted
@@ -1810,41 +1816,79 @@ fn reconcile_score_thresholds(value: &mut serde_json::Value, kind: &str, tgt_pat
     }
 }
 
-/// Reconcile the per-queue `training_enabled` flag so migrate+sync is stable.
+/// The queue fields that make up the `automation` carry group.
 ///
-/// Engine auto-training is a per-env policy (you train the model in dev, not in
-/// a throwaway test clone), and Rossum resets `training_enabled` to `false` when
-/// a queue is created. Carrying the source's value therefore makes every
-/// migrate+sync conflict — the migrated queue says `true`, the deployed queue is
-/// `false`, and neither side ever converges. Following the same rule as
-/// [`reconcile_score_thresholds`]:
+/// All three are top-level on a queue — verified against 240 pulled
+/// `queue.json` files, where every one carries them at the top level — so this
+/// needs no position-agnostic search of the kind `default_score_threshold` has.
+const AUTOMATION_KEYS: &[&str] = &[
+    "automation_enabled",
+    "automation_level",
+    "quality_spot_check_percentage",
+];
+
+/// Reconcile top-level queue fields that the TARGET env owns, so migrate does
+/// not promote them from the source.
 ///
-/// - **Matched target** (`tgt_path` exists + carries the flag): adopt the
-///   TARGET's value, so each env keeps its own training policy.
-/// - **New target** (or the target lacks the flag): drop it, so Rossum's
-///   create-time default (`false`) applies and the round-trip is stable.
+/// Two callers, one rule:
+///
+/// * `training_enabled` — unconditional. Engine auto-training is a per-env
+///   policy (you train the model in dev, not in a throwaway test clone), and
+///   Rossum resets the flag to `false` when a queue is created. Carrying the
+///   source's value makes every migrate+sync conflict — the migrated queue says
+///   `true`, the deployed queue is `false`, and neither side ever converges.
+/// * [`AUTOMATION_KEYS`] — unless `--carry automation`. Whether a queue
+///   auto-exports without human review is the target organization's operational
+///   decision, taken after watching its own accuracy; it is not solution
+///   configuration that travels with a schema change.
+///
+/// The rule, following [`reconcile_score_thresholds`]:
+///
+/// - **Matched target** (`tgt_path` exists and carries the key): adopt the
+///   TARGET's value, so each env keeps its own policy.
+/// - **New target, or the target lacks that key**: drop it, so the server's
+///   create-time default applies and the round-trip is stable. Per key, not
+///   all-or-nothing.
+///
+/// A key the source body does not have is never introduced from the target:
+/// this adopts, it does not populate.
 ///
 /// A no-op for any kind other than `queues`.
-fn reconcile_training_enabled(value: &mut serde_json::Value, kind: &str, tgt_path: &Path) {
-    const KEY: &str = "training_enabled";
+fn reconcile_target_owned_keys(
+    value: &mut serde_json::Value,
+    kind: &str,
+    tgt_path: &Path,
+    keys: &[&str],
+) {
     if kind != "queues" {
         return;
     }
-    let Some(obj) = value.as_object_mut() else {
+    // Check before reading: a queue body carrying none of the keys needs no
+    // target file at all, and `transform_file` runs this per file.
+    let Some(obj) = value.as_object() else {
         return;
     };
-    if !obj.contains_key(KEY) {
+    if !keys.iter().any(|k| obj.contains_key(*k)) {
         return;
     }
+    // Absent/unparseable target => brand-new queue => every key drops.
     let target: Option<serde_json::Value> = std::fs::read(tgt_path)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok());
-    match target.as_ref().and_then(|t| t.get(KEY)).cloned() {
-        Some(v) => {
-            obj.insert(KEY.to_string(), v);
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    for key in keys {
+        if !obj.contains_key(*key) {
+            continue;
         }
-        None => {
-            obj.shift_remove(KEY);
+        match target.as_ref().and_then(|t| t.get(*key)).cloned() {
+            Some(v) => {
+                obj.insert((*key).to_string(), v);
+            }
+            None => {
+                obj.shift_remove(*key);
+            }
         }
     }
 }
@@ -5177,7 +5221,7 @@ mod tests {
         // `false`, or migrate+sync perpetually conflicts).
         let mut source = serde_json::json!({ "name": "Q", "training_enabled": true });
         let (_d, tgt) = tgt_file(&serde_json::json!({ "name": "Q", "training_enabled": false }));
-        reconcile_training_enabled(&mut source, "queues", &tgt);
+        reconcile_target_owned_keys(&mut source, "queues", &tgt, &["training_enabled"]);
         assert_eq!(source["training_enabled"], serde_json::json!(false));
     }
 
@@ -5187,7 +5231,7 @@ mod tests {
         // (false) applies and the round-trip is stable.
         let mut source = serde_json::json!({ "name": "Q", "training_enabled": true });
         let missing = std::path::Path::new("/nonexistent/does-not-exist/queue.json");
-        reconcile_training_enabled(&mut source, "queues", missing);
+        reconcile_target_owned_keys(&mut source, "queues", missing, &["training_enabled"]);
         assert!(source.get("training_enabled").is_none());
     }
 
@@ -5196,8 +5240,93 @@ mod tests {
         // Only queues carry `training_enabled`; other kinds are untouched.
         let mut source = serde_json::json!({ "name": "S", "training_enabled": true });
         let (_d, tgt) = tgt_file(&serde_json::json!({ "name": "S" }));
-        reconcile_training_enabled(&mut source, "schemas", &tgt);
+        reconcile_target_owned_keys(&mut source, "schemas", &tgt, &["training_enabled"]);
         assert_eq!(source["training_enabled"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn reconcile_automation_matched_adopts_every_target_value() {
+        // A prod org that has earned automation must not be reset by a dev env
+        // that has not — nor the reverse.
+        let mut source = serde_json::json!({
+            "name": "Q",
+            "automation_enabled": true,
+            "automation_level": "always",
+            "quality_spot_check_percentage": 0.02,
+        });
+        let (_d, tgt) = tgt_file(&serde_json::json!({
+            "name": "Q",
+            "automation_enabled": false,
+            "automation_level": "never",
+            "quality_spot_check_percentage": 0.0,
+        }));
+        reconcile_target_owned_keys(&mut source, "queues", &tgt, AUTOMATION_KEYS);
+        assert_eq!(source["automation_enabled"], serde_json::json!(false));
+        assert_eq!(source["automation_level"], serde_json::json!("never"));
+        assert_eq!(source["quality_spot_check_percentage"], serde_json::json!(0.0));
+    }
+
+    #[test]
+    fn reconcile_automation_new_target_drops_every_key() {
+        // A brand-new queue POSTs without them, so the server's own defaults
+        // apply — `automation_enabled: false` and `automation_level: "never"`,
+        // i.e. automation OFF. Verified against the published OpenAPI spec:
+        // `POST /v1/queues` requires only `name` and `schema`.
+        let mut source = serde_json::json!({
+            "name": "Q",
+            "automation_enabled": true,
+            "automation_level": "confident",
+            "quality_spot_check_percentage": 0.02,
+        });
+        let missing = std::path::Path::new("/nonexistent/does-not-exist/queue.json");
+        reconcile_target_owned_keys(&mut source, "queues", missing, AUTOMATION_KEYS);
+        assert!(source.get("automation_enabled").is_none());
+        assert!(source.get("automation_level").is_none());
+        assert!(source.get("quality_spot_check_percentage").is_none());
+        assert_eq!(source["name"], serde_json::json!("Q"), "unrelated keys survive");
+    }
+
+    #[test]
+    fn reconcile_automation_drops_only_the_keys_the_target_lacks() {
+        // Per-key, not all-or-nothing: a target pulled before a field existed
+        // keeps the reconcile honest for the fields it does carry.
+        let mut source = serde_json::json!({
+            "name": "Q",
+            "automation_enabled": true,
+            "automation_level": "always",
+            "quality_spot_check_percentage": 0.02,
+        });
+        let (_d, tgt) = tgt_file(&serde_json::json!({
+            "name": "Q",
+            "automation_level": "confident",
+        }));
+        reconcile_target_owned_keys(&mut source, "queues", &tgt, AUTOMATION_KEYS);
+        assert_eq!(source["automation_level"], serde_json::json!("confident"));
+        assert!(source.get("automation_enabled").is_none());
+        assert!(source.get("quality_spot_check_percentage").is_none());
+    }
+
+    #[test]
+    fn reconcile_automation_no_op_for_non_queue() {
+        // Only queues carry these; a schema of the same shape is untouched.
+        let mut source = serde_json::json!({ "name": "S", "automation_level": "always" });
+        let (_d, tgt) = tgt_file(&serde_json::json!({ "name": "S", "automation_level": "never" }));
+        reconcile_target_owned_keys(&mut source, "schemas", &tgt, AUTOMATION_KEYS);
+        assert_eq!(source["automation_level"], serde_json::json!("always"));
+    }
+
+    #[test]
+    fn reconcile_leaves_a_key_the_source_does_not_carry_absent() {
+        // The reconcile adopts, it does not introduce: a source body with no
+        // automation keys must not grow them from the target, or migrate would
+        // write fields into objects that never had them.
+        let mut source = serde_json::json!({ "name": "Q" });
+        let (_d, tgt) = tgt_file(&serde_json::json!({
+            "name": "Q",
+            "automation_level": "confident",
+        }));
+        reconcile_target_owned_keys(&mut source, "queues", &tgt, AUTOMATION_KEYS);
+        assert!(source.get("automation_level").is_none());
     }
 
     // ---- engine-slot reconciliation ----

@@ -894,6 +894,187 @@ fn migrate_carries_score_thresholds_with_flag() {
     );
 }
 
+/// Helper: a src+tgt queue tree with an identity mapping where both queues
+/// carry the three `automation` group fields. `(enabled, level, spot_check)`
+/// per env. Returns the project root.
+fn setup_automation_project(
+    src: (bool, &str, f64),
+    tgt: (bool, &str, f64),
+) -> TempDir {
+    let project = init_two_env_project();
+    let root = project.path().to_path_buf();
+    let queue = |a: (bool, &str, f64)| {
+        serde_json::json!({
+            "name": "Invoices",
+            "workspace": "rdc://workspaces/main",
+            "schema": "rdc://schemas/invoices",
+            "automation_enabled": a.0,
+            "automation_level": a.1,
+            "quality_spot_check_percentage": a.2,
+        })
+    };
+    let schema = serde_json::json!({
+        "name": "Invoices schema",
+        "content": [{
+            "category": "section", "id": "header",
+            "children": [{ "category": "datapoint", "id": "amount", "type": "number" }]
+        }]
+    });
+    for (env, a) in [("test", src), ("prod", tgt)] {
+        let base = root.join(format!("envs/{env}/workspaces/main/queues/invoices"));
+        write(&base.join("schema.json"), &schema);
+        write(&base.join("queue.json"), &queue(a));
+        write(
+            &root.join(format!("envs/{env}/workspaces/main/workspace.json")),
+            &serde_json::json!({ "name": "Main" }),
+        );
+    }
+    let map_dir = root.join(".rdc/map");
+    std::fs::create_dir_all(&map_dir).unwrap();
+    std::fs::write(
+        map_dir.join("test-to-prod.toml"),
+        "version = 1\n\n[workspaces]\n\"main\" = \"main\"\n\n[queues]\n\"invoices\" = \"invoices\"\n\n[schemas]\n\"invoices\" = \"invoices\"\n",
+    )
+    .unwrap();
+    project
+}
+
+/// By default a matched target keeps its OWN automation configuration —
+/// whether a queue auto-exports without review is the target organization's
+/// operational decision, not something a schema promotion carries with it.
+#[test]
+fn migrate_ignores_queue_automation_by_default() {
+    let project = setup_automation_project((true, "always", 0.02), (false, "never", 0.0));
+    let root = project.path();
+
+    let _guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::NONE);
+    std::env::set_current_dir(&prev).unwrap();
+    result.expect("migrate should succeed");
+
+    let queue = read_json(
+        &root.join("envs/prod/workspaces/main/queues/invoices/queue.json"),
+    );
+    assert_eq!(queue["automation_enabled"], serde_json::json!(false));
+    assert_eq!(queue["automation_level"], serde_json::json!("never"));
+    assert_eq!(queue["quality_spot_check_percentage"], serde_json::json!(0.0));
+}
+
+/// `--carry automation` promotes the source's values verbatim — the behavior
+/// that predates this reconcile, for an env pair that is meant to be a mirror.
+#[test]
+fn migrate_carries_queue_automation_with_the_carry_group() {
+    let project = setup_automation_project((true, "always", 0.02), (false, "never", 0.0));
+    let root = project.path();
+
+    let carry = Carry { automation: true, ..Carry::NONE };
+    let _guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], carry);
+    std::env::set_current_dir(&prev).unwrap();
+    result.expect("migrate should succeed");
+
+    let queue = read_json(
+        &root.join("envs/prod/workspaces/main/queues/invoices/queue.json"),
+    );
+    assert_eq!(queue["automation_enabled"], serde_json::json!(true));
+    assert_eq!(queue["automation_level"], serde_json::json!("always"));
+    assert_eq!(queue["quality_spot_check_percentage"], serde_json::json!(0.02));
+}
+
+/// A queue the target has never had: the three keys are dropped so the POST
+/// omits them and Rossum's own defaults apply (automation off). Carrying the
+/// source's `always` here would auto-export documents in a fresh organization
+/// from its first day.
+#[test]
+fn migrate_drops_queue_automation_for_a_brand_new_target_queue() {
+    let project = setup_automation_project((true, "always", 0.02), (false, "never", 0.0));
+    let root = project.path();
+    std::fs::remove_file(root.join("envs/prod/workspaces/main/queues/invoices/queue.json"))
+        .expect("the target queue file must exist to be removed");
+
+    let _guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::NONE);
+    std::env::set_current_dir(&prev).unwrap();
+    result.expect("migrate should succeed");
+
+    let queue = read_json(
+        &root.join("envs/prod/workspaces/main/queues/invoices/queue.json"),
+    );
+    assert!(queue.get("automation_enabled").is_none(), "{queue}");
+    assert!(queue.get("automation_level").is_none(), "{queue}");
+    assert!(queue.get("quality_spot_check_percentage").is_none(), "{queue}");
+}
+
+/// `overlay.toml` is the user declaring the target's value on purpose, so it
+/// must win over the reconcile — the documented precedence, and the only way to
+/// choose a new env's automation deliberately. Without this the overlay entry
+/// is silently inert forever: the reconcile writes the target's pulled value
+/// back on every run.
+#[test]
+fn migrate_overlay_wins_over_the_automation_reconcile() {
+    let project = setup_automation_project((true, "always", 0.02), (false, "never", 0.0));
+    let root = project.path();
+    std::fs::write(
+        root.join("envs/prod/overlay.toml"),
+        "version = 1\n\n[queues.invoices]\nautomation_level = \"confident\"\n",
+    )
+    .unwrap();
+
+    let _guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::NONE);
+    std::env::set_current_dir(&prev).unwrap();
+    result.expect("migrate should succeed");
+
+    let queue = read_json(
+        &root.join("envs/prod/workspaces/main/queues/invoices/queue.json"),
+    );
+    assert_eq!(
+        queue["automation_level"],
+        serde_json::json!("confident"),
+        "an explicit overlay automation_level must win over the reconcile"
+    );
+    assert_eq!(
+        queue["automation_enabled"],
+        serde_json::json!(false),
+        "a key the overlay does not name still comes from the target"
+    );
+}
+
+/// The second run reads the first run's output as its target, so the reconcile
+/// must be a fixed point. A migrate that is not byte-stable shows up as endless
+/// churn in `git diff` and re-pushes the whole env on every cycle.
+#[test]
+fn migrate_automation_reconcile_is_idempotent() {
+    let project = setup_automation_project((true, "always", 0.02), (false, "never", 0.0));
+    let root = project.path();
+    let out = root.join("envs/prod/workspaces/main/queues/invoices/queue.json");
+
+    let _guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+    rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::NONE)
+        .expect("first migrate");
+    let first = std::fs::read(&out).expect("first output");
+    rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::NONE)
+        .expect("second migrate");
+    let second = std::fs::read(&out).expect("second output");
+    std::env::set_current_dir(&prev).unwrap();
+
+    assert_eq!(
+        String::from_utf8_lossy(&first),
+        String::from_utf8_lossy(&second),
+        "a second migrate must produce identical bytes"
+    );
+}
+
 /// `--only queues/<slug>` for a queue the target has never deployed writes a
 /// `queue.json` naming a schema that was never migrated — `POST /queues`
 /// answers `400 schema: This field is required.` and the env is half-built by
