@@ -102,12 +102,27 @@ pub fn normalize_write(kind: &str, body: &mut Value) {
 
 /// Quirk `inbox_email_is_re_derived_on_write`'s implementation:
 /// `email` is server-derived from `email_prefix`
-/// (`src/snapshot/limits.rs:468`), so a body that carries `email_prefix`
+/// (`src/snapshot/limits.rs:466`), so a body that carries `email_prefix`
 /// gets `email` (re-)computed from it — on create AND on every later PATCH.
 /// A body with no `email_prefix` (the real API also accepts a direct
 /// `email`, per the same `400 non_field_errors` this fake does not yet
 /// enforce) is left untouched: this rule only ever DERIVES, it never
 /// invents a fallback prefix.
+///
+/// A body carrying BOTH an explicit `email` and an `email_prefix` lets
+/// `email_prefix` win — unconditionally overwriting whatever `email` the
+/// body sent. That is deliberate, and it is a FIDELITY improvement over
+/// what this fake used to do (create-time code that kept an explicit
+/// `email` untouched), not an untested regression: `email` is
+/// server-assigned on the real API, never client-decided, precisely
+/// because it's computed FROM `email_prefix`
+/// (`src/snapshot/limits.rs:466`: "`email` cannot satisfy it from rdc's
+/// side... because it is server-derived"; `src/snapshot/create.rs:57`:
+/// `strip_for_create` removes `email` for inboxes for the same reason). So
+/// prefix-winning is what the real server would do too, given both. This
+/// is also an input shape `rdc` itself can never produce — `strip_for_create`
+/// means a hand-written `email` never reaches the wire — so it's a fidelity
+/// choice at a shape nothing depends on, not a behavior anything relies on.
 ///
 /// `kinds::inbox_defaults` still owns exactly one thing this rule
 /// deliberately does not: a create-only fallback for a body sent with
@@ -131,6 +146,14 @@ fn derive_inbox_email(body: &mut Value) {
 /// `kinds::inbox_defaults`'s narrower create-only fallback, so the two
 /// trigger conditions can never drift into computing different addresses
 /// for the same prefix.
+///
+/// NOT a faithful reproduction of the real shape, on purpose: a real
+/// address is `<email_prefix>-<hash>@<host>` (`src/snapshot/limits.rs:466`),
+/// with a hash segment this fake has never modelled (a stage-1
+/// simplification, predating this task). Anyone later asserting on the
+/// exact *shape* of a fake inbox's address — rather than treating it as an
+/// opaque string that must merely track `email_prefix` — would be testing
+/// this fake's simplification, not the real server.
 pub(super) fn inbox_email_for(prefix: &str) -> String {
     format!("{prefix}@fake.rossum.invalid")
 }
