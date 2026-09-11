@@ -53,6 +53,26 @@ impl Drop for RestoreSettings {
     }
 }
 
+/// The fake-backed twin. Runs in a plain `cargo test`; see
+/// `crate::support::fake`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fake_organization_settings_push() {
+    let fake = crate::support::fake::FakeOrg::start().await;
+    organization_settings_push(&fake.config()).await;
+}
+
+/// The live twin. Unchanged: same `#[ignore]`, same env gate, so
+/// `cargo test --test live -- --ignored` still selects exactly the live set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live: needs RDC_LIVE_* env"]
+async fn live_organization_settings_push() {
+    let Some(cfg) = LiveConfig::from_env() else {
+        eprintln!("{}", LiveConfig::skip_reason());
+        return;
+    };
+    organization_settings_push(&cfg).await;
+}
+
 /// Edit `settings.annotation_list_table.columns` locally to a single `meta`
 /// column, push it through `rdc sync`, and confirm the remote org actually
 /// persisted it — then restore the org's original `settings` verbatim and
@@ -67,14 +87,8 @@ impl Drop for RestoreSettings {
 /// the "only settings pushed" notice) are covered by fast, network-free
 /// integration tests in `tests/cli_sync.rs` and don't need network access
 /// to verify.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "live: needs RDC_LIVE_* env"]
-async fn live_organization_settings_push() {
-    let Some(cfg) = LiveConfig::from_env() else {
-        eprintln!("{}", LiveConfig::skip_reason());
-        return;
-    };
-    let client = LiveClient::connect(&cfg).expect("connect");
+async fn organization_settings_push(cfg: &LiveConfig) {
+    let client = LiveClient::connect(cfg).expect("connect");
 
     // Baseline, captured straight from the API before anything is touched.
     let original_settings = client
@@ -85,13 +99,13 @@ async fn live_organization_settings_push() {
     // Constructed BEFORE any mutation below, so a panic anywhere in this test
     // still restores the org on the way out.
     let restore = RestoreSettings {
-        client: LiveClient::connect(&cfg).expect("connect (restore)"),
+        client: LiveClient::connect(cfg).expect("connect (restore)"),
         org_id: cfg.org_id,
         original: original_settings.clone(),
     };
 
     // Pull the org into a fresh local project.
-    let project = ProjectFixture::init(&cfg, &["test"]).expect("init project");
+    let project = ProjectFixture::init(cfg, &["test"]).expect("init project");
     let pull = project.run_rdc(&["sync", "test", "--no-push"]);
     assert!(
         pull.status.success(),
