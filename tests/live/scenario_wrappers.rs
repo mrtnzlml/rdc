@@ -18,13 +18,29 @@
 //! protects nothing.
 //!
 //! Parsing is deliberately simple and line-based, matching
-//! `tests/command_references.rs`: a scenario "core" is a trimmed line of the
-//! shape `async fn <name>_core(cfg: &LiveConfig)`; `<name>` is what a
-//! `fake_<name>_core` / `live_<name>_core` pair must share. A signature
-//! rustfmt has wrapped across multiple lines would slip past this — the same
-//! tradeoff `command_references.rs` makes for backticked verbs: a narrow rule
-//! with no false positives beats a clever one that has them, and every
+//! `tests/command_references.rs`: a scenario body is a trimmed line of the
+//! shape `async fn <name>(cfg: &LiveConfig)`; `<name>` is what a
+//! `fake_<name>` / `live_<name>` pair must share. A signature rustfmt has
+//! wrapped across multiple lines would slip past this — the same tradeoff
+//! `command_references.rs` makes for backticked verbs: a narrow rule with
+//! few false positives beats a clever one that has more, and every
 //! signature in this codebase today is short enough not to wrap.
+//!
+//! The body is identified by its **signature**, not by a `_core` name
+//! suffix. An earlier version of this guard matched only
+//! `async fn <name>_core(cfg: &LiveConfig)` and stripped `_core` back off to
+//! get `<name>` — which meant a shared body ported under any other name
+//! (`push_create_ordering`, `organization_settings_push`) was invisible to
+//! both checks below, silently, with only the blanket ignored-count still
+//! covering it. Signature-keying fixes that false negative but opens a
+//! matching false positive: a helper — not a scenario body — that happens to
+//! take exactly `(cfg: &LiveConfig)` will now be treated as one, and the
+//! guard will demand `fake_<name>` / `live_<name>` wrappers for it that were
+//! never meant to exist. That trade is deliberate and considered the better
+//! failure mode: it is loud, it names the offending function, and the fix is
+//! obvious (rename the helper's parameter, or give it the wrappers it
+//! apparently needs) — unlike the false negative it replaces, which passed
+//! silently. See `scenario_core_name` below.
 
 use std::path::{Path, PathBuf};
 
@@ -51,17 +67,27 @@ fn scenario_files() -> Vec<PathBuf> {
     out
 }
 
-/// If a trimmed line is `async fn <name>_core(cfg: &LiveConfig)`, return
-/// `<name>`. Only the shared body takes `cfg: &LiveConfig`; both wrappers
-/// take no arguments at all, which is what keeps this from matching them.
+/// If a trimmed line is `async fn <name>(cfg: &LiveConfig)`, return `<name>`
+/// verbatim (no suffix is stripped — `<name>` may or may not end in
+/// `_core`; that is just whatever the author called the body). Only the
+/// shared body takes `cfg: &LiveConfig`; both wrappers take no arguments at
+/// all, which is what keeps this from matching them.
+///
+/// This keys on the signature, not the name, on purpose: it is what lets the
+/// guard see `push_create_ordering` and `organization_settings_push`
+/// alongside `round_trip_core`, none of which share a name suffix. The
+/// tradeoff — a non-scenario helper that happens to take exactly
+/// `(cfg: &LiveConfig)` will be mistaken for a scenario body and the guard
+/// will demand wrappers it doesn't have — is deliberate; see the module doc
+/// comment above for why that failure mode is the one worth accepting.
 fn scenario_core_name(line: &str) -> Option<String> {
     let rest = line.trim().strip_prefix("async fn ")?;
     let paren = rest.find('(')?;
     let name = rest[..paren].trim();
-    if !rest[paren..].starts_with("(cfg: &LiveConfig)") {
+    if name.is_empty() || !rest[paren..].starts_with("(cfg: &LiveConfig)") {
         return None;
     }
-    name.strip_suffix("_core").map(str::to_string)
+    Some(name.to_string())
 }
 
 /// True if some line of `text`, trimmed, starts with `async fn <name>(` —
@@ -128,7 +154,7 @@ fn every_scenario_core_has_both_wrappers() {
     }
     assert!(
         !cores.is_empty(),
-        "found zero `async fn <name>_core(cfg: &LiveConfig)` scenario bodies; \
+        "found zero `async fn <name>(cfg: &LiveConfig)` scenario bodies; \
          has round_trip.rs changed shape, or has the parser broken?"
     );
 
@@ -136,12 +162,12 @@ fn every_scenario_core_has_both_wrappers() {
     let mut ported_live_ignored = 0usize;
     for (name, file, line) in &cores {
         let rel = file.strip_prefix(root).unwrap_or(file);
-        let fake_name = format!("fake_{name}_core");
-        let live_name = format!("live_{name}_core");
+        let fake_name = format!("fake_{name}");
+        let live_name = format!("live_{name}");
 
         if !sources.iter().any(|(_, t)| defines_fn(t, &fake_name)) {
             bad.push(format!(
-                "{}:{line}: `{name}_core` has no `{fake_name}` wrapper",
+                "{}:{line}: `{name}` has no `{fake_name}` wrapper",
                 rel.display()
             ));
         }
@@ -160,7 +186,7 @@ fn every_scenario_core_has_both_wrappers() {
             ));
         } else {
             bad.push(format!(
-                "{}:{line}: `{name}_core` has no `{live_name}` wrapper",
+                "{}:{line}: `{name}` has no `{live_name}` wrapper",
                 rel.display()
             ));
         }
@@ -190,14 +216,26 @@ fn every_scenario_core_has_both_wrappers() {
 
 #[test]
 fn scenario_core_name_matches_only_the_shared_body() {
+    // A name ending in `_core` still matches — but on the signature, not the
+    // suffix; nothing strips `_core` off any more.
     assert_eq!(
         scenario_core_name("async fn round_trip_core(cfg: &LiveConfig) {"),
-        Some("round_trip".to_string())
+        Some("round_trip_core".to_string())
     );
     assert_eq!(
         scenario_core_name("    async fn round_trip_core(cfg: &LiveConfig) {"),
-        Some("round_trip".to_string()),
+        Some("round_trip_core".to_string()),
         "leading indentation must not matter"
+    );
+    // Names with no `_core` suffix at all must match just as well — these
+    // are the two cases the old suffix-keyed rule silently missed.
+    assert_eq!(
+        scenario_core_name("async fn push_create_ordering(cfg: &LiveConfig) {"),
+        Some("push_create_ordering".to_string())
+    );
+    assert_eq!(
+        scenario_core_name("async fn organization_settings_push(cfg: &LiveConfig) {"),
+        Some("organization_settings_push".to_string())
     );
     // The wrappers take no arguments at all — that must NOT match.
     assert_eq!(
