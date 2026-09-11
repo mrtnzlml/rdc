@@ -47,7 +47,7 @@ release. These are current:
 
 | invariant | value |
 | --- | --- |
-| `cargo test --locked` | **1748** passed, 0 failed |
+| `cargo test --locked` | **1752** passed, 0 failed (1748 + 4 new tests from this plan) |
 | `cargo test --locked -- --skip fake` | **1685** passed, 0 failed |
 | `cargo test --test live -- --ignored --list` | **exactly 23** |
 | `cargo clippy --all-targets --locked -- -D warnings` | clean |
@@ -159,7 +159,7 @@ fake-backed test go red.** That regression is the original incident.
 - Produces: `quirks::normalize_write(kind: &str, body: &mut Value)`, called
   from both `create_unchecked` and `patch` in `state.rs`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 The discriminating test is the inbox one — it is the fact that would otherwise
 bless a real churn cycle:
@@ -204,12 +204,12 @@ bless a real churn cycle:
     }
 ```
 
-- [ ] **Step 2: Run it and watch it fail**
+- [x] **Step 2: Run it and watch it fail**
 
 Run: `cargo test --test live fake::tests::an_inbox_email -- --nocapture`
 Expected: FAIL — the store keeps `before@…`.
 
-- [ ] **Step 3: Add the seam**
+- [x] **Step 3: Add the seam**
 
 `quirks::normalize_write(kind, &mut Value)`, called from `state.rs` at **both**
 write entrances — `create_unchecked` and `patch` — mirroring how
@@ -228,7 +228,7 @@ Two things to get right, and say how you did in your report:
   purpose (a refused create must not consume one). Say where in that order the
   seam runs, and why that is right.
 
-- [ ] **Step 4: Record what is still not modelled**
+- [x] **Step 4: Record what is still not modelled**
 
 The other two facts from the review remain unmodelled, and the registry is
 where that belongs. Add `modelled: false` quirks for both, each citing what
@@ -239,7 +239,7 @@ documents it:
   the fake is wrong; the defect is the unrecorded choice, not the choice;
 - `patch`'s shallow merge persists read-only `id`/`url` a client may send.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 The four invariants, plus: confirm no other kind's stored state changed, and
 that the organization tests from the foundation still pass unaltered.
@@ -265,7 +265,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 **Files:**
 - Modify: `tests/live/scenarios/ordering.rs`
 
-- [ ] **Step 1: Extract and wrap**
+- [x] **Step 1: Extract and wrap**
 
 Rename `live_push_create_ordering` to `push_create_ordering`, take
 `cfg: &LiveConfig`, drop the test attributes and the `from_env()` block, change
@@ -277,7 +277,7 @@ and the gate), both `#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 one keeps its `#[ignore]`; the ignored count must stay 23 because the attribute
 **moves** rather than multiplies.
 
-- [ ] **Step 2: Run the fake twin and read the output**
+- [x] **Step 2: Run the fake twin and read the output**
 
 Run: `cargo test --test live fake_push_create_ordering -- --nocapture`
 
@@ -295,7 +295,7 @@ Run: `cargo test --test live fake_push_create_ordering -- --nocapture`
   lines, the byte diff, the trace, the object and field — write it up, leave
   the test failing, and report `DONE_WITH_CONCERNS`.
 
-- [ ] **Step 3: Verify and commit**
+- [x] **Step 3: Verify and commit**
 
 All four invariants, with the ignored count still exactly 23.
 
@@ -306,7 +306,7 @@ All four invariants, with the ignored count still exactly 23.
 **Files:**
 - Modify: `tests/live/scenarios/organization.rs`
 
-- [ ] **Step 1: Extract and wrap**
+- [x] **Step 1: Extract and wrap**
 
 Same shape as Task 2: `organization_settings_push(cfg: &LiveConfig)` plus
 `fake_` and `#[ignore]`d `live_` wrappers.
@@ -315,7 +315,7 @@ Note this scenario's teardown restores the org's original `settings` through
 `LiveClient::patch_organization_settings`. Against the fake that is harmless
 but should still run — do not special-case it away.
 
-- [ ] **Step 2: Make the port protective**
+- [x] **Step 2: Make the port protective**
 
 The port itself only proves the scenario runs. What makes it *worth* porting is
 that it should fail if `rdc` regressed to the naive write-back — which is the
@@ -329,11 +329,65 @@ If it does *not* go red, that is the finding: say so, and say what the fake
 would need in order to catch it. A port that cannot catch the incident it was
 chosen for is worth knowing about.
 
-- [ ] **Step 3: Verify and commit**
+- [x] **Step 3: Verify and commit**
 
 ---
 
 ### Task 4: Make the edge table self-verifying
+
+**Status: displaced, not started — carried forward to the next plan.**
+While porting the two scenarios above, `tests/live/scenario_wrappers.rs` was
+found to be silently blind: it keyed its per-scenario pairing and
+`#[ignore]`-placement checks on a body name ending in `_core`, so
+`push_create_ordering` and `organization_settings_push` — neither named that
+way — were invisible to everything except the blanket total-ignored count,
+which cannot name a broken wrapper or catch a missing twin at all. That is a
+guard blind-spot that compounds with every future port, so fixing it
+(`496319b`, keying `scenario_core_name` on the `(cfg: &LiveConfig)` signature
+instead of the `_core` suffix) took this task's slot instead of this task.
+The edge-table self-verification work below does not compound the same way —
+it stays exactly as valuable a week from now — so it was deferred rather than
+squeezed in alongside the guard fix and the two ports. Nothing else in this
+plan recorded that swap before this note.
+
+Before starting Step 1, carry forward these four findings from the review of
+this plan's own branch — each is a concrete opening move, not just a
+concern:
+
+1. **`modelled: false` conflates two different meanings.** The flag is
+   defined as "the real API's behavior isn't reproduced here," which is what
+   `patch_persists_client_sent_id_and_url` and
+   `inbox_patch_response_omits_fields_the_get_response_includes` mean by it.
+   But `back_reference_growth_leaves_modified_at_unbumped` uses the same
+   `false` to mean something else — the *fake's* choice is arbitrary and the
+   real API's behavior is simply unknown. A reader scanning the table for
+   "what does the fake not do yet?" reads that third entry backwards. Give
+   the "fake picked an answer, real behavior unknown" case its own state
+   (a third variant, or a second field alongside `modelled`) so the two
+   meanings stop sharing one boolean.
+2. **`has_modified_at` is a registry-invisible divergence, and its own
+   justification contradicts a row added on this same branch.** Whatever
+   reasoning currently keeps `has_modified_at` out of `QUIRKS` should be
+   re-read against `back_reference_growth_leaves_modified_at_unbumped` — that
+   row exists precisely because a `modified_at`-shaped fact was judged
+   worth registering. This is also the first place the fake has been shaped
+   to match *rdc's own contract* rather than the *real server's* behavior —
+   worth deciding on purpose, and recording, before a later port crosses the
+   same boundary without noticing it moved.
+3. **`saved_views.queues_filter` has no `EDGES` row.** The ordering port
+   exercises `saved_views`, but its coverage there is thinner than this plan
+   advertised because that field never got an `EDGES` entry. The `EDGES` doc
+   comment already anticipates this gap; adding the row is a one-line fix,
+   worth doing as part of (or just before) Step 1's table-driven rewrite.
+4. **`normalize_write`'s doc comment overclaims its own reach.** It says it
+   is called from every place a stored body is updated, but `graph.rs`'s
+   `relink`/`unlink` — which also update stored bodies, growing or shrinking
+   a back-reference — call neither `normalize_write` nor go through
+   `state.rs`'s `create_unchecked`/`patch` at all. Either narrow the doc
+   comment to what is actually true today, or decide whether `relink`/`unlink`
+   should route through the seam too (which would also bear on finding 2
+   above, since a back-ref growing is exactly what leaves `modified_at`
+   unbumped).
 
 The foundation's review flagged that `kinds.rs`'s two edge tests are
 table-*shape* assertions — they check rows exist in the same structure under

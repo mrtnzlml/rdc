@@ -55,6 +55,21 @@ impl Drop for RestoreSettings {
 
 /// The fake-backed twin. Runs in a plain `cargo test`; see
 /// `crate::support::fake`.
+///
+/// This is the one ported scenario proven to be genuinely protective, not
+/// merely passing: the incident it guards is recorded at
+/// `src/cli/push/organization.rs:161` — writing a `PATCH /organizations/{id}`
+/// response wholesale to disk, instead of just `settings`, caused a phantom
+/// "1 changed" cycle on every settings push. This test catches a regression
+/// of that incident only because
+/// `tests/live/support/fake/quirks.rs::insert_organization_rir_key` puts
+/// `rir_key` on the PATCH response and nowhere else; reintroducing the
+/// incident here turns this test red against the fake. `rir_key` alone
+/// carries that property — the scenario pushes a `width` and a non-empty
+/// `annotation_list_table`, so the quirk's `settings`-normalization half
+/// (`normalize_organization_settings`) is never exercised by it. The two are
+/// a matched pair: touching one without checking the other is how the
+/// protection would go silently missing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fake_organization_settings_push() {
     let fake = crate::support::fake::FakeOrg::start().await;

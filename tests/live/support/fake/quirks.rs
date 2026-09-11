@@ -201,6 +201,19 @@ pub(super) fn inbox_email_for(prefix: &str) -> String {
 /// `normalize_organization_settings` below already make a naive write-back
 /// of a PATCH response detectably wrong on the next pull, which is the
 /// property this whole exercise exists to protect.
+///
+/// `tests/live/scenarios/organization.rs::fake_organization_settings_push`
+/// depends on this rule: its `assert_unprefixed_object_stable` check goes red
+/// the moment `src/cli/push/organization.rs` writes a raw, non-GET-shaped
+/// PATCH response to disk, and `rir_key` — present only here, never on a
+/// GET — is what makes that body non-GET-shaped. That scenario pushes a
+/// `width` and a non-empty `annotation_list_table`, so it never exercises
+/// `normalize_organization_settings` below; `rir_key` alone carries the
+/// scenario's entire protective property. Deleting this rule for the same
+/// reason the `users` reorder above was dropped — "unmodellable, so drop
+/// it" — would not fail that scenario; it would silently stop it from
+/// protecting anything while it stayed green. Removing this quirk requires
+/// also reckoning with that test.
 fn insert_organization_rir_key(body: &mut Value) {
     let Some(obj) = body.as_object_mut() else { return };
     // Presence is what matters, not the value.
