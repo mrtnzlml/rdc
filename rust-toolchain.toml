@@ -1,0 +1,24 @@
+# The one place this repo's Rust version is decided.
+#
+# It exists because the release gate was the ONLY thing ever running clippy,
+# on `dtolnay/rust-toolchain@stable`, while the maintainer's local stable sat
+# three releases behind (1.95 vs 1.98). Lints that could not fire locally were
+# therefore discovered by a red release on a Monday morning -- which is exactly
+# how 2026-09-07 lost a week (4 `drop_non_drop` errors, all three ticks red).
+#
+# rustup honours this file for every cargo invocation inside the repo, so local
+# and CI now run byte-identical clippy. A new stable no longer arrives on its
+# own: bump `channel` deliberately, and meet the new lints when you choose to.
+#
+# NOTE: `dtolnay/rust-toolchain` does NOT read this file -- it picks its
+# toolchain from its own @rev. That is why every workflow materialises the pin
+# with `rustup show` instead of using that action; leaving one behind would let
+# it install targets/components onto a DIFFERENT toolchain than the one cargo
+# actually runs, and cross-compiled release builds would fail on a missing
+# target the first time stable moved past the pin.
+[toolchain]
+channel = "1.98.0"
+# rustfmt is installed but never enforced in CI: this tree is not fmt-clean
+# under the local rustfmt and never has been.
+components = ["clippy", "rustfmt"]
+profile = "minimal"

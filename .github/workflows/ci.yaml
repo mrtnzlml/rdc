@@ -1,0 +1,75 @@
+name: CI
+
+# Runs the release gate on every push to main and every pull request.
+#
+# Why this exists: until 2026-09-11 the ONLY thing in this repo that ever ran
+# `cargo test`, `cargo clippy` or `cargo doc` was weekly-release.yaml. A
+# regression on main was therefore invisible until it killed a release --
+# silently, once a week, costing the entire week. Not hypothetical: on
+# 2026-09-07 all three Monday ticks died on the same four `drop_non_drop`
+# errors, and the fix already existed locally, unpushed, before the first tick
+# even ran.
+#
+# The three steps below are the SAME three gates weekly-release.yaml runs, and
+# they have to stay that way: whatever this workflow accepts, the release gate
+# must also accept, or Monday gets surprised again. If you change a gate here,
+# change it there -- and vice versa.
+#
+# `cargo fmt` is deliberately absent from both, for the same reason: this tree
+# is not fmt-clean under the local rustfmt and never has been.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A newer push to the same ref makes the older run pointless. Note the release
+# workflows deliberately do NOT cancel in progress -- never kill a release
+# halfway -- but a superseded CI run is just spent minutes on a private repo's
+# monthly quota.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: Test, clippy, docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        # Pinned by rust-toolchain.toml -- see the note in that file for why
+        # this is `rustup show` and not dtolnay/rust-toolchain.
+        run: rustup show
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # rust-toolchain.toml is in the key on purpose: a target/ built by the
+          # previous pin must not be restored under a new one. Cargo would
+          # rebuild anyway (rustc version is part of its fingerprint), but a
+          # cache that can never be stale is one less way to get a false green.
+          key: cargo-ci-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-ci-
+
+      - name: Test
+        # tests/live.rs is #[ignore] by default, so this never touches the API.
+        run: cargo test --locked
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Docs
+        # --document-private-items on purpose: it is the strict superset, and it
+        # is how anyone reading this tree's maintainer docs would generate them.
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --document-private-items --locked

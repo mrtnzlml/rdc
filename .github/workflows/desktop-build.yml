@@ -81,7 +81,12 @@ jobs:
         run: echo "VERSION=${LABEL#v}" >> "$GITHUB_ENV"
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # Pinned by rust-toolchain.toml -- see the note in that file. Cargokit
+        # adds whatever targets it needs itself (the macOS universal build needs
+        # both apple targets), and those now land on the pinned toolchain.
+        # rustup finds the file by walking up from `desktop/`.
+        shell: bash
+        run: rustup show
 
       # Cargokit redirects cargo's --target-dir to CARGOKIT_TARGET_TEMP_DIR
       # (inside the Flutter/Xcode build tree), NOT desktop/rust/target, so only

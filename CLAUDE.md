@@ -85,6 +85,27 @@ Project-specific instructions for working in this repo.
   rather than pushing a tag, because a tag pushed with the default
   `GITHUB_TOKEN` does not start `on: push: tags` workflows. A manual
   `git push origin vX.Y.Z` still works unchanged.
+- **`.github/workflows/ci.yaml` runs the release gate on every push to `main`
+  and every PR**, and it exists because that gate used to run *nowhere else*.
+  Until 2026-09-11 `cargo test` / `clippy` / `doc` ran only inside
+  `weekly-release.yaml`, so a regression on main stayed invisible until it
+  killed a release — silently, once a week, costing the whole week. That is how
+  2026-09-07 was lost: all three ticks died on the same four `drop_non_drop`
+  errors, and the fix already existed locally, unpushed, before the first tick
+  ran. The three gate steps are **duplicated on purpose** in `ci.yaml` and
+  `weekly-release.yaml`; whatever CI accepts the release gate must also accept,
+  so change one and you must change the other. `cargo fmt` is absent from both
+  — this tree is not fmt-clean and never has been.
+- **`rust-toolchain.toml` is the only place the Rust version is decided**, and
+  no workflow may use `dtolnay/rust-toolchain` again: that action picks its
+  toolchain from its own `@rev` and **never reads the file**, so it would
+  install components and `targets:` onto a different toolchain than the one
+  cargo actually runs — and the first stable release past the pin would fail
+  `release.yaml`'s cross-builds on a missing target. Every workflow therefore
+  materialises the pin with `rustup show` (plus `rustup target add` per matrix
+  target in `release.yaml`, under `shell: bash` because windows-latest defaults
+  to pwsh). Bump `channel` deliberately and meet the new lints when you choose;
+  the pin is in the cargo cache keys so a stale `target/` cannot outlive it.
 - The install script *also* accepts `latest` (newest release) and a series
   prefix like `v0.6` (newest patch in that line), resolved through
   `api.github.com`. Those are **deliberate opt-ins for our own CI** — don't

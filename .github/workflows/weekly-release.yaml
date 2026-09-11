@@ -120,9 +120,12 @@ jobs:
 
       - name: Install Rust
         if: steps.plan.outputs.release == 'true'
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+        # The version is pinned by rust-toolchain.toml; `rustup show`
+        # materialises it (channel + components, clippy included). NOT
+        # dtolnay/rust-toolchain: that action picks its toolchain from its own
+        # @rev and never reads the file, so it would install components onto a
+        # different toolchain than the one cargo then runs.
+        run: rustup show
 
       - name: Cache cargo
         if: steps.plan.outputs.release == 'true'
@@ -132,7 +135,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-weekly-${{ hashFiles('Cargo.lock') }}
+          key: cargo-weekly-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-weekly-
 
       - name: Test

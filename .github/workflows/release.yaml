@@ -64,9 +64,16 @@ jobs:
           ref: ${{ inputs.tag || github.ref }}
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+        # Pinned by rust-toolchain.toml -- see the note in that file. Replacing
+        # dtolnay/rust-toolchain here is not cosmetic: that action would add
+        # `targets` to whatever `stable` resolved to that week, while cargo
+        # obeys the pin, so the first stable release past the pin would fail
+        # these cross-builds on a target the active toolchain does not have.
+        # windows-latest defaults to pwsh, where `&&` is not a separator.
+        shell: bash
+        run: |
+          rustup show
+          rustup target add ${{ matrix.target }}
 
       - name: Cache cargo registry
         uses: actions/cache@v6
