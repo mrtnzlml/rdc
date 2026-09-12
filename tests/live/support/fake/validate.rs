@@ -12,8 +12,9 @@
 //!
 //! - A schema DELETE is never refused for being referenced by a queue. The
 //!   real API answers `409 conflict_referenced`
-//!   (`tests/live/support/teardown.rs:36-44`, `tests/live/scenarios/ordering.rs:298-301`)
-//!   while a queue still points at the schema; the fake has no such check.
+//!   (`tests/live/support/teardown.rs:36-44`, and the `assert_before`
+//!   rationale at `tests/live/scenarios/ordering.rs:311-315`) while a queue
+//!   still points at the schema; the fake has no such check.
 //! - An `engine_fields` DELETE is never refused for being referenced by a
 //!   schema either — the sibling this list lost when the engine-delete
 //!   refusal above was modelled (`on_delete`'s `kind == "engines"` branch)
@@ -21,14 +22,26 @@
 //!   ("Cannot delete engine field used in a schema",
 //!   `tests/live/support/teardown.rs:55-57`) while a schema still names the
 //!   field; the fake has no such check. Not merely theoretical: a real
-//!   `DELETE /engine_fields/{id}` for exactly this gap is issued against the
-//!   fake today. `fake_push_create_ordering` (`tests/live/scenarios/ordering.rs`)
-//!   binds an engine field to its fixture queue's schema, and the scenario's
-//!   own `Teardown` unconditionally sweeps `engine_field` by name prefix,
-//!   after queues and schemas, as part of its cleanup
-//!   (`tests/live/support/teardown.rs:68-78`) — against the very fake org
-//!   the scenario ran against. That request reaches this fake's `on_delete`
-//!   and succeeds because nothing here refuses it.
+//!   `DELETE /engine_fields/{id}` for exactly this gap reaches this fake on
+//!   every `fake_push_create_ordering` run, and it comes out of **rdc's own
+//!   delete pass**, not out of the test harness.
+//!   `tests/live/scenarios/ordering.rs` binds an engine field to its fixture
+//!   queue's schema — the schema's single datapoint `id` IS the engine
+//!   field's `name`, which is what buys that scenario its server-side
+//!   ordering oracle — and then tombstones `envs/test/engines/<prefix>engine`
+//!   as a whole directory, so the field is tombstoned along with its engine.
+//!   `push::deletes::reverse_dep_order_iter` lists `engine_fields` FIRST and
+//!   `schemas` TENTH, so `sync test --allow-deletes` issues
+//!   `DELETE /engine_fields/{id}` while the schema naming the field is still
+//!   very much alive — exactly the 409 case. `push::deletes::delete_one`'s
+//!   drift gate waves it through rather than skipping it, because
+//!   `KindSpec::has_modified_at` is `false` for this kind and
+//!   `fetch_remote_modified_at` discards the remote value anyway, leaving
+//!   both sides of the comparison `None`. The fake answers `204`.
+//!   The scenario's own `Teardown` sweep of `engine_field` by name prefix
+//!   (`tests/live/support/teardown.rs:68-78`) is NOT the source: by the time
+//!   it runs, rdc has already deleted the field, so the prefix lookup comes
+//!   back empty and the sweep issues no request at all.
 //! - PATCH validation in general is unmodelled — see the doc comment on
 //!   `on_write` for why and for the exact scope (create-only) of what IS
 //!   checked.
