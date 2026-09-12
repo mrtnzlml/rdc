@@ -53,11 +53,9 @@ pub struct KindSpec {
     /// behavior is unknown), and it was in `QUIRKS` from the start. Same
     /// category — "the fake had to pick an answer and the real API's
     /// behaviour is unknown" — deserves the same treatment, which is exactly
-    /// what `Provenance::ChosenUnverified` is for. See that row's doc
-    /// comment for the fuller picture: for `engines` specifically,
-    /// `ordering.rs::live_push_create_ordering`'s green run CORROBORATES —
-    /// does not prove — that a real engine's create response carries no
-    /// `modified_at`; `engine_fields` has no such corroboration at all.
+    /// what `Provenance::ChosenUnverified` is for. See that row's own doc
+    /// comment for the evidence — not restated here, so this comment can't
+    /// drift out of sync with it again.
     pub has_modified_at: bool,
     /// Fill in server-assigned and required-but-absent fields.
     pub defaults: fn(&mut Map<String, Value>, &OrgCtx),
