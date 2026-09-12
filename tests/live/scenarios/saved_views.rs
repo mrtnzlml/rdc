@@ -12,6 +12,18 @@ use crate::support::project::ProjectFixture;
 use crate::support::run_id::RunId;
 use crate::support::teardown::Teardown;
 
+/// The fake-backed twin. Runs in a plain `cargo test`; see
+/// `crate::support::fake`. `saved_views_round_trip` never calls
+/// `capture_mode` / `load_or_compare` — it has no golden — so, like
+/// `fake_sidecars_redaction`, there is nothing here to refuse.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fake_saved_views_round_trip() {
+    let fake = crate::support::fake::FakeOrg::start().await;
+    saved_views_round_trip(&fake.config()).await;
+}
+
+/// The live twin. Unchanged: same `#[ignore]`, same env gate, so
+/// `cargo test --test live -- --ignored` still selects exactly the live set.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live: needs RDC_LIVE_* env"]
 async fn live_saved_views_round_trip() {
@@ -19,15 +31,18 @@ async fn live_saved_views_round_trip() {
         eprintln!("{}", LiveConfig::skip_reason());
         return;
     };
+    saved_views_round_trip(&cfg).await;
+}
 
+async fn saved_views_round_trip(cfg: &LiveConfig) {
     let run_id = RunId::new();
-    let client = LiveClient::connect(&cfg).expect("connect");
+    let client = LiveClient::connect(cfg).expect("connect");
     // Teardown guard FIRST so a panic anywhere still cleans up both views —
     // `teardown_by_prefix` lists saved views WITHOUT the shared-only filter
     // `rdc` applies, so it reaches the private one too even though `rdc`
     // itself never learns that one exists.
     let teardown = Teardown::new(
-        LiveClient::connect(&cfg).expect("connect (teardown)"),
+        LiveClient::connect(cfg).expect("connect (teardown)"),
         run_id.clone(),
     );
 
@@ -67,7 +82,7 @@ async fn live_saved_views_round_trip() {
         .expect("create private saved view");
 
     // --- pull into a fresh local project ---
-    let project = ProjectFixture::init(&cfg, &["test"]).expect("init project");
+    let project = ProjectFixture::init(cfg, &["test"]).expect("init project");
     let pull = project.run_rdc(&["sync", "test", "--no-push"]);
     assert!(
         pull.status.success(),
