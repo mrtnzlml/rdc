@@ -1061,6 +1061,60 @@ pub const QUIRKS: &[Quirk] = &[
         },
     },
     Quirk {
+        name: "queue_create_materializes_automation_config_switched_off",
+        // Modelled in `kinds::queue_defaults`. A real queue response carries
+        // the queue's automation configuration whether or not the create body
+        // mentioned it, and a fresh queue lands on automation OFF.
+        //
+        // PRESENCE is what the citation names: `cli::migrate`'s
+        // `AUTOMATION_KEYS` doc comment records the three keys as "verified
+        // against 240 pulled `queue.json` files, where every one carries them
+        // at the top level". That is a survey of real pulled snapshots, so it
+        // says a real GET answers with them; it says nothing about what a
+        // brand-new queue's values are.
+        //
+        // The VALUES come from Rossum's own OpenAPI document, probed on
+        // 2026-09-11 and recorded in
+        // `docs/superpowers/specs/2026-09-11-migrate-carry-groups-design.md`
+        // (section "Rossum API — official OpenAPI specification"):
+        // `queue_base.properties.automation_enabled` is `boolean` with
+        // default `false`, `queue_base.properties.automation_level` is an
+        // enum `never`/`confident`/`always` with default `"never"`, and
+        // neither is `readOnly`. README.md's `--carry` section restates the
+        // same pair as "Rossum's own defaults". That evidence is not what the
+        // citation field holds, because
+        // `every_source_citation_names_a_real_file` requires a `.rs` path —
+        // hence the `.rs` survey below, with the OpenAPI probe named here in
+        // prose. Cited by SYMBOL rather than by line, per this module's own
+        // doc comment on citation rot; only the file half of a source
+        // citation is checked.
+        //
+        // `quality_spot_check_percentage` — `AUTOMATION_KEYS`' third member —
+        // is deliberately NOT defaulted. The same OpenAPI probe found it
+        // present in the response-required list but ABSENT from
+        // `queue_base.properties`, so the public spec documents neither its
+        // type nor its default; the 240-file survey saw two values (`0.0` and
+        // `0.02`) and cannot say which one a fresh queue gets. Inventing one
+        // is exactly the "the fake picks an answer nobody has observed" case,
+        // and nothing needs it: `migrate`'s `reconcile_target_owned_keys`
+        // skips a key the body does not carry.
+        //
+        // SOURCE-cited, not LIVE-cited, even though
+        // `migrate_promotion.rs::live_migrate_overlay_and_mirror` asserts
+        // something that can only hold if this does — its "migrate promoted
+        // the source org's automation level over the target's" check passes
+        // only when the SOURCE queue's pulled file carries
+        // `automation_level`, since `reconcile_target_owned_keys` returns
+        // early on a body carrying none of the keys and leaves the target
+        // file a plain copy of the source. But that scenario has never run:
+        // the commit that added it (`8cab2fc`) says so in its own message —
+        // "compile-verified only and have never run against a real server".
+        // A live citation would claim proof that does not exist yet.
+        provenance: Provenance::Modelled {
+            proven_by: "src/cli/migrate/mod.rs:AUTOMATION_KEYS",
+        },
+    },
+    Quirk {
         name: "field_order_is_a_property_of_the_kind_not_of_the_request",
         // Modelled in `impose_field_order` (this file), called from
         // `shape_response` for every response. See that function's doc

@@ -98,6 +98,12 @@ fn queue_defaults(o: &mut Map<String, Value>, _c: &OrgCtx) {
     ensure(o, "webhooks", json!([]));
     ensure(o, "users", json!([]));
     ensure(o, "locale", json!("en_GB"));
+    // Quirk `queue_create_materializes_automation_config_switched_off`
+    // (`quirks::QUIRKS`) — see that row for the evidence and for why
+    // `quality_spot_check_percentage`, the third member of
+    // `cli::migrate::AUTOMATION_KEYS`, is deliberately NOT here.
+    ensure(o, "automation_enabled", json!(false));
+    ensure(o, "automation_level", json!("never"));
 }
 
 /// `email` is server-assigned: the real address is globally unique, and the
