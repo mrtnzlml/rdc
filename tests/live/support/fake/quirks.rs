@@ -57,6 +57,17 @@
 //! a citation to make a test pass is not a third option; downgrading it to an
 //! honestly-labeled SOURCE citation, when that is what the evidence actually
 //! supports, is not weakening — it's correcting an overclaim.
+//!
+//! One more shape question, not specific to `Quirk::citation` but met
+//! everywhere in this directory's doc comments that point elsewhere: cite a
+//! symbol whenever the target has one — a function, a constant, a struct
+//! field, a test name — and spend a bare line number only where nothing
+//! does, such as a statement inside a function body, a comment, or a
+//! fixture line. A line-number citation into a file other commits keep
+//! editing rots on a schedule nobody controls, and that is not
+//! hypothetical: a citation of `kinds.rs:226-235` for `kinds::EDGES`, in
+//! this very file, was invalidated by an unrelated doc edit two commits
+//! after it was written.
 
 use serde_json::{json, Value};
 
@@ -116,25 +127,38 @@ pub fn shape_response(kind: &str, method: &str, body: &mut Value) {
 /// of that goes through this seam. Today that is harmless, not by
 /// coincidence but because the two write into disjoint (kind, field) space:
 /// `relink`/`unlink` only ever write into a back-ref edge's TARGET kind, and
-/// every such edge in `kinds::EDGES` targets `workspaces`, `schemas`, or
-/// `queues` (`kinds.rs:226-235`) — never `organizations` or `inboxes`, the
-/// only two kinds a rule here keys on. A future rule keyed to one of THOSE
-/// three kinds (say, a rule reacting to `queues.hooks`, `queues.rules`,
-/// `queues.inbox`, `workspaces.queues`, or `schemas.queues` — the exact
-/// fields `add_ref`/`set_field` write) would silently miss every write
-/// `relink`/`unlink` make, because nothing calls `normalize_write` from
+/// every back_ref-carrying row of `kinds::EDGES` — `queues.workspace`,
+/// `queues.schema`, `inboxes.queues`, `hooks.queues`, and `rules.queues` —
+/// targets `workspaces`, `schemas`, or `queues`, never `organizations` or
+/// `inboxes`, the only two kinds a rule here keys on. A future rule keyed to
+/// one of THOSE three kinds (say, a rule reacting to `queues.hooks`,
+/// `queues.rules`, `queues.inbox`, `workspaces.queues`, or `schemas.queues` —
+/// the exact fields `add_ref`/`set_field` write) would silently miss every
+/// write `relink`/`unlink` make, because nothing calls `normalize_write` from
 /// `graph.rs`. Fixing that would mean adding that call to
 /// `add_ref`/`remove_ref`/`set_field`/`remove_field` themselves, not adding a
 /// fourth call site here — the same "one seam, not a growing set of hand-wired
 /// call sites" reasoning the paragraph above already gives for why this
 /// function exists at all.
 ///
+/// **Also not reached from `OrgState::delete`.** A queue's own delete
+/// request writes `workspace`, `schema`, and `status` straight into its
+/// stored object — `delete`'s `if kind == "queues"` branch in `state.rs`,
+/// around the three `obj.insert` calls that null the first two and set the
+/// third to `"deletion_requested"` — reaching neither `create_unchecked`,
+/// `patch`, nor `patch_organization`, so this seam never sees that write
+/// either. Harmless for the same reason as the `graph.rs` bypass above, not
+/// a second one: every field that write touches belongs to `queues`, which
+/// neither of this function's two rules keys on. Nothing enforces that
+/// disjointness for either bypass — it holds for today's two rules, not
+/// necessarily for whichever rule gets added next.
+///
 /// Called unconditionally for every kind at every write, exactly like
 /// `shape_response` is called for every response — so a rule added here for
 /// one kind can never silently apply to another, and a future third rule has
-/// exactly one place to be added rather than a choice of three call sites to
-/// hand-wire it into (`graph.rs`'s back-ref writes aside, per the paragraph
-/// above).
+/// exactly one place to be added rather than a choice of call sites to
+/// hand-wire it into (`graph.rs`'s back-ref writes and `OrgState::delete`'s
+/// queue-draining write aside, per the two paragraphs above).
 ///
 /// One structural limit, for whoever adds that third rule: unlike
 /// `shape_response`, this signature carries no phase distinguisher —

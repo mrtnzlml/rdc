@@ -447,8 +447,9 @@ impl OrgState {
     /// Every queue currently bound to `engine_url` — active or draining
     /// alike. `validate::on_delete` does NOT intersect this with
     /// [`Self::queues_awaiting_deletion`] — the two checks run
-    /// sequentially, and whichever fires first wins outright
-    /// (`validate.rs:41-52`). It calls `queues_awaiting_deletion` FIRST: if
+    /// sequentially, and whichever fires first wins outright: see
+    /// `on_delete`'s two sequential `if … return Err(...)` checks
+    /// (`validate.rs:56-67`). It calls `queues_awaiting_deletion` FIRST: if
     /// any draining queue is bound to this engine, it returns
     /// `engine_attached_to_queues_waiting_for_deletion` right there, and
     /// this method is never even called. Only when that first check finds
