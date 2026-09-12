@@ -126,6 +126,81 @@ fn defines_ignored_fn(text: &str, name: &str) -> bool {
     })
 }
 
+/// The lines strictly between `fn_name`'s `async fn <fn_name>(...)`
+/// signature line and the first following line that is exactly `}` with no
+/// indentation — i.e. the function's body, signature and closing brace both
+/// excluded. Every wrapper in this file is a top-level function, so a
+/// bare, unindented `}` is a reliable terminator: it cannot be a nested
+/// block's closing brace, which always carries at least one level of
+/// indentation. Returns `None` if `fn_name`'s signature (or, having found
+/// it, a matching terminator) is not present in `text`.
+fn fn_body<'a>(text: &'a str, fn_name: &str) -> Option<Vec<&'a str>> {
+    let needle = format!("async fn {fn_name}(");
+    let lines: Vec<&str> = text.lines().collect();
+    let sig = lines.iter().position(|l| l.trim_start().starts_with(&needle))?;
+    let end = lines[sig + 1..].iter().position(|l| *l == "}")?;
+    Some(lines[sig + 1..sig + 1 + end].to_vec())
+}
+
+/// The part of `line` before its first `//` — a naive line-comment strip,
+/// with no notion of a `//` inside a string literal (no line in this file's
+/// subject matter has ever needed one). Used by `wrapper_calls_body_name` so
+/// a call left in only as a dead, commented-out line does not count as the
+/// wrapper actually calling it.
+fn strip_line_comment(line: &str) -> &str {
+    match line.find("//") {
+        Some(i) => &line[..i],
+        None => line,
+    }
+}
+
+/// True if `wrapper_name`'s body (see `fn_body`) contains a call to
+/// `target_name` — the literal substring `<target_name>(`, with the
+/// character immediately before it (if any) not an identifier character
+/// (`_` or alphanumeric), so a longer name merely ENDING in `target_name`
+/// (a `big_target_name(` call) cannot satisfy it.
+///
+/// Deliberately excludes the signature line from the search: `wrapper_name`
+/// is conventionally `fake_<target_name>`, so the signature line itself —
+/// `async fn fake_<target_name>(...)` — already contains the substring
+/// `<target_name>(` as its own tail. A check that searched the signature
+/// line too would be satisfied by every wrapper unconditionally, including
+/// one with a completely empty body, which is the exact failure mode this
+/// check exists to catch: an empty or stubbed `fake_X` wrapper that
+/// satisfies the pairing check in `every_scenario_core_has_both_wrappers`
+/// and shows up as a green test that ran nothing.
+///
+/// Also strips each body line's `//` line comment before searching (see
+/// `strip_line_comment`) — a "stubbed" wrapper is exactly as likely to have
+/// its call commented out as deleted outright (this file's own sabotage
+/// history bears that out: the first draft of this check was verified
+/// against a wrapper with its call deleted, and separately still passed a
+/// wrapper whose call was merely commented out, which is equally "ran
+/// nothing"). Naive and line-based, like every other check in this file —
+/// it does not know about `//` inside a string literal, which no scenario
+/// wrapper in this codebase has ever needed.
+fn wrapper_calls_body_name(text: &str, wrapper_name: &str, target_name: &str) -> bool {
+    let Some(body_lines) = fn_body(text, wrapper_name) else {
+        return false;
+    };
+    let body: String =
+        body_lines.iter().map(|l| strip_line_comment(l)).collect::<Vec<_>>().join("\n");
+    let needle = format!("{target_name}(");
+    let mut from = 0usize;
+    while let Some(rel) = body[from..].find(&needle) {
+        let at = from + rel;
+        let prev_is_ident = body[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        if !prev_is_ident {
+            return true;
+        }
+        from = at + 1;
+    }
+    false
+}
+
 /// Count of lines that, trimmed, literally start with `#[ignore` — real
 /// attribute syntax, not a doc-comment mention. `round_trip.rs` carries one
 /// of the latter on purpose ("Unchanged: same `#[ignore]`..."); a naive
@@ -179,11 +254,22 @@ fn every_scenario_core_has_both_wrappers() {
         let fake_name = format!("fake_{name}");
         let live_name = format!("live_{name}");
 
-        if !sources.iter().any(|(_, t)| defines_fn(t, &fake_name)) {
-            bad.push(format!(
-                "{}:{line}: `{name}` has no `{fake_name}` wrapper",
-                rel.display()
-            ));
+        match sources.iter().find(|(_, t)| defines_fn(t, &fake_name)) {
+            None => {
+                bad.push(format!(
+                    "{}:{line}: `{name}` has no `{fake_name}` wrapper",
+                    rel.display()
+                ));
+            }
+            Some((_, t)) if !wrapper_calls_body_name(t, &fake_name, name) => {
+                bad.push(format!(
+                    "{}:{line}: `{fake_name}` is defined but its body never \
+                     mentions `{name}` — an empty or stubbed wrapper would \
+                     satisfy the pairing check above and run nothing",
+                    rel.display()
+                ));
+            }
+            Some(_) => {}
         }
 
         let live_ignored = sources.iter().any(|(_, t)| defines_ignored_fn(t, &live_name));
@@ -324,4 +410,61 @@ fn defines_ignored_fn_requires_the_attribute_directly_above() {
 
     let unignored = "async fn live_x_core() {}\n";
     assert!(!defines_ignored_fn(unignored, "live_x_core"));
+}
+
+#[test]
+fn wrapper_calls_body_name_is_false_for_an_empty_wrapper_body() {
+    // The trap: `fake_round_trip_core`'s own SIGNATURE line contains the
+    // substring `round_trip_core(` (as the tail of `fake_round_trip_core(`),
+    // so a naive `full_text.contains(&format!("{name}("))` scan would report
+    // `true` here even though the body between the braces is empty — the
+    // exact failure mode (a green check that tests nothing) this helper
+    // exists to catch. If this assertion passed against that naive scan, the
+    // check would be tautological.
+    let text = "async fn fake_round_trip_core() {\n}\n";
+    assert!(!wrapper_calls_body_name(text, "fake_round_trip_core", "round_trip_core"));
+}
+
+#[test]
+fn wrapper_calls_body_name_is_false_for_a_stubbed_body() {
+    let text = "async fn fake_round_trip_core() {\n    // TODO: wire this up\n}\n";
+    assert!(!wrapper_calls_body_name(text, "fake_round_trip_core", "round_trip_core"));
+}
+
+#[test]
+fn wrapper_calls_body_name_is_true_when_the_body_calls_it() {
+    let text = "async fn fake_round_trip_core() {\n\
+                 \x20\x20\x20\x20let fake = crate::support::fake::FakeOrg::start().await;\n\
+                 \x20\x20\x20\x20round_trip_core(&fake.config()).await;\n\
+                 }\n";
+    assert!(wrapper_calls_body_name(text, "fake_round_trip_core", "round_trip_core"));
+}
+
+#[test]
+fn wrapper_calls_body_name_ignores_a_commented_out_call() {
+    // A call left in only as a `//` comment — stubbed out, e.g. mid-refactor
+    // — must not count: the wrapper calls nothing at runtime, which is
+    // exactly the "ran nothing" failure mode this check exists to catch.
+    let text = "async fn fake_round_trip_core() {\n    // round_trip_core(&fake.config()).await;\n}\n";
+    assert!(!wrapper_calls_body_name(text, "fake_round_trip_core", "round_trip_core"));
+}
+
+#[test]
+fn wrapper_calls_body_name_rejects_a_longer_identifier_ending_in_the_name() {
+    // `big_round_trip_core(` ends in `round_trip_core(` too, but the
+    // character right before the match (`g`) is an identifier character, so
+    // this must not count as a call to `round_trip_core`.
+    let text = "async fn fake_round_trip_core() {\n    big_round_trip_core(&cfg).await;\n}\n";
+    assert!(!wrapper_calls_body_name(text, "fake_round_trip_core", "round_trip_core"));
+}
+
+#[test]
+fn fn_body_excludes_the_signature_and_closing_brace_lines() {
+    let text = "async fn fake_x() {\n    one();\n    two();\n}\n";
+    assert_eq!(fn_body(text, "fake_x"), Some(vec!["    one();", "    two();"]));
+}
+
+#[test]
+fn fn_body_is_none_when_the_signature_is_missing() {
+    assert_eq!(fn_body("async fn fake_y() {\n}\n", "fake_x"), None);
 }
