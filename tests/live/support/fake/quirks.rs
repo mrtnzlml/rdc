@@ -160,6 +160,15 @@ pub fn shape_response(kind: &str, method: &str, body: &mut Value) {
 /// orgs (`1b89e5a`), which is the evidence that the real API does not behave
 /// this way.
 ///
+/// # What this closes off
+///
+/// Making the fake uniformly orderly is permissive, not merely convenient,
+/// and the quirk row in [`QUIRKS`] carries the full statement of what a
+/// fake-backed scenario can therefore no longer catch. The short version:
+/// two orgs can no longer disagree about field order here, and on a real
+/// pair that disagreed, `migrate::settle`'s byte comparison would rewrite
+/// the target file every cycle while `content_hash` stayed quiet.
+///
 /// # Top level only
 ///
 /// Nested objects are left alone, and that is a fidelity requirement rather
@@ -1126,6 +1135,47 @@ pub const QUIRKS: &[Quirk] = &[
         // absent from that body — a wholly fake-specific artifact, since a
         // real server's response is serialized from its OWN backend model,
         // never from whatever field order the request happened to submit.
+        //
+        // LIMITATION — what this quirk now makes UNREACHABLE.
+        //
+        // `impose_field_order` gives every response one key order
+        // (alphabetical, `sort_top_level_keys`) for every kind, every
+        // endpoint and every method, in every `FakeOrg`. The real API is not
+        // known to be that orderly: `snapshot::noise::sort_keys_recursive`'s
+        // own doc comment records this repo's belief that "the Rossum API
+        // doesn't guarantee stable key order across endpoints", which is the
+        // whole reason `content_hash` canonicalizes. So the fake is now MORE
+        // orderly than the server it stands in for — in the permissive
+        // direction, and that closes off a real failure class.
+        //
+        // The class. On-disk key order is the SERVER's, not rdc's:
+        // `key_order::reorder_top_level` has exactly one caller in `src/`
+        // (`snapshot::hook`), and even there it only hoists `HOOK_KEY_ORDER`
+        // to the front and leaves the remainder in the order the response
+        // arrived in; no other kind is reordered at all. `migrate` then
+        // re-emits the SOURCE file's order — `transform_file` parses the
+        // source body into an order-preserving `Value`, mutates it in place
+        // and hands it to `serde_json::to_vec_pretty`, and nothing between
+        // sorts — while push write-back writes back what the TARGET server
+        // answered. Two orgs whose hosts or API versions serialize one kind
+        // differently would therefore hand `migrate` and `sync` two different
+        // orders for the same object, and `migrate::settle` compares
+        // `existing == bytes`, so it charges the difference as
+        // `FileOutcome::Updated` and rewrites the file — every cycle, forever.
+        // `content_hash` cannot see any of it (`sort_keys_recursive` again),
+        // so rdc's own drift detection stays quiet while the working tree
+        // churns. That is the same SHAPE as the churn this quirk was added to
+        // stop, but not the same thing: the fake's version was an artifact of
+        // the fake, and this one would be real.
+        //
+        // Both `FakeOrg`s now serve that one order, so no fake-backed
+        // scenario can reproduce a cross-host disagreement —
+        // `deploy_flow.rs::fake_deploy_flow` and
+        // `migrate_promotion.rs::fake_migrate_overlay_and_mirror`, the two
+        // that run two orgs, included. Deliberately NOT fixed here: making
+        // the fake vary its order per org would be a claim about the real API
+        // that nobody has evidence for, and what it would expose is a `src/`
+        // concern, not a fake one.
         //
         // LIVE-cited, not `ChosenUnverified`, because `deploy_flow.rs`'s
         // chain-stability assertion — `prod_before` (captured after the
