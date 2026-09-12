@@ -122,7 +122,7 @@ impl OrgState {
     /// `settings` normalization, by contrast, happens HERE, as the merge —
     /// not at the response seam. Quirk
     /// `organization_patch_response_is_not_get_shaped` (`quirks.rs`) is
-    /// `modelled: true`, and the real fact it models for `settings`
+    /// `Provenance::Modelled`, and the real fact it models for `settings`
     /// (`width: 140` comes back `140.0`; an empty `annotation_list_table`
     /// comes back `{ "columns": [] }`) is that the real server normalizes
     /// `settings` when it is WRITTEN — so the normalized value is what's
@@ -280,10 +280,10 @@ impl OrgState {
             if let (Some(dst), Some(src)) = (slot.as_object_mut(), patch.as_object()) {
                 for (k, v) in src {
                     // A Rossum PATCH is a shallow merge of the keys it
-                    // carries. Not modelled: nothing here protects
+                    // carries. Chosen, unverified: nothing here protects
                     // read-only server-owned keys like `id`/`url` from a
                     // body that happens to carry them — see quirk
-                    // `patch_persists_client_sent_id_and_url` (`quirks.rs`).
+                    // `id_and_url_survive_a_client_sent_patch` (`quirks.rs`).
                     dst.insert(k.clone(), v.clone());
                 }
                 if spec.has_modified_at {

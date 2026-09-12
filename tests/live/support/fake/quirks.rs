@@ -2,7 +2,8 @@
 //! discover in a live org, expressed once, executably.
 //!
 //! Every entry in [`QUIRKS`] carries evidence for the fact it names, in one
-//! of two shapes distinguished by [`Quirk::proven_by`]'s own syntax:
+//! of two shapes distinguished by [`Quirk::citation`]'s own syntax — the
+//! string [`Provenance`] holds, whichever of its three fields carries it:
 //!
 //! - A LIVE citation, `<scenario file>::<test fn>` (a double colon) — a live
 //!   scenario actually asserts the fact. Checked by
@@ -12,18 +13,35 @@
 //!   at least that the citation cannot rot into a dangling reference.
 //! - A SOURCE citation, `<repo file>:<line>` (a single colon) — no live
 //!   scenario proves this fact; the evidence is a repo comment, a captured
-//!   fixture, or (for `modelled: false` entries) the description of a gap.
-//!   Checked by `every_source_citation_names_a_real_file`, which confirms the
-//!   cited file exists.
+//!   fixture, or (for a [`Provenance::NotModelled`] or
+//!   [`Provenance::ChosenUnverified`] entry) the description of a gap or an
+//!   unverified choice. Checked by `every_source_citation_names_a_real_file`,
+//!   which confirms the cited file exists.
 //!
-//! [`Quirk::modelled`] is orthogonal to which citation shape is used: it says
-//! whether the fake actually IMPLEMENTS the fact. Most quirks are `modelled:
-//! true` with a live citation. A `modelled: true` quirk with a SOURCE
-//! citation means "the fake does this, but no live scenario proves it yet."
-//! A `modelled: false` quirk means "the fake does NOT do this yet" — recorded
-//! here anyway, so a known gap is visible in the same table as everything the
-//! fake gets right, rather than living only in a doc comment somewhere a
-//! reader has to already know to check.
+//! [`Quirk::provenance`] is orthogonal to which citation shape is used above:
+//! it says WHY this row exists, as one of three categories:
+//!
+//! - [`Provenance::Modelled`] — the fake reproduces a real API behaviour.
+//!   Most quirks are this, with a LIVE citation; a `Modelled` quirk with a
+//!   SOURCE citation means "the fake does this, but no live scenario proves
+//!   it yet."
+//! - [`Provenance::NotModelled`] — a real API fact the fake does NOT yet
+//!   reproduce, recorded anyway so a known gap is visible in the same table
+//!   as everything the fake gets right, rather than living only in a doc
+//!   comment somewhere a reader has to already know to check. Its citation
+//!   names what DOCUMENTS the fact, and is always SOURCE-shaped: an
+//!   unimplemented behavior cannot have live proof of the fake's own
+//!   conduct.
+//! - [`Provenance::ChosenUnverified`] — the fake had to pick an answer and
+//!   the real API's behaviour is UNKNOWN. Its citation names whatever
+//!   evidence exists for the choice — explicitly NOT proof of it, and, like
+//!   `NotModelled`, always SOURCE-shaped: a citation that "corroborates" a
+//!   guess is a different, weaker claim than one that "proves" a fact, and a
+//!   `::` here would blur the two. A row that has genuine live corroboration
+//!   (see `an_engine_or_engine_field_carries_no_modified_at` below)
+//!   still points its structured citation at a SOURCE location and spells
+//!   the corroboration out in prose, rather than encoding it where the
+//!   citation-shape guards would read it as proof.
 //!
 //! The rule this encodes: the fake invents nothing, and neither does this
 //! registry — an entry's citation must point at real, checkable evidence, and
@@ -98,7 +116,7 @@ pub fn shape_response(kind: &str, method: &str, body: &mut Value) {
 /// normalization and email re-derivation are both pure functions of the
 /// post-merge body. A rule that must act differently create-vs-patch, or
 /// that needs what the body looked like BEFORE this write — e.g. a real fix
-/// for quirk `patch_persists_client_sent_id_and_url` below, which would
+/// for quirk `id_and_url_survive_a_client_sent_patch` below, which would
 /// need to know the id/url that stood in `patch`'s `slot` before the merge,
 /// in order to restore them — will not fit this signature and needs a
 /// different seam, not a third `match` arm here.
@@ -259,26 +277,68 @@ pub(super) fn normalize_organization_settings(value: &mut Value) {
     }
 }
 
+/// The three things a [`Quirk`] can be recording — see the module doc
+/// comment for what each one means. Bundling each category's evidence INSIDE
+/// its variant, rather than a separate `proven_by` field next to a
+/// `modelled: bool`, makes the citation's FIELD NAME say which claim is
+/// being made: `Modelled { proven_by }` says a real behaviour is proven,
+/// `NotModelled { documented_at }` says a gap is documented,
+/// `ChosenUnverified { weighed_against }` says a guess is merely weighed
+/// against something. A previous version of this registry squeezed
+/// `NotModelled` and `ChosenUnverified` into one `modelled: false`, which is
+/// exactly what let a `ChosenUnverified` row read as "the fake doesn't do
+/// this real thing yet" when its own comment said the real thing was
+/// unknown. The guards below still exist because Rust cannot check the
+/// CONTENT of a `&'static str` — whether it is a live or source shape,
+/// whether the file it names exists — only which field held it.
+pub enum Provenance {
+    /// The fake reproduces a real API behaviour. `proven_by`: see the module
+    /// doc comment for the two citation shapes and which guard checks each.
+    Modelled { proven_by: &'static str },
+    /// A real API fact the fake does not yet reproduce. `documented_at`
+    /// names what documents the fact — always a SOURCE citation (see the
+    /// module doc comment for why), checked against a live-citation ban by
+    /// `only_a_modelled_quirk_may_claim_a_live_citation` below.
+    NotModelled { documented_at: &'static str },
+    /// The fake had to pick an answer and the real API's behaviour is
+    /// UNKNOWN. `weighed_against` names whatever evidence exists for the
+    /// choice — always a SOURCE citation, same reason and same guard as
+    /// `NotModelled` — explicitly NOT a claim that the choice is correct:
+    /// see the row's own doc comment for what the evidence actually shows
+    /// and does not show.
+    ChosenUnverified { weighed_against: &'static str },
+}
+
 pub struct Quirk {
     pub name: &'static str,
-    /// Whether the fake actually implements this behavior. `false` marks a
-    /// real API fact this registry records but the fake does not yet
-    /// reproduce.
-    pub modelled: bool,
-    /// See the module doc comment: `<scenario file>::<test fn>` (live proof)
-    /// or `<repo file>:<line>` (documented, not live-proven).
-    pub proven_by: &'static str,
+    /// Which of the three categories this row belongs to, bundled with its
+    /// evidence. See [`Provenance`]'s doc comment.
+    pub provenance: Provenance,
+}
+
+impl Quirk {
+    /// The evidence string, whichever field its category stored it under —
+    /// every guard below reads this instead of matching [`Provenance`]
+    /// itself, so the citation-shape checks stay one piece of logic
+    /// regardless of category.
+    fn citation(&self) -> &'static str {
+        match self.provenance {
+            Provenance::Modelled { proven_by } => proven_by,
+            Provenance::NotModelled { documented_at } => documented_at,
+            Provenance::ChosenUnverified { weighed_against } => weighed_against,
+        }
+    }
 }
 
 pub const QUIRKS: &[Quirk] = &[
     Quirk {
         name: "queue_create_materializes_typed_email_template_defaults",
-        modelled: true,
-        proven_by: "email_templates.rs::live_email_templates_round_trip",
+        provenance: Provenance::Modelled {
+            proven_by: "email_templates.rs::live_email_templates_round_trip",
+        },
     },
     Quirk {
         name: "queue_delete_is_async_and_cascades",
-        modelled: true,
         // This citation proves only the ASYNC half: `live_push_create_ordering`
         // asserts `status == "deletion_requested"` at `ordering.rs:348`. The
         // CASCADE half (the queue's auto-created email templates and inbox
@@ -291,11 +351,12 @@ pub const QUIRKS: &[Quirk] = &[
         // `conflicts_deletes.rs::live_conflicts_deletes`, proved neither
         // half: that scenario's delete branch deletes a RULE, never a
         // queue, and never observes a 202 or a cascade.
-        proven_by: "ordering.rs::live_push_create_ordering",
+        provenance: Provenance::Modelled {
+            proven_by: "ordering.rs::live_push_create_ordering",
+        },
     },
     Quirk {
         name: "engine_delete_refused_while_a_queue_awaits_deletion",
-        modelled: true,
         // NOT what `ordering.rs`'s cascade hits: `push::deletes` orders
         // engines BEFORE queues, so by the time an engine delete is
         // attempted there, its bound queue has not been asked to delete yet
@@ -308,11 +369,12 @@ pub const QUIRKS: &[Quirk] = &[
         // exercises this branch over HTTP; the state-level proof is
         // `state.rs::an_engine_cannot_be_deleted_while_a_queue_awaits_deletion`,
         // which deletes the queue first and is not itself a `live_*` test.
-        proven_by: "tests/live/support/teardown.rs:62",
+        provenance: Provenance::Modelled {
+            proven_by: "tests/live/support/teardown.rs:62",
+        },
     },
     Quirk {
         name: "engine_attached_to_active_queues",
-        modelled: true,
         // This IS what `ordering.rs`'s cascade hits: `push::deletes` orders
         // engines BEFORE queues, so the fixture queue is still fully live —
         // never asked to delete — when its engine's `DELETE` is attempted.
@@ -324,11 +386,12 @@ pub const QUIRKS: &[Quirk] = &[
         // `tests/live/support/teardown.rs:61`. State-level proof of the
         // fake's own rule:
         // `state.rs::an_engine_cannot_be_deleted_while_bound_to_an_active_queue`.
-        proven_by: "ordering.rs::live_push_create_ordering",
+        provenance: Provenance::Modelled {
+            proven_by: "ordering.rs::live_push_create_ordering",
+        },
     },
     Quirk {
         name: "unresolvable_ref_is_an_invalid_hyperlink",
-        modelled: true,
         // No live scenario provokes an unresolvable ref:
         // `cross_refs.rs::live_cross_refs` has no negative path, and the
         // only other mention of this exact string, `ordering.rs:110-112`,
@@ -338,21 +401,24 @@ pub const QUIRKS: &[Quirk] = &[
         // refusal `rdc`'s whole deferred-relink path is built around.
         // `validate::on_write` matches it, and it is offline-tested at
         // `state.rs::a_ref_that_matches_no_object_is_an_invalid_hyperlink`.
-        proven_by: "src/snapshot/refs.rs:159",
+        provenance: Provenance::Modelled {
+            proven_by: "src/snapshot/refs.rs:159",
+        },
     },
     Quirk {
         name: "over_length_field_is_refused_after_trailing_whitespace_trim",
-        modelled: true,
-        proven_by: "server_truth.rs::live_field_limits_match_the_server",
+        provenance: Provenance::Modelled {
+            proven_by: "server_truth.rs::live_field_limits_match_the_server",
+        },
     },
     Quirk {
         name: "queue_carries_one_engine_slot_only",
-        modelled: true,
-        proven_by: "server_truth.rs::live_queue_engine_slot_counts_values_not_keys",
+        provenance: Provenance::Modelled {
+            proven_by: "server_truth.rs::live_queue_engine_slot_counts_values_not_keys",
+        },
     },
     Quirk {
         name: "organization_patch_response_is_not_get_shaped",
-        modelled: true,
         // Two of the three differences documented at
         // `src/cli/push/organization.rs:161-177` between a real
         // `PATCH /organizations/{id}` response and what `GET` on the same
@@ -407,11 +473,12 @@ pub const QUIRKS: &[Quirk] = &[
         // That test predates this fake and doesn't run through it, so it
         // cannot serve as this quirk's citation either — hence the SOURCE
         // form, naming the fact's original documentation.
-        proven_by: "src/cli/push/organization.rs:161",
+        provenance: Provenance::Modelled {
+            proven_by: "src/cli/push/organization.rs:161",
+        },
     },
     Quirk {
         name: "inbox_email_is_re_derived_on_write",
-        modelled: true,
         // `email` is server-derived from `email_prefix`
         // (`<email_prefix>-<hash>@<host>`) — `src/snapshot/limits.rs:468`
         // records this directly, and it's why `strip_for_create` removes a
@@ -433,45 +500,13 @@ pub const QUIRKS: &[Quirk] = &[
         // (`tests.rs`), which — like the organization quirk's offline pin
         // above — proves the FAKE's own behavior, not the real API's, so it
         // cannot serve as this quirk's citation either.
-        proven_by: "src/snapshot/limits.rs:468",
+        provenance: Provenance::Modelled {
+            proven_by: "src/snapshot/limits.rs:468",
+        },
     },
-    Quirk {
-        name: "back_reference_growth_leaves_modified_at_unbumped",
-        modelled: false,
-        // `graph.rs`'s `add_ref`/`set_field` — the functions `relink` calls
-        // to grow a back-reference (e.g. a new hook pushing itself onto
-        // `queue.hooks`) — touch only the target's own field, never
-        // `modified_at`; only `state.rs`'s `create`/`patch`/`patch_organization`
-        // stamp the clock, and only for the object THEY write, not for a
-        // target that merely gained a back-ref as a side effect.
-        //
-        // This is recorded, not modelled, because the real API's behavior
-        // here is UNKNOWN — nothing in this repo says whether a real
-        // `queue.modified_at` moves when a hook that names it is created.
-        // That is the defect this entry names: an unrecorded choice, not a
-        // wrong one. The fake picked "no" silently; this entry is what
-        // makes that a visible, deliberate placeholder instead of a fact
-        // nobody could tell was ever decided.
-        proven_by: "tests/live/support/fake/graph.rs:82",
-    },
-    Quirk {
-        name: "patch_persists_client_sent_id_and_url",
-        modelled: false,
-        // `state.rs`'s `patch` is an unconditional shallow merge of every
-        // key the request body carries (`dst.insert(k.clone(), v.clone())`
-        // for each key, no exclusion list) — a PATCH body that happens to
-        // carry `id` or `url` (both read-only, server-assigned fields)
-        // would silently overwrite the stored ones. `rdc` DOES PATCH full
-        // objects that carry both: `push`'s update paths serialize the
-        // whole typed model, id and url included, trusting the real API to
-        // ignore or reject them. Not modelled: the fake does not protect
-        // these keys, so a hand-built request that sent a bogus `id` would
-        // corrupt the store in a way no real org would ever allow.
-        proven_by: "tests/live/support/fake/state.rs:280",
-    },
+    // --- category 2: a real API fact the fake does not yet reproduce -----
     Quirk {
         name: "inbox_patch_response_omits_fields_the_get_response_includes",
-        modelled: false,
         // A real `PATCH /inboxes/{id}` response omits fields that `GET
         // /inboxes/{id}` on the same id includes — `bounce_email_to: null`
         // is the one example the source comment names, introduced with
@@ -499,7 +534,103 @@ pub const QUIRKS: &[Quirk] = &[
         // asymmetry, so a test that ought to catch a naive write-back of an
         // inbox PATCH response will not catch it via the fake — only the
         // existing offline mock test above does, today.
-        proven_by: "src/cli/push/inboxes.rs:377",
+        provenance: Provenance::NotModelled {
+            documented_at: "src/cli/push/inboxes.rs:377",
+        },
+    },
+    // --- category 3: the fake picked an answer; the real one is unknown --
+    Quirk {
+        name: "modified_at_does_not_move_when_a_back_reference_grows",
+        // Renamed from `back_reference_growth_leaves_modified_at_unbumped`:
+        // that name described the FAKE's own conduct ("[the fake] leaves
+        // modified_at unbumped"), which read as a known real-API gap
+        // (category 2) when it is actually a stance the fake had to invent
+        // (category 3) — see the module doc comment. The name now states the
+        // claim being made about the SERVER, however unverified.
+        //
+        // `graph.rs`'s `add_ref`/`set_field` — the functions `relink` calls
+        // to grow a back-reference (e.g. a new hook pushing itself onto
+        // `queue.hooks`) — touch only the target's own field, never
+        // `modified_at`; only `state.rs`'s `create`/`patch`/`patch_organization`
+        // stamp the clock, and only for the object THEY write, not for a
+        // target that merely gained a back-ref as a side effect.
+        //
+        // This is `ChosenUnverified`, not `Modelled` or `NotModelled`,
+        // because the real API's behavior here is UNKNOWN — nothing in this
+        // repo says whether a real `queue.modified_at` moves when a hook
+        // that names it is created. That is the defect this entry names: an
+        // unrecorded choice, not a wrong one. The fake picked "no" silently;
+        // this entry is what makes that a visible, deliberate placeholder
+        // instead of a fact nobody could tell was ever decided.
+        provenance: Provenance::ChosenUnverified {
+            weighed_against: "tests/live/support/fake/graph.rs:82",
+        },
+    },
+    Quirk {
+        name: "id_and_url_survive_a_client_sent_patch",
+        // Renamed from `patch_persists_client_sent_id_and_url`: same
+        // problem as the row above — "[the fake's] patch persists" named
+        // the fake's own merge function, not a claim about the server.
+        //
+        // `state.rs`'s `patch` is an unconditional shallow merge of every
+        // key the request body carries (`dst.insert(k.clone(), v.clone())`
+        // for each key, no exclusion list) — a PATCH body that happens to
+        // carry `id` or `url` (both read-only, server-assigned fields)
+        // would silently overwrite the stored ones. `rdc` DOES PATCH full
+        // objects that carry both: `push`'s update paths serialize the
+        // whole typed model, id and url included, trusting the real API to
+        // ignore or reject them — but nothing in this repo pins WHICH of
+        // those two the real API actually does, or confirms it does either
+        // one. `ChosenUnverified`: the fake does not protect these keys, so
+        // a hand-built request that sent a bogus `id` would corrupt the
+        // store in a way a real org is assumed, but not shown, to refuse.
+        provenance: Provenance::ChosenUnverified {
+            weighed_against: "tests/live/support/fake/state.rs:280",
+        },
+    },
+    Quirk {
+        name: "an_engine_or_engine_field_carries_no_modified_at",
+        // `kinds::MODELLED`'s `has_modified_at: false` for `"engines"` and
+        // `"engine_fields"` (`kinds.rs`) was ORIGINALLY justified purely as
+        // an internal-consistency argument with rdc's OWN drift-check code,
+        // not as an observed server fact — see that field's doc comment,
+        // corrected alongside this row. On its own, that argument says
+        // nothing about the real server: `push::deletes::fetch_remote_modified_at`
+        // (`src/cli/push/deletes.rs:481` / `:487`) unconditionally discards
+        // whatever these two kinds' bodies carry (`.map(|_| None)`) when it
+        // reads them back for the DELETE-time drift check, regardless of
+        // what a real response would say.
+        //
+        // For ENGINES specifically, that is no longer the whole story.
+        // `push::engines`'s CREATE-time write-back
+        // (`src/cli/push/engines.rs:111`) is NOT special-cased the way the
+        // delete-time read is — it stores whatever `.modified_at()` a real
+        // `POST /engines` response reports, `Some` or `None`, straight into
+        // the lockfile. So `delete_one`'s drift comparison — remote forced
+        // to `None` by the discard above, against whatever the CREATE
+        // response actually put in the lockfile — only agrees (both `None`,
+        // `drifted == false`, so `delete_one` falls through to actually
+        // issuing `DELETE /engines/{id}`) if the real create response
+        // carried no `modified_at` to begin with.
+        // `ordering.rs::live_push_create_ordering` asserts that stderr
+        // contains the exact warning `"engines/{slug} delete failed
+        // (skipped)"` — `push::deletes::run_deletes`'s catch for a
+        // server-REFUSED delete — a string only reachable if the HTTP
+        // `DELETE` was actually attempted, which by the chain above requires
+        // exactly that. A green run of that scenario is therefore an
+        // OBSERVATION that a real engine's create response carries no
+        // `modified_at` — CORROBORATION, not proof: nothing in that scenario
+        // reads the create response's raw body directly, and the same
+        // warning string could in principle be produced by some other path.
+        //
+        // ENGINE_FIELDS has no equivalent corroboration: `ordering.rs`'s own
+        // "everything that could go, went" sweep explicitly EXCLUDES
+        // `engine_fields` (`ordering.rs:279`), so nothing in this suite
+        // exercises its delete path the same way. Its half of this row
+        // remains a bare, uncorroborated choice.
+        provenance: Provenance::ChosenUnverified {
+            weighed_against: "src/cli/push/deletes.rs:481",
+        },
     },
 ];
 
@@ -686,7 +817,7 @@ mod tests {
     /// invented. Written in the same spirit as `tests/command_references.rs`:
     /// the check is mechanical so the citation cannot rot silently.
     ///
-    /// Runs only on LIVE citations (`proven_by` containing `::`) — see the
+    /// Runs only on LIVE citations (`citation()` containing `::`) — see the
     /// module doc comment for the other shape, checked by
     /// `every_source_citation_names_a_real_file` below.
     ///
@@ -722,11 +853,13 @@ mod tests {
     #[test]
     fn every_live_citation_actually_proves_it() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/live/scenarios");
-        for q in QUIRKS.iter().filter(|q| q.proven_by.contains("::")) {
+        let mut checked = 0;
+        for q in QUIRKS.iter().filter(|q| q.citation().contains("::")) {
+            checked += 1;
             let (file, test) = q
-                .proven_by
+                .citation()
                 .split_once("::")
-                .unwrap_or_else(|| panic!("quirk '{}' has a malformed citation: {}", q.name, q.proven_by));
+                .unwrap_or_else(|| panic!("quirk '{}' has a malformed citation: {}", q.name, q.citation()));
             assert!(
                 is_plain_scenario_filename(file),
                 "quirk '{}' cites '{file}', which is not a plain scenario filename \
@@ -743,23 +876,32 @@ mod tests {
                 q.name
             );
         }
+        // Every `Modelled` quirk must have a citation that resolves — this
+        // loop is how a LIVE one gets checked. If nobody cited a live
+        // scenario any more, this test would pass having verified nothing;
+        // `QUIRKS` today carries several, so a regression to zero is a real
+        // signal, not a false alarm.
+        assert!(checked > 0, "no quirk claims a live citation — this guard would be checking nothing");
     }
 
     /// The other citation shape: a SOURCE citation (`<file>:<line>`, no
     /// `::`), used when no live scenario proves the fact — including every
-    /// `modelled: false` entry, which by definition can have no live proof.
-    /// Weaker than the live check (there is no line-number or content
-    /// verification, only that the file exists), but that asymmetry is
-    /// honest: a source citation was never claiming live proof in the first
-    /// place, only that a reader who follows it lands on a real file.
+    /// `NotModelled` or `ChosenUnverified` entry, neither of which can have
+    /// live proof by definition (see `only_a_modelled_quirk_may_claim_a_live_citation`
+    /// below). Weaker than the live check (there is no line-number or
+    /// content verification, only that the file exists), but that asymmetry
+    /// is honest: a source citation was never claiming live proof in the
+    /// first place, only that a reader who follows it lands on a real file.
     #[test]
     fn every_source_citation_names_a_real_file() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        for q in QUIRKS.iter().filter(|q| !q.proven_by.contains("::")) {
+        let mut checked = 0;
+        for q in QUIRKS.iter().filter(|q| !q.citation().contains("::")) {
+            checked += 1;
             let (file, _loc) = q
-                .proven_by
+                .citation()
                 .split_once(':')
-                .unwrap_or_else(|| panic!("quirk '{}' has a malformed citation: {}", q.name, q.proven_by));
+                .unwrap_or_else(|| panic!("quirk '{}' has a malformed citation: {}", q.name, q.citation()));
             assert!(
                 is_safe_repo_relative_path(file),
                 "quirk '{}' cites '{file}', which is not a safe repo-relative path \
@@ -772,6 +914,7 @@ mod tests {
                 q.name
             );
         }
+        assert!(checked > 0, "no quirk claims a source citation — this guard would be checking nothing");
     }
 
     /// Pins `is_plain_scenario_filename`'s three failure modes directly,
@@ -823,20 +966,66 @@ mod tests {
         assert!(!is_safe_repo_relative_path("src/main"), "must end in .rs");
     }
 
-    /// Every quirk is visible and self-consistent: `modelled: false` can
-    /// never pair with a LIVE citation, because an unimplemented behavior
-    /// cannot have live proof of the fake's own conduct — a `false` entry
-    /// making that claim would be lying about strength of evidence, exactly
-    /// what this whole registry exists to prevent.
+    /// Every quirk is visible and self-consistent: only `Provenance::Modelled`
+    /// may pair with a LIVE citation. `NotModelled` can't — an unimplemented
+    /// behavior cannot have live proof of the fake's own conduct — and
+    /// `ChosenUnverified` can't either, for the same underlying reason: a
+    /// citation there is evidence WEIGHED AGAINST a choice, never proof of
+    /// it, and a `::` would claim the stronger thing. This subsumes the
+    /// registry's old single check (`modelled: false` never claims a live
+    /// citation): both non-`Modelled` categories used to collapse into that
+    /// one flag, which is exactly how a `ChosenUnverified` row got read as
+    /// "the fake doesn't do this real thing yet" — see the module doc
+    /// comment.
+    ///
+    /// Checks both non-`Modelled` categories explicitly (not just "any row
+    /// that isn't `Modelled`") and counts each separately, so this cannot
+    /// pass by iterating an empty set for either one — a real risk here:
+    /// `QUIRKS` has exactly one `NotModelled` row today, so a filter bug
+    /// that silently dropped that category would otherwise go unnoticed.
     #[test]
-    fn an_unmodelled_quirk_never_claims_a_live_citation() {
-        for q in QUIRKS.iter().filter(|q| !q.modelled) {
+    fn only_a_modelled_quirk_may_claim_a_live_citation() {
+        let (mut not_modelled_checked, mut chosen_unverified_checked) = (0, 0);
+        for q in QUIRKS.iter() {
+            match q.provenance {
+                Provenance::Modelled { .. } => continue,
+                Provenance::NotModelled { .. } => not_modelled_checked += 1,
+                Provenance::ChosenUnverified { .. } => chosen_unverified_checked += 1,
+            }
             assert!(
-                !q.proven_by.contains("::"),
-                "quirk '{}' is unmodelled but cites '{}' as if a live scenario proved it",
+                !q.citation().contains("::"),
+                "quirk '{}' is not Modelled but cites '{}' as if a live scenario proved it",
                 q.name,
-                q.proven_by
+                q.citation()
             );
         }
+        assert!(not_modelled_checked > 0, "no NotModelled quirk was checked — this guard covers that category vacuously");
+        assert!(
+            chosen_unverified_checked > 0,
+            "no ChosenUnverified quirk was checked — this guard covers that category vacuously"
+        );
+    }
+
+    /// Anchor for the guards above: if a future edit collapsed every row
+    /// into one category (e.g. by mis-porting `provenance` during a
+    /// refactor), `only_a_modelled_quirk_may_claim_a_live_citation`'s own
+    /// non-vacuousness asserts would already catch a missing `NotModelled`
+    /// or `ChosenUnverified` — this test names the same fact directly, at
+    /// the registry level rather than inside one guard, so a reader
+    /// scanning test names sees the invariant even before opening that
+    /// guard's body.
+    #[test]
+    fn every_provenance_category_has_at_least_one_row() {
+        let (mut modelled, mut not_modelled, mut chosen_unverified) = (0, 0, 0);
+        for q in QUIRKS.iter() {
+            match q.provenance {
+                Provenance::Modelled { .. } => modelled += 1,
+                Provenance::NotModelled { .. } => not_modelled += 1,
+                Provenance::ChosenUnverified { .. } => chosen_unverified += 1,
+            }
+        }
+        assert!(modelled > 0, "no Modelled quirk exists");
+        assert!(not_modelled > 0, "no NotModelled quirk exists");
+        assert!(chosen_unverified > 0, "no ChosenUnverified quirk exists");
     }
 }

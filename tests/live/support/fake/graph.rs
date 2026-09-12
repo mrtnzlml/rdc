@@ -85,7 +85,7 @@ impl OrgState {
     /// THEY write, not for a target that merely gained a back-reference as
     /// a side effect of someone else's write. Whether a real
     /// `queue.modified_at` moves when, say, a new hook names it is unknown
-    /// either way; recorded as quirk `back_reference_growth_leaves_modified_at_unbumped`
+    /// either way; recorded as quirk `modified_at_does_not_move_when_a_back_reference_grows`
     /// (`quirks.rs`) rather than left as a silent, undocumented choice.
     fn add_ref(
         &mut self,

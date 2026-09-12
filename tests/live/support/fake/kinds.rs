@@ -24,29 +24,40 @@ pub struct KindSpec {
     pub list_omits: &'static [&'static str],
     /// Whether the fake should stamp `modified_at` when it creates or
     /// patches an object of this kind. `false` only for `engines` and
-    /// `engine_fields` — NOT because this fake has observed that the real
-    /// API omits the field on those two (it hasn't; that's unobserved
-    /// here), but because `push::deletes::fetch_remote_modified_at`
-    /// (`src/cli/push/deletes.rs`) deliberately DISCARDS whatever these two
-    /// kinds' bodies carry: its `"engines"`/`"engine_fields"` arms end
-    /// `.map(|_| None)` (lines 486/492), throwing the value away, where
-    /// every other arm — e.g. `"labels"`/`"saved_views"` at lines 458/464 —
-    /// keeps it via `.map(|x| x.modified_at()...)`. So rdc's own drift
-    /// signal for these two kinds is existence-only BY CONSTRUCTION,
-    /// regardless of what the wire actually sends. A fake that stamped a
-    /// timestamp anyway would make `push::deletes::delete_one`'s comparison
-    /// see `(None, Some(_))` — "one side has a timestamp the other
-    /// doesn't" — and skip a delete this scenario expects to reach the
-    /// server and be refused there instead. `has_modified_at: false` matches
-    /// rdc's comparison contract, not a claim about the real response body.
+    /// `engine_fields` — ORIGINALLY chosen not because this fake had
+    /// observed that the real API omits the field on those two, but because
+    /// `push::deletes::fetch_remote_modified_at` (`src/cli/push/deletes.rs`)
+    /// deliberately DISCARDS whatever these two kinds' bodies carry: its
+    /// `"engines"`/`"engine_fields"` arms end `.map(|_| None)` (lines
+    /// 486/492), throwing the value away, where every other arm — e.g.
+    /// `"labels"`/`"saved_views"` at lines 458/464 — keeps it via
+    /// `.map(|x| x.modified_at()...)`. So rdc's own drift signal for these
+    /// two kinds is existence-only BY CONSTRUCTION, regardless of what the
+    /// wire actually sends. A fake that stamped a timestamp anyway would
+    /// make `push::deletes::delete_one`'s comparison see `(None, Some(_))`
+    /// — "one side has a timestamp the other doesn't" — and skip a delete
+    /// this scenario expects to reach the server and be refused there
+    /// instead. `has_modified_at: false` matches rdc's comparison contract,
+    /// not, on its own, a claim about the real response body.
     ///
-    /// Deliberately not a `quirks::QUIRKS` entry: that registry is for
-    /// behaviors of the real API (`quirks.rs`'s own module doc), each
-    /// backed by real, checkable evidence. This flag encodes an
-    /// internal-consistency requirement between the fake and rdc's own
-    /// drift-check code, not an observed server fact — there is no live
-    /// citation or repo-documented server behavior to point a `proven_by`
-    /// at without overstating what is actually known.
+    /// It IS also a `quirks::QUIRKS` entry now — name
+    /// `"an_engine_or_engine_field_carries_no_modified_at"`, a
+    /// `Provenance::ChosenUnverified` row (`quirks.rs`). An earlier version
+    /// of this comment argued the opposite — "deliberately NOT a
+    /// `quirks::QUIRKS` entry: that registry is for behaviors of the real
+    /// API, each backed by real, checkable evidence; this flag encodes an
+    /// internal-consistency requirement... not an observed server fact" —
+    /// but that rationale did not survive its own registry: the sibling row
+    /// `modified_at_does_not_move_when_a_back_reference_grows` is EQUALLY an
+    /// unobserved, chosen-not-proven fact (its own comment says the real
+    /// behavior is unknown), and it was in `QUIRKS` from the start. Same
+    /// category — "the fake had to pick an answer and the real API's
+    /// behaviour is unknown" — deserves the same treatment, which is exactly
+    /// what `Provenance::ChosenUnverified` is for. See that row's doc
+    /// comment for the fuller picture: for `engines` specifically,
+    /// `ordering.rs::live_push_create_ordering`'s green run CORROBORATES —
+    /// does not prove — that a real engine's create response carries no
+    /// `modified_at`; `engine_fields` has no such corroboration at all.
     pub has_modified_at: bool,
     /// Fill in server-assigned and required-but-absent fields.
     pub defaults: fn(&mut Map<String, Value>, &OrgCtx),
