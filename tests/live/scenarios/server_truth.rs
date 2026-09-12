@@ -30,7 +30,7 @@
 
 use crate::support::client::LiveClient;
 use crate::support::config::LiveConfig;
-use crate::support::expected::{load_or_compare, CapturedState};
+use crate::support::expected::{capture_mode, load_or_compare, CapturedState};
 use crate::support::project::ProjectFixture;
 use crate::support::run_id::RunId;
 use crate::support::seeder::seed;
@@ -347,10 +347,32 @@ async fn preflight_refuses_over_length_before_touching_the_env(cfg: &LiveConfig)
     drop(teardown);
 }
 
-/// Characterize what the server does with trailing whitespace, per field.
+/// The fake-backed twin. Runs in a plain `cargo test`; see
+/// `crate::support::fake`.
 ///
-/// Recorded, not predicted — see the module docs. A change in any recorded
-/// value means an rdc premise about trimming needs revisiting.
+/// This is the strongest twin in the file, and the reason is the golden.
+/// `testdata/live/expected/server_truth.toml` was captured from a real
+/// organization, so a green run here says the fake's trimming model
+/// reproduces something a real server did — an independent oracle, not a
+/// restatement of anything rdc or the fake believes. That is also exactly why
+/// this backend must never WRITE the golden: a capture from the fake would
+/// replace live evidence with the fake's own opinion, silently (the "CAPTURED
+/// golden" notice goes to stderr, which cargo swallows without
+/// `--nocapture`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fake_trailing_whitespace_handling_is_unchanged() {
+    assert!(
+        !capture_mode(),
+        "RDC_LIVE_CAPTURE is set: a fake-backed run must never capture a golden. \
+         Capture only from the live invocation, e.g. \
+         `RDC_LIVE_CAPTURE=1 cargo test --test live -- --ignored live_trailing_whitespace_handling_is_unchanged`."
+    );
+    let fake = crate::support::fake::FakeOrg::start().await;
+    trailing_whitespace_handling_is_unchanged(&fake.config()).await;
+}
+
+/// The live twin. Unchanged: same `#[ignore]`, same env gate, so
+/// `cargo test --test live -- --ignored` still selects exactly the live set.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live: needs RDC_LIVE_* env"]
 async fn live_trailing_whitespace_handling_is_unchanged() {
@@ -358,9 +380,17 @@ async fn live_trailing_whitespace_handling_is_unchanged() {
         eprintln!("{}", LiveConfig::skip_reason());
         return;
     };
+    trailing_whitespace_handling_is_unchanged(&cfg).await;
+}
+
+/// Characterize what the server does with trailing whitespace, per field.
+///
+/// Recorded, not predicted — see the module docs. A change in any recorded
+/// value means an rdc premise about trimming needs revisiting.
+async fn trailing_whitespace_handling_is_unchanged(cfg: &LiveConfig) {
     let run_id = RunId::new();
-    let client = LiveClient::connect(&cfg).expect("connect");
-    let teardown = Teardown::new(LiveClient::connect(&cfg).unwrap(), run_id.clone());
+    let client = LiveClient::connect(cfg).expect("connect");
+    let teardown = Teardown::new(LiveClient::connect(cfg).unwrap(), run_id.clone());
 
     let manifest = load_manifest().expect("manifest");
     let index = seed(&client, &run_id, &static_dir(), &manifest).await.expect("seed");
