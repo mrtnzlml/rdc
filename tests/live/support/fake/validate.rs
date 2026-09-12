@@ -47,11 +47,15 @@
 //!   [`field_caps`] and the queue engine-slot exclusion of
 //!   [`check_queue_engine_slots`]. Everything else [`on_write`] checks is
 //!   create-only here, and each omission is a real gap:
-//!   - A PATCH's REFS are not resolved. The real API answers
-//!     `Invalid hyperlink - No URL match` on a PATCH exactly as it does on a
-//!     POST (`src/snapshot/refs.rs:159` describes the refusal without
-//!     restricting it to creates, and rdc's deferred-relink path exists
-//!     precisely because it PATCHes refs). The fake accepts them.
+//!   - A PATCH's REFS are not resolved. `src/snapshot/refs.rs`'s
+//!     `residual_rdc_refs` documents the refusal as a property of any body
+//!     that is SENT ("the body is NOT safe to send … that opaque 400 …
+//!     mid-push"), not of creates specifically, and rdc's deferred-relink
+//!     path delivers refs by PATCH — so a PATCH almost certainly answers
+//!     `Invalid hyperlink - No URL match` the same way. Almost: no live
+//!     scenario provokes one on either verb, so this is a gap declared
+//!     against repo documentation, not against an observation. The fake
+//!     accepts them.
 //!   - The schema-vs-engine-fields rule and the unique-typed-template rule
 //!     (rules 5 and 4 of [`on_write`]) are not re-checked on a PATCH.
 //!   - Nothing validates the MERGED result. Both modelled rules read only the
@@ -222,15 +226,15 @@ pub fn on_patch(kind: &'static str, body: &Value) -> Result<(), ApiError> {
 
 /// Refuse a create the real API refuses.
 ///
-/// Wired into `create` only — **PATCH validation is a deliberate, documented
-/// gap**, not an oversight. Doing it properly means validating the MERGED
-/// result (this patch applied on top of the object's current state) while
-/// exempting the create-only rules: a partial PATCH legitimately carries no
-/// `schema` key, so rule 2 below ("a queue needs a schema") would fire
-/// wrongly on a PATCH that never touches `schema`. That is a design question
-/// this task does not answer. Nothing in stage 1 needs it — the only PATCHes
-/// any scenario sends are a valid label colour and a hook rename — so this
-/// leaves stage 2 a documented limitation instead of a silent one.
+/// Wired into `create` only. The PATCH path has its own, narrower entry
+/// point, [`on_patch`], rather than reusing this one, because most of what is
+/// checked below is CREATE-only by construction: a partial PATCH legitimately
+/// carries no `schema` key, so rule 2 ("a queue needs a schema") would fire
+/// wrongly on a PATCH that never touches `schema`. Doing it in full means
+/// validating the MERGED result — this patch applied on top of the object's
+/// current state — which is a design question neither function answers; what
+/// PATCH does and does not check today, and what the real API is known to do
+/// instead, is listed in the module doc comment.
 pub fn on_write(st: &OrgState, kind: &'static str, body: &Value) -> Result<(), ApiError> {
     // 1. Every ref must resolve, AND resolve to the right kind. This is the
     //    refusal rdc's whole deferred-relink path is built around
