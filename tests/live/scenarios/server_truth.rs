@@ -36,6 +36,7 @@ use crate::support::run_id::RunId;
 use crate::support::seeder::seed;
 use crate::support::staticdir::{load_manifest, static_dir};
 use crate::support::teardown::Teardown;
+use rdc::kinds::PUSH_CAPABLE;
 use rdc::snapshot::limits::field_limits;
 
 /// A string of exactly `len` code points that still starts with `prefix`, so
@@ -61,6 +62,137 @@ fn limit_for(kind: &str, field: &str) -> usize {
         .unwrap_or_else(|| panic!("snapshot::limits no longer declares a limit for {kind}.{field}"))
 }
 
+/// What a probe value for a given field has to LOOK like, beyond its length.
+///
+/// A cap probe sends one value at exactly the cap and one a single code point
+/// over, so for most fields any string of the right length will do. `color`
+/// is the exception in this fixture: it is capped at 7, which is also the
+/// length of a `#rrggbb` literal, so its two probe values are colour-shaped
+/// and the panic messages below name the shape — a refusal there could be the
+/// cap or could be format validation, and this test cannot tell them apart.
+#[derive(Debug, Clone, Copy)]
+enum Shape {
+    /// Free-form text: a run-id-prefixed string, so teardown can still find
+    /// whatever it is set on.
+    Text,
+    /// `#` plus hex digits, the only shape a colour field takes.
+    Color,
+}
+
+/// One `(kind, field)` cap to probe on one object.
+///
+/// `kind` keys `snapshot::limits::field_limits`; `endpoint` is the singular
+/// kind `LiveClient::patch_fields` takes. They differ (`labels` / `label`),
+/// and both are needed.
+struct Probe {
+    kind: &'static str,
+    endpoint: &'static str,
+    id: u64,
+    field: &'static str,
+    shape: Shape,
+}
+
+/// A value of exactly `len` code points, shaped so the SERVER's only reason to
+/// refuse it is the length.
+fn probe_value(shape: Shape, prefix: &str, len: usize) -> String {
+    match shape {
+        Shape::Text => padded(prefix, len),
+        Shape::Color => format!("#{}", "f".repeat(len.saturating_sub(1))),
+    }
+}
+
+/// What to leave the probed field as, so later probes and teardown are
+/// unaffected: something short, and still shaped like the field.
+fn restore_value(shape: Shape, run_id: &RunId) -> String {
+    match shape {
+        Shape::Text => run_id.prefix("probe"),
+        // The seeded label's own colour (`testdata/live/bodies/labels/priority.json`).
+        Shape::Color => "#ff0000".to_string(),
+    }
+}
+
+/// The `(kind, field)` caps this scenario does NOT probe, each with the reason
+/// it cannot be probed here rather than an implicit shrug.
+///
+/// Two reasons, and they are different in kind:
+///
+/// - **No object of that kind is in front of the API here.** `engines` and
+///   `engine_fields` are absent from `testdata/live/manifest.toml`, and this
+///   scenario does not create them. It creates the other two kinds the
+///   manifest omits (an email template, a saved view) because both are
+///   cheap: they are created and swept like every other object. An engine is
+///   not. `teardown_by_prefix`'s engine sweep is best-effort by design — an
+///   engine that was ever bound to a queue is refused deletion for up to 24
+///   hours, which is why `janitor_sweep` reports an engine backlog instead of
+///   asserting one empty — so seeding one per run of a cap probe trades a
+///   cheap test for a slow leak. `live_engines_round_trip` owns that
+///   lifecycle instead, unbound and deleted in the same run.
+/// - **The value is shape-constrained past what a length probe can build.**
+///   `extension_image_url` and `read_more_url` are URL fields: a run-id-padded
+///   string is not a URL at any length, and whether a synthetic 200-character
+///   URL is accepted for other reasons has never been observed, so a probe
+///   here could report a moved cap when the server had merely rejected the
+///   shape. `rir_params` is a legacy extraction-parameters string with no
+///   observed value anywhere in this repo — there is no value known to be
+///   valid AT the cap, which is exactly what the accepted-at-the-limit half
+///   needs.
+///
+/// Note the two reasons are not interchangeable, and `engine_fields` would
+/// carry both: even with an engine seeded, `subtype` and
+/// `pre_trained_field_id` take catalogue values (`"amount"` and the like, per
+/// `live_engines_round_trip`'s seed body), so a 50-character filler is not a
+/// valid value for them at any length either.
+///
+/// [`assert_coverage_is_accounted_for`] keeps this list honest: every cap
+/// `field_limits` declares is either probed or named here, so a cap added to
+/// either table cannot quietly go unwatched.
+const UNPROBED_CAPS: &[(&str, &str)] = &[
+    ("hooks", "extension_image_url"),
+    ("hooks", "read_more_url"),
+    ("queues", "rir_params"),
+    ("engines", "name"),
+    ("engine_fields", "name"),
+    ("engine_fields", "label"),
+    ("engine_fields", "pre_trained_field_id"),
+    ("engine_fields", "subtype"),
+];
+
+/// Every cap `field_limits` declares for a `kinds::PUSH_CAPABLE` kind is
+/// either probed by this run or listed in [`UNPROBED_CAPS`], and never both.
+///
+/// Runs inside the scenario, against the probe list it is about to execute,
+/// rather than as a standalone unit test: what needs pinning is the coverage
+/// of the run that actually happens, and a separate test would drift from it
+/// the first time someone edited one and not the other.
+fn assert_coverage_is_accounted_for(probes: &[Probe]) {
+    let mut probed: Vec<(&str, &str)> = probes.iter().map(|p| (p.kind, p.field)).collect();
+    probed.sort_unstable();
+    probed.dedup();
+    for kind in PUSH_CAPABLE {
+        for (field, _) in field_limits(kind) {
+            let pair = (*kind, *field);
+            let is_probed = probed.contains(&pair);
+            let is_excused = UNPROBED_CAPS.contains(&pair);
+            assert!(
+                is_probed || is_excused,
+                "snapshot::limits caps {kind}.{field}, but nothing probes it and \
+                 UNPROBED_CAPS does not say why — add a probe, or add the pair with its \
+                 reason"
+            );
+            assert!(
+                !(is_probed && is_excused),
+                "{kind}.{field} is both probed and listed in UNPROBED_CAPS"
+            );
+        }
+    }
+    for (kind, field) in UNPROBED_CAPS {
+        assert!(
+            field_limits(kind).iter().any(|(f, _)| f == field),
+            "UNPROBED_CAPS excuses {kind}.{field}, which snapshot::limits no longer caps"
+        );
+    }
+}
+
 /// The fake-backed twin. Runs in a plain `cargo test`; see
 /// `crate::support::fake`. `field_limits_match_the_server` never calls
 /// `capture_mode` / `load_or_compare` — it has no golden — so, like
@@ -70,12 +202,21 @@ fn limit_for(kind: &str, field: &str) -> usize {
 /// "server" side of the comparison is `fake::validate::field_caps`, which is
 /// pinned independently of `snapshot::limits::field_limits` and deliberately
 /// not imported from it. So a green run here proves the two tables still
-/// AGREE — it is a drift detector, and a real one: change either table alone
-/// and this goes red naming the field. It does NOT prove either table matches
-/// Rossum, because both were written from the same live probes. Only
-/// `live_field_limits_match_the_server` can say that. Making the fake import
-/// `field_limits` would collapse even the drift detection into a tautology;
-/// see `field_caps`' doc comment.
+/// AGREE on every pair it probes — it is a drift detector, and a real one:
+/// change either table's entry for a probed pair and this goes red naming the
+/// field. It does NOT prove either table matches Rossum, because both were
+/// written from the same live probes. Only `live_field_limits_match_the_server`
+/// can say that. Making the fake import `field_limits` would collapse even the
+/// drift detection into a tautology; see `field_caps`' doc comment.
+///
+/// "Every pair it probes" is load-bearing and used to be the whole gap here:
+/// the probe set was three pairs of the twenty-one the two tables carry, so
+/// changing `rules.description` in either one went unnoticed — measured, by
+/// moving that exact cap in `field_caps` to 256: green before, red naming
+/// `rules.description` now. The probe set covers thirteen of the twenty-one,
+/// and [`assert_coverage_is_accounted_for`] fails the run if a cap is neither
+/// probed nor listed in [`UNPROBED_CAPS`] with a reason, so the eight that are
+/// left say why in one place.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fake_field_limits_match_the_server() {
     let fake = crate::support::fake::FakeOrg::start().await;
@@ -96,6 +237,10 @@ async fn live_field_limits_match_the_server() {
 
 /// Every `max_length` rdc enforces offline must be the one the server really
 /// enforces: exactly at the limit is accepted, one code point over is refused.
+///
+/// Probes every cap in `snapshot::limits::field_limits` except the ones
+/// [`UNPROBED_CAPS`] names — thirteen of twenty-one — and asserts that
+/// accounting itself before it sends anything.
 async fn field_limits_match_the_server(cfg: &LiveConfig) {
     let run_id = RunId::new();
     let client = LiveClient::connect(cfg).expect("connect");
@@ -105,49 +250,99 @@ async fn field_limits_match_the_server(cfg: &LiveConfig) {
     let index = seed(&client, &run_id, &static_dir(), &manifest).await.expect("seed");
     let prefix = run_id.list_prefix();
 
-    // (kind, endpoint kind, id, field) triples to probe. Deliberately small:
-    // one tight cap and one generous one, on objects the seed already made.
+    // Two kinds carry caps but have no object in the seeding manifest. Create
+    // one each, rather than leave their caps unwatched: both creates are the
+    // shapes already proven live elsewhere in this suite — the email template
+    // by `trailing_whitespace_handling_is_unchanged` below, the shared saved
+    // view by `saved_views_round_trip`. Teardown sweeps both kinds by name
+    // prefix.
+    let queue_url = index.url("queue", "queue-invoices-main").expect("queue url").to_string();
+    let (template_id, _) = client
+        .create(
+            "email_template",
+            &serde_json::json!({
+                "name": run_id.prefix("cap-probe-template"),
+                "type": "custom",
+                "subject": run_id.prefix("cap-probe-subject"),
+                "message": "<p>cap probe</p>",
+                "automate": false,
+                "queue": queue_url,
+            }),
+        )
+        .await
+        .expect("create the cap-probe email template");
+    let (view_id, _) = client
+        .create(
+            "saved_view",
+            &serde_json::json!({
+                "name": run_id.prefix("cap-probe-view"),
+                "shared": true,
+                // An empty `$and` is refused (`saved_views.rs`); use a real
+                // condition.
+                "query": { "$and": [ { "status": { "$in": ["to_review"] } } ] },
+            }),
+        )
+        .await
+        .expect("create the cap-probe saved view");
+
     let hook_id = index.id("hook-validator").expect("validator hook id");
     let label_id = index.id("label-priority").expect("label id");
+    let queue_id = index.id("queue-invoices-main").expect("queue id");
+    let schema_id = index.id("schema-invoices-main").expect("schema id");
+    let workspace_id = index.id("ws-main").expect("workspace id");
+    let inbox_id = index.id("inbox-invoices-main").expect("inbox id");
+    let rule_id = index.id("rule-totals").expect("rule id");
 
-    let probes: [(&str, &str, u64, &str); 3] = [
-        ("labels", "label", label_id, "name"),
-        ("hooks", "hook", hook_id, "name"),
-        ("hooks", "hook", hook_id, "description"),
+    let probes = [
+        Probe { kind: "labels", endpoint: "label", id: label_id, field: "name", shape: Shape::Text },
+        Probe { kind: "labels", endpoint: "label", id: label_id, field: "color", shape: Shape::Color },
+        Probe { kind: "hooks", endpoint: "hook", id: hook_id, field: "name", shape: Shape::Text },
+        Probe { kind: "hooks", endpoint: "hook", id: hook_id, field: "description", shape: Shape::Text },
+        Probe { kind: "queues", endpoint: "queue", id: queue_id, field: "name", shape: Shape::Text },
+        Probe { kind: "schemas", endpoint: "schema", id: schema_id, field: "name", shape: Shape::Text },
+        Probe { kind: "workspaces", endpoint: "workspace", id: workspace_id, field: "name", shape: Shape::Text },
+        Probe { kind: "inboxes", endpoint: "inbox", id: inbox_id, field: "name", shape: Shape::Text },
+        Probe { kind: "rules", endpoint: "rule", id: rule_id, field: "name", shape: Shape::Text },
+        Probe { kind: "rules", endpoint: "rule", id: rule_id, field: "description", shape: Shape::Text },
+        Probe { kind: "email_templates", endpoint: "email_template", id: template_id, field: "name", shape: Shape::Text },
+        Probe { kind: "email_templates", endpoint: "email_template", id: template_id, field: "subject", shape: Shape::Text },
+        Probe { kind: "saved_views", endpoint: "saved_view", id: view_id, field: "name", shape: Shape::Text },
     ];
+    assert_coverage_is_accounted_for(&probes);
 
-    for (kind, endpoint, id, field) in probes {
+    for Probe { kind, endpoint, id, field, shape } in probes {
         let limit = limit_for(kind, field);
 
         // Exactly at the limit: accepted.
-        let at = padded(&prefix, limit);
+        let at = probe_value(shape, &prefix, limit);
         client
             .patch_fields(endpoint, id, serde_json::json!({ field: at }))
             .await
             .unwrap_or_else(|e| {
                 panic!(
-                    "the server REFUSED {kind}.{field} at exactly {limit} chars, but \
-                     snapshot::limits says that is allowed — rdc's pre-flight is too \
-                     loose and will let a push 400 mid-flight: {e:#}"
+                    "the server REFUSED {kind}.{field} at exactly {limit} chars \
+                     ({shape:?}-shaped probe value), but snapshot::limits says that is \
+                     allowed — rdc's pre-flight is too loose and will let a push 400 \
+                     mid-flight: {e:#}"
                 )
             });
 
         // One over: refused.
-        let over = padded(&prefix, limit + 1);
+        let over = probe_value(shape, &prefix, limit + 1);
         let res = client
             .patch_fields(endpoint, id, serde_json::json!({ field: over }))
             .await;
         assert!(
             res.is_err(),
-            "the server ACCEPTED {kind}.{field} at {} chars, but snapshot::limits caps \
-             it at {limit} — rdc's pre-flight is too strict and will refuse work the \
-             server would take",
+            "the server ACCEPTED {kind}.{field} at {} chars ({shape:?}-shaped probe \
+             value), but snapshot::limits caps it at {limit} — rdc's pre-flight is too \
+             strict and will refuse work the server would take",
             limit + 1
         );
 
         // Restore a sane value so later probes and teardown are unaffected.
         client
-            .patch_fields(endpoint, id, serde_json::json!({ field: run_id.prefix("probe") }))
+            .patch_fields(endpoint, id, serde_json::json!({ field: restore_value(shape, &run_id) }))
             .await
             .expect("restoring the probed field");
     }
@@ -177,23 +372,33 @@ async fn field_limits_match_the_server(cfg: &LiveConfig) {
 /// Unlike its two neighbours, this scenario never runs `rdc`: it is a client
 /// talking straight to a server, so a fake-backed twin would have the fake
 /// assert the fake's own rule, with no second party anywhere in the test.
-/// `field_limits_match_the_server` above survives the same treatment only
-/// because it reads `snapshot::limits::field_limits` — rdc's table — and
-/// compares it against the fake's independently pinned one. There is no
-/// equivalent here. `state.rs::a_queue_patch_counts_engine_values_not_engine_keys`
-/// already pins the fake's own conduct, at the layer where that is the honest
-/// claim.
+///
+/// The criterion, stated the same way it is stated at
+/// `fake_trailing_whitespace_handling_is_unchanged` below: a fake-backed twin
+/// earns its place when something in the test is not the fake's own opinion.
+/// Its two neighbours each have one. `field_limits_match_the_server` above
+/// reads `snapshot::limits::field_limits` — rdc's table — and compares it
+/// against the fake's independently pinned one. The whitespace twin below
+/// must reproduce a golden captured from a real organization, which is a
+/// weaker second party than it looks (the fake's trim table was written from
+/// that golden, so three of its four rows check the wiring rather than the
+/// fact) but is still an artifact the fake did not author. This scenario has
+/// neither: no rdc code, no captured artifact.
+/// `state.rs::a_queue_patch_counts_engine_values_not_engine_keys` already
+/// pins the fake's own conduct, at the layer where that is the honest claim.
 ///
 /// Two gaps would have to be invented to get a twin green at all, both
-/// observed by running the port before reverting it: `LiveClient::get_value`
-/// rejects the plural kind (fixed below — it panicked "unsupported kind
-/// 'queues'" before the first probe, which also means this LIVE scenario has
-/// never run green), and the fake's `kinds::queue_defaults` binds no generic
-/// engine, so the assertion below fails with "a freshly created queue is
-/// expected to be generic-engine bound". Modelling that second one means
-/// inventing a whole `/generic_engines/<id>` URL space the fake's
-/// `kinds::EDGES` currently mis-points at `engines` — three inventions for a
-/// test with no independent oracle.
+/// observed by running the port before reverting it. `LiveClient::get_value`
+/// rejected the plural kind: `client.get_value("queues", ...)` panicked
+/// "unsupported kind 'queues'" before the first probe, which is also how we
+/// know this LIVE scenario has never been observed green. That one was
+/// repaired in `0d9d61f` — the body below passes the singular — but the
+/// second stands: the fake's `kinds::queue_defaults` binds no generic engine,
+/// so the assertion below fails with "a freshly created queue is expected to
+/// be generic-engine bound". Modelling it means inventing a whole
+/// `/generic_engines/<id>` URL space the fake's `kinds::EDGES` currently
+/// mis-points at `engines` — an invention in service of a test with no second
+/// party.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live: needs RDC_LIVE_* env"]
 async fn live_queue_engine_slot_counts_values_not_keys() {
@@ -350,15 +555,43 @@ async fn preflight_refuses_over_length_before_touching_the_env(cfg: &LiveConfig)
 /// The fake-backed twin. Runs in a plain `cargo test`; see
 /// `crate::support::fake`.
 ///
-/// This is the strongest twin in the file, and the reason is the golden.
+/// **What a green run here is worth, row by row.** The golden
 /// `testdata/live/expected/server_truth.toml` was captured from a real
-/// organization, so a green run here says the fake's trimming model
-/// reproduces something a real server did — an independent oracle, not a
-/// restatement of anything rdc or the fake believes. That is also exactly why
-/// this backend must never WRITE the golden: a capture from the fake would
-/// replace live evidence with the fake's own opinion, silently (the "CAPTURED
-/// golden" notice goes to stderr, which cargo swallows without
-/// `--nocapture`).
+/// organization — but `fake::quirks::TRIMMED_ON_WRITE` was written FROM that
+/// golden (its doc comment says so: "Every row is a line of
+/// `testdata/live/expected/server_truth.toml`"), in `d6607be`, the commit
+/// immediately before this port. So for the three trimming rows —
+/// `hook.description`, `email_template.subject`, `email_template.message` —
+/// this twin compares a table against its own source. What it still
+/// establishes for them is not nothing and is not proof: that the table is
+/// WIRED (`quirks::trim_stored_text` really runs on the write path, and the
+/// trim survives a round trip through the HTTP layer), and that the fake has
+/// not drifted off the live capture. Measured, by deleting rows from the
+/// table: drop `("hooks", "description")` and this goes red, drop both email
+/// rows and this goes red.
+///
+/// The fourth row, `label.name.at_limit_plus_newline = "accepted"`, is the
+/// one genuine two-party check in the body: it reads rdc's cap through
+/// `limit_for` and the fake answers from `validate::field_caps`, pinned
+/// independently — the same shape that makes `field_limits_match_the_server`
+/// above worth running against the fake at all.
+///
+/// The criterion, stated once so it reads the same here and at
+/// `live_queue_engine_slot_counts_values_not_keys`'s "# Not ported to the
+/// fake" note below: a fake-backed twin earns its place when something in the
+/// test is not the fake's own opinion — rdc's table, or a live-captured
+/// artifact it must reproduce. The engine-slot scenario has neither, which is
+/// why it stayed live-only. This one has the artifact for every row and rdc's
+/// table for the fourth, which is why it was ported. Neither is "an
+/// independent oracle" for the rule it names; only `live_*` can be that.
+///
+/// That is also why this backend must never WRITE the golden: a capture from
+/// the fake would replace live evidence with the fake's own opinion, silently
+/// (the "CAPTURED golden" notice goes to stderr, which cargo swallows without
+/// `--nocapture`). The refusal is the `Golden::Compare` handed to the body
+/// below — `load_or_compare` reads no environment variable at all — and it is
+/// structural rather than a race the assert below happened to win. See
+/// `support::expected::Golden` for the run that proved the difference.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fake_trailing_whitespace_handling_is_unchanged() {
     assert!(

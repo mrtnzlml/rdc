@@ -251,6 +251,11 @@ impl LiveClient {
             "schema" => "schemas",
             "inbox" => "inboxes",
             "email_template" => "email_templates",
+            // `RossumClient` has no typed saved-view PATCH; `rdc` itself
+            // pushes one through the generic value endpoint, and so does this
+            // client — the same reasoning as the `saved_view` arm of
+            // `delete` above.
+            "saved_view" => "saved_views",
             other => anyhow::bail!("patch_fields: unsupported kind '{other}'"),
         };
         let path = format!("/{endpoint}/{id}");
