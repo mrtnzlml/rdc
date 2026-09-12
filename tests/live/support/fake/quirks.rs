@@ -628,14 +628,61 @@ pub const QUIRKS: &[Quirk] = &[
     },
     Quirk {
         name: "over_length_field_is_refused_after_trailing_whitespace_trim",
+        // Enforced on CREATE and on PATCH alike
+        // (`validate::check_field_caps`, shared by `on_write` and
+        // `on_patch`). The cited scenario probes only the PATCH path.
+        //
+        // Read the fake-backed twin of that scenario carefully: it compares
+        // `snapshot::limits::field_limits` against `validate::field_caps`,
+        // which are two tables written from the SAME live probes and kept
+        // deliberately separate. Green therefore means "the two still agree",
+        // which is a real drift detector, and not "rdc agrees with Rossum",
+        // which only `live_field_limits_match_the_server` can say.
         provenance: Provenance::Modelled {
             proven_by: "server_truth.rs::live_field_limits_match_the_server",
         },
     },
     Quirk {
         name: "queue_carries_one_engine_slot_only",
+        // Enforced on CREATE and on PATCH alike (`validate::on_write` rule 2
+        // and `validate::on_patch`, both through
+        // `validate::check_queue_engine_slots`), counting VALUES rather than
+        // keys. The cited scenario is the live probe of both halves; note it
+        // only ever probes the PATCH path, which is why the create half is
+        // strictly the fake's own extrapolation of the same rule.
+        //
+        // What the citation does NOT establish: the scenario has never been
+        // observed green. Its first client call is
+        // `client.get_value("queues", queue_id)`, and `LiveClient::get_value`
+        // matches the SINGULAR kind names only ("queue", "hook", …), so
+        // "queues" falls to its `other =>` arm and the `.expect("GET queue")`
+        // panics before any probe runs. Recorded as a finding rather than
+        // silently repaired here.
         provenance: Provenance::Modelled {
             proven_by: "server_truth.rs::live_queue_engine_slot_counts_values_not_keys",
+        },
+    },
+    Quirk {
+        name: "queue_engine_slots_are_counted_on_the_patch_body",
+        // `validate::on_patch` counts the engine slots the PATCH BODY
+        // carries, never the merged result. So a partial
+        // `PATCH {"engine": "<url>"}` against a queue that already holds a
+        // `generic_engine` is ACCEPTED by the fake, leaving the stored queue
+        // with two bindings — a state the real API very likely refuses.
+        //
+        // Why the guess is the safe one here: the only shape anyone has
+        // observed is the all-three-keys body. `src/snapshot/limits.rs:334`
+        // records the rule as "a body may still carry all three keys — a
+        // pulled queue always does — as long as at most one has a value; the
+        // API counts values, not keys", which is a statement about ONE body,
+        // not about a merge. rdc never sends anything else: its within-env
+        // push re-serializes the whole on-disk queue (always three keys), and
+        // `cli::migrate::reconcile_engine_slot` nulls the losers rather than
+        // removing them. Modelling a merge would therefore be modelling a
+        // request rdc cannot produce, on no evidence.
+        provenance: Provenance::ChosenUnverified {
+            weighed_against: "src/snapshot/limits.rs:334",
+            corroborated_by: &[],
         },
     },
     Quirk {

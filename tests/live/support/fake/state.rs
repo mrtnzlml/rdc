@@ -251,6 +251,11 @@ impl OrgState {
         if self.get(kind, id).is_none() {
             return Err(ApiError::not_found());
         }
+        // Before anything is merged: a refused PATCH must leave the object —
+        // and its `modified_at` — exactly as it was, or `rdc`'s drift
+        // detection would see a change the server never stored. Deliberately
+        // a narrower check than `create`'s `on_write`; see `on_patch`.
+        super::validate::on_patch(kind, patch)?;
         // `relink` only ever adds. Without unlinking against the PRE-merge
         // refs first, a patch that re-parents an object (e.g. a hook's
         // `queues` from [q1] to [q2], or a queue's `workspace` from A to B)
@@ -983,6 +988,66 @@ mod tests {
         assert_eq!(err.status, 400);
         assert!(
             format!("{:?}", err.body).contains("Invalid hyperlink - No URL match"),
+            "wrong body: {:?}",
+            err.body
+        );
+    }
+
+    /// The create path's `an_over_length_field_is_refused_after_a_trailing_whitespace_trim`
+    /// twin for PATCH. Separate because the two paths take different
+    /// entry points (`validate::on_write` vs `validate::on_patch`) even
+    /// though they share `check_field_caps`, so a wiring regression on one
+    /// is invisible to the other's test.
+    #[test]
+    fn a_patch_is_refused_when_it_outruns_a_field_cap() {
+        let mut s = st();
+        let cap = crate::support::fake::validate::field_caps("labels")
+            .iter()
+            .find(|(field, _)| *field == "name")
+            .map(|(_, cap)| *cap)
+            .expect("labels/name has a cap");
+        let label = s.create("labels", json!({ "name": "L", "color": "#ff0000" })).unwrap();
+        let id = label["id"].as_u64().unwrap();
+        // At the cap, plus a trailing newline the server trims before it
+        // measures: accepted. This is the `label.name.at_limit_plus_newline`
+        // row of `testdata/live/expected/server_truth.toml`.
+        let at_limit = format!("{}\n", "n".repeat(cap));
+        s.patch("labels", id, &json!({ "name": at_limit })).expect("at the cap, accepted");
+        let over = "n".repeat(cap + 1);
+        let err = s.patch("labels", id, &json!({ "name": over })).expect_err("must be refused");
+        assert_eq!(err.status, 400);
+        // A refused PATCH stores nothing.
+        assert_eq!(s.get("labels", id).unwrap()["name"], json!(at_limit));
+    }
+
+    /// Quirk `queue_carries_one_engine_slot_only`, on the PATCH path: the
+    /// shape every rdc queue push sends — all three keys, one value — must be
+    /// accepted, and two values must not be.
+    #[test]
+    fn a_queue_patch_counts_engine_values_not_engine_keys() {
+        let mut s = st();
+        let sc = s.create("schemas", json!({ "name": "S" })).unwrap();
+        let e1 = s.create("engines", json!({ "name": "E" })).unwrap();
+        let q = s
+            .create("queues", json!({ "name": "Q", "schema": sc["url"] }))
+            .unwrap();
+        let id = q["id"].as_u64().unwrap();
+        s.patch(
+            "queues",
+            id,
+            &json!({
+                "engine": Value::Null,
+                "dedicated_engine": Value::Null,
+                "generic_engine": e1["url"],
+            }),
+        )
+        .expect("all three keys with one value is one binding");
+        let err = s
+            .patch("queues", id, &json!({ "engine": e1["url"], "generic_engine": e1["url"] }))
+            .expect_err("two bindings must be refused");
+        assert_eq!(err.status, 400);
+        assert!(
+            format!("{:?}", err.body).contains("Only one of dedicated_engine"),
             "wrong body: {:?}",
             err.body
         );

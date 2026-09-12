@@ -42,9 +42,25 @@
 //!   (`tests/live/support/teardown.rs:68-78`) is NOT the source: by the time
 //!   it runs, rdc has already deleted the field, so the prefix lookup comes
 //!   back empty and the sweep issues no request at all.
-//! - PATCH validation in general is unmodelled — see the doc comment on
-//!   `on_write` for why and for the exact scope (create-only) of what IS
-//!   checked.
+//! - PATCH validation is only PARTLY modelled. [`on_patch`] applies the two
+//!   rules that are decidable from the patch body alone — the length caps of
+//!   [`field_caps`] and the queue engine-slot exclusion of
+//!   [`check_queue_engine_slots`]. Everything else [`on_write`] checks is
+//!   create-only here, and each omission is a real gap:
+//!   - A PATCH's REFS are not resolved. The real API answers
+//!     `Invalid hyperlink - No URL match` on a PATCH exactly as it does on a
+//!     POST (`src/snapshot/refs.rs:159` describes the refusal without
+//!     restricting it to creates, and rdc's deferred-relink path exists
+//!     precisely because it PATCHes refs). The fake accepts them.
+//!   - The schema-vs-engine-fields rule and the unique-typed-template rule
+//!     (rules 5 and 4 of [`on_write`]) are not re-checked on a PATCH.
+//!   - Nothing validates the MERGED result. Both modelled rules read only the
+//!     keys the patch carries, so a partial PATCH that sets `engine` on a
+//!     queue already holding a `generic_engine` is accepted here. What the
+//!     real API does with that body is unknown: every live observation of the
+//!     rule (`server_truth.rs::live_queue_engine_slot_counts_values_not_keys`)
+//!     sends all three keys at once, which is also the only shape rdc's push
+//!     ever sends — see quirk `queue_engine_slots_are_counted_on_the_patch_body`.
 
 use serde_json::Value;
 
@@ -123,6 +139,87 @@ pub fn field_caps(kind: &str) -> &'static [(&'static str, usize)] {
 const UNIQUE_TEMPLATE_TYPES: &[&str] =
     &["rejection_default", "email_with_no_processable_attachments"];
 
+/// The three mutually exclusive fields a queue names its extraction engine
+/// through.
+///
+/// Pinned here and NOT imported from
+/// `crate::snapshot::limits::QUEUE_ENGINE_FIELDS`, for exactly the reason
+/// [`field_caps`] is not imported from `field_limits`: the fake stands in for
+/// the SERVER, and a shared constant would make any test of this rule compare
+/// rdc's belief with itself. The names are quoted from the refusal
+/// `src/cli/migrate/mod.rs`'s `reconcile_engine_slot` documents.
+const QUEUE_ENGINE_SLOTS: [&str; 3] = ["engine", "dedicated_engine", "generic_engine"];
+
+/// Refuse a queue body that binds more than one engine.
+///
+/// Counts VALUES, not KEYS: a body carrying all three keys with two of them
+/// explicitly `null` binds one engine and is accepted. That asymmetry is
+/// load-bearing for rdc twice over — `cli::migrate::reconcile_engine_slot`
+/// clears a losing binding by nulling it rather than removing the key, and
+/// every within-env queue PATCH re-serializes the whole on-disk body, which
+/// always carries all three keys. A fake that counted keys would refuse both.
+///
+/// The message is the one `src/cli/migrate/mod.rs`'s `reconcile_engine_slot`
+/// and `src/snapshot/limits.rs`'s `QUEUE_ENGINE_FIELDS` both quote verbatim
+/// from the real API.
+fn check_queue_engine_slots(body: &Value) -> Result<(), ApiError> {
+    let bound = QUEUE_ENGINE_SLOTS
+        .iter()
+        .filter(|f| body.get(**f).is_some_and(|v| !v.is_null()))
+        .count();
+    if bound > 1 {
+        return Err(ApiError::non_field(
+            "Only one of dedicated_engine, generic_engine or engine can be set.",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a body whose string fields outrun [`field_caps`].
+///
+/// Measured after the trailing-whitespace trim the server applies before
+/// validating, in `chars()` (Unicode code points, what Django's
+/// `MaxLengthValidator` counts), not bytes. The boundary is INCLUSIVE —
+/// reject only when strictly longer than the cap — which is load-bearing, not
+/// pedantry: a label's `color` is capped at 7 and the seed fixture carries
+/// `"#ff0000"`, exactly 7 characters. rdc itself treats caps as inclusive; see
+/// `hook_description_exactly_at_limit_is_accepted` in `src/snapshot/limits.rs`.
+///
+/// Shared by [`on_write`] and [`on_patch`] so the trim-then-count rule cannot
+/// drift between the two paths.
+fn check_field_caps(kind: &str, body: &Value) -> Result<(), ApiError> {
+    for &(field, cap) in field_caps(kind) {
+        if let Some(s) = body.get(field).and_then(Value::as_str)
+            && s.trim_end().chars().count() > cap
+        {
+            return Err(ApiError::bad_request(format!(
+                "{field}: Ensure this field has no more than {cap} characters."
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a PATCH the real API refuses.
+///
+/// A deliberate SUBSET of [`on_write`]: only the rules decidable from the
+/// patch body alone, because a partial PATCH legitimately omits most keys and
+/// re-running the create-only rules against it would refuse bodies the server
+/// takes (rule 2's "a queue needs a schema" would fire on every PATCH that
+/// doesn't touch `schema`). The module doc comment lists what is therefore
+/// still unmodelled here and what the real API does instead.
+///
+/// Takes no `OrgState`: neither modelled rule consults the object's current
+/// state, which is itself the modelling choice recorded as quirk
+/// `queue_engine_slots_are_counted_on_the_patch_body`.
+pub fn on_patch(kind: &'static str, body: &Value) -> Result<(), ApiError> {
+    if kind == "queues" {
+        check_queue_engine_slots(body)?;
+    }
+    check_field_caps(kind, body)?;
+    Ok(())
+}
+
 /// Refuse a create the real API refuses.
 ///
 /// Wired into `create` only — **PATCH validation is a deliberate, documented
@@ -167,40 +264,18 @@ pub fn on_write(st: &OrgState, kind: &'static str, body: &Value) -> Result<(), A
         }
     }
 
-    // 2. A queue is created with its schema, or not at all.
+    // 2. A queue is created with its schema, or not at all — and binds at
+    //    most one engine ([`check_queue_engine_slots`], shared with
+    //    [`on_patch`]).
     if kind == "queues" {
         if body.get("schema").and_then(Value::as_str).is_none() {
             return Err(ApiError::bad_request("schema: This field is required."));
         }
-        let slots = ["engine", "generic_engine"]
-            .iter()
-            .filter(|f| body.get(**f).map(|v| !v.is_null()).unwrap_or(false))
-            .count();
-        if slots > 1 {
-            return Err(ApiError::non_field(
-                "Only one of engine, generic_engine may be set.",
-            ));
-        }
+        check_queue_engine_slots(body)?;
     }
 
-    // 3. Length caps, measured after the trailing-whitespace trim the server
-    //    applies before validating, in `chars()` (Unicode code points, what
-    //    Django's `MaxLengthValidator` counts), not bytes. The boundary is
-    //    INCLUSIVE — reject only when strictly longer than the cap — which is
-    //    load-bearing, not pedantry: a label's `color` is capped at 7 and the
-    //    seed fixture carries `"#ff0000"`, exactly 7 characters. rdc itself
-    //    treats caps as inclusive; see
-    //    `hook_description_exactly_at_limit_is_accepted` in
-    //    `src/snapshot/limits.rs`.
-    for &(field, cap) in field_caps(kind) {
-        if let Some(s) = body.get(field).and_then(Value::as_str)
-            && s.trim_end().chars().count() > cap
-        {
-            return Err(ApiError::bad_request(format!(
-                "{field}: Ensure this field has no more than {cap} characters."
-            )));
-        }
-    }
+    // 3. Length caps ([`check_field_caps`], shared with [`on_patch`]).
+    check_field_caps(kind, body)?;
 
     // 4. A queue holds one template of each unique type, and it already has
     //    the ones the server made (`src/cli/push/email_templates.rs:97`).
