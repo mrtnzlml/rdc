@@ -2,17 +2,35 @@ use crate::support::assert_local::{load_lockfile, lockfile_keys, queue_file_path
 use crate::support::client::LiveClient;
 use crate::support::config::LiveConfig;
 use crate::support::converge::assert_converged;
-use crate::support::expected::{load_or_compare, CapturedState};
+use crate::support::expected::{capture_mode, load_or_compare, CapturedState};
 use crate::support::project::ProjectFixture;
 use crate::support::run_id::RunId;
 use crate::support::seeder::seed;
 use crate::support::staticdir::{load_manifest, static_dir};
 use crate::support::teardown::Teardown;
 
-/// Seed the graph (queue->ws/schema/hook, hook run_after), pull, and assert
-/// every cross-ref on disk is a portable `rdc://` ref. Capture the
-/// (run-id-stripped) `queue.schema` / `queue.workspace` ref values into
-/// `CapturedState.refs` for golden comparison.
+/// The fake-backed twin. Runs in a plain `cargo test`; see
+/// `crate::support::fake`.
+///
+/// See `fake_round_trip_core` (`tests/live/scenarios/round_trip.rs`) for why
+/// this refusal exists: `cross_refs` calls `load_or_compare` against
+/// `testdata/live/expected/cross_refs.toml`, a golden captured from a real
+/// organization, and a fake-backed run must never be the one that (re)writes
+/// it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fake_cross_refs() {
+    assert!(
+        !capture_mode(),
+        "RDC_LIVE_CAPTURE is set: a fake-backed run must never capture a golden. \
+         Capture only from the live invocation, e.g. \
+         `RDC_LIVE_CAPTURE=1 cargo test --test live -- --ignored live_cross_refs`."
+    );
+    let fake = crate::support::fake::FakeOrg::start().await;
+    cross_refs(&fake.config()).await;
+}
+
+/// The live twin. Unchanged: same `#[ignore]`, same env gate, so
+/// `cargo test --test live -- --ignored` still selects exactly the live set.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live: needs RDC_LIVE_* env"]
 async fn live_cross_refs() {
@@ -20,17 +38,25 @@ async fn live_cross_refs() {
         eprintln!("{}", LiveConfig::skip_reason());
         return;
     };
+    cross_refs(&cfg).await;
+}
+
+/// Seed the graph (queue->ws/schema/hook, hook run_after), pull, and assert
+/// every cross-ref on disk is a portable `rdc://` ref. Capture the
+/// (run-id-stripped) `queue.schema` / `queue.workspace` ref values into
+/// `CapturedState.refs` for golden comparison.
+async fn cross_refs(cfg: &LiveConfig) {
     let run_id = RunId::new();
-    let client = LiveClient::connect(&cfg).expect("connect");
+    let client = LiveClient::connect(cfg).expect("connect");
     // Teardown guard FIRST so a panic anywhere still cleans up.
-    let teardown = Teardown::new(LiveClient::connect(&cfg).unwrap(), run_id.clone());
+    let teardown = Teardown::new(LiveClient::connect(cfg).unwrap(), run_id.clone());
 
     let manifest = load_manifest().expect("manifest");
     let _index = seed(&client, &run_id, &static_dir(), &manifest)
         .await
         .expect("seed");
 
-    let project = ProjectFixture::init(&cfg, &["test"]).expect("init");
+    let project = ProjectFixture::init(cfg, &["test"]).expect("init");
     let out = project.run_rdc(&["sync", "test", "--no-push"]);
     assert!(
         out.status.success(),
