@@ -294,6 +294,59 @@ pub fn normalize_write(kind: &str, body: &mut Value) {
         "inboxes" => derive_inbox_email(body),
         _ => {}
     }
+    // Keyed on `(kind, field)` of its own rather than on the match above, the
+    // same way `impose_field_order` sits outside `shape_response`'s match: the
+    // rule spans several kinds and is about the field, not about which arm
+    // happens to exist.
+    trim_stored_text(kind, body);
+}
+
+/// The `(kind, field)` pairs the core API has been OBSERVED to store with
+/// trailing whitespace removed.
+///
+/// Every row is a line of `testdata/live/expected/server_truth.toml`, captured
+/// from a real organization by `live_trailing_whitespace_handling_is_unchanged`
+/// — `hook.description.trailing_spaces`,
+/// `email_template.subject.trailing_spaces`,
+/// `email_template.message.trailing_spaces`, all `"trimmed"`. Nothing else is
+/// in this table, and adding a row means capturing that golden again, not
+/// reasoning by analogy.
+///
+/// The obvious generalization — "DRF's `CharField(trim_whitespace=True)` is
+/// the default, so every top-level string is trimmed" — is deliberately NOT
+/// taken. It might well be right; it is also the shape of the premise that
+/// already cost this repo real data once, and the two directions of being
+/// wrong are not symmetric. Preserving where the server trims makes a fake
+/// scenario churn, loudly. Trimming where the server preserves silently
+/// normalizes away a difference, which is precisely how the MDH `$concat`
+/// corruption stayed invisible (`src/snapshot/noise.rs:93`). Between a loud
+/// wrong answer and a quiet one, the fake takes the loud one.
+const TRIMMED_ON_WRITE: &[(&str, &str)] = &[
+    ("hooks", "description"),
+    ("email_templates", "subject"),
+    ("email_templates", "message"),
+];
+
+/// Quirk `core_api_trims_trailing_whitespace_in_the_observed_fields`'s
+/// implementation: strip trailing whitespace from the stored value of every
+/// [`TRIMMED_ON_WRITE`] field.
+///
+/// TOP-LEVEL only. It reads the field straight off `body` and never walks
+/// into it, so a `message` key nested inside a hook's `config` or `settings`
+/// — where an MDH `$concat` separator lives — is untouched, which is the half
+/// of the rule `src/snapshot/noise.rs`'s `trim_trailing_whitespace` documents
+/// as verified. rdc's own trim is key-scoped at any depth; this one is
+/// kind-and-field-scoped at depth zero. They are not the same rule and must
+/// not be made to look like one.
+fn trim_stored_text(kind: &str, body: &mut Value) {
+    for &(_, field) in TRIMMED_ON_WRITE.iter().filter(|(k, _)| *k == kind) {
+        if let Some(Value::String(s)) = body.get_mut(field) {
+            let trimmed = s.trim_end();
+            if trimmed.len() != s.len() {
+                *s = trimmed.to_string();
+            }
+        }
+    }
 }
 
 /// Quirk `inbox_email_is_re_derived_on_write`'s implementation:
@@ -660,6 +713,53 @@ pub const QUIRKS: &[Quirk] = &[
         // silently repaired here.
         provenance: Provenance::Modelled {
             proven_by: "server_truth.rs::live_queue_engine_slot_counts_values_not_keys",
+        },
+    },
+    Quirk {
+        name: "core_api_trims_trailing_whitespace_in_the_observed_fields",
+        // Implemented by `quirks::trim_stored_text` over `TRIMMED_ON_WRITE`,
+        // on the write path, so a GET after the write returns the trimmed
+        // value — the same storage-fact shape as the `settings` half of
+        // `organization_patch_response_is_not_get_shaped`, not a
+        // response-only transform.
+        //
+        // The citation is unusually strong for this registry: the cited
+        // scenario does not assert a predicted answer, it compares against
+        // `testdata/live/expected/server_truth.toml`, an artifact CAPTURED
+        // from a real organization. Three of its four rows are this quirk.
+        //
+        // The fourth row, `label.name.at_limit_plus_newline = "accepted"`, is
+        // a different fact modelled elsewhere: `validate::check_field_caps`
+        // trims before it measures, so a name at exactly the cap plus a
+        // newline fits — quirk
+        // `over_length_field_is_refused_after_trailing_whitespace_trim`. That
+        // row was VACUOUS against this fake until `validate::on_patch`
+        // existed, because a fake that validated no PATCH at all accepted it
+        // for the wrong reason.
+        provenance: Provenance::Modelled {
+            proven_by: "server_truth.rs::live_trailing_whitespace_handling_is_unchanged",
+        },
+    },
+    Quirk {
+        name: "trailing_whitespace_in_every_other_field_is_unobserved",
+        // Three fields have been observed trimmed; every other string the
+        // fake stores is kept verbatim, nested strings above all. That is a
+        // deliberate REFUSAL to generalize, not an oversight — see
+        // `TRIMMED_ON_WRITE`'s doc comment for the asymmetry that decides it,
+        // and the cited line for the incident that makes the asymmetry real:
+        // "the server PRESERVES trailing whitespace in structured data",
+        // verified for MDH `$concat` label builders, after an earlier rdc
+        // trimmed all string leaves and corrupted them.
+        //
+        // Note the cited fact is about the CORE API too, not only about Data
+        // Storage: a `$concat` builder lives inside a hook's `settings`,
+        // which `GET /hooks/{id}` serves. So "the core API trims broadly" and
+        // "trailing whitespace in structured data survives" are both true,
+        // and depth is what separates them. `trim_stored_text` never
+        // descends, which is the only part of that boundary anyone has
+        // evidence for.
+        provenance: Provenance::NotModelled {
+            documented_at: "src/snapshot/noise.rs:93",
         },
     },
     Quirk {
@@ -1180,6 +1280,57 @@ mod tests {
         for t in listed["results"].as_array().unwrap() {
             assert_eq!(t["queue"], q["url"], "each default belongs to the queue");
         }
+    }
+
+    /// Quirk `core_api_trims_trailing_whitespace_in_the_observed_fields` at
+    /// the layer where the fake's own conduct is the honest claim — the
+    /// golden in `testdata/live/expected/server_truth.toml` is what pins it
+    /// against a real organization.
+    ///
+    /// Both halves matter, and the second one is the one with teeth. Measured:
+    /// replace `trim_stored_text`'s table lookup with "trim every top-level
+    /// string" and every scenario in this suite still passes — the golden
+    /// included, since all three of its trimming rows name fields that ARE in
+    /// the table. The only assertions that notice are this one and
+    /// `state.rs::a_patch_is_refused_when_it_outruns_a_field_cap`, both of
+    /// which name a field the table deliberately omits.
+    #[test]
+    fn only_the_observed_fields_are_trimmed_and_only_at_the_top_level() {
+        let mut s = OrgState::new("http://127.0.0.1:9/api/v1".to_string(), 1);
+        let hook = s
+            .create(
+                "hooks",
+                json!({
+                    "name": "H  ",
+                    "description": "documented   ",
+                    // A `$concat` separator lives at exactly this depth. It is
+                    // the value the original data-loss incident destroyed.
+                    "settings": { "label": ["Line ", "x", " - ", "y"] },
+                }),
+            )
+            .unwrap();
+        assert_eq!(hook["description"], json!("documented"), "an observed field is trimmed");
+        assert_eq!(hook["name"], json!("H  "), "an unobserved field is left verbatim");
+        assert_eq!(
+            hook["settings"]["label"],
+            json!(["Line ", "x", " - ", "y"]),
+            "nothing nested is touched, whatever the key"
+        );
+    }
+
+    /// The trim is a STORAGE fact, not a response transform: it must survive
+    /// into the stored object, so a later read sees it too — and it must run
+    /// on the PATCH path as well as on create, which is the only path
+    /// `live_trailing_whitespace_handling_is_unchanged` actually exercises
+    /// for a hook.
+    #[test]
+    fn the_trim_applies_to_a_patch_and_persists() {
+        let mut s = OrgState::new("http://127.0.0.1:9/api/v1".to_string(), 1);
+        let hook = s.create("hooks", json!({ "name": "H" })).unwrap();
+        let id = hook["id"].as_u64().unwrap();
+        let patched = s.patch("hooks", id, &json!({ "description": "later   " })).unwrap();
+        assert_eq!(patched["description"], json!("later"));
+        assert_eq!(s.get("hooks", id).unwrap()["description"], json!("later"));
     }
 
     #[test]
