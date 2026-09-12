@@ -3,8 +3,34 @@ use crate::support::config::LiveConfig;
 use crate::support::run_id::RunId;
 use crate::support::teardown::teardown_by_prefix;
 
-/// Safety net: delete every `rdc-it-*` object left behind by a crashed run.
-/// Deletes ALL harness objects regardless of run-id (the marker prefix).
+/// The fake-backed twin. Runs in a plain `cargo test`; see
+/// `crate::support::fake`.
+///
+/// Against a FRESH fake org (what `FakeOrg::start()` always hands back) this
+/// asserts nothing that can fail: every kind list here is checked via
+/// `list_ids_by_name_prefix(...).unwrap_or_default()` (an error and "no
+/// objects" are indistinguishable to the assertion), and a fresh org already
+/// has zero objects of every kind before the sweep even runs — so every
+/// `left.is_empty()` / `queues_left.is_empty()` check is vacuously true
+/// regardless of whether `teardown_by_prefix` does anything at all. The MDH
+/// half is even more vacuous: the fake has no Data Storage route at all
+/// (`mod.rs::route`'s doc comment: "Everything outside the API prefix — Data
+/// Storage included — is a flat 404"), `drop_mdh_collections_by_prefix`
+/// swallows that failure and returns `Ok(())` unconditionally, and the
+/// trailing `list_collection_names().await.unwrap_or_default()` again turns
+/// the resulting error into an empty vec. So this port is NOT falsifiable
+/// against a fresh fake org — it cannot go red no matter what
+/// `teardown_by_prefix` or the MDH sweep actually do. See the task report for
+/// the fuller reasoning; it is reported as an extraction that runs green by
+/// construction, not as a scenario this port meaningfully protects.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fake_janitor_sweep() {
+    let fake = crate::support::fake::FakeOrg::start().await;
+    janitor_sweep(&fake.config()).await;
+}
+
+/// The live twin. Unchanged: same `#[ignore]`, same env gate, so
+/// `cargo test --test live -- --ignored` still selects exactly the live set.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live: needs RDC_LIVE_* env"]
 async fn live_janitor_sweep() {
@@ -12,7 +38,13 @@ async fn live_janitor_sweep() {
         eprintln!("{}", LiveConfig::skip_reason());
         return;
     };
-    let client = LiveClient::connect(&cfg).expect("connect");
+    janitor_sweep(&cfg).await;
+}
+
+/// Safety net: delete every `rdc-it-*` object left behind by a crashed run.
+/// Deletes ALL harness objects regardless of run-id (the marker prefix).
+async fn janitor_sweep(cfg: &LiveConfig) {
+    let client = LiveClient::connect(cfg).expect("connect");
     teardown_by_prefix(&client, RunId::marker()).await.expect("janitor sweep");
 
     // Sweep the TARGET org too when one is configured: the promotion scenarios
@@ -67,13 +99,13 @@ async fn live_janitor_sweep() {
 
     // MDH: drop every throwaway `rdc_it_*` collection a crashed run left behind.
     crate::support::teardown::drop_mdh_collections_by_prefix(
-        &cfg,
+        cfg,
         crate::support::mdh::MDH_COLLECTION_MARKER,
     )
     .await
     .expect("janitor mdh sweep");
     // Collection drop is async (202); poll until none remain (bounded).
-    let raw = crate::support::mdh::MdhRaw::connect(&cfg).expect("connect mdh");
+    let raw = crate::support::mdh::MdhRaw::connect(cfg).expect("connect mdh");
     let mut remaining = raw.list_collection_names().await.unwrap_or_default();
     let mut waited = 0;
     while remaining
