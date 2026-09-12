@@ -84,8 +84,9 @@ fn schema_defaults(o: &mut Map<String, Value>, _c: &OrgCtx) {
 /// A real pulled queue carries these server-owned arrays. The evidence is
 /// `snapshot::noise::sort_url_arrays`, whose doc names them as exactly that —
 /// "a queue's server-computed back-reference arrays (`hooks`, `webhooks`,
-/// `rules`, `users`, …)", returned in an order the real API varies per env and
-/// endpoint. NOT `testdata/live/snapshot/**/queue.json`, which this comment
+/// `rules`, `users`, `workflows`, `queues`, `run_after`, `triggers`, …)",
+/// returned in an order the real API varies per env and endpoint. The
+/// trailing `…` is that doc's own, not a truncation of it. NOT `testdata/live/snapshot/**/queue.json`, which this comment
 /// used to call a captured body: `support::snapshot`'s module doc says that
 /// tree is hand-authored and written straight to disk, so it shows what rdc
 /// sends, not what the server answered. `pull::queues::refresh_backrefs`

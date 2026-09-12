@@ -68,10 +68,18 @@
 //! hypothetical: a citation of `kinds.rs:226-235` for `kinds::EDGES`, in
 //! this very file, was invalidated by an unrelated doc edit FOUR commits
 //! after it was written (added in `ca5c501`; `464d0c3`, `7c7d7b7` and
-//! `2605933` went by, then `e72e373` grew the `has_modified_at` doc comment
-//! and shifted `EDGES` up two lines). The brief that commissioned this rule
-//! said "two", which is how a worked example about rot came to misstate its
-//! own history.
+//! `2605933` went by, then `e72e373` replaced five lines of restated
+//! evidence in the `has_modified_at` doc comment with a three-line pointer
+//! — a net two lines FEWER, which moved `EDGES` up by two). Note the
+//! direction: the edit that broke the citation SHRANK the file. A rule of
+//! thumb that only watches for insertions above a citation would have
+//! missed it.
+//!
+//! This worked example has itself been wrong twice: the brief that
+//! commissioned the rule said "two commits" when it was four, and the
+//! correction of that then said `e72e373` "grew" the comment when it shrank
+//! it. Both slips survived a verification pass. Which is the point — an
+//! anecdote about citation rot is exactly the kind of prose nobody re-checks.
 
 use serde_json::{json, Value};
 
