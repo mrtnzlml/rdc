@@ -2,17 +2,35 @@ use crate::support::assert_local::{load_lockfile, lockfile_keys, queue_file_path
 use crate::support::client::LiveClient;
 use crate::support::config::LiveConfig;
 use crate::support::converge::assert_converged;
-use crate::support::expected::{load_or_compare, CapturedState};
+use crate::support::expected::{capture_mode, load_or_compare, CapturedState};
 use crate::support::project::ProjectFixture;
 use crate::support::run_id::RunId;
 use crate::support::seeder::seed;
 use crate::support::staticdir::{load_manifest, static_dir};
 use crate::support::teardown::Teardown;
 
-/// Seed two workspaces each owning a queue named "Invoices" (+ schema +,
-/// for one, an inbox). After pull, pin the lockfile slugs and the on-disk
-/// directory layout for the same-named objects. The exact dedup form is
-/// CAPTURED, not predicted (see plan Global Constraints).
+/// The fake-backed twin. Runs in a plain `cargo test`; see
+/// `crate::support::fake`.
+///
+/// See `fake_round_trip_core` (`tests/live/scenarios/round_trip.rs`) for why
+/// this refusal exists: `collisions_identity` calls `load_or_compare` against
+/// `testdata/live/expected/collisions.toml`, a golden captured from a real
+/// organization, and a fake-backed run must never be the one that (re)writes
+/// it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fake_collisions_identity() {
+    assert!(
+        !capture_mode(),
+        "RDC_LIVE_CAPTURE is set: a fake-backed run must never capture a golden. \
+         Capture only from the live invocation, e.g. \
+         `RDC_LIVE_CAPTURE=1 cargo test --test live -- --ignored live_collisions_identity`."
+    );
+    let fake = crate::support::fake::FakeOrg::start().await;
+    collisions_identity(&fake.config()).await;
+}
+
+/// The live twin. Unchanged: same `#[ignore]`, same env gate, so
+/// `cargo test --test live -- --ignored` still selects exactly the live set.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live: needs RDC_LIVE_* env"]
 async fn live_collisions_identity() {
@@ -20,14 +38,22 @@ async fn live_collisions_identity() {
         eprintln!("{}", LiveConfig::skip_reason());
         return;
     };
+    collisions_identity(&cfg).await;
+}
+
+/// Seed two workspaces each owning a queue named "Invoices" (+ schema +,
+/// for one, an inbox). After pull, pin the lockfile slugs and the on-disk
+/// directory layout for the same-named objects. The exact dedup form is
+/// CAPTURED, not predicted (see plan Global Constraints).
+async fn collisions_identity(cfg: &LiveConfig) {
     let run_id = RunId::new();
-    let client = LiveClient::connect(&cfg).expect("connect");
-    let teardown = Teardown::new(LiveClient::connect(&cfg).unwrap(), run_id.clone());
+    let client = LiveClient::connect(cfg).expect("connect");
+    let teardown = Teardown::new(LiveClient::connect(cfg).unwrap(), run_id.clone());
 
     let manifest = load_manifest().expect("manifest");
     let index = seed(&client, &run_id, &static_dir(), &manifest).await.expect("seed");
 
-    let project = ProjectFixture::init(&cfg, &["test"]).expect("init");
+    let project = ProjectFixture::init(cfg, &["test"]).expect("init");
     let out = project.run_rdc(&["sync", "test", "--no-push"]);
     assert!(out.status.success(), "pull failed: {}", String::from_utf8_lossy(&out.stderr));
 
