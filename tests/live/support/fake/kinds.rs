@@ -81,8 +81,14 @@ fn schema_defaults(o: &mut Map<String, Value>, _c: &OrgCtx) {
     ensure(o, "content", json!([]));
 }
 
-/// A real pulled queue carries these server-owned arrays — see the captured
-/// body in `testdata/live/snapshot/**/queue.json`. `pull::queues::refresh_backrefs`
+/// A real pulled queue carries these server-owned arrays. The evidence is
+/// `snapshot::noise::sort_url_arrays`, whose doc names them as exactly that —
+/// "a queue's server-computed back-reference arrays (`hooks`, `webhooks`,
+/// `rules`, `users`, …)", returned in an order the real API varies per env and
+/// endpoint. NOT `testdata/live/snapshot/**/queue.json`, which this comment
+/// used to call a captured body: `support::snapshot`'s module doc says that
+/// tree is hand-authored and written straight to disk, so it shows what rdc
+/// sends, not what the server answered. `pull::queues::refresh_backrefs`
 /// exists precisely because `hooks`/`rules` change when a child is created, so
 /// a fake that never grew them would leave that path unexercised.
 fn queue_defaults(o: &mut Map<String, Value>, _c: &OrgCtx) {
@@ -212,14 +218,35 @@ pub struct Edge {
 }
 
 /// The complete edge table: eleven owner-scoped edges plus the two universal
-/// ones. `saved_views.queues_filter` — confirmed against the shape captured
-/// in `testdata/live/snapshot/saved-views/rdc-it-{{RUN}}-view.json`
-/// (`"queues_filter": ["rdc://queues/..."]`) — is array-shaped and carries no
-/// back-reference: a saved view doesn't own the queues it filters on, the way
-/// a hook or rule owns the queues it runs against, so nothing on `queues`
-/// grows when a saved view names it. Adding an edge is a one-line addition
-/// here; nothing else should ever need touching —
-/// `every_edge_in_the_table_is_load_bearing` below drives it for free.
+/// ones. Adding an edge is a one-line addition here; nothing else should ever
+/// need touching — `every_edge_in_the_table_is_load_bearing` below drives it
+/// for free.
+///
+/// `saved_views.queues_filter`'s two halves are evidenced very differently,
+/// so they are stated separately.
+///
+/// ARRAY-shaped: `model::SavedView::queues_filter` is a `Vec<String>`, and
+/// that model is what every real `GET /saved_views` response is deserialized
+/// into, so the wire shape is settled. The fixture
+/// `testdata/live/snapshot/saved-views/rdc-it-{{RUN}}-view.json` agrees
+/// (`"queues_filter": ["rdc://queues/..."]`) but is NOT independent
+/// confirmation of it: `support::snapshot`'s module doc says that whole tree
+/// is hand-authored and written straight to disk, never seeded and pulled, so
+/// it evidences what rdc SENDS, never what a server returned.
+///
+/// `back_ref: None` is a CHOICE, and weaker. An earlier version of this
+/// comment justified it as "a saved view doesn't own the queues it filters
+/// on, the way a hook or rule owns the queues it runs against" — a principle
+/// that does not discriminate: `email_templates.queue` also carries
+/// `back_ref: None`, and a queue owns its email templates if it owns anything
+/// (they are literally stored under it on disk). The honest position is
+/// narrower: nothing in this repo shows a queue growing a `saved_views`
+/// array, so the fake does not grow one. The nearest corroboration is
+/// `snapshot::noise::sort_url_arrays`, whose doc enumerates the queue
+/// back-reference arrays the real API returns in non-deterministic order —
+/// `hooks`, `webhooks`, `rules`, `users`, `workflows`, `queues`, `run_after`,
+/// `triggers` — with no `saved_views` among them. That list ends in an
+/// ellipsis, so its silence is weak evidence, not proof.
 pub const EDGES: &[Edge] = &[
     Edge { owner: Some("queues"), field: "workspace", shape: RefShape::Single, target: "workspaces", back_ref: Some(BackRef::Push("queues")) },
     Edge { owner: Some("queues"), field: "schema", shape: RefShape::Single, target: "schemas", back_ref: Some(BackRef::Push("queues")) },
@@ -616,18 +643,50 @@ mod tests {
     /// `validate.rs` or `graph.rs` stops actually consulting a row that is
     /// still declared here — the more likely regression, since deleting a
     /// row outright is a diff anyone reviewing `EDGES` would see — the
-    /// corresponding assertion fails HERE, naming the row.
+    /// corresponding assertion fails HERE, naming the row. With one
+    /// exception, worth knowing before trusting a green run too far.
+    ///
+    /// The REF-TYPE half is masked for the three `*.queues` owner rows
+    /// (`inboxes`, `hooks`, `rules`). `validate::on_write` iterates every
+    /// edge whose `owner` is `None` or equal to the kind being written, so a
+    /// wrong-kind url in one of those bodies is refused by the universal
+    /// `(None, "queues", "queues")` row just as well as by the owner's own —
+    /// `assert_ref_type_is_enforced` would still pass if `validate` stopped
+    /// consulting the owner row entirely. Verified by driving the fake with
+    /// exactly those three rows filtered out of `on_write`'s iteration: the
+    /// loop stayed green. Every other row is unmasked, because no universal
+    /// row carries its field name (`workspace`, `schema`, `engine`,
+    /// `generic_engine`, `queue`, `organization`, `queues_filter`).
+    ///
+    /// Those three rows are still proven load-bearing here — by the OTHER
+    /// half. `graph::relink`/`unlink` walk `kinds::edges_for`, which is
+    /// owner-scoped only and never sees a universal row, so
+    /// `assert_back_ref_is_maintained` fails the moment one of them stops
+    /// being consulted; verified the same way, by skipping those three rows
+    /// in `relink` and watching the loop fail naming `inboxes.queues`.
     ///
     /// A row's outright DELETION is a narrower case this loop cannot itself
     /// catch: it can only assert about rows still present in `EDGES`, so
-    /// removing one just shrinks the loop rather than failing it. For a
-    /// `back_ref`-carrying row, that deletion still fails LOUDLY — just one
-    /// module over, in `only_the_documented_owners_maintain_a_back_reference`
-    /// above (the owner drops out of the expected set) and in graph.rs's
-    /// hand-written creation tests (the back-reference stops growing) — both
-    /// verified live while writing this loop. A non-`back_ref` row's
-    /// deletion (e.g. `email_templates.queue`) currently has no such
-    /// independent backstop; see the task report for this finding.
+    /// removing one just shrinks the loop rather than failing it. The
+    /// backstop for that is
+    /// `the_edge_table_still_models_every_edge_it_is_supposed_to` above,
+    /// which pins the full row set against a hand-written list and therefore
+    /// covers EVERY row — owner-scoped or universal, `back_ref`-carrying or
+    /// not, `email_templates.queue` included.
+    ///
+    /// Two narrower backstops also fire for some rows, and neither is
+    /// general — stated exactly, because "a deleted row fails loudly
+    /// somewhere else too" is easy to over-read:
+    /// `only_the_documented_owners_maintain_a_back_reference` compares the
+    /// set of OWNERS, so it only notices a deletion that leaves an owner
+    /// with no `back_ref` row at all. That covers `inboxes.queues`,
+    /// `hooks.queues` and `rules.queues`, but NOT `queues.workspace` or
+    /// `queues.schema`: delete either and `"queues"` is still in the set via
+    /// the surviving sibling. graph.rs's hand-written tests cover those two
+    /// (`creating_a_queue_grows_its_workspace_and_schema` asserts both
+    /// back-references, `patching_a_queues_workspace_moves_the_back_ref` the
+    /// first). All of it verified by deleting each row in turn and reading
+    /// off which tests actually went red.
     #[test]
     fn every_edge_in_the_table_is_load_bearing() {
         for edge in EDGES {
