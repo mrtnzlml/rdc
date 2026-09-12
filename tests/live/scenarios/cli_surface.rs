@@ -91,8 +91,16 @@ async fn auth_validates_before_writing(cfg: &LiveConfig) {
     );
 }
 
-/// `rdc doctor` is a no-op on a freshly pulled snapshot, realigns a slug after
-/// the object is renamed remotely, and leaves the env still converging.
+/// The fake-backed twin. Runs in a plain `cargo test`; see
+/// `crate::support::fake`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fake_doctor_realign_after_a_remote_rename() {
+    let fake = crate::support::fake::FakeOrg::start().await;
+    doctor_realign_after_a_remote_rename(&fake.config()).await;
+}
+
+/// The live twin. Unchanged: same `#[ignore]`, same env gate, so
+/// `cargo test --test live -- --ignored` still selects exactly the live set.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live: needs RDC_LIVE_* env"]
 async fn live_doctor_realign_after_a_remote_rename() {
@@ -100,15 +108,21 @@ async fn live_doctor_realign_after_a_remote_rename() {
         eprintln!("{}", LiveConfig::skip_reason());
         return;
     };
+    doctor_realign_after_a_remote_rename(&cfg).await;
+}
+
+/// `rdc doctor` is a no-op on a freshly pulled snapshot, realigns a slug after
+/// the object is renamed remotely, and leaves the env still converging.
+async fn doctor_realign_after_a_remote_rename(cfg: &LiveConfig) {
     let run_id = RunId::new();
-    let client = LiveClient::connect(&cfg).expect("connect");
-    let teardown = Teardown::new(LiveClient::connect(&cfg).unwrap(), run_id.clone());
+    let client = LiveClient::connect(cfg).expect("connect");
+    let teardown = Teardown::new(LiveClient::connect(cfg).unwrap(), run_id.clone());
 
     let manifest = load_manifest().expect("manifest");
     let index = seed(&client, &run_id, &static_dir(), &manifest).await.expect("seed");
 
     let prefix = run_id.list_prefix();
-    let project = ProjectFixture::init(&cfg, &["test"]).expect("init");
+    let project = ProjectFixture::init(cfg, &["test"]).expect("init");
     let pull = project.run_rdc(&["sync", "test", "--no-push"]);
     assert!(pull.status.success(), "pull failed: {}", combined(&pull));
     assert_converged(&project, "test", &prefix, "after the initial pull");
