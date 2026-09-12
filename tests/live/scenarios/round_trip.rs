@@ -2,7 +2,7 @@ use crate::support::assert_local::{field, load_lockfile, lockfile_keys, queue_fi
 use crate::support::client::LiveClient;
 use crate::support::config::LiveConfig;
 use crate::support::converge::assert_converged;
-use crate::support::expected::{capture_mode, load_or_compare, CapturedState};
+use crate::support::expected::{capture_mode, load_or_compare, CapturedState, Golden};
 use crate::support::project::ProjectFixture;
 use crate::support::run_id::RunId;
 use crate::support::seeder::seed;
@@ -14,16 +14,25 @@ use crate::support::teardown::Teardown;
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fake_round_trip_core() {
     // `round_trip_core` calls `load_or_compare` on the same golden path for
-    // both backends, and `capture_mode()` reads the process-global
-    // `RDC_LIVE_CAPTURE` env var. The documented capture command passes
-    // `--ignored`, which excludes this test — but anyone with that variable
-    // exported in their shell who runs a plain `cargo test` would have THIS
-    // test rewrite `testdata/live/expected/round_trip.toml` from the fake
-    // instead (the "CAPTURED golden" notice goes to stderr, which cargo
-    // swallows without `--nocapture`, so nothing would even look wrong).
-    // That golden is an artifact captured from a real organization; blessing
-    // a fake divergence into it would corrupt the live oracle silently. So:
-    // refuse outright rather than ever letting this backend write it.
+    // both backends. `testdata/live/expected/round_trip.toml` is an artifact
+    // captured from a real organization; blessing a fake divergence into it
+    // would corrupt the live oracle silently — the "CAPTURED golden" notice
+    // goes to stderr, which cargo swallows without `--nocapture`, so nothing
+    // would even look wrong.
+    //
+    // What actually keeps that from happening is the `Golden::Compare` passed
+    // below: `load_or_compare` no longer consults the environment at all, so
+    // this backend has no way to express a capture. The assert is the
+    // courtesy half — it tells someone who exported `RDC_LIVE_CAPTURE` and
+    // then ran a plain `cargo test` that their variable will not do what they
+    // expect here (the documented capture command passes `--ignored`, which
+    // excludes this test).
+    //
+    // The assert alone was NOT enough, and the gap was not the exported-shell
+    // case it was written for: `capture_mode()` used to be read inside
+    // `load_or_compare`, seconds after this assert passed, while a unit test
+    // in this same binary set `RDC_LIVE_CAPTURE` process-wide. See
+    // `support::expected::Golden` for the demonstration.
     assert!(
         !capture_mode(),
         "RDC_LIVE_CAPTURE is set: a fake-backed run must never capture a golden. \
@@ -31,7 +40,7 @@ async fn fake_round_trip_core() {
          `RDC_LIVE_CAPTURE=1 cargo test --test live -- --ignored live_round_trip_core`."
     );
     let fake = crate::support::fake::FakeOrg::start().await;
-    round_trip_core(&fake.config()).await;
+    round_trip_core(&fake.config(), Golden::Compare).await;
 }
 
 /// The live twin. Unchanged: same `#[ignore]`, same env gate, so
@@ -43,13 +52,13 @@ async fn live_round_trip_core() {
         eprintln!("{}", LiveConfig::skip_reason());
         return;
     };
-    round_trip_core(&cfg).await;
+    round_trip_core(&cfg, Golden::from_env()).await;
 }
 
 /// Full round-trip: seed the graph on the remote, `rdc sync test` pulls it
 /// down, assert the local snapshot/lockfile, edit a label locally, push it,
 /// and assert the remote reflects the edit. Teardown deletes everything.
-async fn round_trip_core(cfg: &LiveConfig) {
+async fn round_trip_core(cfg: &LiveConfig, golden: Golden) {
     let run_id = RunId::new();
     let client = LiveClient::connect(cfg).expect("connect");
     // Teardown guard FIRST so a panic anywhere still cleans up.
@@ -119,8 +128,8 @@ async fn round_trip_core(cfg: &LiveConfig) {
             .unwrap_or_else(|| panic!("queue {qslug_raw} has no workspace ref"));
         captured.refs.insert("queue.workspace".into(), w.replace(&prefix.to_lowercase(), "<id>"));
     }
-    let golden = static_dir().join("expected/round_trip.toml");
-    load_or_compare(&golden, &captured).expect("local state matches golden");
+    let golden_path = static_dir().join("expected/round_trip.toml");
+    load_or_compare(&golden_path, &captured, golden).expect("local state matches golden");
 
     // --- edit a label locally and push ---
     let label_id = index.id("label-priority").expect("label id");

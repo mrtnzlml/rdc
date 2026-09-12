@@ -2,7 +2,7 @@ use crate::support::assert_local::{load_lockfile, lockfile_keys, queue_file_path
 use crate::support::client::LiveClient;
 use crate::support::config::LiveConfig;
 use crate::support::converge::assert_converged;
-use crate::support::expected::{capture_mode, load_or_compare, CapturedState};
+use crate::support::expected::{capture_mode, load_or_compare, CapturedState, Golden};
 use crate::support::project::ProjectFixture;
 use crate::support::run_id::RunId;
 use crate::support::seeder::seed;
@@ -16,7 +16,8 @@ use crate::support::teardown::Teardown;
 /// this refusal exists: `collisions_identity` calls `load_or_compare` against
 /// `testdata/live/expected/collisions.toml`, a golden captured from a real
 /// organization, and a fake-backed run must never be the one that (re)writes
-/// it.
+/// it. The `Golden::Compare` below is the guarantee; the assert is the
+/// courtesy notice.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fake_collisions_identity() {
     assert!(
@@ -26,7 +27,7 @@ async fn fake_collisions_identity() {
          `RDC_LIVE_CAPTURE=1 cargo test --test live -- --ignored live_collisions_identity`."
     );
     let fake = crate::support::fake::FakeOrg::start().await;
-    collisions_identity(&fake.config()).await;
+    collisions_identity(&fake.config(), Golden::Compare).await;
 }
 
 /// The live twin. Unchanged: same `#[ignore]`, same env gate, so
@@ -38,14 +39,14 @@ async fn live_collisions_identity() {
         eprintln!("{}", LiveConfig::skip_reason());
         return;
     };
-    collisions_identity(&cfg).await;
+    collisions_identity(&cfg, Golden::from_env()).await;
 }
 
 /// Seed two workspaces each owning a queue named "Invoices" (+ schema +,
 /// for one, an inbox). After pull, pin the lockfile slugs and the on-disk
 /// directory layout for the same-named objects. The exact dedup form is
 /// CAPTURED, not predicted (see plan Global Constraints).
-async fn collisions_identity(cfg: &LiveConfig) {
+async fn collisions_identity(cfg: &LiveConfig, golden: Golden) {
     let run_id = RunId::new();
     let client = LiveClient::connect(cfg).expect("connect");
     let teardown = Teardown::new(LiveClient::connect(cfg).unwrap(), run_id.clone());
@@ -110,8 +111,8 @@ async fn collisions_identity(cfg: &LiveConfig) {
     // id-pinned slug stays put, so a following cycle has nothing to do.
     assert_converged(&project, "test", &prefix, "after a remote rename was re-pulled");
 
-    let golden = static_dir().join("expected/collisions.toml");
-    load_or_compare(&golden, &captured).expect("collision state matches golden");
+    let golden_path = static_dir().join("expected/collisions.toml");
+    load_or_compare(&golden_path, &captured, golden).expect("collision state matches golden");
 
     drop(teardown);
 }

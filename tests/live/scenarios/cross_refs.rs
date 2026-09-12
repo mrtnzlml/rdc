@@ -2,7 +2,7 @@ use crate::support::assert_local::{load_lockfile, lockfile_keys, queue_file_path
 use crate::support::client::LiveClient;
 use crate::support::config::LiveConfig;
 use crate::support::converge::assert_converged;
-use crate::support::expected::{capture_mode, load_or_compare, CapturedState};
+use crate::support::expected::{capture_mode, load_or_compare, CapturedState, Golden};
 use crate::support::project::ProjectFixture;
 use crate::support::run_id::RunId;
 use crate::support::seeder::seed;
@@ -16,7 +16,8 @@ use crate::support::teardown::Teardown;
 /// this refusal exists: `cross_refs` calls `load_or_compare` against
 /// `testdata/live/expected/cross_refs.toml`, a golden captured from a real
 /// organization, and a fake-backed run must never be the one that (re)writes
-/// it.
+/// it. The `Golden::Compare` below is the guarantee; the assert is the
+/// courtesy notice.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fake_cross_refs() {
     assert!(
@@ -26,7 +27,7 @@ async fn fake_cross_refs() {
          `RDC_LIVE_CAPTURE=1 cargo test --test live -- --ignored live_cross_refs`."
     );
     let fake = crate::support::fake::FakeOrg::start().await;
-    cross_refs(&fake.config()).await;
+    cross_refs(&fake.config(), Golden::Compare).await;
 }
 
 /// The live twin. Unchanged: same `#[ignore]`, same env gate, so
@@ -38,14 +39,14 @@ async fn live_cross_refs() {
         eprintln!("{}", LiveConfig::skip_reason());
         return;
     };
-    cross_refs(&cfg).await;
+    cross_refs(&cfg, Golden::from_env()).await;
 }
 
 /// Seed the graph (queue->ws/schema/hook, hook run_after), pull, and assert
 /// every cross-ref on disk is a portable `rdc://` ref. Capture the
 /// (run-id-stripped) `queue.schema` / `queue.workspace` ref values into
 /// `CapturedState.refs` for golden comparison.
-async fn cross_refs(cfg: &LiveConfig) {
+async fn cross_refs(cfg: &LiveConfig, golden: Golden) {
     let run_id = RunId::new();
     let client = LiveClient::connect(cfg).expect("connect");
     // Teardown guard FIRST so a panic anywhere still cleans up.
@@ -143,8 +144,8 @@ async fn cross_refs(cfg: &LiveConfig) {
     // -drift class this whole harness exists to catch.
     assert_converged(&project, "test", &prefix, "after pulling the cross-ref graph");
 
-    let golden = static_dir().join("expected/cross_refs.toml");
-    load_or_compare(&golden, &captured).expect("cross-ref state matches golden");
+    let golden_path = static_dir().join("expected/cross_refs.toml");
+    load_or_compare(&golden_path, &captured, golden).expect("cross-ref state matches golden");
 
     drop(teardown); // explicit: delete everything now (also runs on panic)
 }

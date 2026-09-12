@@ -30,7 +30,7 @@
 
 use crate::support::client::LiveClient;
 use crate::support::config::LiveConfig;
-use crate::support::expected::{capture_mode, load_or_compare, CapturedState};
+use crate::support::expected::{capture_mode, load_or_compare, CapturedState, Golden};
 use crate::support::project::ProjectFixture;
 use crate::support::run_id::RunId;
 use crate::support::seeder::seed;
@@ -368,7 +368,7 @@ async fn fake_trailing_whitespace_handling_is_unchanged() {
          `RDC_LIVE_CAPTURE=1 cargo test --test live -- --ignored live_trailing_whitespace_handling_is_unchanged`."
     );
     let fake = crate::support::fake::FakeOrg::start().await;
-    trailing_whitespace_handling_is_unchanged(&fake.config()).await;
+    trailing_whitespace_handling_is_unchanged(&fake.config(), Golden::Compare).await;
 }
 
 /// The live twin. Unchanged: same `#[ignore]`, same env gate, so
@@ -380,14 +380,14 @@ async fn live_trailing_whitespace_handling_is_unchanged() {
         eprintln!("{}", LiveConfig::skip_reason());
         return;
     };
-    trailing_whitespace_handling_is_unchanged(&cfg).await;
+    trailing_whitespace_handling_is_unchanged(&cfg, Golden::from_env()).await;
 }
 
 /// Characterize what the server does with trailing whitespace, per field.
 ///
 /// Recorded, not predicted — see the module docs. A change in any recorded
 /// value means an rdc premise about trimming needs revisiting.
-async fn trailing_whitespace_handling_is_unchanged(cfg: &LiveConfig) {
+async fn trailing_whitespace_handling_is_unchanged(cfg: &LiveConfig, golden: Golden) {
     let run_id = RunId::new();
     let client = LiveClient::connect(cfg).expect("connect");
     let teardown = Teardown::new(LiveClient::connect(cfg).unwrap(), run_id.clone());
@@ -471,8 +471,9 @@ async fn trailing_whitespace_handling_is_unchanged(cfg: &LiveConfig) {
         if res.is_ok() { "accepted".into() } else { "rejected".to_string() },
     );
 
-    let golden = static_dir().join("expected/server_truth.toml");
-    load_or_compare(&golden, &captured).expect("server whitespace behavior matches the golden");
+    let golden_path = static_dir().join("expected/server_truth.toml");
+    load_or_compare(&golden_path, &captured, golden)
+        .expect("server whitespace behavior matches the golden");
 
     drop(teardown);
 }
