@@ -62,6 +62,18 @@ fn ids_of(templates: &[(std::path::PathBuf, serde_json::Value)]) -> Vec<u64> {
     v
 }
 
+/// The fake-backed twin. Runs in a plain `cargo test`; see
+/// `crate::support::fake`. `email_templates_round_trip` never calls
+/// `capture_mode` / `load_or_compare` — it has no golden — so, like
+/// `fake_sidecars_redaction`, there is nothing here to refuse.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fake_email_templates_round_trip() {
+    let fake = crate::support::fake::FakeOrg::start().await;
+    email_templates_round_trip(&fake.config()).await;
+}
+
+/// The live twin. Unchanged: same `#[ignore]`, same env gate, so
+/// `cargo test --test live -- --ignored` still selects exactly the live set.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live: needs RDC_LIVE_* env"]
 async fn live_email_templates_round_trip() {
@@ -69,12 +81,16 @@ async fn live_email_templates_round_trip() {
         eprintln!("{}", LiveConfig::skip_reason());
         return;
     };
+    email_templates_round_trip(&cfg).await;
+}
+
+async fn email_templates_round_trip(cfg: &LiveConfig) {
     let run_id = RunId::new();
-    let client = LiveClient::connect(&cfg).expect("connect");
+    let client = LiveClient::connect(cfg).expect("connect");
     // Teardown guard FIRST — the templates carry the run-id name prefix, so
     // `teardown_by_prefix` reaches them (it deletes email_template before
     // queue, which is the order the API needs).
-    let teardown = Teardown::new(LiveClient::connect(&cfg).unwrap(), run_id.clone());
+    let teardown = Teardown::new(LiveClient::connect(cfg).unwrap(), run_id.clone());
 
     let manifest = load_manifest().expect("manifest");
     let index = seed(&client, &run_id, &static_dir(), &manifest).await.expect("seed");
@@ -120,7 +136,7 @@ async fn live_email_templates_round_trip() {
     );
 
     // --- pull ---
-    let project = ProjectFixture::init(&cfg, &["test"]).expect("init");
+    let project = ProjectFixture::init(cfg, &["test"]).expect("init");
     let pull = project.run_rdc(&["sync", "test", "--no-push"]);
     assert!(pull.status.success(), "pull failed: {}", combined(&pull));
 
