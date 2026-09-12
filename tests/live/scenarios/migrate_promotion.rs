@@ -63,6 +63,28 @@ fn automation_level(project: &ProjectFixture, env: &str, q_slug: &str) -> Option
     v.get("automation_level").and_then(|l| l.as_str()).map(str::to_string)
 }
 
+/// The fake-backed twin. Runs in a plain `cargo test`; see
+/// `crate::support::fake`. TWO independent `FakeOrg`s with DIFFERENT org
+/// ids, paired via `FakeOrg::paired_config` — exactly as `fake_deploy_flow`
+/// does, and for the reason this module's own doc comment gives above:
+/// pointed at one org, `test` and `prod` are two views of the same objects,
+/// `--mirror` reads the source env's objects as target-only extras, and
+/// `assert_converged(.., "test", ..)` after the promotion is unassertable.
+///
+/// Not a theoretical hazard. Collapsing the pair — `src.paired_config(&src)`
+/// — was tried while porting, and the run goes red at the overlay check
+/// below ("the overlay value did not reach the prod remote"), because the
+/// `prod` pull finds the `test` env's own queue already sitting in the org
+/// and the deploy lands somewhere the assertion is not looking.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fake_migrate_overlay_and_mirror() {
+    let src = crate::support::fake::FakeOrg::start_with_org(1).await;
+    let tgt = crate::support::fake::FakeOrg::start_with_org(2).await;
+    migrate_overlay_and_mirror(&src.paired_config(&tgt)).await;
+}
+
+/// The live twin. Unchanged: same `#[ignore]`, same env gate, so
+/// `cargo test --test live -- --ignored` still selects exactly the live set.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live: needs RDC_LIVE_* env"]
 async fn live_migrate_overlay_and_mirror() {
@@ -70,17 +92,21 @@ async fn live_migrate_overlay_and_mirror() {
         eprintln!("{}", LiveConfig::skip_reason());
         return;
     };
+    migrate_overlay_and_mirror(&cfg).await;
+}
+
+async fn migrate_overlay_and_mirror(cfg: &LiveConfig) {
     let Some(tgt) = cfg.target.clone() else {
         eprintln!("{}", LiveConfig::skip_reason_target());
         return;
     };
     let run_id = RunId::new();
-    let src_client = LiveClient::connect(&cfg).expect("connect (source)");
+    let src_client = LiveClient::connect(cfg).expect("connect (source)");
     let tgt_client = LiveClient::connect_creds(&tgt).expect("connect (target)");
 
     // One guard PER ORG: the run creates objects in both, and each org's
     // teardown only sees its own.
-    let teardown_src = Teardown::new(LiveClient::connect(&cfg).unwrap(), run_id.clone());
+    let teardown_src = Teardown::new(LiveClient::connect(cfg).unwrap(), run_id.clone());
     let teardown_tgt = Teardown::new(
         LiveClient::connect_creds(&tgt).unwrap(),
         run_id.clone(),
