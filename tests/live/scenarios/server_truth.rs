@@ -257,9 +257,23 @@ async fn live_queue_engine_slot_counts_values_not_keys() {
     drop(teardown);
 }
 
-/// rdc's offline pre-flight must refuse an over-long field before it opens a
-/// single connection — the property that keeps one bad field from wedging a
-/// whole project's syncs half-applied.
+/// The fake-backed twin. Runs in a plain `cargo test`; see
+/// `crate::support::fake`. No golden, so nothing to refuse capturing.
+///
+/// This is the one scenario in this file whose assertions are mostly about
+/// **rdc**, not about the server: the pre-flight it exercises is offline, so
+/// a fake backend is a perfectly good stand-in for the env it must not touch.
+/// The server-side half is the closing assertion — the hook's remote
+/// `description` is still short — and that one really does read the fake's
+/// stored state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fake_preflight_refuses_over_length_before_touching_the_env() {
+    let fake = crate::support::fake::FakeOrg::start().await;
+    preflight_refuses_over_length_before_touching_the_env(&fake.config()).await;
+}
+
+/// The live twin. Unchanged: same `#[ignore]`, same env gate, so
+/// `cargo test --test live -- --ignored` still selects exactly the live set.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live: needs RDC_LIVE_* env"]
 async fn live_preflight_refuses_over_length_before_touching_the_env() {
@@ -267,15 +281,22 @@ async fn live_preflight_refuses_over_length_before_touching_the_env() {
         eprintln!("{}", LiveConfig::skip_reason());
         return;
     };
+    preflight_refuses_over_length_before_touching_the_env(&cfg).await;
+}
+
+/// rdc's offline pre-flight must refuse an over-long field before it opens a
+/// single connection — the property that keeps one bad field from wedging a
+/// whole project's syncs half-applied.
+async fn preflight_refuses_over_length_before_touching_the_env(cfg: &LiveConfig) {
     let run_id = RunId::new();
-    let client = LiveClient::connect(&cfg).expect("connect");
-    let teardown = Teardown::new(LiveClient::connect(&cfg).unwrap(), run_id.clone());
+    let client = LiveClient::connect(cfg).expect("connect");
+    let teardown = Teardown::new(LiveClient::connect(cfg).unwrap(), run_id.clone());
 
     let manifest = load_manifest().expect("manifest");
     let index = seed(&client, &run_id, &static_dir(), &manifest).await.expect("seed");
     let hook_id = index.id("hook-validator").expect("validator hook id");
 
-    let project = ProjectFixture::init(&cfg, &["test"]).expect("init");
+    let project = ProjectFixture::init(cfg, &["test"]).expect("init");
     let pull = project.run_rdc(&["sync", "test", "--no-push"]);
     assert!(
         pull.status.success(),
