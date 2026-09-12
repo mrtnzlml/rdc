@@ -172,6 +172,28 @@ async fn field_limits_match_the_server(cfg: &LiveConfig) {
 /// an `engine` is 403 on the sandbox token. That is the load-bearing half:
 /// what is being tested is whether an explicit `null` counts as "set", and the
 /// answer cannot depend on which of the three carries the value.
+/// # Not ported to the fake, on purpose
+///
+/// Unlike its two neighbours, this scenario never runs `rdc`: it is a client
+/// talking straight to a server, so a fake-backed twin would have the fake
+/// assert the fake's own rule, with no second party anywhere in the test.
+/// `field_limits_match_the_server` above survives the same treatment only
+/// because it reads `snapshot::limits::field_limits` — rdc's table — and
+/// compares it against the fake's independently pinned one. There is no
+/// equivalent here. `state.rs::a_queue_patch_counts_engine_values_not_engine_keys`
+/// already pins the fake's own conduct, at the layer where that is the honest
+/// claim.
+///
+/// Two gaps would have to be invented to get a twin green at all, both
+/// observed by running the port before reverting it: `LiveClient::get_value`
+/// rejects the plural kind (fixed below — it panicked "unsupported kind
+/// 'queues'" before the first probe, which also means this LIVE scenario has
+/// never run green), and the fake's `kinds::queue_defaults` binds no generic
+/// engine, so the assertion below fails with "a freshly created queue is
+/// expected to be generic-engine bound". Modelling that second one means
+/// inventing a whole `/generic_engines/<id>` URL space the fake's
+/// `kinds::EDGES` currently mis-points at `engines` — three inventions for a
+/// test with no independent oracle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live: needs RDC_LIVE_* env"]
 async fn live_queue_engine_slot_counts_values_not_keys() {
@@ -189,7 +211,7 @@ async fn live_queue_engine_slot_counts_values_not_keys() {
 
     // Whatever binding the seeded queue came up with — a fresh queue is on the
     // built-in generic engine.
-    let before = client.get_value("queues", queue_id).await.expect("GET queue");
+    let before = client.get_value("queue", queue_id).await.expect("GET queue");
     let generic = before.get("generic_engine").cloned().unwrap_or(serde_json::Value::Null);
     assert!(
         !generic.is_null(),
