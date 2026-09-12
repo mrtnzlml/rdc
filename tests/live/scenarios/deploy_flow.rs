@@ -10,6 +10,41 @@ use crate::support::seeder::seed;
 use crate::support::staticdir::{load_manifest, static_dir};
 use crate::support::teardown::Teardown;
 
+/// The fake-backed twin. Runs in a plain `cargo test`; see
+/// `crate::support::fake`. Two independent `FakeOrg`s, paired via
+/// `paired_config` — a real promotion needs `test` and `prod` in SEPARATE
+/// orgs (see `deploy_flow`'s own doc comment below), and pointing both envs
+/// at one org would quietly defeat every promotion assertion it makes.
+///
+/// This port found a fake bug the single-org ports structurally could not:
+/// two orgs mean the same object shape is created twice from two different
+/// bodies, and the fake used to let the create body decide the field order
+/// it served back. `migrate` writes the source env's order into the target's
+/// files, so the second `migrate` rewrote them with `locale` moved and the
+/// chain-stability assertion below charged `rdc` for it. Fixed at the fake's
+/// response seam — quirk
+/// `field_order_is_a_property_of_the_kind_not_of_the_request`
+/// (`quirks::impose_field_order`), pinned by
+/// `fake::tests::one_list_response_orders_every_row_the_same_way`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fake_deploy_flow() {
+    let src = crate::support::fake::FakeOrg::start_with_org(1).await;
+    let tgt = crate::support::fake::FakeOrg::start_with_org(2).await;
+    deploy_flow(&src.paired_config(&tgt)).await;
+}
+
+/// The live twin. Unchanged: same `#[ignore]`, same env gate, so
+/// `cargo test --test live -- --ignored` still selects exactly the live set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live: needs RDC_LIVE_* env"]
+async fn live_deploy_flow() {
+    let Some(cfg) = LiveConfig::from_env() else {
+        eprintln!("{}", LiveConfig::skip_reason());
+        return;
+    };
+    deploy_flow(&cfg).await;
+}
+
 /// Deploy flow: pull `test`, `rdc migrate test prod` (renames every object via
 /// an explicit mapping so prod objects don't collide with test in the shared
 /// org), `rdc sync prod` to push, then assert the prod lockfile recorded
@@ -40,23 +75,17 @@ use crate::support::teardown::Teardown;
 ///   time must not move a single byte. This is the mirror-chain oscillation
 ///   class (stale-map prune, unique-typed template skip, MDH KeepLocal base
 ///   preservation), which by construction needs two full chains to detect.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "live: needs RDC_LIVE_* env"]
-async fn live_deploy_flow() {
-    let Some(cfg) = LiveConfig::from_env() else {
-        eprintln!("{}", LiveConfig::skip_reason());
-        return;
-    };
+async fn deploy_flow(cfg: &LiveConfig) {
     let Some(tgt) = cfg.target.clone() else {
         eprintln!("{}", LiveConfig::skip_reason_target());
         return;
     };
     let run_id = RunId::new();
-    let client = LiveClient::connect(&cfg).expect("connect (source)");
+    let client = LiveClient::connect(cfg).expect("connect (source)");
     let tgt_client = LiveClient::connect_creds(&tgt).expect("connect (target)");
     // One teardown guard PER ORG — the run creates objects in both, and each
     // org's sweep only sees its own.
-    let teardown_src = Teardown::new(LiveClient::connect(&cfg).unwrap(), run_id.clone());
+    let teardown_src = Teardown::new(LiveClient::connect(cfg).unwrap(), run_id.clone());
     let teardown_tgt =
         Teardown::new(LiveClient::connect_creds(&tgt).unwrap(), run_id.clone());
 
