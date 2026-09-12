@@ -8,6 +8,27 @@ use crate::support::seeder::seed;
 use crate::support::staticdir::{load_manifest, static_dir};
 use crate::support::teardown::Teardown;
 
+/// The fake-backed twin. Runs in a plain `cargo test`; see
+/// `crate::support::fake`. `conflicts_deletes` never calls `capture_mode` /
+/// `load_or_compare` — it has no golden — so there is nothing here to refuse.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fake_conflicts_deletes() {
+    let fake = crate::support::fake::FakeOrg::start().await;
+    conflicts_deletes(&fake.config()).await;
+}
+
+/// The live twin. Unchanged: same `#[ignore]`, same env gate, so
+/// `cargo test --test live -- --ignored` still selects exactly the live set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live: needs RDC_LIVE_* env"]
+async fn live_conflicts_deletes() {
+    let Some(cfg) = LiveConfig::from_env() else {
+        eprintln!("{}", LiveConfig::skip_reason());
+        return;
+    };
+    conflicts_deletes(&cfg).await;
+}
+
 /// Deterministic conflict + delete outcomes against the real API:
 ///
 ///  (a) content conflict (both-diverged), non-interactive => a shadow file is
@@ -23,24 +44,18 @@ use crate::support::teardown::Teardown;
 /// the pull post-pass skip that object *forever*, which is why every branch
 /// here ends in a full convergence check rather than just an assertion about
 /// the value.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "live: needs RDC_LIVE_* env"]
-async fn live_conflicts_deletes() {
-    let Some(cfg) = LiveConfig::from_env() else {
-        eprintln!("{}", LiveConfig::skip_reason());
-        return;
-    };
+async fn conflicts_deletes(cfg: &LiveConfig) {
     let run_id = RunId::new();
-    let client = LiveClient::connect(&cfg).expect("connect");
+    let client = LiveClient::connect(cfg).expect("connect");
     // Teardown guard FIRST so a panic anywhere still cleans up.
-    let teardown = Teardown::new(LiveClient::connect(&cfg).unwrap(), run_id.clone());
+    let teardown = Teardown::new(LiveClient::connect(cfg).unwrap(), run_id.clone());
 
     let manifest = load_manifest().expect("manifest");
     let index = seed(&client, &run_id, &static_dir(), &manifest)
         .await
         .expect("seed");
 
-    let project = ProjectFixture::init(&cfg, &["test"]).expect("init");
+    let project = ProjectFixture::init(cfg, &["test"]).expect("init");
     let pull = project.run_rdc(&["sync", "test", "--no-push"]);
     assert!(
         pull.status.success(),
