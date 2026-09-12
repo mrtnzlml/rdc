@@ -23,8 +23,25 @@ use crate::support::seeder::seed;
 use crate::support::staticdir::{load_manifest, static_dir};
 use crate::support::teardown::Teardown;
 
-/// `rdc auth <env> --token` accepts a real token and REFUSES a bad one without
-/// destroying the good credentials already on disk.
+/// The fake-backed twin. Runs in a plain `cargo test`; see
+/// `crate::support::fake`.
+///
+/// The fake genuinely refuses a bad token rather than ignoring it, which is
+/// what keeps the negative half of this scenario from asserting nothing:
+/// `fake::authorized` compares the `authorization` header against
+/// `token <fake::TOKEN>` and `fake::route` answers
+/// `state::ApiError::unauthorized` (401, `{"detail": "Invalid token."}`)
+/// before it looks at the path at all. `cli::auth::validate_token` validates
+/// with `GET /organizations/<id>`, which is inside `/api/v1/` and therefore
+/// behind exactly that check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fake_auth_validates_before_writing() {
+    let fake = crate::support::fake::FakeOrg::start().await;
+    auth_validates_before_writing(&fake.config()).await;
+}
+
+/// The live twin. Unchanged: same `#[ignore]`, same env gate, so
+/// `cargo test --test live -- --ignored` still selects exactly the live set.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live: needs RDC_LIVE_* env"]
 async fn live_auth_validates_before_writing() {
@@ -32,8 +49,14 @@ async fn live_auth_validates_before_writing() {
         eprintln!("{}", LiveConfig::skip_reason());
         return;
     };
+    auth_validates_before_writing(&cfg).await;
+}
+
+/// `rdc auth <env> --token` accepts a real token and REFUSES a bad one without
+/// destroying the good credentials already on disk.
+async fn auth_validates_before_writing(cfg: &LiveConfig) {
     // No remote objects are created, so no teardown guard is needed.
-    let project = ProjectFixture::init(&cfg, &["test"]).expect("init");
+    let project = ProjectFixture::init(cfg, &["test"]).expect("init");
     let secrets_rel = "secrets/test.secrets.json";
 
     // A valid token is accepted and persisted.
