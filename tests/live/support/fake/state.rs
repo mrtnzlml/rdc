@@ -115,9 +115,14 @@ impl OrgState {
     /// Merges `patch` into stored state and returns the result. What comes
     /// back from THIS function is not, by itself, what a client observes on
     /// the wire: `mod.rs::kind_response` runs it through
-    /// `quirks::shape_response` afterward, which inserts `rir_key` — the one
-    /// difference that belongs at the response layer. See
-    /// `quirks::insert_organization_rir_key`'s doc comment for why.
+    /// `quirks::shape_response` afterward, which applies TWO response-layer
+    /// transforms. `quirks::insert_organization_rir_key` adds `rir_key` — see
+    /// its doc comment for why that one belongs at the response layer and not
+    /// in stored state. `quirks::impose_field_order` then orders the
+    /// top-level keys, which is not organization-specific at all: it runs for
+    /// every kind and method, because a real serializer imposes its order
+    /// uniformly. It runs LAST, so the `rir_key` just inserted is ordered
+    /// like every other key rather than trailing the body.
     ///
     /// `settings` normalization, by contrast, happens HERE, as the merge —
     /// not at the response seam. Quirk

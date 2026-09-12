@@ -120,8 +120,16 @@ fn err_response(e: ApiError) -> ResponseTemplate {
 /// GET and PATCH shapes has exactly one place to attach. Error bodies do
 /// NOT come through here: they go straight through `json_response`, because
 /// they are never GET/PATCH-shaped kind bodies, and shaping one would be
-/// meaningless — see `quirks::shape_response`'s doc comment for what the one
-/// rule it carries actually does.
+/// meaningless.
+///
+/// `shape_response` now carries TWO transforms, not one, and they are keyed
+/// differently on purpose: `insert_organization_rir_key` fires for the single
+/// `(kind, method)` pair `("organizations", "PATCH")`, while
+/// `quirks::impose_field_order` applies to every body regardless of kind or
+/// method, because field order on a real API is the serializer's job rather
+/// than any one endpoint's. See `quirks::shape_response`'s doc comment for
+/// both, and the `field_order_is_a_property_of_the_kind_not_of_the_request`
+/// row of `quirks::QUIRKS` for what imposing that order costs the fake.
 fn kind_response(kind: &str, method: &str, status: u16, body: &Value) -> ResponseTemplate {
     let mut shaped = body.clone();
     quirks::shape_response(kind, method, &mut shaped);
