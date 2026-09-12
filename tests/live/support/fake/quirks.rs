@@ -325,11 +325,41 @@ pub fn normalize_write(kind: &str, body: &mut Value) {
 /// the default, so every top-level string is trimmed" — is deliberately NOT
 /// taken. It might well be right; it is also the shape of the premise that
 /// already cost this repo real data once, and the two directions of being
-/// wrong are not symmetric. Preserving where the server trims makes a fake
-/// scenario churn, loudly. Trimming where the server preserves silently
-/// normalizes away a difference, which is precisely how the MDH `$concat`
-/// corruption stayed invisible (`src/snapshot/noise.rs:93`). Between a loud
-/// wrong answer and a quiet one, the fake takes the loud one.
+/// wrong are not symmetric.
+///
+/// The asymmetry is about which direction this suite can SEE, and all three
+/// claims below were measured by breaking the table and running
+/// `cargo test --test live`:
+///
+/// - Preserving where the server trims is caught, for every row of this
+///   table, by the golden: it records a verdict per field, so
+///   `*_trailing_whitespace_handling_is_unchanged` goes red. Dropping
+///   `("hooks", "description")` reddens it (plus
+///   `tests::only_the_observed_fields_are_trimmed_and_only_at_the_top_level`
+///   and `tests::the_trim_applies_to_a_patch_and_persists`, which read this
+///   table directly); dropping both `email_templates` rows reddens it alone.
+/// - Trimming where the server preserves is the quiet direction: no golden
+///   records a `"preserved"` verdict for any field, so widening
+///   `trim_stored_text` to every top-level string leaves every scenario green
+///   — the golden included — and the only reds are
+///   `tests::only_the_observed_fields_are_trimmed_and_only_at_the_top_level`
+///   and `state.rs::a_patch_is_refused_when_it_outruns_a_field_cap`, both of
+///   which name a field this table deliberately omits. That is the fake
+///   checking its own rule; nothing live objects. It is also how the MDH
+///   `$concat` corruption stayed invisible (`src/snapshot/noise.rs:93`).
+/// - Neither direction CHURNS. rdc's own trim
+///   (`snapshot::noise::trim_trailing_whitespace`) is key-scoped to
+///   `subject`/`message` and only affects hashing, so no `assert_converged`
+///   notices a wrong answer here either way — measured: no convergence
+///   assertion failed in any of the three runs above. An earlier version of
+///   this comment said a preserving fake would "churn, loudly"; the loudness
+///   is real, the churn is not, and the alarm is the golden rather than a
+///   second sync cycle.
+///
+/// The first two of those rest on the golden carrying a verdict for the
+/// field, which is the other reason adding a row here means capturing the
+/// golden again: a row this suite records no verdict for would be wrong
+/// silently in both directions.
 const TRIMMED_ON_WRITE: &[(&str, &str)] = &[
     ("hooks", "description"),
     ("email_templates", "subject"),
@@ -709,19 +739,39 @@ pub const QUIRKS: &[Quirk] = &[
         // Enforced on CREATE and on PATCH alike (`validate::on_write` rule 2
         // and `validate::on_patch`, both through
         // `validate::check_queue_engine_slots`), counting VALUES rather than
-        // keys. The cited scenario is the live probe of both halves; note it
-        // only ever probes the PATCH path, which is why the create half is
-        // strictly the fake's own extrapolation of the same rule.
+        // keys. Every observation behind this row is of a PATCH, so the
+        // create half stays the fake's own extrapolation of the same rule.
         //
-        // What the citation does NOT establish: the scenario has never been
-        // observed green. Its first client call is
-        // `client.get_value("queues", queue_id)`, and `LiveClient::get_value`
-        // matches the SINGULAR kind names only ("queue", "hook", …), so
-        // "queues" falls to its `other =>` arm and the `.expect("GET queue")`
-        // panics before any probe runs. Recorded as a finding rather than
-        // silently repaired here.
+        // SOURCE-cited, not LIVE-cited, and the difference is the whole
+        // point of this row's history. It used to claim
+        // `server_truth.rs::live_queue_engine_slot_counts_values_not_keys` as
+        // proof. That scenario has never been observed green: its first
+        // client call was `client.get_value("queues", queue_id)`, and
+        // `LiveClient::get_value` matches the SINGULAR kind names only
+        // ("queue", "hook", …), so "queues" fell to its `other =>` arm and
+        // the `.expect("GET queue")` panicked before any probe ran. The typo
+        // is repaired (`0d9d61f`; the scenario now passes "queue"), but a
+        // repaired scenario nobody has run against a real org is still not
+        // proof, and the row's own prose said as much while the structured
+        // field said the opposite.
+        //
+        // The fact itself is evidenced, just not by that scenario:
+        // `snapshot::limits`'s `QUEUE_ENGINE_FIELDS` doc comment quotes the
+        // refusal verbatim — `400 non_field_errors: Only one of
+        // dedicated_engine, generic_engine or engine can be set.` — together
+        // with the values-not-keys rule that `reconcile_engine_slot` and
+        // every queue PATCH rdc sends both depend on. Behind that comment is
+        // the incident in `46f8f04`: a promoted queue left carrying `engine`
+        // AND the target's restored `generic_engine`, which 400ed every
+        // later `rdc sync <tgt>` until a human read an error naming only a
+        // remote queue id. The cited line is the message inside that doc
+        // comment; the symbol to look for is `QUEUE_ENGINE_FIELDS`.
+        //
+        // Offline proof of the fake's own conduct, which is a different
+        // claim and honestly labelled as one:
+        // `state.rs::a_queue_patch_counts_engine_values_not_engine_keys`.
         provenance: Provenance::Modelled {
-            proven_by: "server_truth.rs::live_queue_engine_slot_counts_values_not_keys",
+            proven_by: "src/snapshot/limits.rs:334",
         },
     },
     Quirk {

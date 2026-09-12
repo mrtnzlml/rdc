@@ -61,10 +61,18 @@
 //!   - Nothing validates the MERGED result. Both modelled rules read only the
 //!     keys the patch carries, so a partial PATCH that sets `engine` on a
 //!     queue already holding a `generic_engine` is accepted here. What the
-//!     real API does with that body is unknown: every live observation of the
-//!     rule (`server_truth.rs::live_queue_engine_slot_counts_values_not_keys`)
-//!     sends all three keys at once, which is also the only shape rdc's push
-//!     ever sends — see quirk `queue_engine_slots_are_counted_on_the_patch_body`.
+//!     real API does with that body is unknown, and nothing in this repo has
+//!     ever sent one: rdc's own queue PATCH re-serializes the whole on-disk
+//!     body, which always carries all three keys, and so does the live probe
+//!     written for the rule
+//!     (`server_truth.rs::live_queue_engine_slot_counts_values_not_keys` —
+//!     which is a probe, not an observation: it has never been run green, see
+//!     quirk `queue_carries_one_engine_slot_only`). The refusal itself HAS
+//!     been observed, in the incident behind `46f8f04` — but there too the
+//!     offending body was a whole queue file re-serialized by push, not a
+//!     partial patch. So the partial-body case is unobserved rather than
+//!     observed-and-unmodelled — see quirk
+//!     `queue_engine_slots_are_counted_on_the_patch_body`.
 
 use serde_json::Value;
 
