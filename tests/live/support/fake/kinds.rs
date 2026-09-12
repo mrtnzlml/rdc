@@ -213,10 +213,15 @@ pub struct Edge {
     pub back_ref: Option<BackRef>,
 }
 
-/// The complete edge table: ten owner-scoped edges plus the two universal
-/// ones. Adding an edge — including the `saved_views.queues_filter` one
-/// stage 2 needs next — is a one-line addition here; nothing else should ever
-/// need touching.
+/// The complete edge table: eleven owner-scoped edges plus the two universal
+/// ones. `saved_views.queues_filter` — confirmed against the shape captured
+/// in `testdata/live/snapshot/saved-views/rdc-it-{{RUN}}-view.json`
+/// (`"queues_filter": ["rdc://queues/..."]`) — is array-shaped and carries no
+/// back-reference: a saved view doesn't own the queues it filters on, the way
+/// a hook or rule owns the queues it runs against, so nothing on `queues`
+/// grows when a saved view names it. Adding an edge is a one-line addition
+/// here; nothing else should ever need touching —
+/// `every_edge_in_the_table_is_load_bearing` below drives it for free.
 pub const EDGES: &[Edge] = &[
     Edge { owner: Some("queues"), field: "workspace", shape: RefShape::Single, target: "workspaces", back_ref: Some(BackRef::Push("queues")) },
     Edge { owner: Some("queues"), field: "schema", shape: RefShape::Single, target: "schemas", back_ref: Some(BackRef::Push("queues")) },
@@ -228,6 +233,7 @@ pub const EDGES: &[Edge] = &[
     Edge { owner: Some("inboxes"), field: "queues", shape: RefShape::Array, target: "queues", back_ref: Some(BackRef::Set("inbox")) },
     Edge { owner: Some("hooks"), field: "queues", shape: RefShape::Array, target: "queues", back_ref: Some(BackRef::Push("hooks")) },
     Edge { owner: Some("rules"), field: "queues", shape: RefShape::Array, target: "queues", back_ref: Some(BackRef::Push("rules")) },
+    Edge { owner: Some("saved_views"), field: "queues_filter", shape: RefShape::Array, target: "queues", back_ref: None },
     // Universal: checked for every kind, never back-ref'd — see the doc
     // comment on `Edge::owner`.
     Edge { owner: None, field: "queues", shape: RefShape::Array, target: "queues", back_ref: None },
@@ -272,30 +278,6 @@ mod tests {
         }
     }
 
-    /// The edge table must cover every edge the two derived behaviors used to
-    /// hand-write, or one of them silently stops working. These are the ten
-    /// owner-scoped edges as they stood at c47b3fe.
-    #[test]
-    fn the_edge_table_covers_every_edge_the_fake_used_to_hand_write() {
-        for (owner, field, target) in [
-            ("queues", "workspace", "workspaces"),
-            ("queues", "schema", "schemas"),
-            ("queues", "engine", "engines"),
-            ("queues", "generic_engine", "engines"),
-            ("email_templates", "queue", "queues"),
-            ("labels", "organization", "organizations"),
-            ("workspaces", "organization", "organizations"),
-            ("inboxes", "queues", "queues"),
-            ("hooks", "queues", "queues"),
-            ("rules", "queues", "queues"),
-        ] {
-            assert!(
-                edges_for(owner).any(|e| e.field == field && e.target == target),
-                "edge table is missing {owner}.{field} -> {target}"
-            );
-        }
-    }
-
     /// A universal row's `back_ref` is dead: `edges_for` — the only thing
     /// `graph::relink`/`unlink` consult — filters on `owner == Some(...)`,
     /// so nothing ever reads a `back_ref` set on an `owner: None` row.
@@ -312,19 +294,6 @@ mod tests {
         );
     }
 
-    /// The two universal rows are deliberate, not an oversight: `queues` and
-    /// `run_after` mean the same thing on whatever kind carries them, so the
-    /// TYPE check must still apply to a kind with no row of its own.
-    #[test]
-    fn the_universal_ref_fields_are_still_universal() {
-        for (field, target) in [("queues", "queues"), ("run_after", "hooks")] {
-            assert!(
-                universal_edges().any(|e| e.field == field && e.target == target),
-                "the universal type check lost {field} -> {target}"
-            );
-        }
-    }
-
     /// Only the four owners that maintained a back-reference before may carry
     /// one now — an accidental extra back-ref would mutate objects the real
     /// server does not touch.
@@ -339,5 +308,275 @@ mod tests {
             with_back_ref,
             ["hooks", "inboxes", "queues", "rules"].into_iter().collect(),
         );
+    }
+
+    // ---- The load-bearing loop -------------------------------------------
+    //
+    // `no_universal_row_carries_a_back_ref` and
+    // `only_the_documented_owners_maintain_a_back_reference` above pin real
+    // invariants about the SHAPE of the table. What used to sit alongside
+    // them — a pair of tests hand-listing every row and asserting it was
+    // present — restated the table rather than proving anything reads it:
+    // they would stay green even if `validate::on_write` or `graph::relink`
+    // stopped consulting `EDGES` entirely. This loop replaces that pair. It
+    // drives the FAKE itself, through the same `OrgState::create` every
+    // scenario goes through, and asserts what each row actually claims.
+
+    use super::super::state::OrgState;
+
+    /// Which kind to `create` in order to exercise `edge`. An owner-scoped
+    /// row creates an instance of its own owner. A universal row (`owner:
+    /// None`) has no owner of its own to instantiate — see the doc comment
+    /// on `Edge::owner` — so a driving kind is chosen by hand for each of
+    /// the two that exist today: `queues` is deliberately driven against
+    /// `workspaces`, which is NOT one of the three owner rows for that field
+    /// (`inboxes`/`hooks`/`rules`), specifically to prove the universal
+    /// check reaches a kind with no row of its own; `run_after` is, in
+    /// practice, only ever carried by `hooks` (`src/snapshot/hook.rs`).
+    /// A third universal row would need its own arm here — the panic says
+    /// so rather than silently skipping it.
+    fn driving_kind(edge: &Edge) -> &'static str {
+        match edge.owner {
+            Some(k) => k,
+            None if edge.field == "queues" => "workspaces",
+            None if edge.field == "run_after" => "hooks",
+            None => panic!(
+                "no driving kind chosen for the new universal edge on {:?} — \
+                 add one alongside `driving_kind`'s other two arms",
+                edge.field
+            ),
+        }
+    }
+
+    /// A minimal, otherwise-valid create body for `kind`, before the edge
+    /// under test overwrites its own one field. Only `queues` has a
+    /// create-time requirement `validate::on_write` enforces regardless of
+    /// which edge is under test (rule 2: a schema); every other kind here
+    /// creates cleanly off just a name, so a wrong-kind url is the ONLY
+    /// reason any of these bodies gets refused.
+    fn minimal_body(kind: &str, ws_url: &str, schema_url: &str) -> Map<String, Value> {
+        let mut body = Map::new();
+        body.insert("name".to_string(), json!(format!("z-{kind}")));
+        match kind {
+            "queues" => {
+                body.insert("workspace".to_string(), json!(ws_url));
+                body.insert("schema".to_string(), json!(schema_url));
+            }
+            // Not required by the fake, but a real inbox never lacks one;
+            // `inbox_defaults` only invents an address when BOTH `email` and
+            // `email_prefix` are absent, and this keeps the body realistic.
+            "inboxes" => {
+                body.insert("email_prefix".to_string(), json!("z"));
+            }
+            _ => {}
+        }
+        body
+    }
+
+    /// A real, EXISTING url of some kind other than `target` — proving the
+    /// check is a TYPE check, not mere presence
+    /// (`OrgState::resolves_kind`'s doc comment, and
+    /// `a_ref_of_the_wrong_kind_is_refused_even_though_it_resolves` in
+    /// `state.rs`). `ws_url` is wrong for every target except `workspaces`
+    /// itself, where `schema_url` steps in.
+    fn wrong_kind_url(ws_url: &str, schema_url: &str, target: &str) -> String {
+        if target == "workspaces" { schema_url.to_string() } else { ws_url.to_string() }
+    }
+
+    /// For `edge`, drive a create that puts a wrong-kind url in its field and
+    /// assert the fake refuses it — the behavior `validate::on_write`'s rule
+    /// 1 derives from every row in `EDGES`.
+    fn assert_ref_type_is_enforced(edge: &Edge) {
+        let mut st = OrgState::new("http://127.0.0.1:9/api/v1".to_string(), 1);
+        let ws = st.create("workspaces", json!({ "name": "ws" })).unwrap();
+        let sc = st.create("schemas", json!({ "name": "sc" })).unwrap();
+        let ws_url = ws["url"].as_str().unwrap().to_string();
+        let sc_url = sc["url"].as_str().unwrap().to_string();
+
+        let kind = driving_kind(edge);
+        let mut body = minimal_body(kind, &ws_url, &sc_url);
+        let bad_url = wrong_kind_url(&ws_url, &sc_url, edge.target);
+        let value = match edge.shape {
+            RefShape::Single => json!(bad_url),
+            RefShape::Array => json!([bad_url]),
+        };
+        body.insert(edge.field.to_string(), value);
+
+        let err = st.create(kind, Value::Object(body)).expect_err(&format!(
+            "edge {:?}.{} -> {} accepted a wrong-kind url — the ref-type \
+             check for this row is not being reached",
+            edge.owner, edge.field, edge.target
+        ));
+        assert_eq!(
+            err.status, 400,
+            "edge {:?}.{} -> {}: wrong-kind url got status {} instead of a 400",
+            edge.owner, edge.field, edge.target, err.status
+        );
+        assert!(
+            format!("{:?}", err.body).contains("Invalid hyperlink"),
+            "edge {:?}.{} -> {}: refused for the wrong reason: {:?}",
+            edge.owner,
+            edge.field,
+            edge.target,
+            err.body
+        );
+    }
+
+    /// A fresh, real instance of `target` to attach a back-reference to.
+    /// Only the three kinds that are ever the TARGET of a `back_ref` row
+    /// need an arm here (`only_the_documented_owners_maintain_a_back_reference`
+    /// pins the owner side; this is the target side) — a future back-ref row
+    /// aimed at a new target kind needs its own arm, and the panic says so
+    /// rather than silently building a nonsense body.
+    fn create_target(
+        st: &mut OrgState,
+        target: &'static str,
+        ws_url: &str,
+        schema_url: &str,
+    ) -> (u64, String) {
+        let body = match target {
+            "workspaces" => json!({ "name": "target-ws" }),
+            "schemas" => json!({ "name": "target-schema" }),
+            "queues" => json!({ "name": "target-queue", "workspace": ws_url, "schema": schema_url }),
+            other => panic!(
+                "assert_back_ref_is_maintained has no target-builder for {other:?} \
+                 — add one alongside the new back_ref row"
+            ),
+        };
+        let created = st.create(target, body).expect("target create must succeed");
+        (created["id"].as_u64().unwrap(), created["url"].as_str().unwrap().to_string())
+    }
+
+    /// The correct back-reference for `(owner, target)`, pinned independent
+    /// of whatever `EDGES` currently says. Without this, a renamed
+    /// `back_ref` field (e.g. `queue.inbox` corrupted to `queue.inbox_wrong`)
+    /// would be invisible to a check that reads the field name to look up
+    /// from the SAME row it is verifying: `graph::relink` and the assertion
+    /// below would both derive "which field" from the one (broken) row and
+    /// agree with each other — a fake `state.rs` demonstrated live, driving
+    /// this exact rename, in the course of writing this loop. Only an
+    /// answer that does NOT come from the row can catch that, which is what
+    /// this is; the graph.rs hand-written tests
+    /// (`creating_an_inbox_sets_its_queues_inbox` and siblings) already
+    /// pin the same facts by hand, one row at a time — this is the same
+    /// oracle, applied to every row through the loop instead.
+    fn expected_back_ref(owner: &str, target: &str) -> BackRef {
+        match (owner, target) {
+            ("queues", "workspaces") => BackRef::Push("queues"),
+            ("queues", "schemas") => BackRef::Push("queues"),
+            ("inboxes", "queues") => BackRef::Set("inbox"),
+            ("hooks", "queues") => BackRef::Push("hooks"),
+            ("rules", "queues") => BackRef::Push("rules"),
+            (o, t) => panic!(
+                "expected_back_ref has no known-good answer for {o}.* -> {t} \
+                 — add one alongside the new back_ref row"
+            ),
+        }
+    }
+
+    /// For `edge` (which must carry a `back_ref`), first check the row's
+    /// declared `back_ref` against the independent, known-good answer above,
+    /// then create a VALID instance of its owner pointing at a fresh target
+    /// and assert the back-reference really appears on that target
+    /// afterward — the behavior `graph::relink` derives from every
+    /// `back_ref` in `EDGES`.
+    fn assert_back_ref_is_maintained(edge: &Edge) {
+        let mut st = OrgState::new("http://127.0.0.1:9/api/v1".to_string(), 1);
+        let ws = st.create("workspaces", json!({ "name": "ws" })).unwrap();
+        let sc = st.create("schemas", json!({ "name": "sc" })).unwrap();
+        let ws_url = ws["url"].as_str().unwrap().to_string();
+        let sc_url = sc["url"].as_str().unwrap().to_string();
+
+        let (target_id, target_url) = create_target(&mut st, edge.target, &ws_url, &sc_url);
+
+        let owner = edge.owner.expect(
+            "back_ref is only ever set on an owner-scoped row — \
+             no_universal_row_carries_a_back_ref enforces this",
+        );
+        let expected = expected_back_ref(owner, edge.target);
+        assert_eq!(
+            edge.back_ref,
+            Some(expected),
+            "edge {owner}.{} -> {}: back_ref is {:?}, but the known-good answer is {:?} \
+             — this field name was renamed to something the target does not really carry",
+            edge.field,
+            edge.target,
+            edge.back_ref,
+            expected
+        );
+
+        let mut body = minimal_body(owner, &ws_url, &sc_url);
+        let value = match edge.shape {
+            RefShape::Single => json!(target_url),
+            RefShape::Array => json!([target_url]),
+        };
+        body.insert(edge.field.to_string(), value);
+        let created = st.create(owner, Value::Object(body)).unwrap_or_else(|e| {
+            panic!(
+                "edge {owner}.{} -> {}: a VALID create was refused: {:?}",
+                edge.field, edge.target, e.body
+            )
+        });
+        let created_url = created["url"].as_str().unwrap().to_string();
+
+        let target_after = st.get(edge.target, target_id).expect("target still exists");
+        match expected {
+            BackRef::Push(field) => {
+                let arr = target_after.get(field).and_then(Value::as_array).unwrap_or_else(|| {
+                    panic!(
+                        "edge {owner}.{} -> {}: back_ref Push({field:?}) names a field the \
+                         target doesn't have: {target_after:?}",
+                        edge.field, edge.target
+                    )
+                });
+                assert!(
+                    arr.contains(&json!(created_url)),
+                    "edge {owner}.{} -> {}: back_ref Push({field:?}) never appeared on the \
+                     target: {arr:?}",
+                    edge.field,
+                    edge.target
+                );
+            }
+            BackRef::Set(field) => {
+                assert_eq!(
+                    target_after.get(field),
+                    Some(&json!(created_url)),
+                    "edge {owner}.{} -> {}: back_ref Set({field:?}) never appeared on the target: {target_after:?}",
+                    edge.field,
+                    edge.target
+                );
+            }
+        }
+    }
+
+    /// The permanent proof that `EDGES` is actually READ, not merely
+    /// declared: for every row still IN the table, drive the fake and assert
+    /// what the row claims — the ref-type check refuses a wrong-kind url,
+    /// and, when the row names a `back_ref`, that back-reference really
+    /// grows on the target after a real create, at the field name an
+    /// INDEPENDENT answer (`expected_back_ref`) says is correct. If
+    /// `validate.rs` or `graph.rs` stops actually consulting a row that is
+    /// still declared here — the more likely regression, since deleting a
+    /// row outright is a diff anyone reviewing `EDGES` would see — the
+    /// corresponding assertion fails HERE, naming the row.
+    ///
+    /// A row's outright DELETION is a narrower case this loop cannot itself
+    /// catch: it can only assert about rows still present in `EDGES`, so
+    /// removing one just shrinks the loop rather than failing it. For a
+    /// `back_ref`-carrying row, that deletion still fails LOUDLY — just one
+    /// module over, in `only_the_documented_owners_maintain_a_back_reference`
+    /// above (the owner drops out of the expected set) and in graph.rs's
+    /// hand-written creation tests (the back-reference stops growing) — both
+    /// verified live while writing this loop. A non-`back_ref` row's
+    /// deletion (e.g. `email_templates.queue`) currently has no such
+    /// independent backstop; see the task report for this finding.
+    #[test]
+    fn every_edge_in_the_table_is_load_bearing() {
+        for edge in EDGES {
+            assert_ref_type_is_enforced(edge);
+            if edge.back_ref.is_some() {
+                assert_back_ref_is_maintained(edge);
+            }
+        }
     }
 }
