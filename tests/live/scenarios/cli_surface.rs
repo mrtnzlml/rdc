@@ -230,7 +230,16 @@ async fn remote_color(client: &LiveClient, id: u64) -> String {
         .to_string()
 }
 
-/// `--no-push` never writes to the env; `--no-pull` never overwrites local.
+/// The fake-backed twin. Runs in a plain `cargo test`; see
+/// `crate::support::fake`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fake_sync_direction_flags() {
+    let fake = crate::support::fake::FakeOrg::start().await;
+    sync_direction_flags(&fake.config()).await;
+}
+
+/// The live twin. Unchanged: same `#[ignore]`, same env gate, so
+/// `cargo test --test live -- --ignored` still selects exactly the live set.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live: needs RDC_LIVE_* env"]
 async fn live_sync_direction_flags() {
@@ -238,15 +247,20 @@ async fn live_sync_direction_flags() {
         eprintln!("{}", LiveConfig::skip_reason());
         return;
     };
+    sync_direction_flags(&cfg).await;
+}
+
+/// `--no-push` never writes to the env; `--no-pull` never overwrites local.
+async fn sync_direction_flags(cfg: &LiveConfig) {
     let run_id = RunId::new();
-    let client = LiveClient::connect(&cfg).expect("connect");
-    let teardown = Teardown::new(LiveClient::connect(&cfg).unwrap(), run_id.clone());
+    let client = LiveClient::connect(cfg).expect("connect");
+    let teardown = Teardown::new(LiveClient::connect(cfg).unwrap(), run_id.clone());
 
     let manifest = load_manifest().expect("manifest");
     let index = seed(&client, &run_id, &static_dir(), &manifest).await.expect("seed");
 
     let prefix = run_id.list_prefix();
-    let project = ProjectFixture::init(&cfg, &["test"]).expect("init");
+    let project = ProjectFixture::init(cfg, &["test"]).expect("init");
     let pull = project.run_rdc(&["sync", "test", "--no-push"]);
     assert!(pull.status.success(), "pull failed: {}", combined(&pull));
     assert_converged(&project, "test", &prefix, "after the initial pull");
