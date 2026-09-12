@@ -278,6 +278,66 @@ mod tests {
         }
     }
 
+    /// `every_edge_in_the_table_is_load_bearing` below drives every row still
+    /// IN `EDGES` and proves each one is actually consulted — but a row that
+    /// has been deleted outright just shrinks that loop rather than failing
+    /// it. For a `back_ref`-carrying row that deletion still fails loudly
+    /// one module over (`only_the_documented_owners_maintain_a_back_reference`,
+    /// plus graph.rs's hand-written creation tests); a non-`back_ref` row —
+    /// e.g. `email_templates.queue` — had no such backstop, which is exactly
+    /// what an empirical sabotage of this row confirmed while restoring this
+    /// test. This pins the full row set — both owner-scoped edges and the
+    /// two universal ones — against a hand-written list independent of the
+    /// table, so a silent deletion of ANY row is caught here regardless of
+    /// whether it carries a back-reference.
+    ///
+    /// Owner-scoped and universal rows are pinned in the same set rather
+    /// than two: `edges_for` vs `universal_edges` split on `owner` because
+    /// back-reference *maintenance* is owner-specific (that split is what
+    /// `graph.rs` and the loop below rely on), but the property this test
+    /// checks — "this exact row is still in `EDGES`" — doesn't care which
+    /// bucket a row falls into, so one set covers both without duplicating
+    /// the loop.
+    ///
+    /// A failure here means one of two things, and the message says which:
+    /// either a row that should still be here is gone (restore it — this is
+    /// the accidental-loss case this test exists for), or the model was
+    /// changed on purpose (added or removed an edge deliberately) and this
+    /// hand-written list simply needs updating to match — that is the
+    /// correct fix in that case, not a bug.
+    #[test]
+    fn the_edge_table_still_models_every_edge_it_is_supposed_to() {
+        let actual: std::collections::BTreeSet<(Option<&str>, &str, &str)> =
+            EDGES.iter().map(|e| (e.owner, e.field, e.target)).collect();
+        let expected: std::collections::BTreeSet<(Option<&str>, &str, &str)> = [
+            (Some("queues"), "workspace", "workspaces"),
+            (Some("queues"), "schema", "schemas"),
+            (Some("queues"), "engine", "engines"),
+            (Some("queues"), "generic_engine", "engines"),
+            (Some("email_templates"), "queue", "queues"),
+            (Some("labels"), "organization", "organizations"),
+            (Some("workspaces"), "organization", "organizations"),
+            (Some("inboxes"), "queues", "queues"),
+            (Some("hooks"), "queues", "queues"),
+            (Some("rules"), "queues", "queues"),
+            (Some("saved_views"), "queues_filter", "queues"),
+            (None, "queues", "queues"),
+            (None, "run_after", "hooks"),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            actual, expected,
+            "EDGES no longer matches the pinned row set (shown above as a left/right \
+             set diff). If a row you expect is missing from `actual`, something \
+             deleted it by accident — restore it in EDGES; that's the bug this test \
+             exists to catch (the load-bearing loop above cannot, since it only \
+             drives rows still present). If you changed the model on purpose — you \
+             meant to add or remove an edge — update the `expected` list here to \
+             match; that is the correct fix, not a bug."
+        );
+    }
+
     /// A universal row's `back_ref` is dead: `edges_for` — the only thing
     /// `graph::relink`/`unlink` consult — filters on `owner == Some(...)`,
     /// so nothing ever reads a `back_ref` set on an `owner: None` row.
