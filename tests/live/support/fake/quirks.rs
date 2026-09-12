@@ -1184,4 +1184,16 @@ mod tests {
         assert!(not_modelled > 0, "no NotModelled quirk exists");
         assert!(chosen_unverified > 0, "no ChosenUnverified quirk exists");
     }
+
+    /// `kinds.rs` has `kind_paths_are_unique` for `MODELLED`; `QUIRKS` had no
+    /// analogue, so a copy-pasted row that forgot to rename its `name` would
+    /// compile clean and just sit there unnoticed — two facts sharing one
+    /// name, with no guard to say so.
+    #[test]
+    fn quirk_names_are_unique() {
+        let mut seen = std::collections::BTreeSet::new();
+        for q in QUIRKS {
+            assert!(seen.insert(q.name), "duplicate quirk name: {}", q.name);
+        }
+    }
 }
