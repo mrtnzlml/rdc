@@ -265,6 +265,92 @@ async fn the_organization_patch_response_is_not_get_shaped() {
     );
 }
 
+/// Quirk `field_order_is_a_property_of_the_kind_not_of_the_request`
+/// (`quirks::impose_field_order`).
+///
+/// The two queues below differ in ONE way: the first create body omits
+/// `locale` and the second sends it. `kinds::queue_defaults` fills it in
+/// either way, so the two stored objects end with the identical key SET and
+/// the only thing left to compare is ORDER. Before `impose_field_order`,
+/// `kinds::ensure` (`entry().or_insert()`, which under `preserve_order`
+/// appends a vacant key and leaves an occupied one in place) put `locale`
+/// last on the first queue and fourth on the second — two different field
+/// orders in ONE list response, which no real serializer can produce.
+///
+/// Asserting it on a single `GET /queues` is what makes it unarguable: any
+/// story about endpoints or API versions differing is unavailable when both
+/// rows came out of the same response to the same request.
+///
+/// Deliberately raw rather than through the typed client: `model::Queue`
+/// serializes its own declared fields in its own order and would hide
+/// exactly the difference under test.
+#[tokio::test]
+async fn one_list_response_orders_every_row_the_same_way() {
+    let fake = FakeOrg::start().await;
+    let base = fake.api_base();
+    let post = |path: &'static str, body: Value| {
+        let url = format!("{base}/{path}");
+        async move {
+            authed_json(reqwest::Method::POST, &url, &body)
+                .await
+                .json::<Value>()
+                .await
+                .expect("created")
+        }
+    };
+    let ws = post("workspaces", json!({ "name": "W" })).await;
+    let s1 = post("schemas", json!({ "name": "S1" })).await;
+    let s2 = post("schemas", json!({ "name": "S2" })).await;
+    let url_of = |v: &Value| v["url"].as_str().expect("url").to_string();
+
+    post(
+        "queues",
+        json!({ "name": "A", "workspace": url_of(&ws), "schema": url_of(&s1) }),
+    )
+    .await;
+    post(
+        "queues",
+        json!({
+            "name": "B",
+            "workspace": url_of(&ws),
+            "schema": url_of(&s2),
+            "locale": "en_GB",
+        }),
+    )
+    .await;
+
+    let listed: Value = authed_request(reqwest::Method::GET, &format!("{base}/queues"))
+        .await
+        .json()
+        .await
+        .expect("list");
+    let rows = listed["results"].as_array().expect("results");
+    assert_eq!(rows.len(), 2, "both queues must be listed: {listed}");
+    let keys = |row: &Value| {
+        row.as_object().expect("object").keys().cloned().collect::<Vec<String>>()
+    };
+    let (first, second) = (keys(&rows[0]), keys(&rows[1]));
+    assert_eq!(
+        first.iter().collect::<std::collections::BTreeSet<_>>(),
+        second.iter().collect::<std::collections::BTreeSet<_>>(),
+        "the two queues must have the same key SET, or this test is comparing \
+         the wrong thing rather than comparing order: {first:?} vs {second:?}"
+    );
+    assert_eq!(
+        first, second,
+        "one list response served two field orders for one kind — the order \
+         followed the create body instead of the kind"
+    );
+
+    // The second half pins the fake's CHOSEN realization (alphabetical), not
+    // a recovered Rossum fact — the quirk's doc comment says why the real
+    // declaration order is unknown and why nothing needs it. Without this,
+    // an order that is merely equal BY LUCK on these two rows would pass.
+    let mut sorted = first.clone();
+    sorted.sort();
+    assert_eq!(first, sorted, "the fake serves top-level keys alphabetically");
+}
+
 /// `inbox.email` is SERVER-DERIVED from `email_prefix`
 /// (`src/snapshot/limits.rs:468`, which is why `strip_for_create` removes
 /// it). So a PATCH that changes the prefix must change the address — in

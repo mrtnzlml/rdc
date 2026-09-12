@@ -92,10 +92,17 @@ use super::state::OrgState;
 /// So far exactly one pair has a rule: `("organizations", "PATCH")`, which
 /// implements the response-only half of quirk
 /// `organization_patch_response_is_not_get_shaped` below — inserting
-/// `rir_key`. Every other `(kind, method)` passes through unchanged — this
-/// function is a no-op for them, not merely untested for them: `route()`
-/// calls it unconditionally for every kind and method, so a rule added here
-/// for one pair can never silently apply to another.
+/// `rir_key`. Every other `(kind, method)` passes through unchanged by that
+/// rule, not merely untested by it: `route()` calls this function
+/// unconditionally for every kind and method, so a rule added here for one
+/// pair can never silently apply to another.
+///
+/// One transform here is deliberately NOT keyed on `(kind, method)` at all:
+/// [`impose_field_order`], quirk
+/// `field_order_is_a_property_of_the_kind_not_of_the_request`. Field order
+/// on a real API is decided by the SERIALIZER, uniformly, for every kind and
+/// every method — so a per-pair rule would be modelling the wrong shape. See
+/// that function's doc comment.
 ///
 /// `settings` normalization is deliberately NOT here, even though it is the
 /// same quirk's other documented difference — see
@@ -109,6 +116,98 @@ use super::state::OrgState;
 pub fn shape_response(kind: &str, method: &str, body: &mut Value) {
     if (kind, method) == ("organizations", "PATCH") {
         insert_organization_rir_key(body);
+    }
+    // LAST, so a key a rule above just inserted (`rir_key`) is ordered like
+    // every other one rather than trailing the body it was added to.
+    impose_field_order(body);
+}
+
+/// Quirk `field_order_is_a_property_of_the_kind_not_of_the_request`: order
+/// the TOP-LEVEL keys of every response body deterministically, so the same
+/// object shape always comes back in the same order no matter what the
+/// client POSTed.
+///
+/// # The bug this closes
+///
+/// `serde_json` is built with `preserve_order` (`Cargo.toml:33`), so a
+/// `Value::Object` is an `IndexMap` and key order is INSERTION order.
+/// `kinds::ensure` — the one helper every `KindSpec::defaults` fn is written
+/// in — is `entry(key).or_insert(v)`, which APPENDS a key that is absent and
+/// leaves a key that is present exactly where the client's body put it. So
+/// the fake used to serve one key order for an object whose create body
+/// omitted a defaulted field and a different one for an object whose create
+/// body carried it, with no other difference between them:
+///
+/// ```text
+/// POST /queues {"name","workspace","schema"}          -> ...,"users","locale"
+/// POST /queues {"name","workspace","schema","locale"} -> "name",...,"locale","id",...
+/// ```
+///
+/// Nothing on a real API can do that. Field order there is imposed by the
+/// serializer over its own declared field list, so two objects of one kind
+/// with one key set serialize in one order — in the SAME list response, no
+/// less, which is where the fake's version of this was at its least
+/// defensible. `tests.rs::one_list_response_orders_every_row_the_same_way`
+/// pins exactly that.
+///
+/// It mattered: `deploy_flow.rs::fake_deploy_flow` promotes `test` into a
+/// SECOND org, and `migrate` writes the source env's key order into the
+/// target's files. With the target's own files carrying whatever order its
+/// `POST` happened to produce, every re-run of `migrate` rewrote two
+/// `queue.json` files to the same 604 and 349 bytes with `locale` moved —
+/// phantom churn charged to `rdc`, caused entirely by the fake. The live
+/// twin, `live_deploy_flow`, has passed that same assertion against two real
+/// orgs (`1b89e5a`), which is the evidence that the real API does not behave
+/// this way.
+///
+/// # Top level only
+///
+/// Nested objects are left alone, and that is a fidelity requirement rather
+/// than economy. A schema's `content`, a hook's `settings` and an MDH row
+/// are opaque JSON the server stores and returns VERBATIM; imposing an order
+/// inside them would be inventing a behaviour the real API does not have,
+/// and would silently reorder the very client-authored documents `rdc` round
+/// trips. Every key the fake itself adds — `kinds`' defaults, `state`'s
+/// `id`/`url`/`modified_at`, `graph`'s back-references — is top level, so
+/// the top level is exactly the surface that needed this.
+///
+/// # Why the response seam and not the write path
+///
+/// This is the serializer's job, and the serializer runs at response time.
+/// Placing it here also makes it total in a way `normalize_write` could not
+/// be: that seam is documented (at length, on its own doc comment) as NOT
+/// reached from `graph.rs`'s back-reference writes or `OrgState::delete`'s
+/// queue-draining write, both of which insert top-level keys into stored
+/// objects. Everything that goes over the wire goes through
+/// `mod.rs::kind_response`; nothing else has that property.
+fn impose_field_order(body: &mut Value) {
+    // The paginated list envelope (`OrgState::list`) — recognised by BOTH of
+    // its keys, so a future kind that happens to carry a `results` field is
+    // not mistaken for one. Its own two keys are written by that function in
+    // a fixed order already; the rows inside it are what varied.
+    let is_envelope = body.get("pagination").is_some()
+        && body.get("results").is_some_and(Value::is_array);
+    if is_envelope {
+        if let Some(rows) = body.get_mut("results").and_then(Value::as_array_mut) {
+            for row in rows {
+                sort_top_level_keys(row);
+            }
+        }
+        return;
+    }
+    sort_top_level_keys(body);
+}
+
+/// Alphabetical, non-recursive. Alphabetical is a CHOICE, not a recovered
+/// fact — see quirk `field_order_is_a_property_of_the_kind_not_of_the_request`
+/// for why the fake cannot reproduce Rossum's real declaration order and why
+/// nothing needs it to.
+fn sort_top_level_keys(value: &mut Value) {
+    let Some(map) = value.as_object_mut() else { return };
+    let mut entries: Vec<(String, Value)> = std::mem::take(map).into_iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    for (k, v) in entries {
+        map.insert(k, v);
     }
 }
 
@@ -812,6 +911,32 @@ pub const QUIRKS: &[Quirk] = &[
                 "ordering.rs::live_push_create_ordering",
                 "engines.rs::live_engines_round_trip",
             ],
+        },
+    },
+    Quirk {
+        name: "field_order_is_a_property_of_the_kind_not_of_the_request",
+        // Modelled in `impose_field_order` (this file), called from
+        // `shape_response` for every response. See that function's doc
+        // comment for the bug it closes: without it, the fake served a
+        // top-level key order that depended on what the client's create/patch
+        // body happened to contain, because `state.rs` stores nearly the
+        // client's own body verbatim and `kinds::ensure`'s
+        // `entry(key).or_insert(v)` only APPENDS a defaulted key when it is
+        // absent from that body — a wholly fake-specific artifact, since a
+        // real server's response is serialized from its OWN backend model,
+        // never from whatever field order the request happened to submit.
+        //
+        // LIVE-cited, not `ChosenUnverified`, because `deploy_flow.rs`'s
+        // chain-stability assertion — `prod_before` (captured after the
+        // first `sync prod`) byte-equal to a snapshot taken after a SECOND,
+        // independent `migrate test prod` re-derivation of the same file —
+        // is exactly the property this quirk supplies, and `live_deploy_flow`
+        // has passed it against two real organizations (`1b89e5a`, which
+        // added this exact assertion). A real API that reordered fields
+        // based on request-body shape would fail that assertion; the live
+        // run's continued green is the evidence it doesn't.
+        provenance: Provenance::Modelled {
+            proven_by: "deploy_flow.rs::live_deploy_flow",
         },
     },
 ];
