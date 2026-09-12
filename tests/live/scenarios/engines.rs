@@ -7,6 +7,28 @@ use crate::support::project::ProjectFixture;
 use crate::support::run_id::RunId;
 use crate::support::teardown::Teardown;
 
+/// The fake-backed twin. Runs in a plain `cargo test`; see
+/// `crate::support::fake`. `engines_round_trip` never calls `capture_mode` /
+/// `load_or_compare` — it has no golden — so, like `fake_sidecars_redaction`,
+/// there is nothing here to refuse.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fake_engines_round_trip() {
+    let fake = crate::support::fake::FakeOrg::start().await;
+    engines_round_trip(&fake.config()).await;
+}
+
+/// The live twin. Unchanged: same `#[ignore]`, same env gate, so
+/// `cargo test --test live -- --ignored` still selects exactly the live set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live: needs RDC_LIVE_* env"]
+async fn live_engines_round_trip() {
+    let Some(cfg) = LiveConfig::from_env() else {
+        eprintln!("{}", LiveConfig::skip_reason());
+        return;
+    };
+    engines_round_trip(&cfg).await;
+}
+
 /// Full `engines` / `engine_fields` lifecycle against a real org: pull
 /// round-trip, local edit pushed, a field CREATED from a hand-written file, a
 /// field DELETED through a tombstone, then the engine itself deleted.
@@ -25,16 +47,10 @@ use crate::support::teardown::Teardown;
 /// `engines/<engine>/fields/<field>.json`. A field's `name` must match the
 /// schema datapoint id it covers, so it is snake_case where its slug is
 /// hyphenated — `amount_due` becomes `amount-due.json`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "live: needs RDC_LIVE_* env"]
-async fn live_engines_round_trip() {
-    let Some(cfg) = LiveConfig::from_env() else {
-        eprintln!("{}", LiveConfig::skip_reason());
-        return;
-    };
+async fn engines_round_trip(cfg: &LiveConfig) {
     let run_id = RunId::new();
-    let client = LiveClient::connect(&cfg).expect("connect");
-    let teardown = Teardown::new(LiveClient::connect(&cfg).unwrap(), run_id.clone());
+    let client = LiveClient::connect(cfg).expect("connect");
+    let teardown = Teardown::new(LiveClient::connect(cfg).unwrap(), run_id.clone());
 
     // --- seed: one engine, two fields, no queue anywhere near it ---
     let engine_name = run_id.prefix("engine");
@@ -67,7 +83,7 @@ async fn live_engines_round_trip() {
         .expect("create engine field");
 
     // --- pull ---
-    let project = ProjectFixture::init(&cfg, &["test"]).expect("init");
+    let project = ProjectFixture::init(cfg, &["test"]).expect("init");
     let pull = project.run_rdc(&["sync", "test", "--no-push"]);
     assert!(pull.status.success(), "pull failed: {}", combined(&pull));
 
