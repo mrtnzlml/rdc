@@ -251,6 +251,19 @@ async fn live_sync_direction_flags() {
 }
 
 /// `--no-push` never writes to the env; `--no-pull` never overwrites local.
+///
+/// The `--no-pull` half needs one assertion the `--no-push` half does not, and
+/// it was missing until this comment was written. "Local still reads
+/// `#0a0a0a`" is true of a server that never applied the out-of-band drift
+/// patch at all, so against such a backend the half passes while testing
+/// nothing — verified during the fake port by making the fake drop exactly
+/// that PATCH: green. The limitation was the scenario's, not the fake's; the
+/// live twin had it too, and the only record of it was a commit message. The
+/// fix is the `remote_color` check between the drift patch and the
+/// `--no-pull` cycle below: once the env is known to hold `#0b0b0b`, local
+/// still holding `#0a0a0a` afterwards is a real demonstration that the pull
+/// was suppressed, because a normal cycle would have taken that remote
+/// change (base and local agree, so it is not even a conflict).
 async fn sync_direction_flags(cfg: &LiveConfig) {
     let run_id = RunId::new();
     let client = LiveClient::connect(cfg).expect("connect");
@@ -316,6 +329,15 @@ async fn sync_direction_flags(cfg: &LiveConfig) {
         .patch_fields("label", lid, serde_json::json!({ "color": "#0b0b0b" }))
         .await
         .expect("patch remote label");
+    // The drift must actually exist before `--no-pull` can be shown to ignore
+    // it — see this function's doc comment for what this half asserted (and
+    // did not) without this line.
+    assert_eq!(
+        remote_color(&client, lid).await,
+        "#0b0b0b",
+        "the out-of-band drift patch did not land, so `--no-pull` would have nothing to \
+         ignore and the assertion below would pass against an env that never changed"
+    );
     let deploy = project.run_rdc(&["sync", "test", "--no-pull"]);
     assert!(deploy.status.success(), "sync --no-pull failed: {}", combined(&deploy));
     assert_eq!(
