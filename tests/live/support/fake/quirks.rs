@@ -66,8 +66,12 @@
 //! fixture line. A line-number citation into a file other commits keep
 //! editing rots on a schedule nobody controls, and that is not
 //! hypothetical: a citation of `kinds.rs:226-235` for `kinds::EDGES`, in
-//! this very file, was invalidated by an unrelated doc edit two commits
-//! after it was written.
+//! this very file, was invalidated by an unrelated doc edit FOUR commits
+//! after it was written (added in `ca5c501`; `464d0c3`, `7c7d7b7` and
+//! `2605933` went by, then `e72e373` grew the `has_modified_at` doc comment
+//! and shifted `EDGES` up two lines). The brief that commissioned this rule
+//! said "two", which is how a worked example about rot came to misstate its
+//! own history.
 
 use serde_json::{json, Value};
 
@@ -422,20 +426,44 @@ pub const QUIRKS: &[Quirk] = &[
     },
     Quirk {
         name: "queue_delete_is_async_and_cascades",
-        // This citation proves only the ASYNC half: `live_push_create_ordering`
-        // asserts `status == "deletion_requested"` at `ordering.rs:348`. The
-        // CASCADE half (the queue's auto-created email templates and inbox
-        // disappearing with it) has NO live assertion anywhere in the tree —
-        // it is documented only in `state.rs::delete()`'s and
-        // `graph.rs::cascade_queue_delete`'s doc comments, and pinned
-        // offline by `graph.rs::a_queue_delete_cascades_to_its_templates_and_inbox`,
+        // NO live scenario asserts either half, so this is a `Modelled` row
+        // with a SOURCE citation — "the fake does this, but nothing live
+        // proves it yet" (module doc comment).
+        //
+        // This row previously cited `ordering.rs::live_push_create_ordering`
+        // for the ASYNC half, on the strength of that scenario asserting
+        // `status == "deletion_requested"`. It does not. Its closing "the
+        // queue must be deleted or draining" assertion
+        // (`ordering.rs:357-365`) is a DISJUNCTION —
+        // `find_listed_value(...).is_none()` OR
+        // `get_value(...)["status"] == "deletion_requested"` — and a
+        // SYNCHRONOUS `DELETE /queues` satisfies the first branch outright.
+        // A green run therefore establishes "no live queue survived the
+        // delete pass", which is worth having and is not this quirk. (The
+        // citation before THAT, `conflicts_deletes.rs::live_conflicts_deletes`,
+        // was further off still: that scenario's delete branch deletes a
+        // RULE, never a queue.)
+        //
+        // What the citation below does record is a real live OBSERVATION of
+        // the async behaviour, just not an assertion of it:
+        // `teardown.rs`'s schema sweep needs `delete_schema_with_retry`
+        // because a schema deleted straight after its queue answers `409
+        // Cannot delete schema because it is referenced from queue '<id>'`
+        // — "observed on the live sandbox on the very first run of the
+        // expanded suite". A queue that is really gone cannot reference
+        // anything; the retry loop only exists because the real `DELETE
+        // /queues` returns before the queue does.
+        //
+        // The CASCADE half (the queue's auto-created email templates and
+        // inbox disappearing with it) has no live evidence at all, observed
+        // or asserted. It is documented in `state.rs::delete()`'s and
+        // `graph.rs::cascade_queue_delete`'s doc comments and pinned offline
+        // by `graph.rs::a_queue_delete_cascades_to_its_templates_and_inbox`,
         // which exercises the fake's OWN implementation of the rule, not the
-        // real API. The previous citation here,
-        // `conflicts_deletes.rs::live_conflicts_deletes`, proved neither
-        // half: that scenario's delete branch deletes a RULE, never a
-        // queue, and never observes a 202 or a cascade.
+        // real API. A live scenario that deletes a queue and then looks for
+        // its typed default templates is what would upgrade this row.
         provenance: Provenance::Modelled {
-            proven_by: "ordering.rs::live_push_create_ordering",
+            proven_by: "tests/live/support/teardown.rs:36-44",
         },
     },
     Quirk {
@@ -477,9 +505,12 @@ pub const QUIRKS: &[Quirk] = &[
         name: "unresolvable_ref_is_an_invalid_hyperlink",
         // No live scenario provokes an unresolvable ref:
         // `cross_refs.rs::live_cross_refs` has no negative path, and the
-        // only other mention of this exact string, `ordering.rs:110-112`,
-        // documents why correct creation ORDER prevents the 400 from ever
-        // firing live — it is never triggered, let alone asserted. The
+        // only mentions of this message in a live SCENARIO —
+        // `ordering.rs:53` (the scenario's own doc comment, em-dashed) and
+        // `ordering.rs:127` (the `labels` -> `rules` `assert_before`
+        // rationale, the exact string) — both merely document why correct
+        // creation ORDER prevents the 400 from ever firing live; it is never
+        // triggered, let alone asserted. The
         // evidence for the exact message is `src/snapshot/refs.rs:159`: the
         // refusal `rdc`'s whole deferred-relink path is built around.
         // `validate::on_write` matches it, and it is offline-tested at
@@ -668,8 +699,13 @@ pub const QUIRKS: &[Quirk] = &[
         // one. `ChosenUnverified`: the fake does not protect these keys, so
         // a hand-built request that sent a bogus `id` would corrupt the
         // store in a way a real org is assumed, but not shown, to refuse.
+        //
+        // The citation is the merge statement itself, not the `if let` that
+        // opens the block around it — a bare line number is the right shape
+        // here (a statement inside a function body has no symbol of its
+        // own), which is exactly why it has to be the right statement.
         provenance: Provenance::ChosenUnverified {
-            weighed_against: "tests/live/support/fake/state.rs:280",
+            weighed_against: "tests/live/support/fake/state.rs:287",
             corroborated_by: &[],
         },
     },
@@ -688,32 +724,48 @@ pub const QUIRKS: &[Quirk] = &[
         //
         // For ENGINES and ENGINE_FIELDS both, that is no longer the whole
         // story — the same asymmetry corroborates a real-server fact for
-        // each, though at different strengths, because their CREATE-time
-        // write-backs are not special-cased the way the delete-time reads
-        // are: `push::engines` (`src/cli/push/engines.rs:111`) and
-        // `push::engine_fields` (`src/cli/push/engine_fields.rs:100`) each
-        // store whatever `.modified_at()` a real `POST /engines` or
-        // `POST /engine_fields` response reports, `Some` or `None`, straight
-        // into the lockfile. So `delete_one`'s drift comparison — remote
-        // forced to `None` by the discard above, against whatever the
-        // CREATE response actually put in the lockfile — only agrees (both
-        // `None`, `drifted == false`, so `delete_one` falls through to
-        // actually issuing the `DELETE`) if the real create response
-        // carried no `modified_at` to begin with. A drifted comparison would
-        // not fail the delete outright; non-interactively
+        // each, though at different strengths, because the PULL side is not
+        // special-cased the way the delete-time read is. `pull::engines` and
+        // `pull::engine_fields` both record whatever `.modified_at()` the
+        // real `GET /engines` / `GET /engine_fields` LIST response reports,
+        // `Some` or `None`, straight into the lockfile via `record_object`
+        // (`src/cli/pull/engines.rs:96`, `src/cli/pull/engine_fields.rs:142`).
+        // The LIST response, not the create response: `push::engines`
+        // (`src/cli/push/engines.rs:111`) and `push::engine_fields`
+        // (`src/cli/push/engine_fields.rs:100`) do write the CREATE
+        // response's value into the lockfile first, but every `rdc sync`
+        // pulls after it pushes, so the pull pass of that very same sync
+        // overwrites the entry — and both scenarios below then run
+        // `assert_converged` (one more full sync) between the create and the
+        // delete. Whatever the delete-time comparison reads is therefore
+        // pull-derived. Either way it is a real server response, which is
+        // why the conclusion is unchanged; naming the create response was
+        // simply the wrong link in the chain.
+        //
+        // So `delete_one`'s drift comparison — remote forced to `None` by
+        // the discard above, against whatever the LIST response last put in
+        // the lockfile — only agrees (both `None`, `drifted == false`, so
+        // `delete_one` falls through to actually issuing the `DELETE`) if
+        // the real listing carried no `modified_at` to begin with. A drifted
+        // comparison would not fail the delete outright; non-interactively
         // (`resolve_delete_drift`, `src/cli/push/deletes.rs:370-381`) it
         // SKIPS the delete and warns, leaving the object very much alive.
         //
         // For ENGINES: `ordering.rs::live_push_create_ordering` asserts that
         // stderr contains the exact warning `"engines/{slug} delete failed
-        // (skipped)"` — `push::deletes::run_deletes`'s catch for a
-        // server-REFUSED delete, reachable only if the HTTP `DELETE` was
-        // actually attempted, which by the chain above requires exactly
-        // that. A green run is an OBSERVATION that a real engine's create
-        // response carries no `modified_at` — CORROBORATION, not proof:
-        // nothing in that scenario reads the create response's raw body
-        // directly, and the same warning string could in principle be
-        // produced by some other path.
+        // (skipped)"` — `push::deletes::run_deletes`'s `Err(e)` arm, whose
+        // overwhelmingly likely cause is a server-REFUSED `DELETE`, which by
+        // the chain above requires exactly that. Not its ONLY cause, though:
+        // that arm catches every `Err` out of `delete_one`, including a
+        // failure of the listing `fetch_remote_modified_at` performs before
+        // the drift check, and the `bail!` on an interactive
+        // `DeleteDriftChoice::Abort`. Neither is plausible in this scenario —
+        // it runs non-interactively, and a listing failure would take the
+        // rest of the sync down with it — so the inference holds; the word
+        // "only" would not. A green run is an OBSERVATION that a real
+        // engine's listing carries no `modified_at` — CORROBORATION, not
+        // proof: nothing in that scenario reads a raw response body
+        // directly.
         //
         // For ENGINE_FIELDS, the corroboration is DIFFERENT and stronger:
         // `engines.rs::live_engines_round_trip` creates a fresh, unbound
@@ -724,8 +776,9 @@ pub const QUIRKS: &[Quirk] = &[
         // inferred one. By the same drift-comparison chain above, that
         // delete could only have reached the server (rather than being
         // silently skipped on drift, which would have left the field
-        // listed) if the real create response for that engine field also
-        // carried no `modified_at`. Still CORROBORATION, not proof, for the
+        // listed) if the real `GET /engine_fields` listing that
+        // `assert_converged`'s sync last recorded for that field carried no
+        // `modified_at`. Still CORROBORATION, not proof, for the
         // same reason as the engines half — but a directly observed delete
         // is stronger evidence than an inferred one from a refusal warning.
         //
@@ -770,9 +823,15 @@ pub const QUIRKS: &[Quirk] = &[
 /// The exact set below — these five names, types, subjects and messages, no
 /// more and no fewer — comes instead from
 /// `testdata/live/snapshot/**/email-templates/`: the five files with no
-/// run-id prefix in a tree captured from a real org, i.e. the ones the
-/// harness never seeded. That is real evidence, but a captured fixture
-/// rather than a live assertion — nothing in the suite today would fail if a
+/// run-id prefix, i.e. the ones the fixture declares because the SERVER
+/// creates them, not because the harness wanted them. Careful with that
+/// tree, though: `support::snapshot`'s module doc says it is hand-authored
+/// and written straight to disk, never seeded and pulled, so it is not a
+/// capture. These five files specifically were transcribed from a real org —
+/// commit `ac60791`, which added them, records "verified the real default
+/// content via a disposable probe queue on the sandbox" — which is why they
+/// count as evidence at all. Real evidence, but transcribed-fixture evidence
+/// rather than a live assertion: nothing in the suite today would fail if a
 /// live org grew a sixth default or renamed one of these five. A live
 /// scenario that pins the default set by name, rather than filtering it
 /// away, is the thing that would upgrade this half of the quirk from fixture

@@ -327,9 +327,16 @@ impl OrgState {
             // lockfile made a referencing hook re-pull forever). This is
             // repo-documented and offline-regression-tested, NOT
             // live-asserted — no live scenario checks that `workspace` /
-            // `schema` go null, only that `status` becomes
-            // `deletion_requested` (`ordering.rs:348`). Only these three
-            // fields are touched: nothing is known either way about
+            // `schema` go null. The nearest live mention is
+            // `push_create_ordering`'s closing "the queue must be deleted or
+            // draining" assertion (`ordering.rs:357-365`), and it is a
+            // DISJUNCTION: not listed at all, OR listed with `status ==
+            // "deletion_requested"`. A synchronous delete satisfies the
+            // first branch, so a green run does not even establish that the
+            // delete is async, let alone what a draining body looks like —
+            // see quirk `queue_delete_is_async_and_cascades` (`quirks.rs`),
+            // whose citation was corrected for exactly this. Only these
+            // three fields are touched: nothing is known either way about
             // `hooks`/`rules`/anything else on a draining queue.
             if let Some(obj) = self
                 .objects
