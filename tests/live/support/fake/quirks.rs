@@ -33,15 +33,21 @@
 //!   unimplemented behavior cannot have live proof of the fake's own
 //!   conduct.
 //! - [`Provenance::ChosenUnverified`] — the fake had to pick an answer and
-//!   the real API's behaviour is UNKNOWN. Its citation names whatever
-//!   evidence exists for the choice — explicitly NOT proof of it, and, like
-//!   `NotModelled`, always SOURCE-shaped: a citation that "corroborates" a
-//!   guess is a different, weaker claim than one that "proves" a fact, and a
-//!   `::` here would blur the two. A row that has genuine live corroboration
-//!   (see `an_engine_or_engine_field_carries_no_modified_at` below)
-//!   still points its structured citation at a SOURCE location and spells
-//!   the corroboration out in prose, rather than encoding it where the
-//!   citation-shape guards would read it as proof.
+//!   the real API's behaviour is UNKNOWN. Its `weighed_against` citation
+//!   names whatever evidence exists for the CHOICE — explicitly NOT proof of
+//!   it, and, like `NotModelled`, always SOURCE-shaped: a `::` here would
+//!   claim the choice is proven, which it isn't by definition. A row MAY
+//!   additionally carry `corroborated_by`, a list of LIVE citations that
+//!   make the guess less arbitrary without proving it — see
+//!   `an_engine_or_engine_field_carries_no_modified_at` below and
+//!   [`Provenance::ChosenUnverified`]'s own doc comment. Checked by
+//!   `every_corroborating_citation_names_a_real_test` for the same weak
+//!   thing the LIVE check above verifies (the file and function are real),
+//!   never for whether the cited test actually supports the claim — that
+//!   stays a human judgment call, same as it does for `Modelled`. This
+//!   distinction is not academic: this row's first version cited a real
+//!   file at a real line that was simply the wrong one, which only a human
+//!   reviewer caught.
 //!
 //! The rule this encodes: the fake invents nothing, and neither does this
 //! registry — an entry's citation must point at real, checkable evidence, and
@@ -283,14 +289,22 @@ pub(super) fn normalize_organization_settings(value: &mut Value) {
 /// `modelled: bool`, makes the citation's FIELD NAME say which claim is
 /// being made: `Modelled { proven_by }` says a real behaviour is proven,
 /// `NotModelled { documented_at }` says a gap is documented,
-/// `ChosenUnverified { weighed_against }` says a guess is merely weighed
+/// `ChosenUnverified { weighed_against, .. }` says a guess is merely weighed
 /// against something. A previous version of this registry squeezed
 /// `NotModelled` and `ChosenUnverified` into one `modelled: false`, which is
 /// exactly what let a `ChosenUnverified` row read as "the fake doesn't do
 /// this real thing yet" when its own comment said the real thing was
 /// unknown. The guards below still exist because Rust cannot check the
 /// CONTENT of a `&'static str` — whether it is a live or source shape,
-/// whether the file it names exists — only which field held it.
+/// whether the file it names exists, or (`corroborated_by` specifically)
+/// whether a cited test that exists actually supports the claim it's cited
+/// for — only which field held it, and whether the referenced file and
+/// function are real. That last gap is not hypothetical: the first version
+/// of `an_engine_or_engine_field_carries_no_modified_at`'s `corroborated_by`
+/// cited a real file at a real line that was simply the wrong block, and
+/// separately asserted "no corroboration exists" for `engine_fields` when a
+/// stronger one already did — both caught only by a human reviewer reading
+/// the cited scenario, exactly the limit this paragraph is naming.
 pub enum Provenance {
     /// The fake reproduces a real API behaviour. `proven_by`: see the module
     /// doc comment for the two citation shapes and which guard checks each.
@@ -302,11 +316,31 @@ pub enum Provenance {
     NotModelled { documented_at: &'static str },
     /// The fake had to pick an answer and the real API's behaviour is
     /// UNKNOWN. `weighed_against` names whatever evidence exists for the
-    /// choice — always a SOURCE citation, same reason and same guard as
+    /// CHOICE — always a SOURCE citation, same reason and same guard as
     /// `NotModelled` — explicitly NOT a claim that the choice is correct:
     /// see the row's own doc comment for what the evidence actually shows
     /// and does not show.
-    ChosenUnverified { weighed_against: &'static str },
+    ///
+    /// `corroborated_by` is a SEPARATE, optional list of LIVE citations
+    /// (`<file>::<test>`, usually empty — most `ChosenUnverified` rows have
+    /// none yet) that make the guess LESS ARBITRARY without proving it: a
+    /// live scenario that doesn't assert the fact directly, but whose
+    /// passing is only explicable if the fact holds. Checked by
+    /// `every_corroborating_citation_names_a_real_test` below for the same
+    /// weak thing `every_live_citation_actually_proves_it` checks for
+    /// `Modelled` rows — that the file and function are real — which is
+    /// deliberately NOT the same as checking that the cited test supports
+    /// the claim; that half stays a human judgment call, spelled out in the
+    /// row's own doc comment. Kept structurally distinct from
+    /// `weighed_against` (rather than allowing `weighed_against` itself to
+    /// be LIVE-shaped) so `only_a_modelled_quirk_may_claim_a_live_citation`'s
+    /// ban on a `ChosenUnverified` row claiming proof stays simple: it only
+    /// ever has to look at one field, and that field can never lie about
+    /// being proof.
+    ChosenUnverified {
+        weighed_against: &'static str,
+        corroborated_by: &'static [&'static str],
+    },
 }
 
 pub struct Quirk {
@@ -320,12 +354,14 @@ impl Quirk {
     /// The evidence string, whichever field its category stored it under —
     /// every guard below reads this instead of matching [`Provenance`]
     /// itself, so the citation-shape checks stay one piece of logic
-    /// regardless of category.
+    /// regardless of category. Does NOT include `ChosenUnverified`'s
+    /// `corroborated_by` — that's a different kind of claim, read directly
+    /// by `every_corroborating_citation_names_a_real_test` instead.
     fn citation(&self) -> &'static str {
         match self.provenance {
             Provenance::Modelled { proven_by } => proven_by,
             Provenance::NotModelled { documented_at } => documented_at,
-            Provenance::ChosenUnverified { weighed_against } => weighed_against,
+            Provenance::ChosenUnverified { weighed_against, .. } => weighed_against,
         }
     }
 }
@@ -564,6 +600,7 @@ pub const QUIRKS: &[Quirk] = &[
         // instead of a fact nobody could tell was ever decided.
         provenance: Provenance::ChosenUnverified {
             weighed_against: "tests/live/support/fake/graph.rs:82",
+            corroborated_by: &[],
         },
     },
     Quirk {
@@ -586,6 +623,7 @@ pub const QUIRKS: &[Quirk] = &[
         // store in a way a real org is assumed, but not shown, to refuse.
         provenance: Provenance::ChosenUnverified {
             weighed_against: "tests/live/support/fake/state.rs:280",
+            corroborated_by: &[],
         },
     },
     Quirk {
@@ -601,35 +639,71 @@ pub const QUIRKS: &[Quirk] = &[
         // reads them back for the DELETE-time drift check, regardless of
         // what a real response would say.
         //
-        // For ENGINES specifically, that is no longer the whole story.
-        // `push::engines`'s CREATE-time write-back
-        // (`src/cli/push/engines.rs:111`) is NOT special-cased the way the
-        // delete-time read is — it stores whatever `.modified_at()` a real
-        // `POST /engines` response reports, `Some` or `None`, straight into
-        // the lockfile. So `delete_one`'s drift comparison — remote forced
-        // to `None` by the discard above, against whatever the CREATE
-        // response actually put in the lockfile — only agrees (both `None`,
-        // `drifted == false`, so `delete_one` falls through to actually
-        // issuing `DELETE /engines/{id}`) if the real create response
-        // carried no `modified_at` to begin with.
-        // `ordering.rs::live_push_create_ordering` asserts that stderr
-        // contains the exact warning `"engines/{slug} delete failed
-        // (skipped)"` — `push::deletes::run_deletes`'s catch for a
-        // server-REFUSED delete — a string only reachable if the HTTP
-        // `DELETE` was actually attempted, which by the chain above requires
-        // exactly that. A green run of that scenario is therefore an
-        // OBSERVATION that a real engine's create response carries no
-        // `modified_at` — CORROBORATION, not proof: nothing in that scenario
-        // reads the create response's raw body directly, and the same
-        // warning string could in principle be produced by some other path.
+        // For ENGINES and ENGINE_FIELDS both, that is no longer the whole
+        // story — the same asymmetry corroborates a real-server fact for
+        // each, though at different strengths, because their CREATE-time
+        // write-backs are not special-cased the way the delete-time reads
+        // are: `push::engines` (`src/cli/push/engines.rs:111`) and
+        // `push::engine_fields` (`src/cli/push/engine_fields.rs:100`) each
+        // store whatever `.modified_at()` a real `POST /engines` or
+        // `POST /engine_fields` response reports, `Some` or `None`, straight
+        // into the lockfile. So `delete_one`'s drift comparison — remote
+        // forced to `None` by the discard above, against whatever the
+        // CREATE response actually put in the lockfile — only agrees (both
+        // `None`, `drifted == false`, so `delete_one` falls through to
+        // actually issuing the `DELETE`) if the real create response
+        // carried no `modified_at` to begin with. A drifted comparison would
+        // not fail the delete outright; non-interactively
+        // (`resolve_delete_drift`, `src/cli/push/deletes.rs:370-381`) it
+        // SKIPS the delete and warns, leaving the object very much alive.
         //
-        // ENGINE_FIELDS has no equivalent corroboration: `ordering.rs`'s own
-        // "everything that could go, went" sweep explicitly EXCLUDES
-        // `engine_fields` (`ordering.rs:279`), so nothing in this suite
-        // exercises its delete path the same way. Its half of this row
-        // remains a bare, uncorroborated choice.
+        // For ENGINES: `ordering.rs::live_push_create_ordering` asserts that
+        // stderr contains the exact warning `"engines/{slug} delete failed
+        // (skipped)"` — `push::deletes::run_deletes`'s catch for a
+        // server-REFUSED delete, reachable only if the HTTP `DELETE` was
+        // actually attempted, which by the chain above requires exactly
+        // that. A green run is an OBSERVATION that a real engine's create
+        // response carries no `modified_at` — CORROBORATION, not proof:
+        // nothing in that scenario reads the create response's raw body
+        // directly, and the same warning string could in principle be
+        // produced by some other path.
+        //
+        // For ENGINE_FIELDS, the corroboration is DIFFERENT and stronger:
+        // `engines.rs::live_engines_round_trip` creates a fresh, unbound
+        // engine field, confirms it listed remotely (`engines.rs:169`),
+        // deletes it through a tombstone (`sync --allow-deletes`), and
+        // confirms it is NOT listed afterward (`engines.rs:180`) — a
+        // directly OBSERVED successful `DELETE /engine_fields/{id}`, not an
+        // inferred one. By the same drift-comparison chain above, that
+        // delete could only have reached the server (rather than being
+        // silently skipped on drift, which would have left the field
+        // listed) if the real create response for that engine field also
+        // carried no `modified_at`. Still CORROBORATION, not proof, for the
+        // same reason as the engines half — but a directly observed delete
+        // is stronger evidence than an inferred one from a refusal warning.
+        //
+        // An earlier version of this comment cited `ordering.rs:279` for an
+        // "engine_fields has NO corroboration" claim. Both halves of that
+        // were wrong: `ordering.rs:279` is an unrelated pre-flight
+        // tombstone-widening check that skips `engine_fields` for a
+        // slug/path-shape reason (its lockfile slug is compound,
+        // `<engine>/<field>`, and doesn't appear verbatim in its on-disk
+        // path); the "Everything that could go, went." sweep it was
+        // confused with is at `ordering.rs:356` and doesn't mention
+        // `engine_fields` at all, by inclusion or exclusion. And
+        // `engine_fields` was never uncorroborated — `live_engines_round_trip`
+        // corroborates it more directly than `ordering.rs` corroborates
+        // `engines`. Caught in review, not by any guard: a citation naming
+        // a real file at a real line is not the same as that line
+        // supporting the claim, which is exactly why `corroborated_by`
+        // below is checked only for existence, never for whether it proves
+        // anything — that half stays a human's job.
         provenance: Provenance::ChosenUnverified {
             weighed_against: "src/cli/push/deletes.rs:481",
+            corroborated_by: &[
+                "ordering.rs::live_push_create_ordering",
+                "engines.rs::live_engines_round_trip",
+            ],
         },
     },
 ];
@@ -751,6 +825,40 @@ fn is_safe_repo_relative_path(file: &str) -> bool {
         && !file.split('/').any(|seg| seg == "..")
 }
 
+/// Shared by `every_live_citation_actually_proves_it` (a `Modelled` quirk's
+/// `proven_by`) and `every_corroborating_citation_names_a_real_test` (a
+/// `ChosenUnverified` quirk's `corroborated_by`): confirm a LIVE citation
+/// (`<file>::<test>`) names a real scenario file that really defines that
+/// test function. `owner` is the quirk name, used only for the panic
+/// message; `label` distinguishes which field is being checked so a failure
+/// says which one.
+///
+/// Deliberately checks ONLY that the function exists, never that it proves
+/// or corroborates the right thing — that half needs a human reading the
+/// cited test, which is exactly the gap that let this row's own
+/// `corroborated_by` cite a real function at a real location that turned
+/// out to be the wrong one (see `Provenance`'s doc comment). A citation
+/// naming real code is the mechanical half this function closes; whether
+/// that code supports the claim is not mechanically checkable and is not
+/// what this function is for.
+fn assert_live_citation_resolves(owner: &str, label: &str, citation: &str, root: &std::path::Path) {
+    let (file, test) = citation
+        .split_once("::")
+        .unwrap_or_else(|| panic!("quirk '{owner}' has a malformed {label} citation: {citation}"));
+    assert!(
+        is_plain_scenario_filename(file),
+        "quirk '{owner}' cites '{file}' as its {label}, which is not a plain scenario filename \
+         (no path separators, no `..`, must end in `.rs`)"
+    );
+    let path = root.join(file);
+    let src = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("quirk '{owner}' cites '{file}' as its {label}, which cannot be read: {e}"));
+    assert!(
+        src.contains(&format!("fn {test}(")),
+        "quirk '{owner}' cites '{test}' as its {label}, which '{file}' does not define"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -856,25 +964,7 @@ mod tests {
         let mut checked = 0;
         for q in QUIRKS.iter().filter(|q| q.citation().contains("::")) {
             checked += 1;
-            let (file, test) = q
-                .citation()
-                .split_once("::")
-                .unwrap_or_else(|| panic!("quirk '{}' has a malformed citation: {}", q.name, q.citation()));
-            assert!(
-                is_plain_scenario_filename(file),
-                "quirk '{}' cites '{file}', which is not a plain scenario filename \
-                 (no path separators, no `..`, must end in `.rs`)",
-                q.name
-            );
-            let path = root.join(file);
-            let src = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-                panic!("quirk '{}' cites '{file}', which cannot be read: {e}", q.name)
-            });
-            assert!(
-                src.contains(&format!("fn {test}(")),
-                "quirk '{}' cites '{test}', which '{file}' does not define",
-                q.name
-            );
+            assert_live_citation_resolves(q.name, "proven_by", q.citation(), &root);
         }
         // Every `Modelled` quirk must have a citation that resolves — this
         // loop is how a LIVE one gets checked. If nobody cited a live
@@ -882,6 +972,49 @@ mod tests {
         // `QUIRKS` today carries several, so a regression to zero is a real
         // signal, not a false alarm.
         assert!(checked > 0, "no quirk claims a live citation — this guard would be checking nothing");
+    }
+
+    /// The `ChosenUnverified`-only sibling of the guard above, for
+    /// `corroborated_by` rather than `proven_by`/`weighed_against`. Checks
+    /// the exact same mechanical thing — the cited file exists and defines
+    /// the cited test — via the same `assert_live_citation_resolves` helper,
+    /// and is exactly as limited: it cannot tell whether the cited test
+    /// actually corroborates the claim, only that it exists. That limit is
+    /// not theoretical here. This guard was ADDED after
+    /// `an_engine_or_engine_field_carries_no_modified_at`'s first version
+    /// cited `ordering.rs::live_push_create_ordering` correctly (this guard
+    /// would have passed) while ALSO claiming, in prose, that `engine_fields`
+    /// had no corroboration at all — a claim this guard cannot check,
+    /// because it isn't a citation-shape problem, it's a "did anyone verify
+    /// what the prose says" problem. A human reviewer caught it; this guard
+    /// exists only to make sure the citations that DO get added keep pointing
+    /// at real code, so a future citation can't silently rot the way the
+    /// `Modelled` guard above was written to prevent.
+    #[test]
+    fn every_corroborating_citation_names_a_real_test() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/live/scenarios");
+        let mut checked = 0;
+        for q in QUIRKS.iter() {
+            let Provenance::ChosenUnverified { corroborated_by, .. } = q.provenance else { continue };
+            for citation in corroborated_by {
+                checked += 1;
+                assert!(
+                    citation.contains("::"),
+                    "quirk '{}' has a corroborated_by entry '{citation}' that isn't LIVE-shaped \
+                     (`<file>::<test>`) — a source-only fact belongs in `weighed_against`, not here",
+                    q.name
+                );
+                assert_live_citation_resolves(q.name, "corroborated_by", citation, &root);
+            }
+        }
+        // Today exactly one row populates `corroborated_by` (with two
+        // entries), so a naive "iterate and maybe assert" version of this
+        // guard could still pass with zero real checks if that row's field
+        // were ever emptied by accident — this pins that it isn't.
+        assert!(
+            checked > 0,
+            "no quirk has a corroborated_by entry — this guard would be checking nothing"
+        );
     }
 
     /// The other citation shape: a SOURCE citation (`<file>:<line>`, no
