@@ -23,29 +23,115 @@ use crate::support::teardown::teardown_by_prefix;
 /// the fake-side setup seam: `fake_deploy_flow` stands two orgs up in its
 /// own, and the body below stays byte-identical to what the live twin runs.
 ///
-/// **Still undemonstrable: the MDH half, and only that half.** The fake
-/// serves a flat 404 outside `/api/v1/` (`fake::route`'s own comment:
-/// "Everything outside the API prefix — Data Storage included"), so
-/// `drop_mdh_collections_by_prefix` logs the failure and returns `Ok(())`
-/// regardless, and the trailing `list_collection_names().await
-/// .unwrap_or_default()` turns the same error into an empty vec — leaving
-/// `leftover.is_empty()` vacuous. Closing that needs Data Storage in the
-/// fake, which is out of scope for these ports by construction, not by
-/// oversight.
+/// Three things the manifest alone does not cover, and what this wrapper
+/// does about each:
+///
+/// - **`saved_views`.** The manifest seeds none, so the `saved_view` entry in
+///   the body's post-sweep loop asserted nothing. The wrapper creates a
+///   shared view directly on the API — the shape `saved_views_round_trip`
+///   already uses — so that entry now has an object to fail on. Measured: point
+///   `teardown_by_prefix`'s saved-view listing at a kind that does not exist
+///   and the body goes red naming the leftover view.
+/// - **The TARGET org.** `cfg.target` decides whether the body's second sweep
+///   runs at all, and `FakeOrg::config()` sets it to `None`, so six
+///   `assert!(…is_empty())` calls — including the scenario's only
+///   `email_template` assertion — were skipped entirely. The wrapper now
+///   stands a second `FakeOrg` up and pairs it with `paired_config`, the same
+///   way `fake_deploy_flow` does, seeds it, and gives it a marker-named email
+///   template of its own (the queue defaults `POST /queues` materializes are
+///   named by the SERVER and carry no `rdc-it-` marker, so they would leave
+///   that assertion vacuous). Measured: those six assertions really run now —
+///   negate one and the body goes red in the target loop, where before it
+///   passed untouched.
+///
+///   What they check is the END STATE of the target org, not any particular
+///   delete: the fake's queue DELETE cascades, so dropping `email_template`
+///   from `teardown_by_prefix`'s own sweep still leaves the target clean.
+///   Non-vacuity comes from the wrapper asserting a marker-named template
+///   exists BEFORE the sweep, not from the sweep's internal route to
+///   removing it.
+/// - **MDH, which stays undemonstrable.** The fake serves a flat 404 outside
+///   `/api/v1/` (`fake::route`'s own comment: "Everything outside the API
+///   prefix — Data Storage included"), so `drop_mdh_collections_by_prefix`
+///   logs the failure and returns `Ok(())` regardless, and the trailing
+///   `list_collection_names().await.unwrap_or_default()` turns the same error
+///   into an empty vec — leaving `leftover.is_empty()` vacuous. Closing that
+///   needs Data Storage in the fake, which is out of scope for these ports by
+///   construction, not by oversight. It is now the only half of this scenario
+///   the fake cannot demonstrate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fake_janitor_sweep() {
-    let fake = crate::support::fake::FakeOrg::start().await;
-    let cfg = fake.config();
+    let src = crate::support::fake::FakeOrg::start_with_org(1).await;
+    let tgt = crate::support::fake::FakeOrg::start_with_org(2).await;
+    let cfg = src.paired_config(&tgt);
+
     let client = LiveClient::connect(&cfg).expect("connect (seed)");
+    let index = seed_a_sweepable_org(&client).await;
+    assert!(index.id("queue-invoices-main").is_some(), "the seed created the fixture queue");
+
+    // The target org gets the same treatment, plus an email template: the
+    // body asserts `email_template` on the TARGET only, and the five typed
+    // defaults `POST /queues` materializes are named by the server, so
+    // nothing marker-named exists for that assertion without this.
+    let tgt_client =
+        LiveClient::connect_creds(&cfg.target.clone().expect("paired target")).expect("connect (target seed)");
+    let tgt_index = seed_a_sweepable_org(&tgt_client).await;
+    let tgt_queue = tgt_index.url("queue", "queue-invoices-main").expect("target queue url").to_string();
+    tgt_client
+        .create(
+            "email_template",
+            &serde_json::json!({
+                "name": RunId::new().prefix("janitor-template"),
+                "type": "custom",
+                "subject": "janitor probe",
+                "message": "<p>janitor probe</p>",
+                "automate": false,
+                "queue": tgt_queue,
+            }),
+        )
+        .await
+        .expect("create a marker-named email template in the target org");
+    assert!(
+        !tgt_client
+            .list_ids_by_name_prefix("email_template", RunId::marker())
+            .await
+            .expect("listing target email templates")
+            .is_empty(),
+        "the target org has no marker-named email template — the body's only \
+         `email_template` assertion would be vacuous"
+    );
+
+    janitor_sweep(&cfg).await;
+}
+
+/// Seed one org with the standard manifest plus a shared saved view, and
+/// assert every kind the body checks really has a marker-named object in it.
+///
+/// Non-vacuity, asserted rather than assumed: if the seed ever stopped
+/// producing marker-named objects, this wrapper would silently go back to
+/// handing the sweep an empty org and the body's `is_empty()` checks would be
+/// true again for the wrong reason.
+async fn seed_a_sweepable_org(client: &LiveClient) -> crate::support::seeder::SeedIndex {
+    let run_id = RunId::new();
     let manifest = load_manifest().expect("manifest");
-    let index = seed(&client, &RunId::new(), &static_dir(), &manifest)
+    let index = seed(client, &run_id, &static_dir(), &manifest)
         .await
         .expect("seed the org the janitor is about to sweep");
-    // Non-vacuity, asserted rather than assumed: if the seed ever stopped
-    // producing marker-named objects, this wrapper would silently go back to
-    // handing the sweep an empty org and the body's `is_empty()` checks would
-    // be true again for the wrong reason.
-    for kind in ["workspace", "hook", "label", "rule", "inbox", "queue"] {
+    // The manifest seeds no saved view; the body asserts on `saved_view`, so
+    // create one. Shared, and with a non-empty `$and` — an empty one is
+    // refused (`saved_views.rs`).
+    client
+        .create(
+            "saved_view",
+            &serde_json::json!({
+                "name": run_id.prefix("janitor-view"),
+                "shared": true,
+                "query": { "$and": [ { "status": { "$in": ["to_review"] } } ] },
+            }),
+        )
+        .await
+        .expect("create a saved view for the janitor to sweep");
+    for kind in ["workspace", "hook", "label", "rule", "inbox", "queue", "saved_view"] {
         let present = client
             .list_ids_by_name_prefix(kind, RunId::marker())
             .await
@@ -53,12 +139,10 @@ async fn fake_janitor_sweep() {
         assert!(
             !present.is_empty(),
             "the seed left no marker-named {kind} for the janitor to sweep — \
-             every assertion in `janitor_sweep` would be vacuous"
+             the matching assertion in `janitor_sweep` would be vacuous"
         );
     }
-    assert!(index.id("queue-invoices-main").is_some(), "the seed created the fixture queue");
-
-    janitor_sweep(&cfg).await;
+    index
 }
 
 /// The live twin. Unchanged: same `#[ignore]`, same env gate, so
