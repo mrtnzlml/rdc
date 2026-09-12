@@ -8,11 +8,18 @@ use crate::support::seeder::seed;
 use crate::support::staticdir::{load_manifest, static_dir};
 use crate::support::teardown::Teardown;
 
-/// After pull, assert: hook code is extracted to a `.py` sidecar and stripped
-/// from JSON; schema formula is extracted to `formulas/amount_total.py`; rule
-/// trigger_condition is extracted; redacted fields (hook status, queue counts,
-/// inbox email) do not corrupt the round-trip (verified via content-hash
-/// stability on a second sync).
+/// The fake-backed twin. Runs in a plain `cargo test`; see
+/// `crate::support::fake`. `sidecars_redaction` never calls `capture_mode` /
+/// `load_or_compare` — it has no golden — so, unlike `fake_cross_refs`, there
+/// is nothing here to refuse.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fake_sidecars_redaction() {
+    let fake = crate::support::fake::FakeOrg::start().await;
+    sidecars_redaction(&fake.config()).await;
+}
+
+/// The live twin. Unchanged: same `#[ignore]`, same env gate, so
+/// `cargo test --test live -- --ignored` still selects exactly the live set.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live: needs RDC_LIVE_* env"]
 async fn live_sidecars_redaction() {
@@ -20,15 +27,24 @@ async fn live_sidecars_redaction() {
         eprintln!("{}", LiveConfig::skip_reason());
         return;
     };
+    sidecars_redaction(&cfg).await;
+}
+
+/// After pull, assert: hook code is extracted to a `.py` sidecar and stripped
+/// from JSON; schema formula is extracted to `formulas/amount_total.py`; rule
+/// trigger_condition is extracted; redacted fields (hook status, queue counts,
+/// inbox email) do not corrupt the round-trip (verified via content-hash
+/// stability on a second sync).
+async fn sidecars_redaction(cfg: &LiveConfig) {
     let run_id = RunId::new();
-    let client = LiveClient::connect(&cfg).expect("connect");
-    let teardown = Teardown::new(LiveClient::connect(&cfg).unwrap(), run_id.clone());
+    let client = LiveClient::connect(cfg).expect("connect");
+    let teardown = Teardown::new(LiveClient::connect(cfg).unwrap(), run_id.clone());
 
     let manifest = load_manifest().expect("manifest");
     let _ = seed(&client, &run_id, &static_dir(), &manifest)
         .await
         .expect("seed");
-    let project = ProjectFixture::init(&cfg, &["test"]).expect("init");
+    let project = ProjectFixture::init(cfg, &["test"]).expect("init");
     let out = project.run_rdc(&["sync", "test", "--no-push"]);
     assert!(
         out.status.success(),
