@@ -1,32 +1,64 @@
 use crate::support::client::LiveClient;
 use crate::support::config::LiveConfig;
 use crate::support::run_id::RunId;
+use crate::support::seeder::seed;
+use crate::support::staticdir::{load_manifest, static_dir};
 use crate::support::teardown::teardown_by_prefix;
 
 /// The fake-backed twin. Runs in a plain `cargo test`; see
 /// `crate::support::fake`.
 ///
-/// Against a FRESH fake org (what `FakeOrg::start()` always hands back) this
-/// asserts nothing that can fail: every kind list here is checked via
-/// `list_ids_by_name_prefix(...).unwrap_or_default()` (an error and "no
-/// objects" are indistinguishable to the assertion), and a fresh org already
-/// has zero objects of every kind before the sweep even runs — so every
-/// `left.is_empty()` / `queues_left.is_empty()` check is vacuously true
-/// regardless of whether `teardown_by_prefix` does anything at all. The MDH
-/// half is even more vacuous: the fake has no Data Storage route at all
-/// (`mod.rs::route`'s doc comment: "Everything outside the API prefix — Data
-/// Storage included — is a flat 404"), `drop_mdh_collections_by_prefix`
-/// swallows that failure and returns `Ok(())` unconditionally, and the
-/// trailing `list_collection_names().await.unwrap_or_default()` again turns
-/// the resulting error into an empty vec. So this port is NOT falsifiable
-/// against a fresh fake org — it cannot go red no matter what
-/// `teardown_by_prefix` or the MDH sweep actually do. See the task report for
-/// the fuller reasoning; it is reported as an extraction that runs green by
-/// construction, not as a scenario this port meaningfully protects.
+/// The wrapper SEEDS before it sweeps, and that is the whole point of it.
+/// Against the fresh org `FakeOrg::start()` hands back, this body asserts
+/// nothing that can fail: every kind is listed through
+/// `list_ids_by_name_prefix(...).unwrap_or_default()`, which cannot tell an
+/// error from "no objects", and a fresh org has zero objects of every kind
+/// before the sweep even runs — so each `left.is_empty()` /
+/// `queues_left.is_empty()` check is vacuously true no matter what
+/// `teardown_by_prefix` does. Seeding the standard manifest first gives the
+/// sweep real work: a workspace, a queue (with its schema and inbox), two
+/// hooks, a rule and a label, every one of them named with `RunId`'s
+/// `rdc-it-` marker — which is exactly the marker `janitor_sweep` sweeps and
+/// asserts on. The wrapper is the right place for it precisely because it is
+/// the fake-side setup seam: `fake_deploy_flow` stands two orgs up in its
+/// own, and the body below stays byte-identical to what the live twin runs.
+///
+/// **Still undemonstrable: the MDH half, and only that half.** The fake
+/// serves a flat 404 outside `/api/v1/` (`fake::route`'s own comment:
+/// "Everything outside the API prefix — Data Storage included"), so
+/// `drop_mdh_collections_by_prefix` logs the failure and returns `Ok(())`
+/// regardless, and the trailing `list_collection_names().await
+/// .unwrap_or_default()` turns the same error into an empty vec — leaving
+/// `leftover.is_empty()` vacuous. Closing that needs Data Storage in the
+/// fake, which is out of scope for these ports by construction, not by
+/// oversight.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fake_janitor_sweep() {
     let fake = crate::support::fake::FakeOrg::start().await;
-    janitor_sweep(&fake.config()).await;
+    let cfg = fake.config();
+    let client = LiveClient::connect(&cfg).expect("connect (seed)");
+    let manifest = load_manifest().expect("manifest");
+    let index = seed(&client, &RunId::new(), &static_dir(), &manifest)
+        .await
+        .expect("seed the org the janitor is about to sweep");
+    // Non-vacuity, asserted rather than assumed: if the seed ever stopped
+    // producing marker-named objects, this wrapper would silently go back to
+    // handing the sweep an empty org and the body's `is_empty()` checks would
+    // be true again for the wrong reason.
+    for kind in ["workspace", "hook", "label", "rule", "inbox", "queue"] {
+        let present = client
+            .list_ids_by_name_prefix(kind, RunId::marker())
+            .await
+            .unwrap_or_else(|e| panic!("listing seeded {kind}s: {e:#}"));
+        assert!(
+            !present.is_empty(),
+            "the seed left no marker-named {kind} for the janitor to sweep — \
+             every assertion in `janitor_sweep` would be vacuous"
+        );
+    }
+    assert!(index.id("queue-invoices-main").is_some(), "the seed created the fixture queue");
+
+    janitor_sweep(&cfg).await;
 }
 
 /// The live twin. Unchanged: same `#[ignore]`, same env gate, so
