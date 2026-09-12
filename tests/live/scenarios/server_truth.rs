@@ -61,8 +61,29 @@ fn limit_for(kind: &str, field: &str) -> usize {
         .unwrap_or_else(|| panic!("snapshot::limits no longer declares a limit for {kind}.{field}"))
 }
 
-/// Every `max_length` rdc enforces offline must be the one the server really
-/// enforces: exactly at the limit is accepted, one code point over is refused.
+/// The fake-backed twin. Runs in a plain `cargo test`; see
+/// `crate::support::fake`. `field_limits_match_the_server` never calls
+/// `capture_mode` / `load_or_compare` — it has no golden — so, like
+/// `fake_engines_round_trip`, there is nothing here to refuse.
+///
+/// **What this twin can and cannot establish.** Against the fake, the
+/// "server" side of the comparison is `fake::validate::field_caps`, which is
+/// pinned independently of `snapshot::limits::field_limits` and deliberately
+/// not imported from it. So a green run here proves the two tables still
+/// AGREE — it is a drift detector, and a real one: change either table alone
+/// and this goes red naming the field. It does NOT prove either table matches
+/// Rossum, because both were written from the same live probes. Only
+/// `live_field_limits_match_the_server` can say that. Making the fake import
+/// `field_limits` would collapse even the drift detection into a tautology;
+/// see `field_caps`' doc comment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fake_field_limits_match_the_server() {
+    let fake = crate::support::fake::FakeOrg::start().await;
+    field_limits_match_the_server(&fake.config()).await;
+}
+
+/// The live twin. Unchanged: same `#[ignore]`, same env gate, so
+/// `cargo test --test live -- --ignored` still selects exactly the live set.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live: needs RDC_LIVE_* env"]
 async fn live_field_limits_match_the_server() {
@@ -70,9 +91,15 @@ async fn live_field_limits_match_the_server() {
         eprintln!("{}", LiveConfig::skip_reason());
         return;
     };
+    field_limits_match_the_server(&cfg).await;
+}
+
+/// Every `max_length` rdc enforces offline must be the one the server really
+/// enforces: exactly at the limit is accepted, one code point over is refused.
+async fn field_limits_match_the_server(cfg: &LiveConfig) {
     let run_id = RunId::new();
-    let client = LiveClient::connect(&cfg).expect("connect");
-    let teardown = Teardown::new(LiveClient::connect(&cfg).unwrap(), run_id.clone());
+    let client = LiveClient::connect(cfg).expect("connect");
+    let teardown = Teardown::new(LiveClient::connect(cfg).unwrap(), run_id.clone());
 
     let manifest = load_manifest().expect("manifest");
     let index = seed(&client, &run_id, &static_dir(), &manifest).await.expect("seed");
