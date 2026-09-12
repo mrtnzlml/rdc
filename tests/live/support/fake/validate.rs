@@ -14,6 +14,21 @@
 //!   real API answers `409 conflict_referenced`
 //!   (`tests/live/support/teardown.rs:36-44`, `tests/live/scenarios/ordering.rs:298-301`)
 //!   while a queue still points at the schema; the fake has no such check.
+//! - An `engine_fields` DELETE is never refused for being referenced by a
+//!   schema either — the sibling this list lost when the engine-delete
+//!   refusal above was modelled (`on_delete`'s `kind == "engines"` branch)
+//!   but never gained. The real API answers `409 conflict_referenced`
+//!   ("Cannot delete engine field used in a schema",
+//!   `tests/live/support/teardown.rs:55-57`) while a schema still names the
+//!   field; the fake has no such check. Not merely theoretical: a real
+//!   `DELETE /engine_fields/{id}` for exactly this gap is issued against the
+//!   fake today. `fake_push_create_ordering` (`tests/live/scenarios/ordering.rs`)
+//!   binds an engine field to its fixture queue's schema, and the scenario's
+//!   own `Teardown` unconditionally sweeps `engine_field` by name prefix,
+//!   after queues and schemas, as part of its cleanup
+//!   (`tests/live/support/teardown.rs:68-78`) — against the very fake org
+//!   the scenario ran against. That request reaches this fake's `on_delete`
+//!   and succeeds because nothing here refuses it.
 //! - PATCH validation in general is unmodelled — see the doc comment on
 //!   `on_write` for why and for the exact scope (create-only) of what IS
 //!   checked.

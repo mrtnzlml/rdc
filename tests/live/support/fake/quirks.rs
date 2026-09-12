@@ -91,8 +91,8 @@ pub fn shape_response(kind: &str, method: &str, body: &mut Value) {
 
 /// The write-path seam, symmetric with `shape_response` above: that function
 /// is reached from `mod.rs::kind_response`, the ONE place `route()` builds a
-/// response body; this one is reached from every place `state.rs` produces
-/// or updates a STORED object body — `create_unchecked`, `patch`, and
+/// response body; this one is reached from every place `state.rs` merges a
+/// CLIENT-SENT body into stored state — `create_unchecked`, `patch`, and
 /// `patch_organization` (organizations keep their own write function because
 /// the org isn't stored in the generic `objects` map, but it is still a
 /// write entrance and gets the same call). Before this existed, every "the
@@ -107,11 +107,34 @@ pub fn shape_response(kind: &str, method: &str, body: &mut Value) {
 ///   `kinds::inbox_defaults` no longer derives `email` itself and keeps only
 ///   a narrower fallback for a body this rule has nothing to derive from.
 ///
+/// **Not reached from `graph.rs`.** `relink`/`unlink` also update stored
+/// object bodies — `add_ref`/`remove_ref` push and retract a back-ref url,
+/// `set_field`/`remove_field` write or vacate a scalar field, `set_field`'s
+/// `obj.insert(field.to_string(), value)` (`graph.rs:143`) being the plainest
+/// case — and they do it as a side effect of somebody ELSE's write, entirely
+/// outside `create_unchecked`/`patch`/`patch_organization`'s own bodies. None
+/// of that goes through this seam. Today that is harmless, not by
+/// coincidence but because the two write into disjoint (kind, field) space:
+/// `relink`/`unlink` only ever write into a back-ref edge's TARGET kind, and
+/// every such edge in `kinds::EDGES` targets `workspaces`, `schemas`, or
+/// `queues` (`kinds.rs:226-235`) — never `organizations` or `inboxes`, the
+/// only two kinds a rule here keys on. A future rule keyed to one of THOSE
+/// three kinds (say, a rule reacting to `queues.hooks`, `queues.rules`,
+/// `queues.inbox`, `workspaces.queues`, or `schemas.queues` — the exact
+/// fields `add_ref`/`set_field` write) would silently miss every write
+/// `relink`/`unlink` make, because nothing calls `normalize_write` from
+/// `graph.rs`. Fixing that would mean adding that call to
+/// `add_ref`/`remove_ref`/`set_field`/`remove_field` themselves, not adding a
+/// fourth call site here — the same "one seam, not a growing set of hand-wired
+/// call sites" reasoning the paragraph above already gives for why this
+/// function exists at all.
+///
 /// Called unconditionally for every kind at every write, exactly like
 /// `shape_response` is called for every response — so a rule added here for
 /// one kind can never silently apply to another, and a future third rule has
 /// exactly one place to be added rather than a choice of three call sites to
-/// hand-wire it into.
+/// hand-wire it into (`graph.rs`'s back-ref writes aside, per the paragraph
+/// above).
 ///
 /// One structural limit, for whoever adds that third rule: unlike
 /// `shape_response`, this signature carries no phase distinguisher —

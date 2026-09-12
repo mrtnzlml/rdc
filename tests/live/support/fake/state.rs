@@ -445,11 +445,18 @@ impl OrgState {
     }
 
     /// Every queue currently bound to `engine_url` — active or draining
-    /// alike. `validate::on_delete` intersects this with
-    /// [`Self::queues_awaiting_deletion`] to tell the two real refusals
-    /// apart (`engine_attached_to_active_queues` vs
-    /// `engine_attached_to_queues_waiting_for_deletion`,
-    /// `tests/live/support/teardown.rs:59-61`).
+    /// alike. `validate::on_delete` does NOT intersect this with
+    /// [`Self::queues_awaiting_deletion`] — the two checks run
+    /// sequentially, and whichever fires first wins outright
+    /// (`validate.rs:41-52`). It calls `queues_awaiting_deletion` FIRST: if
+    /// any draining queue is bound to this engine, it returns
+    /// `engine_attached_to_queues_waiting_for_deletion` right there, and
+    /// this method is never even called. Only when that first check finds
+    /// nothing does it call this method, refusing with
+    /// `engine_attached_to_active_queues` if the result is non-empty. So an
+    /// engine bound to both a draining queue and a live one is refused with
+    /// the DRAINING message — this method's own result is not consulted in
+    /// that case at all (`tests/live/support/teardown.rs:59-61`).
     pub fn queues_bound_to_engine(&self, engine_url: &str) -> Vec<Value> {
         self.objects
             .get("queues")
