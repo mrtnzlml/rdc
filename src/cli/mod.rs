@@ -83,6 +83,12 @@ const CLI_STYLES: Styles = Styles::styled()
     .valid(VALID)
     .invalid(INVALID);
 
+// `infer_subcommands` lets an unambiguous prefix stand in for a verb: `rdc i`
+// is `rdc init`, `rdc do` is `rdc doctor`. Exact names still win outright, so
+// nothing that worked before stops working. What it costs is that a future
+// verb sharing a first letter would retire that letter for everyone already
+// typing it -- `every_verb_starts_with_a_distinct_letter` (tests/cli_misc.rs)
+// turns that into a deliberate choice instead of a silent break.
 #[derive(Debug, Parser)]
 #[command(
     name = "rdc",
@@ -90,6 +96,7 @@ const CLI_STYLES: Styles = Styles::styled()
     about = "Rossum Deployment as Code",
     styles = CLI_STYLES,
     disable_help_subcommand = true,
+    infer_subcommands = true,
 )]
 pub struct Cli {
     /// Skip interactive prompts (conflict resolver, init wizard).

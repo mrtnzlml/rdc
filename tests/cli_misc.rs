@@ -127,12 +127,60 @@ fn migrate_carry_parses_into_the_named_groups() {
 }
 
 // ---------------------------------------------------------------------------
-// Verb surface.
+// Verb surface: abbreviations, and the absence of hidden verbs.
 // ---------------------------------------------------------------------------
 
-/// No verb may be hidden from `--help`. A hidden verb is undiscoverable by
-/// definition: the `deploy` shim went on answering a command that had been
-/// gone for months, and nothing in the help output said it was there.
+/// Which verb a command line reaches, resolved through the real
+/// `Cli::command()` tree rather than the `Command` enum, so these stay honest
+/// when variants move.
+fn resolve(argv: &[&str]) -> String {
+    use clap::CommandFactory;
+    rdc::cli::Cli::command()
+        .try_get_matches_from(argv)
+        .map(|m| m.subcommand_name().unwrap_or("<no verb>").to_string())
+        .unwrap_or_else(|e| format!("<{:?}>", e.kind()))
+}
+
+/// `rdc i` is `rdc init`: clap's `infer_subcommands` accepts any unambiguous
+/// prefix. The full name always works too -- clap falls back to an exact
+/// match, so no spelling that worked before resolves anywhere new.
+#[test]
+fn an_unambiguous_prefix_resolves_to_its_verb() {
+    for (typed, verb) in [
+        ("i", "init"),
+        ("in", "init"),
+        ("ini", "init"),
+        ("init", "init"),
+        ("s", "sync"),
+        ("sy", "sync"),
+        ("sync", "sync"),
+        ("m", "migrate"),
+        ("a", "auth"),
+        ("d", "doctor"),
+        ("do", "doctor"),
+        ("u", "upgrade"),
+        ("up", "upgrade"),
+    ] {
+        assert_eq!(
+            resolve(&["rdc", typed]),
+            verb,
+            "`rdc {typed}` should reach `rdc {verb}`"
+        );
+    }
+}
+
+/// Inference matches prefixes, not fuzzy spellings: a string that prefixes no
+/// verb is still an error rather than a guess at what was meant.
+#[test]
+fn a_prefix_of_nothing_is_still_rejected() {
+    assert_eq!(resolve(&["rdc", "x"]), "<InvalidSubcommand>");
+    assert_eq!(resolve(&["rdc", "snyc"]), "<InvalidSubcommand>");
+}
+
+/// No verb may be hidden from the help output. A hidden verb is
+/// undiscoverable by definition, and under `infer_subcommands` it quietly
+/// eats a prefix as well: while the `deploy` shim existed, `rdc d` was
+/// ambiguous with `doctor` and so resolved to neither.
 #[test]
 fn the_cli_exposes_no_hidden_verbs() {
     use clap::CommandFactory;
@@ -146,5 +194,34 @@ fn the_cli_exposes_no_hidden_verbs() {
         hidden.is_empty(),
         "hidden verb(s): {hidden:?}. Every verb `rdc` accepts must appear in \
          its help output; retire a command outright rather than hiding it."
+    );
+}
+
+/// Single-letter abbreviations are a promise the next verb can break: adding
+/// `status` would turn a working `rdc s` into "unrecognized subcommand". Keep
+/// first letters distinct, or add the verb knowing what it costs.
+#[test]
+fn every_verb_starts_with_a_distinct_letter() {
+    use clap::CommandFactory;
+    use std::collections::BTreeMap;
+    let cmd = rdc::cli::Cli::command();
+    let mut by_letter: BTreeMap<char, Vec<String>> = BTreeMap::new();
+    for sub in cmd.get_subcommands() {
+        let name = sub.get_name().to_string();
+        let Some(first) = name.chars().next() else {
+            continue;
+        };
+        by_letter.entry(first).or_default().push(name);
+    }
+    let clashes: Vec<String> = by_letter
+        .iter()
+        .filter(|(_, names)| names.len() > 1)
+        .map(|(letter, names)| format!("{letter}: {}", names.join(", ")))
+        .collect();
+    assert!(
+        clashes.is_empty(),
+        "verbs sharing a first letter kill that single-letter abbreviation \
+         for everyone who already types it -- {}",
+        clashes.join("; ")
     );
 }

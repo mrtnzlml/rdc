@@ -53,6 +53,54 @@ fn real_verbs() -> BTreeSet<String> {
     out
 }
 
+/// Can a reader actually run `rdc <token>`? Answered by the real parser
+/// rather than by matching names, so exact verbs, aliases and -- since
+/// `infer_subcommands` -- every unambiguous prefix count automatically, and
+/// this stays right the day any of those change.
+fn reachable(token: &str) -> bool {
+    use clap::CommandFactory;
+    use clap::error::ErrorKind;
+    match rdc::cli::Cli::command().try_get_matches_from(["rdc", token]) {
+        Ok(m) => m.subcommand_name().is_some(),
+        // The token resolved and clap stopped for an unrelated reason: it
+        // printed help or the version (`rdc --help` is a fine thing to point
+        // a reader at), or the line is a fragment missing an argument that
+        // the prose goes on to supply.
+        Err(e) => matches!(
+            e.kind(),
+            ErrorKind::DisplayHelp
+                | ErrorKind::DisplayVersion
+                | ErrorKind::MissingRequiredArgument
+        ),
+    }
+}
+
+/// `infer_subcommands` makes an unambiguous prefix a real invocation, so prose
+/// may legitimately write `rdc i`. A guard that only knew full names would
+/// reject a line that works.
+#[test]
+fn an_abbreviated_command_counts_as_documented() {
+    for token in ["i", "in", "s", "d", "do", "u", "sync", "migrate"] {
+        assert!(reachable(token), "`rdc {token}` runs today; the guard must accept it");
+    }
+}
+
+/// A prefix of nothing is still a dead end -- the whole point of the guard.
+#[test]
+fn an_unrunnable_command_is_still_caught() {
+    for token in ["push", "pull", "deploy", "x"] {
+        assert!(!reachable(token), "`rdc {token}` does not run; the guard must catch it");
+    }
+}
+
+/// `rdc --help` is something a reader can be pointed at, even though it is
+/// not a verb. The extractor reads it as one, so the check must not choke.
+#[test]
+fn the_help_and_version_flags_are_reachable() {
+    assert!(reachable("--help"));
+    assert!(reachable("--version"));
+}
+
 /// Trees that ship or run: anything a user or a future maintainer reads as
 /// current fact. Paths are relative to the crate root.
 const SCANNED: &[&str] = &[
@@ -149,7 +197,7 @@ fn every_documented_rdc_command_exists() {
             continue; // not UTF-8; nothing to read
         };
         for (line, verb) in backticked_verbs(&text) {
-            if !verbs.contains(&verb) {
+            if !reachable(&verb) {
                 let rel = f.strip_prefix(root).unwrap_or(f);
                 bad.push(format!("{}:{line}  `rdc {verb}`", rel.display()));
             }
