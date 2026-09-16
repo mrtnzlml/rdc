@@ -726,3 +726,194 @@ async fn trailing_whitespace_handling_is_unchanged(cfg: &LiveConfig, golden: Gol
 
     drop(teardown);
 }
+
+/// Raw-wire JSON reader.
+///
+/// Every [`LiveClient`] read goes through rdc's typed models — `get_value`
+/// ends in `serde_json::to_value(typed)` — which re-serializes in STRUCT
+/// DECLARATION order and would launder away the exact property under test.
+/// This talks to the API directly, like `support::mdh::MdhRaw` does.
+struct WireReader {
+    http: reqwest::Client,
+    base: String,
+    token: String,
+}
+
+impl WireReader {
+    fn new(cfg: &LiveConfig) -> WireReader {
+        WireReader {
+            http: reqwest::Client::builder().build().expect("building reqwest client"),
+            base: cfg.api_base.trim_end_matches('/').to_string(),
+            token: cfg.token.clone(),
+        }
+    }
+
+    async fn send(&self, req: reqwest::RequestBuilder) -> serde_json::Value {
+        let res = req
+            .header("Authorization", format!("Bearer {}", self.token))
+            .send()
+            .await
+            .expect("live request");
+        let status = res.status();
+        let body = res.text().await.expect("reading response body");
+        assert!(status.is_success(), "request failed {status}: {body}");
+        serde_json::from_str(&body).expect("response is JSON")
+    }
+
+    async fn get(&self, path: &str) -> serde_json::Value {
+        self.send(self.http.get(format!("{}{path}", self.base))).await
+    }
+
+    async fn post(&self, path: &str, body: serde_json::Value) -> serde_json::Value {
+        self.send(self.http.post(format!("{}{path}", self.base)).json(&body)).await
+    }
+
+    async fn patch(&self, path: &str, body: serde_json::Value) -> serde_json::Value {
+        self.send(self.http.patch(format!("{}{path}", self.base)).json(&body)).await
+    }
+}
+
+/// Top-level keys of a JSON object, in wire order. `serde_json` is built with
+/// `preserve_order`, so `Value::Object` is an `IndexMap` and this IS the order
+/// the server sent.
+fn wire_keys(v: &serde_json::Value) -> Vec<String> {
+    v.as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default()
+}
+
+/// Both key lists reduced to the keys they SHARE, each kept in its own order.
+/// Equality of the two results means "same relative order".
+///
+/// Filtering rather than comparing key SETS is the whole point: objects of one
+/// kind legitimately differ in membership — a `function` hook carries a
+/// `status` a `webhook` hook does not, and a schema LIST omits the `content`
+/// its detail response carries. Those are not permutations and must not fail.
+fn shared_order(a: &[String], b: &[String]) -> (Vec<String>, Vec<String>) {
+    let in_a: std::collections::HashSet<&String> = a.iter().collect();
+    let in_b: std::collections::HashSet<&String> = b.iter().collect();
+    (
+        a.iter().filter(|k| in_b.contains(*k)).cloned().collect(),
+        b.iter().filter(|k| in_a.contains(*k)).cloned().collect(),
+    )
+}
+
+/// The wire key-ORDER premise behind rdc's on-disk byte stability.
+///
+/// Two of rdc's writers decide "did this file change?" by comparing RAW
+/// BYTES: `cli::migrate::settle` (`Ok(existing) if existing == bytes`) and
+/// `snapshot::writer::write_atomic` (the same test). Everything else is
+/// already immune — `state::lockfile::content_hash` canonicalizes through
+/// `snapshot::noise::sort_keys_recursive`, and `decide_pull_action`
+/// short-circuits on `local_hash == remote_hash` to `PullAction::NoChange`
+/// without writing. So a key permutation can never produce phantom DRIFT. It
+/// can produce phantom WRITES, and a file two writers disagree about is a
+/// project that never settles — which is why this premise is worth a test.
+///
+/// What reaches disk is a hybrid, and that is why the assertion is narrow.
+/// Pull deserializes into rdc's typed models and re-serializes
+/// (`cli::pull::queues.rs:209`, `serde_json::to_value(q)`), so the TYPED
+/// fields emit in struct-declaration order, which no server can move. Every
+/// model then carries `#[serde(flatten)] extra: IndexMap<String, Value>`, and
+/// an `IndexMap` preserves insertion order — so the flattened TAIL lands in
+/// wire order. That tail is the entire exposure, and it is what this pins.
+///
+/// Measured against a real org on 2026-09-16: the API's key order is
+/// deterministic and positional per kind. Responses differ by MEMBERSHIP,
+/// never by permutation — a `function` hook appends a `status` key a
+/// `webhook` hook lacks; a schema LIST omits the `content` its detail
+/// carries. So every comparison below is over the keys two responses SHARE.
+/// Demanding equal key sets would fail on facts that are perfectly fine.
+///
+/// # Not ported to the fake, on purpose
+///
+/// This is the one gap the fake structurally cannot cover, and the reason the
+/// scenario exists at all. `quirks::impose_field_order` makes the fake serve
+/// ONE order per kind for every endpoint and every method, so a fake-backed
+/// twin would assert the fake's own simplification and pass by construction,
+/// while the real risk — Rossum changing this — went unnoticed. Same
+/// criterion as `live_queue_engine_slot_counts_values_not_keys` above: a twin
+/// earns its place when something in the test is not the fake's own opinion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live: needs RDC_LIVE_* env"]
+async fn live_wire_key_order_is_positional_not_permuted() {
+    let Some(cfg) = LiveConfig::from_env() else {
+        eprintln!("{}", LiveConfig::skip_reason());
+        return;
+    };
+    let wire = WireReader::new(&cfg);
+    let run_id = RunId::new();
+    let teardown = Teardown::new(LiveClient::connect(&cfg).expect("connect"), run_id.clone());
+
+    // (1) and (2): within one LIST response, and LIST versus DETAIL.
+    let mut probed = 0usize;
+    for kind in ["queues", "hooks", "engines", "workspaces", "email_templates", "schemas"] {
+        let list = wire.get(&format!("/{kind}?page_size=20")).await;
+        let results =
+            list.get("results").and_then(|r| r.as_array()).cloned().unwrap_or_default();
+        let Some(first) = results.first() else {
+            continue; // nothing of this kind in the org; not this test's problem
+        };
+        probed += 1;
+        let base_keys = wire_keys(first);
+
+        for other in results.iter().skip(1) {
+            let (a, b) = shared_order(&base_keys, &wire_keys(other));
+            assert_eq!(
+                a, b,
+                "{kind}: two objects in ONE list response disagree on the relative order of \
+                 the keys they share. rdc's flattened `extra` tail is written to disk in wire \
+                 order, so two objects of one kind would now serialize differently and every \
+                 byte-comparing writer (`migrate::settle`, `write_atomic`) would rewrite them \
+                 forever. See this test's doc comment."
+            );
+        }
+
+        let Some(id) = first.get("id").and_then(|i| i.as_u64()) else {
+            continue;
+        };
+        let detail = wire.get(&format!("/{kind}/{id}")).await;
+        let (a, b) = shared_order(&base_keys, &wire_keys(&detail));
+        assert_eq!(
+            a, b,
+            "{kind}: the LIST and DETAIL responses disagree on the relative order of the keys \
+             they share. rdc pulls some kinds by list and re-reads others by id, so the same \
+             object would land on disk in two different orders depending on the path taken."
+        );
+    }
+    assert!(
+        probed >= 4,
+        "only {probed} kind(s) had any objects to probe — this org is too empty for the \
+         assertion to mean anything; point RDC_LIVE_* at an org with content"
+    );
+
+    // (3) POST / PATCH / GET on one throwaway object. This is the push
+    // write-back path: `cli::push::*` writes the CREATE/PATCH response to
+    // disk (portabilized), while pull writes the GET/list response. If those
+    // two orders ever diverge, sync and pull would each rewrite the file into
+    // the other's order on every cycle — the exact "never converges" shape.
+    let org = format!("{}/organizations/{}", cfg.api_base.trim_end_matches('/'), cfg.org_id);
+    let name = run_id.prefix("keyorder");
+    let created = wire
+        .post("/workspaces", serde_json::json!({ "name": name, "organization": org }))
+        .await;
+    let id = created.get("id").and_then(|i| i.as_u64()).expect("created workspace id");
+    let fetched = wire.get(&format!("/workspaces/{id}")).await;
+    let patched = wire
+        .patch(
+            &format!("/workspaces/{id}"),
+            serde_json::json!({ "name": format!("{name}-renamed") }),
+        )
+        .await;
+
+    let get_keys = wire_keys(&fetched);
+    for (label, other) in [("POST", &created), ("PATCH", &patched)] {
+        let (a, b) = shared_order(&get_keys, &wire_keys(other));
+        assert_eq!(
+            a, b,
+            "the {label} response and the GET response disagree on the relative order of the \
+             keys they share. Push write-back writes the {label} body to disk and pull writes \
+             the GET body, so the file would flip between the two orders on every cycle."
+        );
+    }
+
+    drop(teardown);
+}
