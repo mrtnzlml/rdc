@@ -750,7 +750,9 @@ impl WireReader {
 
     async fn send(&self, req: reqwest::RequestBuilder) -> serde_json::Value {
         let res = req
-            .header("Authorization", format!("Bearer {}", self.token))
+            // `token <t>`, not `Bearer <t>` — matching `RossumClient`. The
+            // live API accepts both; the fake accepts only this one.
+            .header("Authorization", format!("token {}", self.token))
             .send()
             .await
             .expect("live request");

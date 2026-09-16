@@ -58,7 +58,11 @@ impl LiveClient {
             let url = format!("{}/schemas?page_size=100&page={page}", self.api_base);
             let res = http
                 .get(&url)
-                .header("Authorization", format!("Bearer {}", self.token))
+                // `token <t>`, not `Bearer <t>` — matching `RossumClient`. The
+                // live API accepts both, so a `Bearer` here passes against a
+                // real org and 401s only against the fake, which enforces
+                // rdc's scheme. That asymmetry hid this for a whole commit.
+                .header("Authorization", format!("token {}", self.token))
                 .send()
                 .await
                 .with_context(|| format!("listing schemas (page {page})"))?;
