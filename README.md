@@ -549,11 +549,26 @@ cargo test --test live live_janitor_sweep -- --ignored
 ```
 
 > Queue deletion is asynchronous on Rossum: `DELETE` returns `202`
-> (`deletion_requested`) and the queue lingers ~24h before purge, with its
-> `workspace` nulled. The harness (and `rdc`'s pull) treat such soft-deleted
-> queues as deleted, so they are never re-pulled or counted. A queue's schema
-> stays referenced (and so undeletable) until the queue actually purges — that
-> transient schema orphan is expected, not an `rdc` defect.
+> (`deletion_requested`) and the queue lingers a full **24 hours** before it
+> purges — the server stamps `delete_after` as the delete time plus 24h — with
+> its `workspace` nulled.
+>
+> Both `rdc` and the harness treat such soft-deleted queues as **deleted**, so
+> they are never re-pulled, counted, or tracked. `rdc` gates on
+> `workspace.is_some()` in both the pull driver and the sync classifier, and a
+> regression test pins it: seeding a soft-deleted queue into the classifier
+> once let a hook's reference to it portabilize on one path but not the other,
+> so the hashes diverged and the hook re-pulled on every single sync.
+>
+> A queue's schema stays referenced, and therefore undeletable, for that same
+> 24-hour window. No retry inside a test run can outlast it, so teardown does
+> not try: it attempts the delete once, and a **later** run's teardown (or
+> `live_janitor_sweep`) collects the orphan by listing `/schemas` by name
+> prefix. Engines bound to a draining queue, and engine fields covered by a
+> surviving schema, are deferred the same way and for the same root cause.
+> A small standing backlog of these three kinds is therefore normal and is
+> reported, not asserted on; a backlog that keeps **growing** run over run
+> means a sweep has broken.
 
 Master Data Hub (MDH) index coverage runs against a per-run throwaway
 collection (`rdc_it_<run-id>_mdh`), created and dropped out-of-band so the

@@ -4,11 +4,20 @@ use crate::support::run_id::RunId;
 use anyhow::Result;
 
 /// Delete every object whose name starts with `prefix`, in dependency order:
-/// children before parents. Schemas have NO list endpoint and rdc's delete
-/// order is `queues -> schemas`, so schema ids are derived from the `schema`
-/// URL of the prefix-matched queues (captured BEFORE the queues are deleted)
-/// and deleted right after the queues. Tolerant: a not-found / already-deleting
-/// object is logged, not fatal.
+/// children before parents.
+///
+/// Schemas are swept twice over, and both halves are needed. rdc's delete
+/// order is `queues -> schemas`, so a schema id is derived from the `schema`
+/// URL of the prefix-matched queues, captured BEFORE those queues are
+/// deleted: that is the precise path, and it finds a schema even if its name
+/// never carried the run prefix. What that path cannot delete today — because
+/// its queue is still inside its 24-hour purge window — is collected on a
+/// LATER run by the orphan sweep, which lists `/schemas` by name prefix. The
+/// orphan half was missing for months on a false premise; see the schema
+/// block below.
+///
+/// Tolerant throughout: a not-found / already-deleting object is logged, not
+/// fatal.
 #[allow(dead_code)]
 pub async fn teardown_by_prefix(client: &LiveClient, prefix: &str) -> Result<()> {
     // Capture schema ids BEFORE deleting queues (schemas can't be listed).
@@ -35,17 +44,59 @@ pub async fn teardown_by_prefix(client: &LiveClient, prefix: &str) -> Result<()>
 
     // Schemas: delete by derived id, now that their queues are gone.
     //
-    // A queue DELETE is ASYNC — it returns 202 `deletion_requested` and the
-    // queue lingers for a while — so a schema delete issued immediately after
-    // races it and gets `409 Cannot delete schema because it is referenced
-    // from queue '<id>'`. Observed on the live sandbox on the very first run of
-    // the expanded suite, and the cost is real: an undeleted schema cannot be
-    // listed (there is no schema list endpoint), so nothing — not even the
-    // janitor — can ever find it again. Retry with a short backoff instead.
+    // A queue DELETE is ASYNC and the queue then lingers for **24 hours** —
+    // the server stamps `delete_after = <delete time> + 24h`, measured across
+    // 29 queues at 24.01–24.04h. Its schema stays referenced that entire
+    // window, so this DELETE answers `409 Cannot delete schema because it is
+    // referenced from queue '<id>'` and NO retry budget can outlast it.
+    //
+    // An earlier version slept 10 × 1.5s here trying to ride that out. It
+    // could never have worked, and it cost ~15s per schema: one live pair of
+    // runs spent roughly 7 minutes asleep in this loop. Try once, log, move
+    // on — and let the orphan sweep below (or a later run's janitor) collect
+    // it, exactly as engines are already handled further down.
+    //
+    // See README.md's live-testing section for the user-facing statement of
+    // this; keep that the authoritative copy rather than restating it here.
+    let mut attempted: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for id in schema_ids {
-        if let Err(e) = delete_schema_with_retry(client, id).await {
-            eprintln!("teardown: delete schema {id} failed (continuing): {e:#}");
+        attempted.insert(id);
+        if let Err(e) = client.delete("schema", id).await {
+            eprintln!("teardown: schema {id} still held, deferred to the janitor ({e:#})");
         }
+    }
+
+    // Orphan schemas left by EARLIER runs. Once a queue finishes its 24h
+    // purge its schema becomes deletable again — but nothing was ever coming
+    // back for it, so they accumulated without bound: the sandbox org held
+    // 385 of them, 90% of every schema in it.
+    //
+    // What made that permanent was a false belief, recorded in this very
+    // comment for months, that a schema which misses its teardown window
+    // "cannot be listed (there is no schema list endpoint), so nothing — not
+    // even the janitor — can ever find it again". The endpoint exists:
+    // `GET /schemas?page_size=100&page=N` returns every schema with its
+    // `name`. rdc's own `pull::common` comment says as much ("the `/schemas`
+    // list omits `content`, so the body must be fetched by id"). The gap was
+    // in `RossumClient`, which has no `list_schemas` because rdc never needs
+    // one — not in the API.
+    //
+    // Swept during ordinary teardown, not only in the janitor, so a normal
+    // run cleans up after its predecessors. Position matters: it must precede
+    // the engine_field sweep below, whose `409 conflict_referenced` clears
+    // once the schema covering the field's name is gone.
+    match client.list_ids_by_name_prefix("schema", prefix).await {
+        Ok(found) => {
+            for (id, name) in found {
+                if attempted.contains(&id) {
+                    continue; // just tried above; its queue is still draining
+                }
+                if let Err(e) = client.delete("schema", id).await {
+                    eprintln!("teardown: orphan schema {id} ({name}) still held ({e:#})");
+                }
+            }
+        }
+        Err(e) => eprintln!("teardown: listing orphan schemas failed (continuing): {e:#}"),
     }
 
     // Engine fields, then engines — after queues and schemas, and the two
@@ -104,31 +155,6 @@ pub async fn teardown_by_prefix(client: &LiveClient, prefix: &str) -> Result<()>
         }
     }
     Ok(())
-}
-
-/// Delete a schema, retrying while the queue that references it is still
-/// finishing its asynchronous delete. Gives up after ~15s.
-#[allow(dead_code)]
-async fn delete_schema_with_retry(client: &LiveClient, id: u64) -> Result<()> {
-    const ATTEMPTS: usize = 10;
-    let mut last: Option<anyhow::Error> = None;
-    for attempt in 0..ATTEMPTS {
-        match client.delete("schema", id).await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                // Only a still-referenced schema is worth waiting out; anything
-                // else (404 already gone, 403) will not improve with time.
-                if !format!("{e:#}").contains("conflict_referenced") {
-                    return Err(e);
-                }
-                last = Some(e);
-                if attempt + 1 < ATTEMPTS {
-                    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
-                }
-            }
-        }
-    }
-    Err(last.unwrap_or_else(|| anyhow::anyhow!("schema {id} still referenced after retries")))
 }
 
 /// Drop every MDH collection whose name starts with `marker` (the throwaway

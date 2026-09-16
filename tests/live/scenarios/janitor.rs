@@ -187,16 +187,23 @@ async fn janitor_sweep(cfg: &LiveConfig) {
         assert!(left.is_empty(), "janitor left {kind} objects: {left:?}");
     }
 
-    // Engines (and their fields) are deliberately NOT asserted empty. An
-    // engine that was bound to a queue is undeletable until that queue
-    // finishes purging — up to 24 hours — so a sweep run soon after
-    // `live_push_create_ordering` legitimately leaves one behind, and it goes
-    // on the next run. A field can strand for even longer: teardown's field
-    // sweep 409s while its schema still exists, and that schema can become
-    // uncollectible once its queue soft-deletes. Report the backlog instead
-    // of asserting on it, so a number that keeps climbing is visible rather
-    // than silent — for either kind.
-    for kind in ["engine", "engine_field"] {
+    // Engines, their fields, and schemas are deliberately NOT asserted empty:
+    // all three can be legitimately un-deletable at sweep time, and for one
+    // shared reason — a queue's DELETE is async and the queue lingers a full
+    // 24 hours before it purges.
+    //
+    // An engine that was bound to such a queue is refused until it drains, so
+    // a sweep soon after `live_push_create_ordering` leaves one behind and it
+    // goes on a later run. A schema is refused for the same window, by the
+    // same draining queue. An engine FIELD is refused while a schema covering
+    // its name still exists — which is a consequence of the schema case, not
+    // an independent one, so schemas being collectible again (they are now:
+    // teardown sweeps orphans off the `/schemas` listing) unblocks fields too.
+    //
+    // Report the backlog rather than asserting on it, so a number that keeps
+    // CLIMBING across runs is visible rather than silent. A steady small
+    // number is the 24h window; a growing one means a sweep has broken.
+    for kind in ["engine", "engine_field", "schema"] {
         let left = client.list_ids_by_name_prefix(kind, RunId::marker()).await.unwrap_or_default();
         if !left.is_empty() {
             eprintln!(

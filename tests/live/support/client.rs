@@ -1,11 +1,15 @@
 use crate::support::config::{EnvCreds, LiveConfig};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use rdc::api::RossumClient;
 
 #[allow(dead_code)]
 pub struct LiveClient {
     inner: RossumClient,
     pub org_url: String,
+    /// Kept for the raw `/schemas` listing below, which `RossumClient` cannot
+    /// do. See [`LiveClient::list_schemas_by_name_prefix`].
+    api_base: String,
+    token: String,
 }
 
 #[allow(dead_code)]
@@ -22,7 +26,61 @@ impl LiveClient {
             creds.api_base.trim_end_matches('/'),
             creds.org_id
         );
-        Ok(LiveClient { inner, org_url })
+        Ok(LiveClient {
+            inner,
+            org_url,
+            api_base: creds.api_base.trim_end_matches('/').to_string(),
+            token: creds.token.clone(),
+        })
+    }
+
+    /// Every `rdc-it-*` schema in the org, paged, as `(id, name)`.
+    ///
+    /// Raw HTTP because `RossumClient` has no `list_schemas` — and should not
+    /// grow one. rdc reaches a schema only through the queue that owns it
+    /// (`pull::common::prefetch_queue_schemas`, keyed by queue id), precisely
+    /// because the `/schemas` LIST omits `content` and every body must be
+    /// fetched by id anyway. A list method would be dead code in `src/`.
+    ///
+    /// That client-side gap is what produced the long-standing claim that the
+    /// API has no schemas list endpoint at all — it does, and this is it.
+    pub async fn list_schemas_by_name_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(u64, String)>> {
+        let http = reqwest::Client::builder()
+            .build()
+            .context("building reqwest client for the raw schema listing")?;
+        let mut out = Vec::new();
+        // Page explicitly: `?offset=` is silently ignored by this API, so
+        // `page=N` is the only paging that works.
+        for page in 1..=100 {
+            let url = format!("{}/schemas?page_size=100&page={page}", self.api_base);
+            let res = http
+                .get(&url)
+                .header("Authorization", format!("Bearer {}", self.token))
+                .send()
+                .await
+                .with_context(|| format!("listing schemas (page {page})"))?;
+            if !res.status().is_success() {
+                return Err(anyhow!("listing schemas (page {page}): HTTP {}", res.status()));
+            }
+            let body: serde_json::Value = res.json().await.context("parsing schema list")?;
+            let results = body.get("results").and_then(|r| r.as_array()).cloned().unwrap_or_default();
+            let count = results.len();
+            for r in results {
+                let name = r.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                if name.starts_with(prefix)
+                    && let Some(id) = r.get("id").and_then(|i| i.as_u64())
+                {
+                    out.push((id, name.to_string()));
+                }
+            }
+            if count < 100 {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// Fetch the organization's `settings` subtree as raw JSON, straight from
@@ -130,6 +188,11 @@ impl LiveClient {
         kind: &str,
         prefix: &str,
     ) -> Result<Vec<(u64, String)>> {
+        // Schemas take the raw path: `RossumClient` has no `list_schemas`, so
+        // they cannot be served from the typed listing below.
+        if kind == "schema" {
+            return self.list_schemas_by_name_prefix(prefix).await;
+        }
         let values: Vec<serde_json::Value> = match kind {
             "workspace" => to_values(self.inner.list_workspaces(None).await?)?,
             "queue" => to_values(self.inner.list_queues(None).await?)?,
