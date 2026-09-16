@@ -363,10 +363,26 @@ async fn field_limits_match_the_server(cfg: &LiveConfig) {
 /// generic_engine or engine can be set.` — the very error this reconcile
 /// exists to prevent — and nothing offline would notice.
 ///
-/// The probe only covers the `generic_engine`-set direction, because creating
-/// an `engine` is 403 on the sandbox token. That is the load-bearing half:
-/// what is being tested is whether an explicit `null` counts as "set", and the
-/// answer cannot depend on which of the three carries the value.
+/// The probe only covers the `generic_engine`-set direction — but NOT because
+/// engines cannot be created. `POST /engines` with type `extractor` succeeds
+/// on the sandbox token: `live_engines_round_trip` creates engines and engine
+/// fields on every run, and a direct probe confirmed it again on 2026-09-16.
+/// An earlier version of this comment asserted a 403 here. Engine creation is
+/// gated by an organization feature flag, so that was either a flag state
+/// that has since changed or a misattribution of some other refusal; either
+/// way it is not true of this org now, and it must not be repeated as a
+/// reason.
+///
+/// The real cost is BINDING, not creating. Pointing a queue's `engine` at a
+/// real engine strands both objects: the engine cannot be deleted while the
+/// queue is draining — "up to 24 hours", with no unbind escape hatch — which
+/// is why `live_push_create_ordering` leaks one engine per run (see the
+/// module doc in `tests/live.rs`, and the stranded `rdc-it-*` engines any
+/// sandbox sweep still finds). Paying that to cover the `engine`-set
+/// direction buys nothing: what is being tested is whether an explicit `null`
+/// counts as "set", and the answer cannot depend on which of the three keys
+/// carries the value.
+///
 /// # Not ported to the fake, on purpose
 ///
 /// Unlike its two neighbours, this scenario never runs `rdc`: it is a client
