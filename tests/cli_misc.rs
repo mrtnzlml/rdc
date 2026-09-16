@@ -125,3 +125,26 @@ fn migrate_carry_parses_into_the_named_groups() {
         }
     );
 }
+
+// ---------------------------------------------------------------------------
+// Verb surface.
+// ---------------------------------------------------------------------------
+
+/// No verb may be hidden from `--help`. A hidden verb is undiscoverable by
+/// definition: the `deploy` shim went on answering a command that had been
+/// gone for months, and nothing in the help output said it was there.
+#[test]
+fn the_cli_exposes_no_hidden_verbs() {
+    use clap::CommandFactory;
+    let cmd = rdc::cli::Cli::command();
+    let hidden: Vec<String> = cmd
+        .get_subcommands()
+        .filter(|s| s.is_hide_set())
+        .map(|s| s.get_name().to_string())
+        .collect();
+    assert!(
+        hidden.is_empty(),
+        "hidden verb(s): {hidden:?}. Every verb `rdc` accepts must appear in \
+         its help output; retire a command outright rather than hiding it."
+    );
+}

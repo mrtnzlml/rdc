@@ -169,31 +169,6 @@ pub enum Command {
         #[arg(long = "no-bell", requires = "watch")]
         no_bell: bool,
     },
-    /// Removed: replaced by `rdc migrate <src> <tgt>` + `rdc sync <tgt>`.
-    ///
-    /// Hidden from help. Invoking it emits a guiding error pointing at the
-    /// replacement workflow rather than a generic "unrecognized subcommand".
-    /// Accepts (and ignores) the former positionals/flags so the error is
-    /// reached regardless of how the old command was invoked.
-    #[command(hide = true)]
-    Deploy {
-        /// Former source environment (ignored).
-        src: Option<String>,
-        /// Former target environment (ignored).
-        tgt: Option<String>,
-        /// Former `--mirror` flag (ignored).
-        #[arg(long)]
-        mirror: bool,
-        /// Former `--dry-run` flag (ignored).
-        #[arg(long = "dry-run")]
-        dry_run: bool,
-        /// Former `--force-overwrite-drift` flag (ignored).
-        #[arg(long = "force-overwrite-drift")]
-        force_overwrite_drift: bool,
-        /// Former `--only` selectors (ignored).
-        #[arg(long = "only", value_name = "SELECTOR", action = clap::ArgAction::Append)]
-        only: Vec<String>,
-    },
     /// Migrate a source env's snapshot into a target env's snapshot, locally.
     ///
     /// Pure-local, ZERO remote calls: copies `envs/<src>/` into `envs/<tgt>/`,
@@ -378,12 +353,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 .await
                 .map(|_outcome| ())
             }
-        }
-        Some(Command::Deploy { .. }) => {
-            anyhow::bail!(
-                "`rdc deploy` has been replaced. Run `rdc migrate <src> <tgt>` to produce \
-                 the target snapshot locally, review the diff, then `rdc sync <tgt>` to push it."
-            )
         }
         Some(Command::Migrate {
             src,

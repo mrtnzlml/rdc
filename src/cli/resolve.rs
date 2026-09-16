@@ -1527,9 +1527,9 @@ pub fn format_user_choices(users: &[crate::model::User], self_user_id: Option<u6
 /// or `None` if the user aborted. Non-TTY callers must skip this and
 /// check the overlay state up-front.
 ///
-/// **No caller today.** This was `rdc deploy`'s store-extension step; a
-/// `token_owner` is now declared per env in `overlay.toml`
-/// (`[hooks."*"] token_owner`, or per hook).
+/// **No caller today.** This was the store-extension step of the retired
+/// `deploy` command; a `token_owner` is now declared per env in
+/// `overlay.toml` (`[hooks."*"] token_owner`, or per hook).
 pub fn prompt_token_owner(
     slug: &str,
     tgt_env: &str,

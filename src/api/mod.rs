@@ -122,7 +122,7 @@ impl RossumClient {
     /// retry wrapper knows which env's token to refresh on a 401.
     ///
     /// Written for a command holding two clients (src + tgt). The command
-    /// that did — `rdc deploy` — was replaced by the offline `rdc migrate`,
+    /// that did — `deploy` — was replaced by the offline `rdc migrate`,
     /// which opens no client at all, so this has **no caller today**; it is
     /// kept for the next multi-env caller rather than as live behavior.
     pub fn with_env_label(mut self, env: impl Into<String>) -> Self {
@@ -322,7 +322,7 @@ impl RossumClient {
     /// Written so a cross-env caller could strip per-env fields like `email`
     /// (auto-assigned at create, immutable in practice; sending the src
     /// env's value cross-env at best is ignored, at worst rewrites the
-    /// tgt inbox's email). That caller was `rdc deploy`; nothing reaches
+    /// tgt inbox's email). That caller was the retired `deploy`; nothing reaches
     /// this today. Mirror of [`Self::update_hook_value`].
     pub async fn update_inbox_value(&self, id: u64, body: &serde_json::Value, progress: ProgressHandle) -> Result<Inbox> {
         self.patch_json(&format!("/inboxes/{id}"), body, progress).await

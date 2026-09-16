@@ -298,7 +298,7 @@ fn init_creates_readme_with_sync_commands_and_skips_deploy_for_single_env() {
 
 /// Two-env project includes a Promote section with a concrete
 /// migrate+sync example using the alphabetically-first pair (BTreeMap
-/// order, deterministic). `rdc deploy` no longer exists; the scaffold
+/// order, deterministic). The `deploy` command no longer exists; the scaffold
 /// must not advertise it.
 #[test]
 fn init_readme_includes_promote_for_multiple_envs() {
@@ -336,12 +336,12 @@ fn init_readme_includes_promote_for_multiple_envs() {
     // The removed command must not be advertised anywhere in the scaffold.
     assert!(
         !body.contains("rdc deploy"),
-        "scaffolded README must not document the removed `rdc deploy`: {body}"
+        "scaffolded README must not document the removed deploy command: {body}"
     );
 }
 
 /// The scaffolded agent guide must describe only commands and flags that
-/// exist: no removed `rdc deploy`, no nonexistent `sync --diff`, and the
+/// exist: no removed deploy command, no nonexistent `sync --diff`, and the
 /// conflict-resolver letters spelled the way `src/cli/resolve.rs` prints
 /// them.
 #[test]
@@ -360,7 +360,7 @@ fn init_claude_md_documents_only_real_commands() {
     let body = std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
     assert!(
         !body.contains("rdc deploy"),
-        "CLAUDE.md must not document the removed `rdc deploy`"
+        "CLAUDE.md must not document the removed deploy command"
     );
     assert!(
         !body.contains("--diff"),

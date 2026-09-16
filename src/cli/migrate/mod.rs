@@ -16,8 +16,9 @@
 //!
 //! Afterwards the user reviews `git diff` and runs `rdc sync <tgt>` to push.
 //! This is the whole local half of a promotion: the command it replaced,
-//! `rdc deploy`, is gone (invoking it now emits a guiding error — see
-//! `cli::Command::Deploy`).
+//! `deploy`, is gone. The hidden shim that answered it with a guiding error
+//! went too, so an old invocation now gets clap's unrecognized-subcommand
+//! error like any other typo.
 
 use crate::mapping::{GenericMapping, Mapping};
 use crate::overlay::{Overlay, apply_overrides};

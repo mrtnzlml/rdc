@@ -11,7 +11,7 @@
 //! failed and no test noticed; the user simply had nowhere to go.
 //!
 //! That is the failure mode this guards: not a crash, but a dead end handed
-//! to someone following instructions. Commands come and go here (`rdc deploy`
+//! to someone following instructions. Commands come and go here (`deploy`
 //! became `migrate` + `sync`; `doctor --rebuild-lock` was dropped), and every
 //! removal leaves prose behind that still compiles.
 //!
@@ -19,9 +19,10 @@
 //! IMMEDIATELY before `rdc` marks a command, and this codebase writes plain
 //! prose ("rdc never writes…", "rdc manages shared views only") without one.
 //! The verb is then checked against clap itself — not a hand-kept list — so
-//! removing a subcommand fails this test until the prose catches up. Hidden
-//! subcommands count: `rdc deploy` is still invocable and answers with a
-//! guiding error, which is a fine thing to point a reader at.
+//! removing a subcommand fails this test until the prose catches up. There is
+//! no hidden-verb exception to carve out: `the_cli_exposes_no_hidden_verbs`
+//! (tests/cli_misc.rs) pins that every verb clap accepts is one that
+//! `rdc --help` lists, so what a reader is pointed at, they can also find.
 //!
 //! `docs/superpowers/` and `.superpowers/` are exempt. They are dated design
 //! records — plans and specs describing what was true when they were written,
@@ -31,8 +32,8 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-/// Verbs the binary accepts, straight from the clap definition, including
-/// hidden ones and aliases.
+/// Verbs the binary accepts, straight from the clap definition, aliases
+/// included.
 fn real_verbs() -> BTreeSet<String> {
     use clap::CommandFactory;
     let cmd = rdc::cli::Cli::command();

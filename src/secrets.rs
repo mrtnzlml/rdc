@@ -521,8 +521,8 @@ pub fn load_hook_secrets(project_root: &Path, env: &str) -> Result<HookSecrets> 
 /// values: instead of asking the user to figure out the JSON shape, rdc
 /// hands them a fill-in-the-blanks form. Returns the absolute path
 /// written so callers can quote it in the actionable error message.
-/// The pre-flight that called it belonged to `rdc deploy` and went with
-/// it; only tests reach this today.
+/// The pre-flight that called it belonged to the retired `deploy`
+/// command and went with it; only tests reach this today.
 ///
 /// Pretty-printed with sorted keys (BTreeMap iteration order) so the
 /// file is human-editable and re-runs produce stable diffs. The atomic
