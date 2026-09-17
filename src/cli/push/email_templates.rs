@@ -48,6 +48,102 @@ fn pick_adoption_id(
         .min()
 }
 
+/// True when `pick_adoption_id` would match this type by NAME rather than by
+/// `type` — i.e. `custom`, or a local file with no `type` at all. Mirrors that
+/// function's `match local_type { Some(t) if t != "custom" => …, _ => … }`, and
+/// exists so the two cannot drift.
+fn is_name_matched_type(local_type: Option<&str>) -> bool {
+    !matches!(local_type, Some(t) if t != "custom")
+}
+
+/// Email-template types that only ever fire because a `trigger` points at
+/// them, and so are inert the moment rdc creates one.
+///
+/// Verified live: creating a queue auto-provisions five templates, and Rossum
+/// wires a trigger to four of them — the three `custom` ones
+/// (`annotation_created` / `_confirmed` / `_exported`) and
+/// `email_with_no_processable_attachments`. Only the rejection family
+/// (`rejection`, `rejection_default`) is trigger-free, and the trigger `event`
+/// enum has no rejection member to wire one with.
+///
+/// A NEGATIVE match on purpose: a template type a future API revision adds
+/// defaults to "warn". A spurious warning costs one line; staying silent about
+/// a template that can never fire is the failure this whole check exists to
+/// prevent.
+fn needs_trigger(local_type: Option<&str>) -> bool {
+    !matches!(local_type, Some("rejection") | Some("rejection_default"))
+}
+
+/// Why a POST of this template is about to produce something that cannot fire,
+/// or `None` when the type does not need a trigger.
+///
+/// `POST /email_templates` never auto-creates a trigger — the template lands
+/// with `triggers: []` and stays silent even with `enabled: true` and
+/// `automate: true` (live-verified). rdc cannot fix this for the user: the
+/// trigger IS creatable over the API, but its required `event` is not
+/// derivable from anything on disk. An email template carries no event field,
+/// and the local snapshot's `triggers` entry is a SOURCE-env URL that means
+/// nothing in the target.
+///
+/// So the check reports rather than repairs, and names the most likely cause.
+/// The usual way to arrive here is a renamed stock template: `pick_adoption_id`
+/// matches `custom` templates by NAME, so a rename stops it adopting the
+/// target's own stock template, and rdc POSTs an inert duplicate beside a
+/// perfectly good wired one. Listing the unadopted, already-wired siblings on
+/// the same queue turns that from a silent mystery into a one-line fix.
+///
+/// A sibling is only offered when `pick_adoption_id` could actually have
+/// adopted it — same queue, unclaimed, and in the same match class — so the
+/// suggestion is never one the matcher would have refused anyway.
+fn inert_create_warning(
+    remotes: &std::collections::HashMap<u64, crate::model::EmailTemplate>,
+    local_queue: &Option<String>,
+    local_type: Option<&str>,
+    claimed: &HashSet<u64>,
+) -> Option<String> {
+    if !needs_trigger(local_type) {
+        return None;
+    }
+    let local_name_matched = is_name_matched_type(local_type);
+    let mut candidates: Vec<&crate::model::EmailTemplate> = remotes
+        .values()
+        .filter(|r| {
+            if claimed.contains(&r.id) || r.queue != *local_queue {
+                return false;
+            }
+            let remote_type = r.extra.get("type").and_then(|v| v.as_str());
+            let same_class = if local_name_matched {
+                is_name_matched_type(remote_type)
+            } else {
+                remote_type == local_type
+            };
+            same_class && has_trigger(r)
+        })
+        .collect();
+    candidates.sort_by_key(|r| r.id);
+
+    let mut why =
+        String::from("created with no trigger — it cannot fire until one is created for it");
+    if !candidates.is_empty() {
+        let names: Vec<String> = candidates.iter().map(|r| format!("{:?}", r.name)).collect();
+        why.push_str(&format!(
+            "; this queue has {} unadopted template(s) that already have one: {}. \
+             If this was a rename, restore the name to adopt it instead",
+            candidates.len(),
+            names.join(", ")
+        ));
+    }
+    Some(why)
+}
+
+/// True when the remote template already has a trigger pointing at it.
+fn has_trigger(t: &crate::model::EmailTemplate) -> bool {
+    t.extra
+        .get("triggers")
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| !a.is_empty())
+}
+
 pub async fn push(
     paths: &Paths,
     client: &RossumClient,
@@ -219,6 +315,17 @@ pub async fn push(
             }
 
             // No existing match → POST as before (skip-and-continue on failure).
+            // A created template is born with `triggers: []` and, for the types
+            // that fire off a trigger, is inert until one is made for it — so
+            // say so rather than report a silent success.
+            if let Some(why) =
+                inert_create_warning(&remote_cache, &local_queue, local_type, &claimed)
+            {
+                progress.event(
+                    Action::Warn,
+                    &format!("email_template/{lockfile_key} {why}"),
+                );
+            }
             strip_for_create(&mut payload, "email_templates");
             match client
                 .create_email_template(&payload, Some(progress.clone()))
@@ -719,6 +826,240 @@ mod tests {
 
     fn cache(templates: Vec<EmailTemplate>) -> HashMap<u64, EmailTemplate> {
         templates.into_iter().map(|t| (t.id, t)).collect()
+    }
+
+    /// A template Rossum has already wired a trigger to.
+    fn wired(id: u64, name: &str, queue: &str, ty: &str) -> EmailTemplate {
+        let mut t = tpl(id, name, queue, ty);
+        t.extra.insert(
+            "triggers".to_string(),
+            serde_json::json!([format!("https://x/api/v1/triggers/{id}")]),
+        );
+        t
+    }
+
+    /// A template with the key present but empty — the shape a POSTed template
+    /// comes back with, and the one that must never be offered as a candidate.
+    fn unwired(id: u64, name: &str, queue: &str, ty: &str) -> EmailTemplate {
+        let mut t = tpl(id, name, queue, ty);
+        t.extra
+            .insert("triggers".to_string(), serde_json::json!([]));
+        t
+    }
+
+    fn q(n: &str) -> Option<String> {
+        Some(format!("https://x/api/v1/queues/{n}"))
+    }
+
+    #[test]
+    fn rejection_family_creates_are_never_warned() {
+        // The only two types Rossum provisions without a trigger, and the
+        // trigger `event` enum has no rejection member to wire one with.
+        let remotes = cache(vec![wired(100, "received", "1", "custom")]);
+        for ty in ["rejection", "rejection_default"] {
+            assert_eq!(
+                inert_create_warning(&remotes, &q("1"), Some(ty), &HashSet::new()),
+                None,
+                "{ty} does not need a trigger"
+            );
+        }
+    }
+
+    #[test]
+    fn a_custom_create_warns_even_with_nothing_to_suggest() {
+        // The bare case: the POST still yields `triggers: []`, so it is still
+        // inert and still worth saying — just with no rename to point at.
+        let why = inert_create_warning(&cache(vec![]), &q("1"), Some("custom"), &HashSet::new())
+            .expect("a custom create is always inert");
+        assert!(why.contains("no trigger"), "{why}");
+        assert!(
+            !why.contains("unadopted"),
+            "nothing to suggest, so no suggestion: {why}"
+        );
+    }
+
+    #[test]
+    fn a_missing_type_is_treated_as_custom() {
+        // `pick_adoption_id` matches a type-less local by name, so it lands in
+        // the same trap; it must warn identically.
+        assert!(
+            inert_create_warning(&cache(vec![]), &q("1"), None, &HashSet::new()).is_some(),
+            "a type-less template is name-matched, so it is trigger-needing"
+        );
+    }
+
+    #[test]
+    fn the_rename_case_names_the_sibling_to_restore() {
+        // The whole point: a renamed stock template no longer name-matches, so
+        // rdc is about to POST an inert duplicate beside the wired original.
+        let remotes = cache(vec![wired(100, "Annotation status change - confirmed", "1", "custom")]);
+        let why = inert_create_warning(&remotes, &q("1"), Some("custom"), &HashSet::new())
+            .expect("inert");
+        assert!(
+            why.contains("\"Annotation status change - confirmed\""),
+            "must name the sibling: {why}"
+        );
+        assert!(why.contains("If this was a rename"), "{why}");
+    }
+
+    #[test]
+    fn siblings_are_listed_lowest_id_first() {
+        // Deterministic across runs despite HashMap iteration order — the same
+        // property `pick_adoption_id` guarantees for the id it returns.
+        let remotes = cache(vec![
+            wired(300, "ccc", "1", "custom"),
+            wired(100, "aaa", "1", "custom"),
+            wired(200, "bbb", "1", "custom"),
+        ]);
+        let why = inert_create_warning(&remotes, &q("1"), Some("custom"), &HashSet::new())
+            .expect("inert");
+        assert!(why.contains("3 unadopted"), "{why}");
+        let at = |n: &str| why.find(n).expect("listed");
+        assert!(at("aaa") < at("bbb") && at("bbb") < at("ccc"), "{why}");
+    }
+
+    #[test]
+    fn a_claimed_sibling_is_not_offered() {
+        // Already owned by another local template this push, so suggesting a
+        // rename onto it would just move the collision.
+        let remotes = cache(vec![wired(100, "Annotation status change - confirmed", "1", "custom")]);
+        let why = inert_create_warning(&remotes, &q("1"), Some("custom"), &HashSet::from([100]))
+            .expect("still inert");
+        assert!(!why.contains("unadopted"), "claimed is not a candidate: {why}");
+    }
+
+    #[test]
+    fn a_sibling_on_another_queue_is_not_offered() {
+        // Templates are per-queue; adoption never crosses queues.
+        let remotes = cache(vec![wired(100, "Annotation status change - confirmed", "2", "custom")]);
+        let why = inert_create_warning(&remotes, &q("1"), Some("custom"), &HashSet::new())
+            .expect("still inert");
+        assert!(!why.contains("unadopted"), "other queue is not a candidate: {why}");
+    }
+
+    #[test]
+    fn a_sibling_with_no_trigger_is_not_offered() {
+        // Adopting it would gain nothing — it is just as inert as the POST.
+        let remotes = cache(vec![
+            unwired(100, "Annotation status change - confirmed", "1", "custom"),
+            tpl(101, "Annotation status change - exported", "1", "custom"),
+        ]);
+        let why = inert_create_warning(&remotes, &q("1"), Some("custom"), &HashSet::new())
+            .expect("still inert");
+        assert!(
+            !why.contains("unadopted"),
+            "an unwired sibling is no help: {why}"
+        );
+    }
+
+    #[test]
+    fn a_custom_local_is_not_pointed_at_a_typed_sibling() {
+        // `pick_adoption_id` would never have adopted it (it matches typed
+        // templates by `type`), so offering it would be a dead-end suggestion.
+        let remotes = cache(vec![wired(
+            100,
+            "Email with no processable attachments",
+            "1",
+            "email_with_no_processable_attachments",
+        )]);
+        let why = inert_create_warning(&remotes, &q("1"), Some("custom"), &HashSet::new())
+            .expect("still inert");
+        assert!(!why.contains("unadopted"), "wrong match class: {why}");
+    }
+
+    #[test]
+    fn the_typed_trigger_needing_type_warns_and_matches_its_own_class() {
+        // `email_with_no_processable_attachments` is trigger-needing too. It
+        // adopts by type so it is rename-proof, but if a POST ever happens the
+        // result is equally inert — and only a same-type sibling is offered.
+        let ty = "email_with_no_processable_attachments";
+        let remotes = cache(vec![
+            wired(100, "whatever", "1", ty),
+            wired(200, "Annotation status change - confirmed", "1", "custom"),
+        ]);
+        let why =
+            inert_create_warning(&remotes, &q("1"), Some(ty), &HashSet::new()).expect("inert");
+        assert!(why.contains("1 unadopted"), "exactly the same-type one: {why}");
+        assert!(why.contains("\"whatever\""), "{why}");
+        assert!(!why.contains("Annotation"), "custom sibling is another class: {why}");
+    }
+
+    /// The one premise the hand-built fixtures above cannot cover: that a REAL
+    /// API response still puts `triggers` where `has_trigger` looks for it.
+    /// `EmailTemplate` models only five fields and flattens the rest into
+    /// `extra`, so this is entirely a `serde(flatten)` bet — and a silent one,
+    /// because a missing key reads as "no trigger" and simply drops the
+    /// suggestion rather than failing anything.
+    ///
+    /// Bodies below are verbatim `GET /email_templates` responses (Rossum's own
+    /// auto-provisioned templates, trimmed to the modelled keys plus the two
+    /// this check reads).
+    #[test]
+    fn a_live_api_body_round_trips_into_the_trigger_check() {
+        let wired_body = serde_json::json!({
+            "id": 20094420,
+            "url": "https://api.elis.rossum.ai/v1/email_templates/20094420",
+            "name": "Annotation status change - confirmed",
+            "subject": "",
+            "queue": "https://api.elis.rossum.ai/v1/queues/4127028",
+            "type": "custom",
+            "triggers": ["https://api.elis.rossum.ai/v1/triggers/16152693"],
+            "enabled": false,
+            "automate": false
+        });
+        let unwired_body = serde_json::json!({
+            "id": 20094416,
+            "url": "https://api.elis.rossum.ai/v1/email_templates/20094416",
+            "name": "Default rejection template",
+            "subject": "",
+            "queue": "https://api.elis.rossum.ai/v1/queues/4127028",
+            "type": "rejection_default",
+            "triggers": [],
+            "enabled": true,
+            "automate": true
+        });
+
+        let live_wired: EmailTemplate = serde_json::from_value(wired_body).unwrap();
+        let live_unwired: EmailTemplate = serde_json::from_value(unwired_body).unwrap();
+        assert!(has_trigger(&live_wired), "`triggers` must reach `extra`");
+        assert!(!has_trigger(&live_unwired), "an empty array is not a trigger");
+
+        // And end to end: a rename against this exact remote must name it.
+        let queue = live_wired.queue.clone();
+        let why = inert_create_warning(
+            &cache(vec![live_wired, live_unwired]),
+            &queue,
+            Some("custom"),
+            &HashSet::new(),
+        )
+        .expect("inert");
+        assert!(
+            why.contains("\"Annotation status change - confirmed\""),
+            "{why}"
+        );
+        assert!(
+            !why.contains("Default rejection"),
+            "the unwired rejection default is not a candidate: {why}"
+        );
+    }
+
+    #[test]
+    fn the_match_class_helper_tracks_pick_adoption_id() {
+        // These two must agree or the suggestion can name a template the
+        // matcher would have refused. Asserted against `pick_adoption_id`
+        // itself rather than restated, so a change to one fails here.
+        for ty in [None, Some("custom"), Some("rejection_default"), Some("other")] {
+            let remotes = cache(vec![tpl(100, "a-name", "1", ty.unwrap_or("custom"))]);
+            // Name-matched types adopt only on an exact name hit.
+            let by_name = pick_adoption_id(&remotes, &q("1"), ty, "a-name", &HashSet::new());
+            let by_wrong_name =
+                pick_adoption_id(&remotes, &q("1"), ty, "different", &HashSet::new());
+            assert_eq!(
+                is_name_matched_type(ty),
+                by_name.is_some() && by_wrong_name.is_none(),
+                "match class disagrees with pick_adoption_id for {ty:?}"
+            );
+        }
     }
 
     #[test]
