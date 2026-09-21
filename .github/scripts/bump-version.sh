@@ -1,6 +1,11 @@
 #!/bin/sh
-# Rewrite the crate version in the four files a release commit touches:
-# Cargo.toml, Cargo.lock, desktop/rust/Cargo.lock and templates/gitlab-ci.yml.
+# Rewrite the crate version in the three files a release commit touches:
+# Cargo.toml, Cargo.lock and desktop/rust/Cargo.lock.
+#
+# templates/gitlab-ci.yml is NOT one of them: the scaffolded pipeline installs
+# `RDC_VERSION: "latest"`, so it names no version for a release to rewrite, and
+# `the_committed_template_floats_and_names_no_version` in src/cli/gitlab_ci.rs
+# keeps it that way. Do not add it back without removing that test first.
 #
 # Every edit is guarded twice -- the target pattern must match exactly one line
 # BEFORE the edit, and the result must differ on exactly one line AFTER it --
@@ -71,12 +76,3 @@ lock_program='
 '
 edit "$root/Cargo.lock" '^name = "rdc"$' "$lock_program"
 edit "$root/desktop/rust/Cargo.lock" '^name = "rdc"$' "$lock_program"
-
-# templates/gitlab-ci.yml: the RDC_VERSION pin, which CLAUDE.md requires to name
-# a real, current tag -- the deploy job it scaffolds runs
-# `rdc sync --allow-deletes --yes` unattended. This is the one line in the file
-# carrying the full version literal; `committed_template_pins_this_crates_version`
-# in src/cli/gitlab_ci.rs keeps it that way.
-edit "$root/templates/gitlab-ci.yml" '^  RDC_VERSION: "' '
-  { if (!done && $0 ~ /^  RDC_VERSION: "/) { $0 = "  RDC_VERSION: \"v" new "\""; done = 1 } print }
-'

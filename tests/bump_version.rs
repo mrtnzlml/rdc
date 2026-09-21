@@ -51,9 +51,11 @@ name = "rdc_bridge"
 version = "0.1.0"
 "#;
 
+/// The scaffolded pipeline floats on `latest`, so a bump must leave it exactly
+/// as it is -- including the historical `pre-0.7`, which names releases that
+/// already shipped.
 const TEMPLATE: &str = r#"variables:
-  # An exact tag is reproducible and is what this file ships with.
-  RDC_VERSION: "v0.7.0"
+  RDC_VERSION: "latest"
   RDC_REPO: "mrtnzlml/rdc"
   # A suffix also matches the pre-0.7 unversioned names.
   RDC_ASSET_SUFFIX: "-x86_64-unknown-linux-gnu.tar.gz"
@@ -88,7 +90,7 @@ fn stderr(out: &Output) -> String {
 }
 
 #[test]
-fn bumps_all_four_files() {
+fn bumps_all_three_files() {
     let t = tree();
     let out = bump(t.path(), "0.8.0");
     assert!(out.status.success(), "{}", stderr(&out));
@@ -98,7 +100,7 @@ fn bumps_all_four_files() {
     assert!(
         read(t.path(), "desktop/rust/Cargo.lock").contains("name = \"rdc\"\nversion = \"0.8.0\"\n")
     );
-    assert!(read(t.path(), "templates/gitlab-ci.yml").contains("  RDC_VERSION: \"v0.8.0\"\n"));
+    assert_eq!(read(t.path(), "templates/gitlab-ci.yml"), TEMPLATE, "the template was rewritten");
 }
 
 #[test]
@@ -115,7 +117,6 @@ fn leaves_every_other_version_line_alone() {
         read(t.path(), "desktop/rust/Cargo.lock")
             .contains("name = \"rdc_bridge\"\nversion = \"0.1.0\"")
     );
-    assert!(read(t.path(), "templates/gitlab-ci.yml").contains("pre-0.7 unversioned names"));
     assert!(read(t.path(), "Cargo.toml").contains("anyhow = \"1\""));
 }
 
@@ -182,13 +183,12 @@ fn leaves_no_temp_files_behind() {
 
 #[test]
 fn bumps_the_real_repository_tree_in_a_copy() {
-    // Guards the four real files against a rename or a reshuffle: copy them out
+    // Guards the three real files against a rename or a reshuffle: copy them out
     // of the checkout and bump the copy. Never touches the working tree.
     let t = TempDir::new().unwrap();
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
     fs::create_dir_all(t.path().join("desktop/rust")).unwrap();
-    fs::create_dir_all(t.path().join("templates")).unwrap();
-    for rel in ["Cargo.toml", "Cargo.lock", "desktop/rust/Cargo.lock", "templates/gitlab-ci.yml"] {
+    for rel in ["Cargo.toml", "Cargo.lock", "desktop/rust/Cargo.lock"] {
         fs::copy(repo.join(rel), t.path().join(rel)).unwrap();
     }
 
@@ -202,9 +202,9 @@ fn bumps_the_real_repository_tree_in_a_copy() {
         read(t.path(), "desktop/rust/Cargo.lock")
             .contains("name = \"rdc\"\nversion = \"99.99.99\"\n")
     );
-    assert!(read(t.path(), "templates/gitlab-ci.yml").contains("  RDC_VERSION: \"v99.99.99\"\n"));
-    // And the old version is gone from both files that spell it out.
-    for rel in ["Cargo.toml", "templates/gitlab-ci.yml"] {
-        assert!(!read(t.path(), rel).contains(current), "{rel} still names {current}");
-    }
+    // And the old version is gone from the one file that spells it out.
+    assert!(
+        !read(t.path(), "Cargo.toml").contains(current),
+        "Cargo.toml still names {current}"
+    );
 }

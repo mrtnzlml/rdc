@@ -46,20 +46,25 @@ Project-specific instructions for working in this repo.
   because a formula returning a field hands back a proxy whose `.value` is the
   datapoint's raw string. Its self-tests ship on purpose: `pytest -q` with
   nothing collected exits 5 and turns the pipeline's test job red.
-- The **committed default must stay a pinned tag** — `RDC_VERSION` names the
-  newest release tag. The deploy job runs `rdc sync --allow-deletes --yes`
-  unattended, so a floating default would let a new rdc change what a
-  destructive sync does with nobody watching. **You no longer bump this by
-  hand**: `.github/workflows/weekly-release.yaml` rewrites it in the same commit
-  as `Cargo.toml`, and `committed_template_pins_this_crates_version`
-  (`src/cli/gitlab_ci.rs`) fails the build if the two ever drift.
-- Because a script rewrites that line, the **full version literal must appear
-  exactly once** in `templates/gitlab-ci.yml` — on the `RDC_VERSION` line, at a
-  two-space indent. Everything else says `<version>`, `vX.Y.Z` or `vX.Y`.
-  `the_version_pin_is_the_only_line_a_bumper_could_match` enforces both halves.
-  Note `pre-0.7` in the `RDC_ASSET_SUFFIX` comment is a *historical* statement
-  about releases that already shipped and must never be bumped; it survives
-  because it is not the full literal.
+- The **committed default is `RDC_VERSION: "latest"`** — the scaffolded
+  pipeline installs the newest release, so a fresh project works and fixes
+  arrive without editing the file. The cost is real and accepted: the deploy job
+  runs `rdc sync --allow-deletes --yes` unattended, so a release changes what a
+  destructive sync does with nobody watching. A project that wants that decided
+  by a commit pins `RDC_VERSION` itself — the install script takes an exact tag
+  (`vX.Y.Z`), a series prefix (`vX.Y`, newest patch in that line) or `latest`,
+  and a manual job's "Run job" form overrides it for one press. (This replaced a
+  pinned default on 2026-09-21. Reverting means reinstating the bumper's fourth
+  edit and its tests below.)
+- Therefore the **full version literal must appear nowhere** in
+  `templates/gitlab-ci.yml`, and `.github/scripts/bump-version.sh` must not
+  touch that file: it edits three files, not four.
+  `the_committed_template_floats_and_names_no_version` (`src/cli/gitlab_ci.rs`)
+  enforces both halves, and `bumps_all_three_files` (`tests/bump_version.rs`)
+  asserts the template comes back byte-identical. Prose says `<version>`,
+  `vX.Y.Z` or `vX.Y`; `pre-0.7` in the `RDC_ASSET_SUFFIX` comment is a
+  *historical* statement about releases that already shipped and must never be
+  bumped.
 - Releases are cut by **`.github/workflows/weekly-release.yaml`** (Monday 06:17
   UTC, plus `workflow_dispatch`), not by hand. It releases only when a commit
   since the last tag touched `src/`, `templates/`, `desktop/`, `Cargo.toml` or

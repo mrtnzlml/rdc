@@ -514,44 +514,28 @@ mod tests {
         );
     }
 
-    /// The template ships a pinned tag, and CLAUDE.md requires that pin to name
-    /// a real, current release -- the deploy job it scaffolds runs
-    /// `rdc sync --allow-deletes --yes` unattended. Both files move in the same
-    /// release commit, so this holds on every committed state; it fails only on
-    /// the intermediate CI state where `Cargo.toml` has been bumped and the
-    /// template has not, which is exactly the half-finished bump it exists to
-    /// catch.
+    /// The committed pipeline floats on `latest`, and carries no version
+    /// literal at all.
+    ///
+    /// Both halves are deliberate. A scaffold's job is to install a working rdc
+    /// on a fresh project; a project that wants the release decided by a commit
+    /// pins `RDC_VERSION` itself, which the install script accepts as an exact
+    /// tag or a series prefix. And with no literal anywhere,
+    /// `.github/scripts/bump-version.sh` has nothing to rewrite in this file --
+    /// it edits three files, not four -- so no comment here can be silently
+    /// falsified by a release.
     #[test]
-    fn committed_template_pins_this_crates_version() {
+    fn the_committed_template_floats_and_names_no_version() {
         let template = crate::cli::init::GITLAB_CI_TEMPLATE;
-        let pin = template
+        let pins: Vec<&str> = template
             .lines()
-            .find_map(|line| line.trim().strip_prefix("RDC_VERSION: "))
-            .expect("templates/gitlab-ci.yml has an RDC_VERSION line")
-            .trim_matches('"');
-        assert_eq!(
-            pin,
-            format!("v{}", env!("CARGO_PKG_VERSION")),
-            "templates/gitlab-ci.yml's RDC_VERSION pin and Cargo.toml's version have drifted"
-        );
-    }
-
-    /// The bumper in `.github/scripts/bump-version.sh` rewrites the ONE line
-    /// matching `^  RDC_VERSION: "`. If a second line ever carries that prefix,
-    /// or the pin loses its two-space indent, the bumper's 1-line-diff
-    /// assertion turns a release red for a reason nobody will guess. And if the
-    /// full version literal appears anywhere else, a bump silently falsifies
-    /// whatever prose carries it.
-    #[test]
-    fn the_version_pin_is_the_only_line_a_bumper_could_match() {
-        let template = crate::cli::init::GITLAB_CI_TEMPLATE;
-        let pins = template.lines().filter(|l| l.starts_with("  RDC_VERSION: \"")).count();
-        assert_eq!(pins, 1, "expected exactly one bumpable RDC_VERSION line");
-        let literals = template.matches(env!("CARGO_PKG_VERSION")).count();
-        assert_eq!(
-            literals, 1,
-            "the full version literal must appear exactly once, so comment prose \
-             can never be silently falsified by a version bump"
+            .filter_map(|line| line.strip_prefix("  RDC_VERSION: "))
+            .collect();
+        assert_eq!(pins, ["\"latest\""], "the committed RDC_VERSION must be \"latest\"");
+        assert!(
+            !template.contains(env!("CARGO_PKG_VERSION")),
+            "the full version literal must not appear in templates/gitlab-ci.yml; \
+             a release would falsify whatever prose carries it"
         );
     }
 }
