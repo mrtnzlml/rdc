@@ -46,25 +46,27 @@ Project-specific instructions for working in this repo.
   because a formula returning a field hands back a proxy whose `.value` is the
   datapoint's raw string. Its self-tests ship on purpose: `pytest -q` with
   nothing collected exits 5 and turns the pipeline's test job red.
-- The **committed default is `RDC_VERSION: "latest"`** — the scaffolded
+- The **committed default is `RDC_RELEASE: "latest"`** — the scaffolded
   pipeline installs the newest release, so a fresh project works and fixes
   arrive without editing the file. The cost is real and accepted: the deploy job
   runs `rdc sync --allow-deletes --yes` unattended, so a release changes what a
   destructive sync does with nobody watching. A project that wants that decided
-  by a commit pins `RDC_VERSION` itself — the install script takes an exact tag
-  (`vX.Y.Z`), a series prefix (`vX.Y`, newest patch in that line) or `latest`,
-  and a manual job's "Run job" form overrides it for one press. (This replaced a
-  pinned default on 2026-09-21. Reverting means reinstating the bumper's fourth
-  edit and its tests below.)
+  by a commit sets `RDC_RELEASE: "tags/vX.Y.Z"`, or overrides it in a manual
+  job's "Run job" form for one press. (This replaced a pinned `RDC_VERSION` on
+  2026-09-21; reverting means reinstating the bumper's fourth edit and its
+  tests.)
+- The value is **the `api.github.com` path**, not a version — which is the whole
+  reason the install script is 14 lines and not 35: `releases/latest` and
+  `releases/tags/vX.Y.Z` are one `curl` with one variable in it. There is no
+  `vX.Y` series form any more, and no `RDC_ASSET_SUFFIX` / `RDC_INSTALL_DIR` /
+  `RDC_ASSET` either; the linux triple is inlined and one asset must match.
 - Therefore the **full version literal must appear nowhere** in
   `templates/gitlab-ci.yml`, and `.github/scripts/bump-version.sh` must not
   touch that file: it edits three files, not four.
   `the_committed_template_floats_and_names_no_version` (`src/cli/gitlab_ci.rs`)
   enforces both halves, and `bumps_all_three_files` (`tests/bump_version.rs`)
   asserts the template comes back byte-identical. Prose says `<version>`,
-  `vX.Y.Z` or `vX.Y`; `pre-0.7` in the `RDC_ASSET_SUFFIX` comment is a
-  *historical* statement about releases that already shipped and must never be
-  bumped.
+  `vX.Y.Z` or `vX.Y`, never the literal.
 - Releases are cut by **`.github/workflows/weekly-release.yaml`** (Monday 06:17
   UTC, plus `workflow_dispatch`), not by hand. It releases only when a commit
   since the last tag touched `src/`, `templates/`, `desktop/`, `Cargo.toml` or
@@ -111,11 +113,12 @@ Project-specific instructions for working in this repo.
   target in `release.yaml`, under `shell: bash` because windows-latest defaults
   to pwsh). Bump `channel` deliberately and meet the new lints when you choose;
   the pin is in the cargo cache keys so a stale `target/` cannot outlive it.
-- The install script *also* accepts `latest` (newest release) and a series
-  prefix like `v0.6` (newest patch in that line), resolved through
-  `api.github.com`. Those are **deliberate opt-ins for our own CI** — don't
-  make either the default, and don't delete the branches thinking they're a
-  mistake.
+- The install script accepts exactly **two** forms, because `RDC_RELEASE` is an
+  API path: `latest` (the default) and `tags/vX.Y.Z`. The `vX.Y` series form
+  and its list-endpoint `python3` filter were **deleted on purpose** on
+  2026-09-21, in favour of the shape a real project's pipeline had been running:
+  nothing in `.github/` ever consumed the series form. Reinstating it means
+  re-adding that filter, not un-commenting something.
 - The repo is private, so the template installs rdc through
   `api.github.com/repos/<repo>/releases/assets/<id>` (resolved from the tag).
   The `releases/download/<tag>/<asset>` browser URL 404s even with a token —

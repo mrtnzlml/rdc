@@ -51,14 +51,11 @@ name = "rdc_bridge"
 version = "0.1.0"
 "#;
 
-/// The scaffolded pipeline floats on `latest`, so a bump must leave it exactly
-/// as it is -- including the historical `pre-0.7`, which names releases that
-/// already shipped.
+/// The scaffolded pipeline names no version at all, so a bump must leave it
+/// exactly as it is.
 const TEMPLATE: &str = r#"variables:
-  RDC_VERSION: "latest"
+  RDC_RELEASE: "latest"
   RDC_REPO: "mrtnzlml/rdc"
-  # A suffix also matches the pre-0.7 unversioned names.
-  RDC_ASSET_SUFFIX: "-x86_64-unknown-linux-gnu.tar.gz"
 "#;
 
 fn tree() -> TempDir {

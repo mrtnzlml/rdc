@@ -40,21 +40,14 @@ default:
   interruptible: true
 
 variables:
-  # "latest" is what this file ships with: every job installs the newest rdc
-  # release, so fixes arrive without anyone editing this file. The cost is that
-  # the deploy job below runs `rdc sync --allow-deletes --yes` unattended, and a
-  # new release therefore changes what a destructive sync does with nobody
-  # watching. Pin the moment you want that decided by a commit instead: an exact
-  # tag (vX.Y.Z) is reproducible, a series prefix (vX.Y) takes patches but never
-  # a new feature, and a manual job's "Run job" form overrides either for one
-  # press.
-  RDC_VERSION: "latest"
+  # The release to install, spelled as its api.github.com path: `latest` for the
+  # newest, or `tags/vX.Y.Z` to pin one. `latest` means fixes arrive without
+  # editing this file -- and that the deploy job below, which runs
+  # `rdc sync --allow-deletes --yes` unattended, can change behaviour with
+  # nobody watching. Pin to decide that in a commit, or in a manual job's
+  # "Run job" form to pin one press.
+  RDC_RELEASE: "latest"
   RDC_REPO: "mrtnzlml/rdc"
-  # Matched against the END of the asset name, because release assets carry the
-  # version (rdc-<version>-x86_64-unknown-linux-gnu.tar.gz). A suffix also
-  # matches the pre-0.7 unversioned names, so this pipeline works against old
-  # and new releases alike. Swap the platform here to install a different build.
-  RDC_ASSET_SUFFIX: "-x86_64-unknown-linux-gnu.tar.gz"
   # Commit-back author and committer. GitLab push rules can require these to
   # match a pattern; if yours does, use an address that satisfies it.
   RDC_GIT_EMAIL: "rdc-ci@example.com"  # TODO
@@ -64,40 +57,18 @@ variables:
 .rdc-install-script: &rdc-install-script |
   set -eu
   : "${RDC_GITHUB_TOKEN:?set RDC_GITHUB_TOKEN (read access to $RDC_REPO)}"
-  install_dir=${RDC_INSTALL_DIR:-/usr/local/bin}
   auth="Authorization: Bearer $RDC_GITHUB_TOKEN"
   api="https://api.github.com/repos/$RDC_REPO"
-  # Three accepted forms, resolved to one release object:
-  #   latest  newest release      always current, never reproducible; the default
-  #   vX.Y    newest patch in X.Y picks up fixes, never a new feature
-  #   vX.Y.Z  exact tag           reproducible
-  case "$RDC_VERSION" in
-    latest)
-      release=$(curl -sSfL -H "$auth" "$api/releases/latest")
-      ;;
-    v*.*.* | [0-9]*.*.*)
-      case "$RDC_VERSION" in v*) tag=$RDC_VERSION ;; *) tag=v$RDC_VERSION ;; esac
-      release=$(curl -sSfL -H "$auth" "$api/releases/tags/$tag")
-      ;;
-    *)
-      # A series prefix. The list endpoint is newest-first, so the first
-      # non-draft, non-prerelease tag under "<prefix>." is the newest patch.
-      case "$RDC_VERSION" in v*) pfx=$RDC_VERSION ;; *) pfx=v$RDC_VERSION ;; esac
-      release=$(curl -sSfL -H "$auth" "$api/releases?per_page=100" | PREFIX="$pfx" python3 -c 'import json,os,sys; p=os.environ["PREFIX"]+"."; r=[x for x in json.load(sys.stdin) if not x["draft"] and not x["prerelease"] and x["tag_name"].startswith(p)]; sys.exit("no release matching "+p+"*") if not r else json.dump(r[0], sys.stdout)')
-      ;;
-  esac
-  # RDC_ASSET (an exact name) was replaced by RDC_ASSET_SUFFIX. Fail loudly
-  # rather than silently ignore a stale override and install the wrong build.
-  if [ -n "${RDC_ASSET:-}" ]; then
-    echo "RDC_ASSET is gone; use RDC_ASSET_SUFFIX (e.g. -x86_64-unknown-linux-gnu.tar.gz)" >&2
-    exit 1
-  fi
-  asset_id=$(printf '%s' "$release" | SUFFIX=$RDC_ASSET_SUFFIX python3 -c 'import json,os,sys; s=os.environ["SUFFIX"]; m=[a["id"] for a in json.load(sys.stdin)["assets"] if a["name"].endswith(s)]; sys.exit("expected exactly 1 asset ending in "+s+", found "+str(len(m))) if len(m)!=1 else print(m[0])')
-  : "${asset_id:?no asset ending in $RDC_ASSET_SUFFIX for RDC_VERSION=$RDC_VERSION}"
+  release=$(curl -sSfL -H "$auth" "$api/releases/$RDC_RELEASE")
+  # Asset names carry the version (rdc-<version>-x86_64-unknown-linux-gnu.tar.gz),
+  # so the target triple is the stable part to match on. Exactly one, or stop:
+  # a release also ships macOS, Windows and desktop builds, and two ids would
+  # silently become one broken URL. Swap the triple for another platform.
+  asset_id=$(printf '%s' "$release" | python3 -c 'import json,sys; m=[a["id"] for a in json.load(sys.stdin)["assets"] if a["name"].endswith("-x86_64-unknown-linux-gnu.tar.gz")]; sys.exit("expected exactly 1 linux asset, found "+str(len(m))) if len(m)!=1 else print(m[0])')
   curl -sSfL -H "$auth" -H "Accept: application/octet-stream" \
-    "https://api.github.com/repos/$RDC_REPO/releases/assets/$asset_id" \
-    | tar -xz -C "$install_dir"
-  "$install_dir/rdc" --version
+    "$api/releases/assets/$asset_id" \
+    | tar -xz -C /usr/local/bin
+  rdc --version
 
 # Commits what rdc wrote to the default branch. before_script and script share
 # one shell, so both jobs call this.

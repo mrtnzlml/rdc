@@ -519,19 +519,18 @@ mod tests {
     ///
     /// Both halves are deliberate. A scaffold's job is to install a working rdc
     /// on a fresh project; a project that wants the release decided by a commit
-    /// pins `RDC_VERSION` itself, which the install script accepts as an exact
-    /// tag or a series prefix. And with no literal anywhere,
-    /// `.github/scripts/bump-version.sh` has nothing to rewrite in this file --
-    /// it edits three files, not four -- so no comment here can be silently
-    /// falsified by a release.
+    /// sets `RDC_RELEASE` to `tags/vX.Y.Z` itself. And with no literal
+    /// anywhere, `.github/scripts/bump-version.sh` has nothing to rewrite in
+    /// this file -- it edits three files, not four -- so no comment here can be
+    /// silently falsified by a release.
     #[test]
     fn the_committed_template_floats_and_names_no_version() {
         let template = crate::cli::init::GITLAB_CI_TEMPLATE;
         let pins: Vec<&str> = template
             .lines()
-            .filter_map(|line| line.strip_prefix("  RDC_VERSION: "))
+            .filter_map(|line| line.strip_prefix("  RDC_RELEASE: "))
             .collect();
-        assert_eq!(pins, ["\"latest\""], "the committed RDC_VERSION must be \"latest\"");
+        assert_eq!(pins, ["\"latest\""], "the committed RDC_RELEASE must be \"latest\"");
         assert!(
             !template.contains(env!("CARGO_PKG_VERSION")),
             "the full version literal must not appear in templates/gitlab-ci.yml; \

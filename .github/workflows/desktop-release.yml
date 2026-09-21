@@ -6,7 +6,7 @@
 # Deliberately publishes NO release. `/releases/latest` returns the most recent
 # non-prerelease, non-draft release sorted by created_at, regardless of tag
 # name, so an extra release from this workflow would shadow the CLI release and
-# break both `RDC_VERSION: latest` in templates/gitlab-ci.yml and the README's
+# break both `RDC_RELEASE: latest` in templates/gitlab-ci.yml and the README's
 # install instructions. Artifacts are downloadable from the run itself
 # (`gh run download <id> -n rdc-desktop-<platform>`).
 
