@@ -225,3 +225,56 @@ fn every_verb_starts_with_a_distinct_letter() {
         clashes.join("; ")
     );
 }
+
+/// Every subcommand and every argument must carry help text.
+///
+/// Written after `rdc init --env <ENV_SPEC>`, `rdc sync [ENV]`, `rdc auth
+/// --token/--username` and `rdc doctor [ENV]` all shipped rendering a blank
+/// help column. Nothing breaks when that happens — the flag parses fine — so
+/// the only reader who notices is the one trying to work out what to pass,
+/// and for `--env` the grammar `<env>=<api_base>:<org_id>` was guessable from
+/// nowhere but the source.
+///
+/// Positionals are included deliberately: a bare `[ENV]` with no help is the
+/// case that actually occurred, four times over.
+#[test]
+fn every_arg_and_subcommand_has_help() {
+    use clap::CommandFactory;
+    let cmd = rdc::cli::Cli::command();
+    let mut missing: Vec<String> = Vec::new();
+
+    fn visit(cmd: &clap::Command, path: &str, missing: &mut Vec<String>) {
+        for arg in cmd.get_arguments() {
+            // `-h/--help` and `-V/--version` are clap's own; it supplies their
+            // text and the derive has nowhere to put ours.
+            if matches!(arg.get_id().as_str(), "help" | "version") {
+                continue;
+            }
+            let has_help = arg
+                .get_help()
+                .or_else(|| arg.get_long_help())
+                .is_some_and(|h| !h.to_string().trim().is_empty());
+            if !has_help {
+                missing.push(format!("{path} {}", arg.get_id()));
+            }
+        }
+        for sub in cmd.get_subcommands() {
+            let has_about = sub
+                .get_about()
+                .or_else(|| sub.get_long_about())
+                .is_some_and(|h| !h.to_string().trim().is_empty());
+            if !has_about {
+                missing.push(format!("{path} {} (subcommand)", sub.get_name()));
+            }
+            visit(sub, &format!("{path} {}", sub.get_name()), missing);
+        }
+    }
+    visit(&cmd, "rdc", &mut missing);
+
+    assert!(
+        missing.is_empty(),
+        "these render a blank help column, leaving a reader to guess what to \
+         pass -- {}",
+        missing.join("; ")
+    );
+}

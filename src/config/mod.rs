@@ -70,7 +70,8 @@ impl ProjectConfig {
                 let parent = path.parent().unwrap_or(path);
                 return Err(anyhow::anyhow!(
                     "not an rdc project: no rdc.toml in {}.\n\
-                     run `rdc init` here, or cd into an existing project directory.",
+                     run `rdc init --env <env>=<api_base>:<org_id>` here, or cd into an \
+                     existing project directory.",
                     parent.display()
                 ));
             }
@@ -82,6 +83,27 @@ impl ProjectConfig {
         let cfg: ProjectConfig = toml::from_str(&raw)
             .with_context(|| format!("parsing {}", path.display()))?;
         Ok(cfg)
+    }
+
+    /// Look up one env, or fail naming the envs that do exist.
+    ///
+    /// The bare "env 'x' is not defined in rdc.toml" this replaces told a
+    /// reader only that they were wrong, never what would have been right —
+    /// and the list is a `BTreeMap` key iteration away. Seven call sites
+    /// built that message by hand; they all come through here now.
+    pub fn env_or_err<'a>(&'a self, env: &str) -> Result<&'a EnvConfig> {
+        self.envs.get(env).ok_or_else(|| {
+            if self.envs.is_empty() {
+                return anyhow::anyhow!(
+                    "env '{env}' is not defined in rdc.toml, which defines no envs at all. \
+                     Add one with `rdc init --env <env>=<api_base>:<org_id>`."
+                );
+            }
+            anyhow::anyhow!(
+                "env '{env}' is not defined in rdc.toml. Defined envs: {}",
+                self.envs.keys().cloned().collect::<Vec<_>>().join(", ")
+            )
+        })
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {

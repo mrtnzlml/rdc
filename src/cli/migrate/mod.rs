@@ -2998,10 +2998,7 @@ pub fn run_at(
     // The target env's organization URL, used to set `organization` on objects
     // that are NEW in tgt (a cross-env create would otherwise carry the source
     // env's org). Matched objects take their org from the existing tgt file.
-    let tgt_env_cfg = project_cfg
-        .envs
-        .get(tgt)
-        .ok_or_else(|| anyhow::anyhow!("env '{tgt}' is not defined in rdc.toml"))?;
+    let tgt_env_cfg = project_cfg.env_or_err(tgt)?;
     let tgt_org_url = format!(
         "{}/organizations/{}",
         tgt_env_cfg.api_base.trim_end_matches('/'),

@@ -6,8 +6,14 @@ use std::io::IsTerminal;
 /// value, return it. Otherwise load `rdc.toml` and present an interactive
 /// picker. Non-TTY contexts (CI / piped) get a clear error pointing at
 /// the available envs.
-pub fn pick_env(question: &str, env: Option<String>) -> Result<String> {
-    pick_env_excluding(question, env, &[])
+///
+/// `usage` is the invocation to re-run with the env spelled out (e.g.
+/// `rdc sync <env>`). It only reaches the non-TTY error, where naming the
+/// command is the whole difference between a dead end and a next step: the
+/// picker is unreachable there, so "env argument required" on its own leaves
+/// the reader to guess where the argument goes.
+pub fn pick_env(question: &str, usage: &str, env: Option<String>) -> Result<String> {
+    pick_env_excluding(question, usage, env, &[])
 }
 
 /// Like [`pick_env`], but hides any envs in `exclude` from the picker.
@@ -15,6 +21,7 @@ pub fn pick_env(question: &str, env: Option<String>) -> Result<String> {
 /// pick can't be the same as the first.
 pub fn pick_env_excluding(
     question: &str,
+    usage: &str,
     env: Option<String>,
     exclude: &[&str],
 ) -> Result<String> {
@@ -46,8 +53,12 @@ pub fn pick_env_excluding(
     }
 
     if !std::io::stdin().is_terminal() {
+        // No terminal means no picker, so the env has to be typed. Name the
+        // full invocation rather than the missing argument: the single-env
+        // auto-select below is also unreachable here, and a reader who knows
+        // only "an env is required" still has to find out where it goes.
         return Err(anyhow!(
-            "env argument required when stdin is not a TTY. \
+            "env argument required without a terminal: run `{usage}`. \
              Defined envs: {}",
             envs.join(", ")
         ));

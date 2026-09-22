@@ -46,8 +46,21 @@ impl EnvLock {
                 Ok(()) => return Ok(EnvLock { file }),
                 Err(TryLockError::WouldBlock) => {
                     if std::time::Instant::now() >= deadline {
+                        // Name the holder and the remedy. The bare timeout
+                        // reads as an rdc fault, when it is almost always a
+                        // second rdc — often a `--watch` left running — partway
+                        // through a cycle on the same env. The env name is the
+                        // lock file's stem (`<env>.lock`, see
+                        // `Paths::env_lock`); the `unwrap_or` only covers a
+                        // caller that built a path some other way.
+                        let env = lock_path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("this env");
                         anyhow::bail!(
-                            "timed out after {:?} waiting for env lock at {}",
+                            "another rdc process is holding the lock on env '{env}' — timed \
+                             out after {:?} waiting for it at {}. Let that run finish, or \
+                             stop it, then retry.",
                             timeout,
                             lock_path.display()
                         );

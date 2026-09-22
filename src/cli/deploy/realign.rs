@@ -655,7 +655,8 @@ pub fn apply(
                 stats.orphan_warnings.extend(warnings);
             }
             Err(e) => stats.orphan_warnings.push(format!(
-                "  could not record the renames in .rdc/mapping.toml ({e:#});                  `rdc migrate` will refuse to promote them until you do"
+                "  could not record the renames in .rdc/mapping.toml ({e:#}); \
+                 `rdc migrate` will refuse to promote them until you do"
             )),
         }
     }
@@ -1445,10 +1446,7 @@ pub async fn run_within_env(env: &str, check: bool, yes: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let paths = Paths::for_env(&cwd, env);
     let cfg = crate::config::ProjectConfig::load(&paths.project_config())?;
-    let env_cfg = cfg
-        .envs
-        .get(env)
-        .ok_or_else(|| anyhow::anyhow!("env '{env}' is not defined in rdc.toml"))?;
+    let env_cfg = cfg.env_or_err(env)?;
     let mut lockfile = Lockfile::load(&paths.lockfile())?;
     // Derive object URLs from ids — set the env's api_base on the lockfile.
     lockfile.api_base = env_cfg.api_base.clone();
@@ -1654,7 +1652,8 @@ fn record_mapping_rows(
             Ok(g) => g,
             Err(e) => {
                 warnings.push(format!(
-                    "  {} stopped parsing while recording ({e}); the remaining                      renames were not recorded",
+                    "  {} stopped parsing while recording ({e}); the remaining \
+                     renames were not recorded",
                     path.display()
                 ));
                 break;

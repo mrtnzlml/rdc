@@ -232,12 +232,26 @@ fn http_client(timeout: Duration) -> Result<reqwest::Client> {
 
 async fn fetch_latest_version_with_timeout(timeout: Duration) -> Result<Version> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let info: ReleaseInfo = http_client(timeout)?
+    let resp = http_client(timeout)?
         .get(&url)
         .header("Accept", "application/vnd.github+json")
         .send()
         .await
-        .with_context(|| format!("GET {url}"))?
+        .with_context(|| format!("GET {url}"))?;
+    // A 404 here is the repository being invisible, not the release being
+    // missing: GitHub answers an unauthorised read of a private repo with 404
+    // rather than 403, and rdc sends no credential of its own. Saying so is
+    // the difference between "there is no release" — which sends a reader
+    // looking in the wrong place — and "this build cannot see the releases".
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        anyhow::bail!(
+            "GitHub returned 404 for {url}. The {REPO} releases are not readable without \
+             credentials, and rdc sends none, so self-upgrade cannot resolve a version. \
+             Install the release asset by hand, or re-run `cargo install` if you build \
+             from source."
+        );
+    }
+    let info: ReleaseInfo = resp
         .error_for_status()
         .with_context(|| format!("non-2xx from {url}"))?
         .json()

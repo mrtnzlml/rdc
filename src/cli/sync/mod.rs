@@ -110,7 +110,7 @@ use crate::log::{Action, Log};
 use crate::paths::Paths;
 use crate::secrets::resolve_token;
 use crate::state::Lockfile;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use std::sync::Arc;
 
 /// Aggregate counts from one sync cycle, used for the watch-loop summary line.
@@ -214,10 +214,7 @@ pub(crate) async fn run_cycle(
     let paths = Paths::for_env(&cwd, env);
 
     let cfg = ProjectConfig::load(&paths.project_config())?;
-    let env_cfg = cfg
-        .envs
-        .get(env)
-        .ok_or_else(|| anyhow!("env '{env}' is not defined in rdc.toml"))?;
+    let env_cfg = cfg.env_or_err(env)?;
 
     let mut lockfile = Lockfile::load(&paths.lockfile())?;
     // Set the env's api_base so the lockfile can DERIVE object URLs from

@@ -22,17 +22,12 @@ use crate::config::ProjectConfig;
 use crate::log::{Action, Log};
 use crate::paths::Paths;
 use crate::state::Lockfile;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 
 pub async fn run(env: &str, dry_run: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let cfg = ProjectConfig::load(&cwd.join("rdc.toml"))?;
-    let api_base = cfg
-        .envs
-        .get(env)
-        .ok_or_else(|| anyhow!("env '{env}' is not defined in rdc.toml"))?
-        .api_base
-        .clone();
+    let api_base = cfg.env_or_err(env)?.api_base.clone();
     let paths = Paths::for_env(&cwd, env);
     let log = Log::new(crate::cli::resolve::detect_color_mode());
 

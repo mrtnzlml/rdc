@@ -29,10 +29,7 @@ pub async fn run(
     let cwd = std::env::current_dir().context("getting current directory")?;
     let cfg_path = cwd.join("rdc.toml");
     let cfg = ProjectConfig::load(&cfg_path)?;
-    let env_cfg = cfg
-        .envs
-        .get(env)
-        .ok_or_else(|| anyhow!("env '{env}' is not defined in rdc.toml"))?;
+    let env_cfg = cfg.env_or_err(env)?;
     let paths = Paths::for_env(&cwd, env);
 
     let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode());
@@ -205,10 +202,7 @@ pub async fn refresh_token_for_401(env: &str) -> Result<()> {
         if let (Some(username), Some(password)) = (user_opt, pass_opt) {
             let cwd = std::env::current_dir().context("getting current directory")?;
             let cfg = ProjectConfig::load(&cwd.join("rdc.toml"))?;
-            let env_cfg = cfg
-                .envs
-                .get(env)
-                .ok_or_else(|| anyhow!("env '{env}' is not defined in rdc.toml"))?;
+            let env_cfg = cfg.env_or_err(env)?;
             let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode());
             log.event(
                 Action::Auth,
@@ -232,10 +226,7 @@ pub async fn refresh_token_for_401(env: &str) -> Result<()> {
 
     let cwd = std::env::current_dir().context("getting current directory")?;
     let cfg = ProjectConfig::load(&cwd.join("rdc.toml"))?;
-    let env_cfg = cfg
-        .envs
-        .get(env)
-        .ok_or_else(|| anyhow!("env '{env}' is not defined in rdc.toml"))?;
+    let env_cfg = cfg.env_or_err(env)?;
     let paths = Paths::for_env(&cwd, env);
     let secrets_path = paths.secrets_file();
 
