@@ -1,3 +1,5 @@
-
-hooks/legacy-export: local file deleted, but remote has been modified since the last pull.
-[k]eep delete  [r]estore  [s]kip  [a]bort > 
+09:41:05 warn   hooks/legacy-export was deleted here, but changed on the remote since the last pull
+         prompt hooks    legacy-export
+[k] delete it remotely too   [r] restore the local file   [s] decide later
+[a] abort the sync
+> 

@@ -917,17 +917,33 @@ fn cascade_pending(rest: &mut [PendingRename], applied: &PendingRename) {
     }
 }
 
-/// The question [`prompt_rename`] asks, one per pending rename.
+/// The header [`prompt_rename`] shows above each pending rename, and the
+/// choices under it.
 ///
 /// Composed here rather than inline so the text can be pinned
 /// (`testdata/prompt_pins/rename_apply.txt`): the prompt writes to the
 /// process's own stderr, which a test cannot capture.
-fn rename_question(p: &PendingRename, n: usize, total: usize) -> String {
-    format!("[{n}/{total}] apply {}? [y/N] ", p.describe())
+fn rename_header(
+    p: &PendingRename,
+    n: usize,
+    total: usize,
+    mode: crate::cli::resolve::ColorMode,
+) -> String {
+    crate::cli::change_view::render_prompt_header(
+        n,
+        total,
+        &format!("rename {}", p.describe()),
+        mode,
+    )
 }
 
-/// Shown when the answer is neither `y` nor `n`, before asking again.
-const RENAME_REASK: &str = "  please answer y or n";
+/// `n` is the default, so Enter skips the rename rather than applying it.
+fn rename_keys() -> Vec<crate::cli::stdin_coord::PromptKey> {
+    vec![
+        crate::cli::stdin_coord::PromptKey::new('y', "rename it"),
+        crate::cli::stdin_coord::PromptKey::new('n', "skip it (default)"),
+    ]
+}
 
 fn prompt_rename(p: &PendingRename, n: usize, total: usize) -> Result<bool> {
     if !std::io::stdin().is_terminal() {
@@ -938,8 +954,11 @@ fn prompt_rename(p: &PendingRename, n: usize, total: usize) -> Result<bool> {
     let stdin = std::io::stdin();
     let mut stderr = std::io::stderr();
     let mut line = String::new();
+    let mode = crate::cli::resolve::detect_color_mode();
+    let keys = rename_keys();
+    writeln!(stderr, "{}", rename_header(p, n, total, mode))?;
     loop {
-        write!(stderr, "{}", rename_question(p, n, total))?;
+        write!(stderr, "{}", crate::cli::change_view::render_menu(&keys, mode))?;
         stderr.flush().ok();
         line.clear();
         if stdin.lock().read_line(&mut line)? == 0 {
@@ -953,7 +972,11 @@ fn prompt_rename(p: &PendingRename, n: usize, total: usize) -> Result<bool> {
             Some('y') | Some('Y') => return Ok(true),
             Some('n') | Some('N') => return Ok(false),
             _ => {
-                writeln!(stderr, "{RENAME_REASK}")?;
+                writeln!(
+                    stderr,
+                    "{}",
+                    crate::cli::change_view::render_reask(&keys, mode)
+                )?;
             }
         }
     }
@@ -1950,9 +1973,16 @@ mod tests {
             old: "sftp-import-initial-load".into(),
             new: "sftp-import-master-data".into(),
         };
+        let mode = crate::cli::resolve::ColorMode::Plain;
+        let keys = rename_keys();
         crate::cli::prompt_pin::pin(
             "rename_apply",
-            &format!("{}\n{RENAME_REASK}", rename_question(&p, 2, 5)),
+            &format!(
+                "{}\n{}\n{}",
+                rename_header(&p, 2, 5, mode),
+                crate::cli::change_view::render_menu(&keys, mode),
+                crate::cli::change_view::render_reask(&keys, mode),
+            ),
         );
     }
 

@@ -188,9 +188,14 @@ pub async fn push_dataset(
         }
         DeleteGate::Bail => {
             anyhow::bail!(
-                "{pending} MDH index(es) on '{collection_name}' marked for deletion but \
+                "{} on '{collection_name}' marked for deletion but \
                  --allow-deletes was not passed. Re-run with --allow-deletes to authorise \
                  the destructive push, or restore {} to cancel.",
+                crate::cli::change_view::count_noun(
+                    pending,
+                    "Master Data Hub index",
+                    "Master Data Hub indexes"
+                ),
                 indexes_path.display()
             );
         }
@@ -731,8 +736,12 @@ fn report_pending_index_drops(
     progress.event(
         Action::Delete,
         &format!(
-            "{n} MDH index(es) on '{collection_name}' would be DROPPED \
-             (no longer present locally)"
+            "{} on '{collection_name}' would be DROPPED (no longer present locally)",
+            crate::cli::change_view::count_noun(
+                n,
+                "Master Data Hub index",
+                "Master Data Hub indexes"
+            )
         ),
     );
     let w = RowWidths::fit([("mdh", collection_name)]);
@@ -770,16 +779,18 @@ fn prompt_confirm_index_drops(
     report_pending_index_drops(progress, collection_name, pending_regular, pending_search);
     progress.with_prompt(|| -> Result<bool> {
         use std::io::Write;
+        let keys = vec![
+            crate::cli::stdin_coord::PromptKey::new('y', "drop them"),
+            crate::cli::stdin_coord::PromptKey::new('n', "cancel (default)"),
+        ];
         crate::cli::stdin_coord::announce(crate::cli::stdin_coord::Prompt {
             kind: crate::cli::stdin_coord::PromptKind::MdhIndexDrop,
-            question: "Proceed with the drop(s)? [y/N] ".into(),
-            keys: vec![
-                crate::cli::stdin_coord::PromptKey::new('y', "drop them"),
-                crate::cli::stdin_coord::PromptKey::new('n', "cancel"),
-            ],
+            question: crate::cli::change_view::menu_one_line(&keys),
+            keys: keys.clone(),
         });
         let mut q = progress.writer();
-        write!(q, "Proceed with the drop(s)? [y/N] ").ok();
+        let mode = crate::cli::resolve::detect_color_mode();
+        write!(q, "{}", crate::cli::change_view::render_menu(&keys, mode)).ok();
         q.flush().ok();
         let ans = crate::cli::stdin_coord::read_line_coordinated()?
             .unwrap_or_default()
@@ -980,7 +991,7 @@ mod tests {
         );
         let text = buf.text();
         assert!(
-            text.contains("2 MDH index(es) on 'vendors' would be DROPPED"),
+            text.contains("2 Master Data Hub indexes on 'vendors' would be DROPPED"),
             "header missing: {text:?}"
         );
         assert!(text.contains("regular index 'idx_vendor_no'"), "{text:?}");
@@ -1642,19 +1653,19 @@ mod tests {
 
         let text = buf.text();
         assert!(
-            text.contains("Proceed with the drop(s)? [y/N] "),
+            text.contains("[y] drop them   [n] cancel (default)"),
             "question missing from the sink: {text:?}"
         );
 
         let seen = route.seen.lock().unwrap();
         assert_eq!(seen.len(), 1, "expected exactly one announce: {seen:?}");
         assert_eq!(seen[0].kind, crate::cli::stdin_coord::PromptKind::MdhIndexDrop);
-        assert_eq!(seen[0].question, "Proceed with the drop(s)? [y/N] ");
+        assert_eq!(seen[0].question, "[y] drop them  [n] cancel (default) > ");
         assert_eq!(
             seen[0].keys,
             vec![
                 crate::cli::stdin_coord::PromptKey::new('y', "drop them"),
-                crate::cli::stdin_coord::PromptKey::new('n', "cancel"),
+                crate::cli::stdin_coord::PromptKey::new('n', "cancel (default)"),
             ]
         );
     }

@@ -115,9 +115,9 @@ mod tests {
         let cfg = three_envs();
         let text = format!(
             "{}\n\n{}",
-            inquire_shape("Which env to sync?", &picker_options(&cfg, &[])),
+            inquire_shape("Sync which environment?", &picker_options(&cfg, &[])),
             inquire_shape(
-                "Migrate to which env (target)?",
+                "Migrate to which environment?",
                 &picker_options(&cfg, &["dev"]),
             ),
         );

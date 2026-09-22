@@ -1,2 +1,3 @@
-09:41:05 delete 12 row(s) on 'vendors' are absent from data.jsonl and would be DELETED
-Proceed with the deletion(s)? [y/N] 
+09:41:05 delete 12 rows on 'vendors' absent from data.jsonl would be DELETED
+[y] delete them   [n] cancel (default)
+> 

@@ -70,7 +70,9 @@ pub(crate) struct ConflictOutcome {
 /// class. Returns `None` when one or fewer conflicts remain — offering "all"
 /// would be identical to resolving the single item, so the options stay
 /// hidden and uppercase `K`/`R` keep their single-item meaning.
-fn build_bulk_prompt(
+use crate::cli::change_view::count_noun;
+
+pub(crate) fn build_bulk_prompt(
     env: &str,
     content: usize,        // BothDiverged remaining, including the current one
     delete_local: usize,   // LocalEditRemoteDelete remaining
@@ -83,22 +85,33 @@ fn build_bulk_prompt(
     let mut keep = format!("Keep local for all {total} remaining conflicts?");
     let mut remote = format!("Use {env} for all {total} remaining conflicts?");
     if content > 0 {
-        keep.push_str(&format!("\n  {content} local file(s) kept and pushed to {env}"));
-        remote.push_str(&format!("\n  {content} local file(s) overwritten with {env}"));
+        keep.push_str(&format!(
+            "\n  {} kept and pushed to {env}",
+            count_noun(content, "local file", "local files")
+        ));
+        remote.push_str(&format!(
+            "\n  {} overwritten with {env}",
+            count_noun(content, "local file", "local files")
+        ));
     }
     if delete_local > 0 {
-        keep.push_str(&format!("\n  {delete_local} file(s) restored on {env}"));
+        keep.push_str(&format!(
+            "\n  {} restored on {env}",
+            count_noun(delete_local, "file", "files")
+        ));
         remote.push_str(&format!(
-            "\n  {delete_local} local file(s) deleted ({env} deleted them)"
+            "\n  {} deleted ({env} deleted them)",
+            count_noun(delete_local, "local file", "local files")
         ));
     }
     if recreate_local > 0 {
         keep.push_str(&format!(
-            "\n  {recreate_local} local deletion(s) need a follow-up \
-             `rdc sync {env} --allow-deletes`"
+            "\n  {} need a follow-up `rdc sync {env} --allow-deletes`",
+            count_noun(recreate_local, "local deletion", "local deletions")
         ));
         remote.push_str(&format!(
-            "\n  {recreate_local} local file(s) recreated from {env}"
+            "\n  {} recreated from {env}",
+            count_noun(recreate_local, "local file", "local files")
         ));
     }
     Some(BulkPrompt { keep_local_summary: keep, use_remote_summary: remote })
@@ -4463,10 +4476,10 @@ mod tests {
     fn build_bulk_prompt_lists_nonzero_classes() {
         let b = build_bulk_prompt("prod", 39, 2, 1).expect("should offer when >1");
         assert!(b.use_remote_summary.contains("all 42 remaining"));
-        assert!(b.use_remote_summary.contains("39 local file(s) overwritten with prod"));
-        assert!(b.use_remote_summary.contains("2 local file(s) deleted"));
-        assert!(b.use_remote_summary.contains("1 local file(s) recreated from prod"));
-        assert!(b.keep_local_summary.contains("39 local file(s) kept and pushed to prod"));
+        assert!(b.use_remote_summary.contains("39 local files overwritten with prod"));
+        assert!(b.use_remote_summary.contains("2 local files deleted"));
+        assert!(b.use_remote_summary.contains("1 local file recreated from prod"));
+        assert!(b.keep_local_summary.contains("39 local files kept and pushed to prod"));
         assert!(b.keep_local_summary.contains("rdc sync prod --allow-deletes"));
         // The follow-up has to name a subcommand that EXISTS. It once named
         // a push subcommand, which rdc has never had — push is a phase of

@@ -1,5 +1,5 @@
 
-[1/4]  conflict
+[1/4]    conflict
          prompt queues   invoices        +1    -1
          ⎿ TMPDIR/queues/invoices.json   - local  + dev
            1   1 │   {
@@ -7,6 +7,10 @@
                2 │ +   "name": "Invoices EU"
            3   3 │   }
 
-[K] keep ALL local  [R] use dev for ALL
-[k] keep local  [r] use dev  [e] edit  [s] skip (shadow file)  [a] abort >          3 more conflicts would keep the local file
-Continue? [y/N] > 
+[K] keep ALL local   [R] use dev for ALL
+[k] keep local (push it to dev)   [r] use dev (overwrite local)
+[e] edit in $EDITOR   [s] decide later   [a] abort the sync
+> Keep local for all 4 remaining conflicts?
+  4 local files kept and pushed to dev
+[y] yes, apply it to all of them   [n] no, ask me one by one (default)
+> 

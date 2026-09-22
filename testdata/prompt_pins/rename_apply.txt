@@ -1,2 +1,4 @@
-[2/5] apply hooks/sftp-import-initial-load -> sftp-import-master-data? [y/N] 
-  please answer y or n
+[2/5]    rename hooks/sftp-import-initial-load -> sftp-import-master-data
+[y] rename it   [n] skip it (default)
+> 
+  (unrecognized; pick one of y/n)

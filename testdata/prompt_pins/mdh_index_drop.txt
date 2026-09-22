@@ -1,4 +1,5 @@
-09:41:05 delete 2 MDH index(es) on 'vendors' would be DROPPED (no longer present locally)
+09:41:05 delete 2 Master Data Hub indexes on 'vendors' would be DROPPED (no longer present locally)
          drop   mdh      vendors                    regular index 'idx_vendor_no'
          drop   mdh      vendors                    search index 'srch_name'
-Proceed with the drop(s)? [y/N] 
+[y] drop them   [n] cancel (default)
+> 

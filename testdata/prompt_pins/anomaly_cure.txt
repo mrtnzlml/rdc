@@ -1,4 +1,4 @@
-Cure for hooks/master-data-import (id 9137, name "Master data import", type function, config.private=true, has config.code=true)?
-  Convert to custom (one PATCH, id preserved)
-  Reinstall as store extension (new id, rewires dependents)
-  Skip this hook
+hooks/master-data-import (id 9137, type function, private, has code) — what should rdc do?
+  Convert it to a custom hook (one PATCH, keeps the same id)
+  Reinstall it from the store (new id, rewires whatever points at it)
+  Leave it alone

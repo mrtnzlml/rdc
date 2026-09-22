@@ -19,9 +19,11 @@
 //! only difference is the SGR. That is what makes a CI log match what the same
 //! command printed locally.
 
+use crate::cli::stdin_coord::PromptKey;
 use crate::cli::resolve::{
-    ColorMode, SGR_ADD_BOLD, SGR_DIM, SGR_REMOVE_BOLD, SGR_RESET, colorize_error,
-    colorize_final_ok, colorize_success, colorize_warning, line_diff,
+    ColorMode, SGR_ADD_BOLD, SGR_DIM, SGR_REMOVE_BOLD, SGR_RESET, colorize_dim, colorize_error,
+    colorize_final_ok, colorize_header, colorize_prompt, colorize_success, colorize_warning,
+    line_diff,
 };
 
 // --- layout constants -------------------------------------------------------
@@ -56,6 +58,111 @@ pub(crate) const SGR_J_KEY: &str = "\x1b[38;2;126;167;255m"; // JSON keys
 pub(crate) const SGR_J_STR: &str = "\x1b[38;2;152;195;121m"; // JSON string values
 pub(crate) const SGR_J_NUM: &str = "\x1b[38;2;229;181;103m"; // JSON numbers
 pub(crate) const SGR_J_KW: &str = "\x1b[38;2;198;146;233m"; // true / false / null
+
+// --- prompts ----------------------------------------------------------------
+//
+// Every prompt rdc shows is built from the three pieces below, so the same
+// choice reads the same way wherever it is asked. `testdata/prompt_pins/`
+// holds one file per prompt; changing anything here moves those files, and
+// the diff IS the design review.
+
+/// `"2 objects"` / `"1 object"`. rdc always knows the count, so no `(s)`.
+pub fn count_noun(n: usize, singular: &str, plural: &str) -> String {
+    if n == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{n} {plural}")
+    }
+}
+
+/// Width a menu line is allowed to reach, indent included. 80 keeps the
+/// wrap deterministic (a pin must not depend on the terminal that ran it)
+/// and fits the narrowest terminal anyone still uses.
+const MENU_WIDTH: usize = 80;
+
+/// The header above a prompt: the position in the timestamp column, so the
+/// word after it lands in the same column as an event line's action token
+/// and a prompt reads as a log line whose clock is a counter.
+pub(crate) fn render_prompt_header(
+    index: usize,
+    total: usize,
+    text: &str,
+    mode: ColorMode,
+) -> String {
+    let counter = format!("[{index}/{total}]");
+    let pad = " ".repeat(INDENT.saturating_sub(counter.chars().count()).max(1));
+    colorize_header(&format!("{counter}{pad}{text}"), mode)
+}
+
+/// The choices under a prompt, wrapped to [`MENU_WIDTH`], then the typing
+/// point on its own line. No trailing newline: the cursor stays after `> `.
+///
+/// Column zero, unlike the rows above it. The 9-space gutter is the
+/// timestamp column and rows earn it by aligning their verb under an event
+/// line's action token — a menu has no such column to line up with, so the
+/// indent would only narrow the line, wrap it sooner and push the typing
+/// point away from the edge the answer is typed at.
+pub(crate) fn render_menu(keys: &[PromptKey], mode: ColorMode) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut prev_upper = false;
+    for k in keys {
+        let item = format!("[{}] {}", k.key, k.label);
+        // An uppercase key answers for EVERY remaining prompt, not just this
+        // one. That is a different kind of answer, so the two groups never
+        // share a line — crossing between them starts a new one.
+        let starts_group = k.key.is_uppercase() != prev_upper;
+        prev_upper = k.key.is_uppercase();
+        if cur.is_empty() {
+            cur = item;
+        } else if starts_group {
+            lines.push(std::mem::take(&mut cur));
+            cur = item;
+        } else if cur.chars().count() + 3 + item.chars().count() <= MENU_WIDTH {
+            cur.push_str("   ");
+            cur.push_str(&item);
+        } else {
+            lines.push(std::mem::take(&mut cur));
+            cur = item;
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    let mut out = String::new();
+    for l in lines {
+        out.push_str(&colorize_prompt(&l, mode));
+        out.push('\n');
+    }
+    out.push_str(&colorize_prompt("> ", mode));
+    out
+}
+
+/// The same choices on one line, for [`crate::cli::stdin_coord::Prompt`]'s
+/// `question`. An embedder renders one line plus its own buttons, so it
+/// wants the unwrapped form — and deriving both from one `keys` slice is
+/// what keeps the dialog and the terminal from drifting apart.
+pub(crate) fn menu_one_line(keys: &[PromptKey]) -> String {
+    let mut s = String::new();
+    for k in keys {
+        if !s.is_empty() {
+            s.push_str("  ");
+        }
+        s.push_str(&format!("[{}] {}", k.key, k.label));
+    }
+    s.push_str(" > ");
+    s
+}
+
+/// Shown when the answer matches no key, before asking again. The letters
+/// come from the same slice the menu was built from, so they cannot drift.
+pub(crate) fn render_reask(keys: &[PromptKey], mode: ColorMode) -> String {
+    let letters: Vec<String> = keys.iter().map(|k| k.key.to_string()).collect();
+    colorize_dim(
+        &format!("  (unrecognized; pick one of {})", letters.join("/")),
+        mode,
+    )
+}
 
 // --- rows -------------------------------------------------------------------
 

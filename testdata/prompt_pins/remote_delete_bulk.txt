@@ -1,11 +1,15 @@
 
-[1/3]  deleted on dev
+[1/3]    deleted on dev
          prompt labels   audit-hold       0    -3
          ⎿ TMPDIR/labels/audit-hold.json   - local  + dev (deleted)
            1     │ - {
            2     │ -   "name": "Audit hold"
            3     │ - }
 
-[K] keep ALL local  [R] use dev for ALL
-[k] keep local (restore on dev)  [r] use dev (delete local)  [s] skip  [a] abort >          2 more local files would be deleted
-Continue? [y/N] > 
+[K] keep ALL local   [R] use dev for ALL
+[k] keep local (restore it on dev)   [r] use dev (delete local)
+[s] decide later   [a] abort the sync
+> Use dev for all 3 remaining conflicts?
+  3 local files deleted (dev deleted them)
+[y] yes, apply it to all of them   [n] no, ask me one by one (default)
+> 

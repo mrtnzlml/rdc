@@ -543,7 +543,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             verbose,
             no_bell,
         }) => {
-            let env = crate::cli::env_picker::pick_env("Which env to sync?", "rdc sync <env>", env)?;
+            let env = crate::cli::env_picker::pick_env("Sync which environment?", "rdc sync <env>", env)?;
             let interactive = crate::cli::resolve::is_interactive(cli.yes);
             if watch {
                 let poll = if no_poll {
@@ -589,9 +589,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             only,
             carry,
         }) => {
-            let src = crate::cli::env_picker::pick_env("Migrate from which env (source)?", "rdc migrate <src> <tgt>", src)?;
+            let src = crate::cli::env_picker::pick_env("Migrate from which environment?", "rdc migrate <src> <tgt>", src)?;
             let tgt = crate::cli::env_picker::pick_env_excluding(
-                "Migrate to which env (target)?",
+                "Migrate to which environment?",
                 "rdc migrate <src> <tgt>",
                 tgt,
                 &[&src],
@@ -612,11 +612,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             )
         }
         Some(Command::Auth { env, token, username }) => {
-            let env = crate::cli::env_picker::pick_env("Set token for which env?", "rdc auth <env>", env)?;
+            let env = crate::cli::env_picker::pick_env("Set the token for which environment?", "rdc auth <env>", env)?;
             crate::cli::auth::run(&env, token, username).await
         }
         Some(Command::Doctor { env, dry_run }) => {
-            let env = crate::cli::env_picker::pick_env("Which env to run the doctor on?", "rdc doctor <env>", env)?;
+            let env = crate::cli::env_picker::pick_env("Run the doctor on which environment?", "rdc doctor <env>", env)?;
             // doctor is fully offline — no `with_401_retry` wrapper needed.
             crate::cli::doctor::run(&env, dry_run).await
         }

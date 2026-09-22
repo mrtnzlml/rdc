@@ -320,22 +320,24 @@ fn prompt_confirm_row_deletes(
     progress.event(
         Action::Delete,
         &format!(
-            "{pending} row(s) on '{collection_name}' are absent from data.jsonl and would \
-             be DELETED"
+            "{} on '{collection_name}' absent from data.jsonl would be DELETED",
+            crate::cli::change_view::count_noun(pending, "row", "rows")
         ),
     );
     progress.with_prompt(|| -> Result<bool> {
         use std::io::Write;
+        let keys = vec![
+            crate::cli::stdin_coord::PromptKey::new('y', "delete them"),
+            crate::cli::stdin_coord::PromptKey::new('n', "cancel (default)"),
+        ];
         crate::cli::stdin_coord::announce(crate::cli::stdin_coord::Prompt {
             kind: crate::cli::stdin_coord::PromptKind::MdhRowDelete,
-            question: "Proceed with the deletion(s)? [y/N] ".into(),
-            keys: vec![
-                crate::cli::stdin_coord::PromptKey::new('y', "delete them"),
-                crate::cli::stdin_coord::PromptKey::new('n', "cancel"),
-            ],
+            question: crate::cli::change_view::menu_one_line(&keys),
+            keys: keys.clone(),
         });
         let mut q = progress.writer();
-        write!(q, "Proceed with the deletion(s)? [y/N] ").ok();
+        let mode = crate::cli::resolve::detect_color_mode();
+        write!(q, "{}", crate::cli::change_view::render_menu(&keys, mode)).ok();
         q.flush().ok();
         let ans = crate::cli::stdin_coord::read_line_coordinated()?
             .unwrap_or_default()
@@ -854,19 +856,19 @@ mod tests {
 
         let text = buf.text();
         assert!(
-            text.contains("Proceed with the deletion(s)? [y/N] "),
+            text.contains("[y] delete them   [n] cancel (default)"),
             "question missing from the sink: {text:?}"
         );
 
         let seen = route.seen.lock().unwrap();
         assert_eq!(seen.len(), 1, "expected exactly one announce: {seen:?}");
         assert_eq!(seen[0].kind, crate::cli::stdin_coord::PromptKind::MdhRowDelete);
-        assert_eq!(seen[0].question, "Proceed with the deletion(s)? [y/N] ");
+        assert_eq!(seen[0].question, "[y] delete them  [n] cancel (default) > ");
         assert_eq!(
             seen[0].keys,
             vec![
                 crate::cli::stdin_coord::PromptKey::new('y', "delete them"),
-                crate::cli::stdin_coord::PromptKey::new('n', "cancel"),
+                crate::cli::stdin_coord::PromptKey::new('n', "cancel (default)"),
             ]
         );
     }

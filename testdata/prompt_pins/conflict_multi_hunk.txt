@@ -1,5 +1,5 @@
 
-[2/7]  conflict
+[2/7]    conflict
          prompt queues   invoices        +2    -2   2 hunks
          ⎿ TMPDIR/queues/invoices.json   - local  + dev
            1   1 │   {
@@ -10,5 +10,11 @@
                4 │ +   "name": "Invoices EU"
            5   5 │   }
 
-[k] keep local  [r] use dev  [e] edit  [h] hunk-by-hunk  [s] skip (shadow file)  [a] abort >   (unrecognized; pick one of k/r/e/h/s/a)
-[k] keep local  [r] use dev  [e] edit  [h] hunk-by-hunk  [s] skip (shadow file)  [a] abort > 
+[k] keep local (push it to dev)   [r] use dev (overwrite local)
+[e] edit in $EDITOR   [h] one change at a time   [s] decide later
+[a] abort the sync
+>   (unrecognized; pick one of k/r/e/h/s/a)
+[k] keep local (push it to dev)   [r] use dev (overwrite local)
+[e] edit in $EDITOR   [h] one change at a time   [s] decide later
+[a] abort the sync
+> 

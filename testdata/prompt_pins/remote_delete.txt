@@ -1,9 +1,11 @@
 
-[1/1]  deleted on dev
+[1/1]    deleted on dev
          prompt labels   audit-hold       0    -3
          ⎿ TMPDIR/labels/audit-hold.json   - local  + dev (deleted)
            1     │ - {
            2     │ -   "name": "Audit hold"
            3     │ - }
 
-[k] keep local (restore on dev)  [r] use dev (delete local)  [s] skip  [a] abort > 
+[k] keep local (restore it on dev)   [r] use dev (delete local)
+[s] decide later   [a] abort the sync
+> 

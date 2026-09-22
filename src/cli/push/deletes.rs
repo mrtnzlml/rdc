@@ -100,7 +100,10 @@ pub fn confirm_or_refuse(
     // also the exact sequence the deletes will run in.
     progress.event(
         Action::Delete,
-        &format!("{n} object(s) would be DELETED from the remote"),
+        &format!(
+            "{} would be DELETED from the remote",
+            crate::cli::change_view::count_noun(n, "object", "objects")
+        ),
     );
     let mut rows: Vec<(&'static str, &str, u64)> = Vec::new();
     for (kind, map) in reverse_dep_order_iter(tombstones) {
@@ -146,16 +149,17 @@ pub fn confirm_or_refuse(
     // Log event: it must sit on the cursor's line for the answer to be typed
     // after it, which a timestamped event line cannot do. Under `Log::new`
     // the renderer's sink is stderr, so the terminal sees the same bytes.
+    let keys = vec![
+        crate::cli::stdin_coord::PromptKey::new('y', "delete them"),
+        crate::cli::stdin_coord::PromptKey::new('n', "cancel (default)"),
+    ];
     crate::cli::stdin_coord::announce(crate::cli::stdin_coord::Prompt {
         kind: crate::cli::stdin_coord::PromptKind::DeleteGate,
-        question: "Proceed with deletion? [y/N] ".into(),
-        keys: vec![
-            crate::cli::stdin_coord::PromptKey::new('y', "delete them"),
-            crate::cli::stdin_coord::PromptKey::new('n', "cancel"),
-        ],
+        question: crate::cli::change_view::menu_one_line(&keys),
+        keys: keys.clone(),
     });
     let mut q = progress.writer();
-    write!(q, "Proceed with deletion? [y/N] ").ok();
+    write!(q, "{}", crate::cli::change_view::render_menu(&keys, mode)).ok();
     q.flush().ok();
     // Route via the stdin coordinator so this prompt cooperates with the
     // `rdc sync --watch` Enter-trigger reader instead of fighting it for
@@ -379,24 +383,40 @@ fn resolve_delete_drift(
         );
         return Ok(DeleteDriftChoice::Skip);
     }
+    use crate::cli::change_view::{ChangeRow, RowVerb, RowWidths, render_row};
+    // Event line, row, menu — the shape every other prompt uses. This one
+    // used to be a bare sentence with no row, the only object-scoped prompt
+    // that never said which object in the same columns as the rest.
+    progress.event(
+        Action::Warn,
+        &format!("{kind}/{slug} was deleted here, but changed on the remote since the last pull"),
+    );
+    let mode = crate::cli::resolve::detect_color_mode();
+    progress.row(&render_row(
+        &ChangeRow {
+            verb: RowVerb::Prompt,
+            kind,
+            name: slug,
+            added: None,
+            removed: None,
+            note: None,
+        },
+        RowWidths::fit([(kind, slug)]),
+        mode,
+    ));
+    let keys = vec![
+        crate::cli::stdin_coord::PromptKey::new('k', "delete it remotely too"),
+        crate::cli::stdin_coord::PromptKey::new('r', "restore the local file"),
+        crate::cli::stdin_coord::PromptKey::new('s', "decide later"),
+        crate::cli::stdin_coord::PromptKey::new('a', "abort the sync"),
+    ];
     crate::cli::stdin_coord::announce(crate::cli::stdin_coord::Prompt {
         kind: crate::cli::stdin_coord::PromptKind::DeleteDrift,
-        question: "[k]eep delete  [r]estore  [s]kip  [a]bort > ".into(),
-        keys: vec![
-            crate::cli::stdin_coord::PromptKey::new('k', "keep delete"),
-            crate::cli::stdin_coord::PromptKey::new('r', "restore"),
-            crate::cli::stdin_coord::PromptKey::new('s', "skip"),
-            crate::cli::stdin_coord::PromptKey::new('a', "abort"),
-        ],
+        question: crate::cli::change_view::menu_one_line(&keys),
+        keys: keys.clone(),
     });
     let mut q = progress.writer();
-    writeln!(q).ok();
-    writeln!(
-        q,
-        "{kind}/{slug}: local file deleted, but remote has been modified since the last pull."
-    )
-    .ok();
-    write!(q, "[k]eep delete  [r]estore  [s]kip  [a]bort > ").ok();
+    write!(q, "{}", crate::cli::change_view::render_menu(&keys, mode)).ok();
     q.flush().ok();
     let ans = crate::cli::stdin_coord::read_line_coordinated()?
         .unwrap_or_default()
@@ -547,7 +567,7 @@ mod tests {
 
         let text = buf.text();
         assert!(
-            text.contains("2 object(s) would be DELETED from the remote"),
+            text.contains("2 objects would be DELETED from the remote"),
             "header missing from the sink: {text:?}"
         );
         for needle in ["hooks", "legacy-export", "id 9137", "engines", "custom-eu", "id 4410"] {
@@ -644,19 +664,22 @@ mod tests {
 
         let text = buf.text();
         assert!(
-            text.contains("Proceed with deletion? [y/N] "),
+            text.contains("[y] delete them   [n] cancel (default)"),
             "question missing from the sink: {text:?}"
         );
 
         let seen = route.seen.lock().unwrap();
         assert_eq!(seen.len(), 1, "expected exactly one announce: {seen:?}");
         assert_eq!(seen[0].kind, crate::cli::stdin_coord::PromptKind::DeleteGate);
-        assert_eq!(seen[0].question, "Proceed with deletion? [y/N] ");
+        assert_eq!(
+            seen[0].question,
+            "[y] delete them  [n] cancel (default) > "
+        );
         assert_eq!(
             seen[0].keys,
             vec![
                 crate::cli::stdin_coord::PromptKey::new('y', "delete them"),
-                crate::cli::stdin_coord::PromptKey::new('n', "cancel"),
+                crate::cli::stdin_coord::PromptKey::new('n', "cancel (default)"),
             ]
         );
     }
@@ -722,7 +745,7 @@ mod tests {
 
         let text = buf.text();
         assert!(
-            text.contains("[k]eep delete  [r]estore  [s]kip  [a]bort > "),
+            text.contains("[k] delete it remotely too   [r] restore the local file"),
             "question missing from the sink: {text:?}"
         );
 
@@ -732,10 +755,10 @@ mod tests {
         assert_eq!(
             seen[0].keys,
             vec![
-                crate::cli::stdin_coord::PromptKey::new('k', "keep delete"),
-                crate::cli::stdin_coord::PromptKey::new('r', "restore"),
-                crate::cli::stdin_coord::PromptKey::new('s', "skip"),
-                crate::cli::stdin_coord::PromptKey::new('a', "abort"),
+                crate::cli::stdin_coord::PromptKey::new('k', "delete it remotely too"),
+                crate::cli::stdin_coord::PromptKey::new('r', "restore the local file"),
+                crate::cli::stdin_coord::PromptKey::new('s', "decide later"),
+                crate::cli::stdin_coord::PromptKey::new('a', "abort the sync"),
             ]
         );
     }

@@ -25,9 +25,7 @@
 //! callers fall through to shadow-file (legacy behavior, CI-safe).
 
 use anyhow::{Context, Result};
-use crate::cli::change_view::{
-    ChangeRow, RowVerb, RowWidths, count_changes, render_connector, render_diff_body, render_row,
-};
+use crate::cli::change_view::{ChangeRow, RowVerb, RowWidths, count_changes, menu_one_line, render_connector, render_diff_body, render_menu, render_prompt_header, render_reask, render_row};
 use crate::cli::stdin_coord::{Prompt, PromptKey, PromptKind};
 use similar::{Algorithm, TextDiff};
 use std::io::{BufRead, IsTerminal, Write};
@@ -259,12 +257,16 @@ fn confirm_bulk<R: BufRead, W: Write>(
     mode: ColorMode,
 ) -> Result<Option<Resolution>> {
     writeln!(output, "{summary}")?;
+    let keys = vec![
+        PromptKey::new('y', "yes, apply it to all of them"),
+        PromptKey::new('n', "no, ask me one by one (default)"),
+    ];
     crate::cli::stdin_coord::announce(Prompt {
         kind: PromptKind::BulkConfirm,
-        question: "Continue? [y/N] > ".into(),
-        keys: vec![PromptKey::new('y', "yes"), PromptKey::new('n', "no")],
+        question: menu_one_line(&keys),
+        keys: keys.clone(),
     });
-    write!(output, "{}", colorize_prompt("Continue? [y/N] > ", mode))?;
+    write!(output, "{}", render_menu(&keys, mode))?;
     output.flush().ok();
     let mut c = String::new();
     if input.read_line(&mut c)? == 0 {
@@ -331,11 +333,7 @@ pub fn prompt_resolve_with_bytes_and_color<R: BufRead, W: Write>(
     writeln!(output)?;
     // The path and the hunk count moved onto the row / connector below, so the
     // header is just the position in the run.
-    writeln!(
-        output,
-        "{}",
-        colorize_header(&format!("[{index}/{total}]  conflict"), mode)
-    )?;
+    writeln!(output, "{}", render_prompt_header(index, total, "conflict", mode))?;
 
     // Row, then connector, then body — the same three parts every other
     // surface uses. The `env` side is `+` (the prompt already names it:
@@ -366,40 +364,31 @@ pub fn prompt_resolve_with_bytes_and_color<R: BufRead, W: Write>(
     writeln!(output)?;
 
     loop {
-        let prompt_text = if hunk_count >= 2 {
-            format!(
-                "[k] keep local  [r] use {env}  [e] edit  [h] hunk-by-hunk  [s] skip (shadow file)  [a] abort > "
-            )
-        } else {
-            format!("[k] keep local  [r] use {env}  [e] edit  [s] skip (shadow file)  [a] abort > ")
-        };
-        if bulk.is_some() {
-            writeln!(
-                output,
-                "{}",
-                colorize_prompt(&format!("[K] keep ALL local  [R] use {env} for ALL"), mode)
-            )?;
-        }
-        let mut keys = vec![
-            PromptKey::new('k', "keep local"),
-            PromptKey::new('r', &format!("use {env}")),
-            PromptKey::new('e', "edit"),
-        ];
-        if hunk_count >= 2 {
-            keys.push(PromptKey::new('h', "hunk-by-hunk"));
-        }
-        keys.push(PromptKey::new('s', "skip (shadow file)"));
-        keys.push(PromptKey::new('a', "abort"));
+        // One `keys` slice drives all three renderings — the terminal menu,
+        // the one-line `question` an embedder shows, and the re-ask list —
+        // so a label can never be right in one and stale in another.
+        // "for ALL" first, as before: a run with many conflicts is the one
+        // where reading six choices per object hurts, and that is exactly
+        // the run where the bulk answer is the one you want.
+        let mut keys = Vec::new();
         if bulk.is_some() {
             keys.push(PromptKey::new('K', "keep ALL local"));
             keys.push(PromptKey::new('R', &format!("use {env} for ALL")));
         }
+        keys.push(PromptKey::new('k', &format!("keep local (push it to {env})")));
+        keys.push(PromptKey::new('r', &format!("use {env} (overwrite local)")));
+        keys.push(PromptKey::new('e', "edit in $EDITOR"));
+        if hunk_count >= 2 {
+            keys.push(PromptKey::new('h', "one change at a time"));
+        }
+        keys.push(PromptKey::new('s', "decide later"));
+        keys.push(PromptKey::new('a', "abort the sync"));
         crate::cli::stdin_coord::announce(Prompt {
             kind: PromptKind::Conflict,
-            question: prompt_text.clone(),
-            keys,
+            question: menu_one_line(&keys),
+            keys: keys.clone(),
         });
-        write!(output, "{}", colorize_prompt(&prompt_text, mode))?;
+        write!(output, "{}", render_menu(&keys, mode))?;
         output.flush().ok();
         let mut line = String::new();
         if input.read_line(&mut line)? == 0 {
@@ -459,12 +448,7 @@ pub fn prompt_resolve_with_bytes_and_color<R: BufRead, W: Write>(
                 }
             }
             _ => {
-                let hint = if hunk_count >= 2 {
-                    "  (unrecognized; pick one of k/r/e/h/s/a)"
-                } else {
-                    "  (unrecognized; pick one of k/r/e/s/a)"
-                };
-                writeln!(output, "{hint}")?;
+                writeln!(output, "{}", render_reask(&keys, mode))?;
                 continue;
             }
         }
@@ -543,7 +527,7 @@ pub fn prompt_remote_delete_with_color<R: BufRead, W: Write>(
     writeln!(
         output,
         "{}",
-        colorize_header(&format!("[{index}/{total}]  deleted on {env}"), mode)
+        render_prompt_header(index, total, &format!("deleted on {env}"), mode)
     )?;
     let (added, removed) = count_changes(&shown, "");
     let row = ChangeRow {
@@ -579,35 +563,21 @@ pub fn prompt_remote_delete_with_color<R: BufRead, W: Write>(
     writeln!(output)?;
 
     loop {
-        let prompt_text = format!(
-            "[k] keep local (restore on {env})  \
-             [r] use {env} (delete local)  \
-             [s] skip  \
-             [a] abort > "
-        );
-        if bulk.is_some() {
-            writeln!(
-                output,
-                "{}",
-                colorize_prompt(&format!("[K] keep ALL local  [R] use {env} for ALL"), mode)
-            )?;
-        }
-        let mut keys = vec![
-            PromptKey::new('k', &format!("keep local (restore on {env})")),
-            PromptKey::new('r', &format!("use {env} (delete local)")),
-            PromptKey::new('s', "skip"),
-            PromptKey::new('a', "abort"),
-        ];
+        let mut keys = Vec::new();
         if bulk.is_some() {
             keys.push(PromptKey::new('K', "keep ALL local"));
             keys.push(PromptKey::new('R', &format!("use {env} for ALL")));
         }
+        keys.push(PromptKey::new('k', &format!("keep local (restore it on {env})")));
+        keys.push(PromptKey::new('r', &format!("use {env} (delete local)")));
+        keys.push(PromptKey::new('s', "decide later"));
+        keys.push(PromptKey::new('a', "abort the sync"));
         crate::cli::stdin_coord::announce(Prompt {
             kind: PromptKind::RemoteDelete,
-            question: prompt_text.clone(),
-            keys,
+            question: menu_one_line(&keys),
+            keys: keys.clone(),
         });
-        write!(output, "{}", colorize_prompt(&prompt_text, mode))?;
+        write!(output, "{}", render_menu(&keys, mode))?;
         output.flush().ok();
         let mut line = String::new();
         if input.read_line(&mut line)? == 0 {
@@ -633,7 +603,7 @@ pub fn prompt_remote_delete_with_color<R: BufRead, W: Write>(
             Some('s') | Some('S') => return Ok(Resolution::Skip),
             Some('a') | Some('A') => return Ok(Resolution::Abort),
             _ => {
-                writeln!(output, "  (unrecognized; pick one of k/r/s/a)")?;
+                writeln!(output, "{}", render_reask(&keys, mode))?;
                 continue;
             }
         }
@@ -1017,11 +987,16 @@ fn prompt_single_hunk<R: BufRead, W: Write>(
             format!("lines {start}-{end}")
         }
     };
-    let header = format!(
-        "[hunk {hunk_idx}/{hunk_total}]  {}  ({line_range})",
-        local_path.display()
-    );
-    writeln!(output, "{}", colorize_header(&header, mode))?;
+    writeln!(
+        output,
+        "{}",
+        render_prompt_header(
+            hunk_idx,
+            hunk_total,
+            &format!("change in {} ({line_range})", local_path.display()),
+            mode,
+        )
+    )?;
 
     // Render this hunk through the same styled renderer the main
     // conflict prompt and deploy --dry-run use — line-numbered gutter,
@@ -1064,21 +1039,20 @@ fn prompt_single_hunk<R: BufRead, W: Write>(
     writeln!(output)?;
 
     loop {
-        let prompt_text =
-            format!("[k] keep local  [r] use {env}  [e] edit  [b] both  [s] skip  [a] abort > ");
+        let keys = vec![
+            PromptKey::new('k', "keep local"),
+            PromptKey::new('r', &format!("use {env}")),
+            PromptKey::new('e', "edit in $EDITOR"),
+            PromptKey::new('b', "keep both"),
+            PromptKey::new('s', "leave the conflict markers"),
+            PromptKey::new('a', "abort the sync"),
+        ];
         crate::cli::stdin_coord::announce(Prompt {
             kind: PromptKind::Conflict,
-            question: prompt_text.clone(),
-            keys: vec![
-                PromptKey::new('k', "keep local"),
-                PromptKey::new('r', &format!("use {env}")),
-                PromptKey::new('e', "edit"),
-                PromptKey::new('b', "both"),
-                PromptKey::new('s', "skip"),
-                PromptKey::new('a', "abort"),
-            ],
+            question: menu_one_line(&keys),
+            keys: keys.clone(),
         });
-        write!(output, "{}", colorize_prompt(&prompt_text, mode))?;
+        write!(output, "{}", render_menu(&keys, mode))?;
         output.flush().ok();
         let mut line = String::new();
         if input.read_line(&mut line)? == 0 {
@@ -1108,7 +1082,7 @@ fn prompt_single_hunk<R: BufRead, W: Write>(
                 }
             }
             _ => {
-                writeln!(output, "  (unrecognized; pick one of k/r/e/b/s/a)")?;
+                writeln!(output, "{}", render_reask(&keys, mode))?;
                 continue;
             }
         }
@@ -1626,10 +1600,14 @@ pub(crate) fn anomaly_cure_question(slug: &str, hook: &crate::model::Hook) -> St
         .and_then(|v| v.as_str())
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false);
-    format!(
-        "Cure for hooks/{slug} (id {}, name {:?}, type {}, config.private={private}, has config.code={has_code})?",
-        hook.id, hook.name, hook.hook_type
-    )
+    let mut flags = vec![format!("id {}", hook.id), format!("type {}", hook.hook_type)];
+    if private {
+        flags.push("private".to_string());
+    }
+    if has_code {
+        flags.push("has code".to_string());
+    }
+    format!("hooks/{slug} ({}) — what should rdc do?", flags.join(", "))
 }
 
 /// The cure picker's options, in the order the answer index maps to
@@ -1642,9 +1620,9 @@ pub(crate) fn anomaly_cure_question(slug: &str, hook: &crate::model::Hook) -> St
 /// "preserved" — two of the three advertised letters selected Convert. The
 /// list is answered with the arrow keys and Enter.
 pub(crate) const ANOMALY_CURE_OPTIONS: [&str; 3] = [
-    "Convert to custom (one PATCH, id preserved)",
-    "Reinstall as store extension (new id, rewires dependents)",
-    "Skip this hook",
+    "Convert it to a custom hook (one PATCH, keeps the same id)",
+    "Reinstall it from the store (new id, rewires whatever points at it)",
+    "Leave it alone",
 ];
 
 /// Per-hook interactive prompt. Non-TTY → `Convert` is the default,
@@ -2412,7 +2390,7 @@ mod tests {
         let s = String::from_utf8_lossy(&out);
         assert!(s.contains("deleted on production"), "header: {s}");
         assert!(
-            s.contains("[k] keep local (restore on production)"),
+            s.contains("[k] keep local (restore it on production)"),
             "k label: {s}"
         );
         assert!(
@@ -2723,7 +2701,7 @@ mod tests {
         .unwrap();
         let s3 = String::from_utf8(output3).unwrap();
         assert!(
-            s3.contains("[h] hunk-by-hunk"),
+            s3.contains("[h] one change at a time"),
             "multi-hunk prompt must offer [h] hunk-by-hunk: {s3}"
         );
         assert!(
@@ -3366,7 +3344,7 @@ mod tests {
             "should have re-prompted at least twice: count={prompts}, output={s}"
         );
         assert!(
-            s.contains("[h] hunk-by-hunk"),
+            s.contains("[h] one change at a time"),
             "multi-hunk re-prompt should include [h]: {s}"
         );
     }
@@ -3626,10 +3604,11 @@ mod tests {
         use std::io::Cursor;
         let dir = tempfile::tempdir().unwrap();
         let local = conflict_fixture(dir.path(), b"{\"name\":\"Invoices\"}");
-        let bulk = BulkPrompt {
-            keep_local_summary: "         3 more conflicts would keep the local file".to_string(),
-            use_remote_summary: "         3 more conflicts would take dev's copy".to_string(),
-        };
+        // The real builder, not a stand-in: its summary is a question plus
+        // one consequence line per class, and that shape is what the pin is
+        // for. 4 content conflicts remain, this one included.
+        let bulk = crate::cli::sync::execute::build_bulk_prompt("dev", 4, 0, 0)
+            .expect("more than one conflict remains");
 
         let mut out: Vec<u8> = Vec::new();
         let r = prompt_resolve_with_bytes_and_color(
@@ -3687,10 +3666,8 @@ mod tests {
         let local = dir.path().join("labels/audit-hold.json");
         std::fs::create_dir_all(local.parent().unwrap()).unwrap();
         std::fs::write(&local, b"{\"name\":\"Audit hold\"}").unwrap();
-        let bulk = BulkPrompt {
-            keep_local_summary: "         2 more deletions would be restored on dev".to_string(),
-            use_remote_summary: "         2 more local files would be deleted".to_string(),
-        };
+        let bulk = crate::cli::sync::execute::build_bulk_prompt("dev", 0, 3, 0)
+            .expect("more than one conflict remains");
 
         let mut out: Vec<u8> = Vec::new();
         // 1 of 3: the bulk options only appear when more than one remains.
