@@ -2521,6 +2521,145 @@ fn should_skip(name: &str, env: &str) -> bool {
         || crate::paths::is_shadow_artifact(name, env)
 }
 
+/// One kind in which a `--mirror` run would DELETE a live target object while
+/// creating another of the same kind — the shape a slug rename takes when
+/// nothing recorded it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RecreateGroup {
+    pub kind: &'static str,
+    /// `(slug, remote id)` per target object the prune would destroy.
+    pub deleted: Vec<(String, u64)>,
+    /// Target slugs this run would create.
+    pub created: Vec<String>,
+}
+
+/// Target-env relative paths the migration WOULD produce: every source file,
+/// minus the un-creatable unique-typed email templates, remapped through the
+/// oriented mapping. Shared by the `--mirror` prune (everything else in the
+/// target is target-only) and by the recreate guard (everything not already on
+/// disk is a create).
+fn produced_paths(
+    src_root: &Path,
+    src_env: &str,
+    mapping: &Mapping,
+    skip: &std::collections::BTreeSet<PathBuf>,
+) -> Result<std::collections::BTreeSet<PathBuf>> {
+    Ok(enumerate_files(src_root, src_env)?
+        .into_iter()
+        .filter(|rel| !skip.contains(rel))
+        .map(|rel| remap_relative(&rel, mapping))
+        .collect())
+}
+
+/// Detect the delete-and-recreate shape, per kind.
+///
+/// A pruned object counts only when the target LOCKFILE still holds a remote id
+/// for it: a local-only file the target never pushed has nothing to lose, and
+/// `--mirror` removing it destroys no remote state. A pruned `(kind, slug)` the
+/// run also produces is not a deletion at all — that is an object moving path
+/// within the target (a queue changing workspace), written at its new path in
+/// the same run.
+///
+/// The pairing is deliberately coarse: one live prune plus one create in the
+/// same kind. It is not trying to identify WHICH object was renamed — after a
+/// create has had its `id` stripped there is nothing left to match on — only to
+/// stop a shape that is almost never deliberate, and to stay rare enough that
+/// `--allow-recreate` never becomes a permanent fixture of a pipeline.
+fn recreate_groups(
+    prune: &[PathBuf],
+    produced: &std::collections::BTreeSet<PathBuf>,
+    tgt_root: &Path,
+    tgt_env: &str,
+    tgt_lockfile: &crate::state::Lockfile,
+) -> Result<Vec<RecreateGroup>> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let produced_objs: BTreeSet<(&'static str, String)> =
+        produced.iter().filter_map(|rel| classify(rel)).collect();
+    let existing_objs: BTreeSet<(&'static str, String)> = enumerate_files(tgt_root, tgt_env)?
+        .iter()
+        .filter_map(|rel| classify(rel))
+        .collect();
+
+    let mut created: BTreeMap<&'static str, BTreeSet<String>> = BTreeMap::new();
+    for (kind, slug) in produced_objs.difference(&existing_objs) {
+        created.entry(kind).or_default().insert(slug.clone());
+    }
+
+    let mut deleted: BTreeMap<&'static str, BTreeMap<String, u64>> = BTreeMap::new();
+    for rel in prune {
+        let Some((kind, slug)) = classify(rel) else {
+            continue;
+        };
+        if produced_objs.contains(&(kind, slug.clone())) {
+            continue; // moved, not deleted
+        }
+        let Some(id) = tgt_lockfile
+            .objects
+            .get(kind)
+            .and_then(|by_slug| by_slug.get(&slug))
+            .map(|e| e.id)
+            .filter(|id| *id != 0)
+        else {
+            continue; // never pushed: no remote object to lose
+        };
+        deleted.entry(kind).or_default().insert(slug, id);
+    }
+
+    Ok(deleted
+        .into_iter()
+        .filter_map(|(kind, dels)| {
+            let created = created.get(kind)?;
+            Some(RecreateGroup {
+                kind,
+                deleted: dels.into_iter().collect(),
+                created: created.iter().cloned().collect(),
+            })
+        })
+        .collect())
+}
+
+/// The refusal. Names every object at risk, and the exact row that turns the
+/// pair back into a rename.
+fn format_recreate_error(groups: &[RecreateGroup], src: &str, tgt: &str) -> String {
+    let mut body = String::new();
+    for g in groups {
+        let dels: Vec<String> = g
+            .deleted
+            .iter()
+            .map(|(slug, id)| format!("{slug} (id {id})"))
+            .collect();
+        body.push_str(&format!(
+            "  {}: delete {} | create {}\n",
+            g.kind,
+            dels.join(", "),
+            g.created.join(", "),
+        ));
+    }
+    // One worked example, from the first pair — enough to copy, short enough
+    // to read.
+    let sample = groups
+        .first()
+        .and_then(|g| Some((g.kind, g.deleted.first()?.0.clone(), g.created.first()?.clone())))
+        .map(|(kind, old, new)| {
+            format!("\n  [[{kind}]]\n  {src} = \"{new}\"\n  {tgt} = \"{old}\"\n")
+        })
+        .unwrap_or_default();
+    format!(
+        "--mirror would DELETE live '{tgt}' objects while creating others of the same kind:\n\
+         {body}\n\
+         That is what a slug rename looks like when nothing recorded it: migrate strips \
+         `id`/`url` from an object it creates, so no file under envs/{tgt}/ ties the new slug \
+         to the object '{tgt}' already has. Deleting a queue takes its documents with it.\n\
+         \n\
+         If these are the SAME objects under a new name, record each one in \
+         .rdc/mapping.toml:\n\
+         {sample}\n\
+         `rdc doctor {src}` writes those rows itself when it renames a slug. If the objects \
+         really are unrelated, re-run with --allow-recreate."
+    )
+}
+
 /// Plan a `--mirror` prune: target-env relative paths that would NOT be
 /// produced by migrating the source snapshot. These are tgt-only objects the
 /// user must delete to make tgt mirror src exactly. The returned paths are
@@ -2538,12 +2677,7 @@ fn mirror_prune_paths(
     mapping: &Mapping,
     skip: &std::collections::BTreeSet<PathBuf>,
 ) -> Result<Vec<PathBuf>> {
-    use std::collections::BTreeSet;
-    let produced: BTreeSet<PathBuf> = enumerate_files(src_root, src_env)?
-        .into_iter()
-        .filter(|rel| !skip.contains(rel))
-        .map(|rel| remap_relative(&rel, mapping))
-        .collect();
+    let produced = produced_paths(src_root, src_env, mapping, skip)?;
     let existing = enumerate_files(tgt_root, tgt_env)?;
     Ok(existing
         .into_iter()
@@ -2757,6 +2891,32 @@ impl Carry {
 /// the target overlay. Makes zero remote calls — afterward the user reviews
 /// `git diff` and runs `rdc sync <tgt>`.
 ///
+/// What a run does with target objects the source no longer produces.
+///
+/// Replaces what used to be a bare `mirror: bool` sitting next to `dry_run`:
+/// with a third flag in play, three adjacent booleans at every call site are
+/// freely interchangeable, and the compiler cannot tell them apart (the same
+/// reasoning that produced `ProjectedPaths`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirrorMode {
+    /// The default: extras in the target are left intact.
+    Additive,
+    /// `--mirror`: prune target-only objects. `allow_recreate` waives the
+    /// guard that refuses to prune a LIVE target object while creating one of
+    /// the same kind — see `recreate_groups`.
+    Mirror { allow_recreate: bool },
+}
+
+impl MirrorMode {
+    pub fn is_mirror(self) -> bool {
+        matches!(self, MirrorMode::Mirror { .. })
+    }
+
+    fn allows_recreate(self) -> bool {
+        matches!(self, MirrorMode::Mirror { allow_recreate: true })
+    }
+}
+
 /// `--mirror` additionally deletes target-only objects (files present in tgt
 /// but not produced by the migration). `--dry-run` prints the plan and writes
 /// nothing. `--only <selector>` narrows the operation to matching
@@ -2764,7 +2924,7 @@ impl Carry {
 pub fn run(
     src: &str,
     tgt: &str,
-    mirror: bool,
+    mirror: MirrorMode,
     dry_run: bool,
     only: Vec<String>,
     carry: Carry,
@@ -2781,11 +2941,12 @@ pub fn run_at(
     cwd: &Path,
     src: &str,
     tgt: &str,
-    mirror: bool,
+    mirror_mode: MirrorMode,
     dry_run: bool,
     only: Vec<String>,
     carry: Carry,
 ) -> Result<()> {
+    let mirror = mirror_mode.is_mirror();
     if src == tgt {
         anyhow::bail!(
             "src and tgt envs are the same ('{src}'). Use two different envs for `rdc migrate`."
@@ -2959,6 +3120,25 @@ pub fn run_at(
                 listing.join("\n"),
             ),
         );
+    }
+
+    // `--mirror` plans its prune BEFORE the first write, so the recreate guard
+    // can refuse without leaving a half-written target tree behind. Planning
+    // early is equivalent to planning late: the plan is the source enumeration
+    // remapped, subtracted from the target tree, and every path the write loop
+    // adds to that tree is by construction one the migration produces — which
+    // is exactly what `mirror_prune_paths` filters out.
+    let prune_plan: Vec<PathBuf> = if mirror {
+        mirror_prune_paths(&src_root, src, &tgt_root, tgt, &mapping, &unique_tpl_skips)?
+    } else {
+        Vec::new()
+    };
+    if mirror && !mirror_mode.allows_recreate() {
+        let produced = produced_paths(&src_root, src, &mapping, &unique_tpl_skips)?;
+        let groups = recreate_groups(&prune_plan, &produced, &tgt_root, tgt, &tgt_lockfile)?;
+        if !groups.is_empty() {
+            anyhow::bail!(format_recreate_error(&groups, src, tgt));
+        }
     }
 
     // `considered` is every file the migration looked at; `written` is the
@@ -3149,8 +3329,7 @@ pub fn run_at(
     // can subtract it from `known` regardless of whether `--mirror` ran.
     let mut pruned_rels: Vec<PathBuf> = Vec::new();
     if mirror {
-        let prune =
-            mirror_prune_paths(&src_root, src, &tgt_root, tgt, &mapping, &unique_tpl_skips)?;
+        let prune = prune_plan;
         pruned_rels = prune.clone();
         for rel in &prune {
             pruned += 1;
@@ -3492,7 +3671,7 @@ mod tests {
         // regardless).
         std::fs::create_dir_all(root.join("envs/dev/workspaces")).unwrap();
 
-        let result = run_at(root, "dev", "prod", false, true /* dry_run */, vec![], Carry::NONE);
+        let result = run_at(root, "dev", "prod", MirrorMode::Additive, true /* dry_run */, vec![], Carry::NONE);
 
         assert!(result.is_ok(), "run_at should succeed: {result:?}");
         assert_eq!(
@@ -6169,7 +6348,7 @@ mod tests {
             }),
         );
 
-        run_at(root, "dev", "prod", false, false, vec![], Carry::NONE)
+        run_at(root, "dev", "prod", MirrorMode::Additive, false, vec![], Carry::NONE)
             .expect("a saved view whose refs all resolve must promote");
 
         let promoted: Value = serde_json::from_slice(
@@ -6207,7 +6386,7 @@ mod tests {
             }),
         );
 
-        let err = run_at(root, "dev", "prod", false, false, vec![], Carry::NONE)
+        let err = run_at(root, "dev", "prod", MirrorMode::Additive, false, vec![], Carry::NONE)
             .expect_err("an unresolvable queues_filter ref must refuse, never defer");
         let msg = format!("{err:#}");
         for want in [
@@ -6244,7 +6423,7 @@ mod tests {
             }),
         );
 
-        let err = run_at(root, "dev", "prod", false, false, vec![], Carry::NONE)
+        let err = run_at(root, "dev", "prod", MirrorMode::Additive, false, vec![], Carry::NONE)
             .expect_err("a user ref must refuse on an api_base with no /api/v1/ segment");
         let msg = format!("{err:#}");
         for want in [
@@ -6279,7 +6458,7 @@ mod tests {
         );
         let before = std::fs::read(&target_only).unwrap();
 
-        run_at(root, "dev", "prod", false, false, vec![], Carry::NONE)
+        run_at(root, "dev", "prod", MirrorMode::Additive, false, vec![], Carry::NONE)
             .expect("a target-native saved view must not block a migration that skips it");
 
         assert_eq!(
@@ -6355,7 +6534,7 @@ mod tests {
         );
 
         // 5th positional arg is `dry_run`.
-        let err = run_at(root, "dev", "prod", false, true, vec![], Carry::NONE)
+        let err = run_at(root, "dev", "prod", MirrorMode::Additive, true, vec![], Carry::NONE)
             .expect_err("--dry-run must forecast the refusal");
         let msg = format!("{err:#}");
         for want in ["saved-views/scoped", "queues_filter[0]", "not-in-target"] {
@@ -6386,7 +6565,7 @@ mod tests {
             }),
         );
 
-        run_at(root, "dev", "prod", false, true, vec![], Carry::NONE)
+        run_at(root, "dev", "prod", MirrorMode::Additive, true, vec![], Carry::NONE)
             .expect("a ref to a queue this run would create must not be refused");
     }
 
@@ -6411,7 +6590,7 @@ mod tests {
                     "organization": "https://dev.example/api/v1/organizations/1"
                 }),
             );
-            run_at(root, "dev", "prod", false, dry, vec![], Carry::NONE)
+            run_at(root, "dev", "prod", MirrorMode::Additive, dry, vec![], Carry::NONE)
                 .unwrap_or_else(|e| panic!("dry_run={dry} must accept, got: {e:#}"));
         }
 
@@ -6430,7 +6609,7 @@ mod tests {
                     "organization": "https://dev.example/api/v1/organizations/1"
                 }),
             );
-            let err = run_at(root, "dev", "prod", false, dry, vec![], Carry::NONE)
+            let err = run_at(root, "dev", "prod", MirrorMode::Additive, dry, vec![], Carry::NONE)
                 .unwrap_err();
             let msg = format!("{err:#}");
             assert!(
@@ -6438,5 +6617,86 @@ mod tests {
                 "dry_run={dry} must name the offending ref, got: {msg}",
             );
         }
+    }
+
+    /// Every object at risk is named, across kinds and however many there are
+    /// per kind — a refusal that lists one of three deletions would send the
+    /// reader to look for the other two themselves.
+    #[test]
+    fn format_recreate_error_names_every_object_and_one_copyable_row() {
+        let groups = vec![
+            RecreateGroup {
+                kind: "queues",
+                deleted: vec![("invoices".into(), 502), ("orders".into(), 504)],
+                created: vec!["vendor-invoices".into(), "sales-orders".into()],
+            },
+            RecreateGroup {
+                kind: "schemas",
+                deleted: vec![("invoices".into(), 503)],
+                created: vec!["vendor-invoices".into()],
+            },
+        ];
+        let msg = format_recreate_error(&groups, "dev", "prod");
+        for want in [
+            "invoices (id 502)",
+            "orders (id 504)",
+            "vendor-invoices",
+            "sales-orders",
+            "schemas",
+            "invoices (id 503)",
+            "--allow-recreate",
+            "rdc doctor dev",
+        ] {
+            assert!(msg.contains(want), "must mention {want}:\n{msg}");
+        }
+        // Exactly one worked example, from the first pair.
+        assert_eq!(msg.matches("[[").count(), 1, "one sample row only:\n{msg}");
+        assert!(msg.contains("[[queues]]\n  dev = \"vendor-invoices\"\n  prod = \"invoices\""), "{msg}");
+    }
+
+    /// The guard reads the target's lockfile, so an object the target tracks
+    /// with no remote id (or none at all) is not something a prune destroys.
+    #[test]
+    fn recreate_groups_ignores_a_prune_with_no_remote_identity() {
+        use std::collections::BTreeSet;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tgt_root = tmp.path().join("envs/prod");
+        let old = PathBuf::from("workspaces/main/queues/invoices/queue.json");
+        let new = PathBuf::from("workspaces/main/queues/vendor-invoices/queue.json");
+        std::fs::create_dir_all(tgt_root.join(old.parent().unwrap())).unwrap();
+        std::fs::write(tgt_root.join(&old), b"{}").unwrap();
+
+        let produced: BTreeSet<PathBuf> = BTreeSet::from([new]);
+        // Empty lockfile: prod has never pushed this queue.
+        let groups =
+            recreate_groups(
+                std::slice::from_ref(&old),
+                &produced,
+                &tgt_root,
+                "prod",
+                &Default::default(),
+            )
+            .unwrap();
+        assert!(groups.is_empty(), "nothing live to lose: {groups:?}");
+
+        // Same run, now with an id recorded for it.
+        let mut lf = crate::state::Lockfile::default();
+        lf.upsert(
+            "queues",
+            "invoices",
+            crate::state::ObjectEntry {
+                id: 502,
+                modified_at: None,
+                modified_by: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
+        let groups =
+            recreate_groups(std::slice::from_ref(&old), &produced, &tgt_root, "prod", &lf).unwrap();
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        assert_eq!(groups[0].kind, "queues");
+        assert_eq!(groups[0].deleted, vec![("invoices".to_string(), 502)]);
+        assert_eq!(groups[0].created, vec!["vendor-invoices".to_string()]);
     }
 }

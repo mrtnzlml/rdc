@@ -200,8 +200,19 @@ pub enum Command {
         /// Mirror semantics: delete tgt snapshot objects that don't exist in
         /// src. Default is additive (extras in tgt are left intact). The
         /// deletions are local file removals — review `git diff` before sync.
+        ///
+        /// Refuses when a prune would destroy a LIVE target object while
+        /// creating another of the same kind: that is what an unrecorded slug
+        /// rename looks like, and pushing it deletes the target object (for a
+        /// queue, its documents) and creates a replacement.
         #[arg(long)]
         mirror: bool,
+        /// Proceed with a `--mirror` prune that deletes live target objects
+        /// while creating others of the same kind. Only for objects that
+        /// really are unrelated — a renamed one belongs in `.rdc/mapping.toml`
+        /// instead, which `rdc doctor` records for you.
+        #[arg(long = "allow-recreate", requires = "mirror")]
+        allow_recreate: bool,
         /// Print the plan (per-file source -> target remap, prunes) and exit
         /// without writing anything.
         #[arg(long = "dry-run")]
@@ -365,6 +376,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             src,
             tgt,
             mirror,
+            allow_recreate,
             dry_run,
             only,
             carry,
@@ -376,6 +388,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 &[&src],
             )?;
             // Pure-local: no remote calls, so no 401-retry wrapper needed.
+            let mirror = if mirror {
+                crate::cli::migrate::MirrorMode::Mirror { allow_recreate }
+            } else {
+                crate::cli::migrate::MirrorMode::Additive
+            };
             crate::cli::migrate::run(
                 &src,
                 &tgt,

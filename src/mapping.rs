@@ -453,6 +453,232 @@ fn merge_legacy_edge(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Surgical edits to the hand-authored `.rdc/mapping.toml`.
+//
+// `rdc doctor` records a slug rename here the moment it applies one, because
+// that is the only moment the correspondence is known: `rdc migrate` strips
+// `id` and `url` from an object it CREATES in the target env, so a target tree
+// holds nothing at all tying a renamed slug to the object that env already
+// has. Without a row the next promotion prunes the old target object and
+// creates a new one — which for a queue is a `DELETE` that purges its
+// documents.
+//
+// The file is hand-authored, so nothing here parses-and-re-serializes it: an
+// edit rewrites one column in place or appends one row, leaving every comment,
+// key order and formatting choice byte-identical. Mirrors the surgical
+// `overlay.toml` header rewrite in `cli::deploy::realign`.
+// ---------------------------------------------------------------------------
+
+impl GenericMapping {
+    /// Index of the `kind` row that names `(env, slug)`, if any. [`validate`]
+    /// makes `(env, slug)` unique per kind, so there is at most one.
+    ///
+    /// [`validate`]: GenericMapping::validate
+    pub fn row_naming(&self, kind: &str, env: &str, slug: &str) -> Option<usize> {
+        let rows = self.kind_rows(kind)?;
+        rows.iter()
+            .position(|r| r.get(env).is_some_and(|s| s == slug))
+    }
+}
+
+/// Split a mapping-file line into `(code, trailing)` at the first `#` that is
+/// not inside a quoted string. `trailing` keeps the `#` and everything after
+/// it, so rejoining the two halves reproduces the line byte-for-byte.
+fn split_off_comment(line: &str) -> (&str, &str) {
+    let bytes = line.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(q) => {
+                if b == b'\\' && q == b'"' {
+                    i += 1; // skip the escaped char
+                } else if b == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if b == b'"' || b == b'\'' {
+                    quote = Some(b);
+                } else if b == b'#' {
+                    return (&line[..i], &line[i..]);
+                }
+            }
+        }
+        i += 1;
+    }
+    (line, "")
+}
+
+/// The kind named by an array-of-tables header line (`[[queues]]`), if this
+/// line is one.
+fn array_table_header(line: &str) -> Option<&str> {
+    let code = split_off_comment(line).0.trim();
+    let inner = code.strip_prefix("[[")?.strip_suffix("]]")?;
+    let name = inner.trim();
+    // A dotted header (`[[a.b]]`) is not a mapping kind; leave it alone.
+    if name.is_empty() || name.contains('.') || name.contains('[') {
+        return None;
+    }
+    Some(name)
+}
+
+/// The key a `key = "value"` line assigns, unquoted, plus the byte range of
+/// the value's quoted literal within `line`. `None` for any line that is not a
+/// simple quoted-string assignment (a blank line, a header, an inline table).
+fn key_and_value_span(line: &str) -> Option<(String, std::ops::Range<usize>, String)> {
+    let (code, _) = split_off_comment(line);
+    // The first `=` outside quotes separates key from value.
+    let bytes = code.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut eq: Option<usize> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(q) => {
+                if b == b'\\' && q == b'"' {
+                    i += 1;
+                } else if b == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if b == b'"' || b == b'\'' {
+                    quote = Some(b);
+                } else if b == b'=' {
+                    eq = Some(i);
+                    break;
+                }
+            }
+        }
+        i += 1;
+    }
+    let eq = eq?;
+    let raw_key = code[..eq].trim();
+    let key = raw_key
+        .strip_prefix('"')
+        .and_then(|k| k.strip_suffix('"'))
+        .or_else(|| raw_key.strip_prefix('\'').and_then(|k| k.strip_suffix('\'')))
+        .unwrap_or(raw_key)
+        .to_string();
+    if key.is_empty() {
+        return None;
+    }
+    // The value must be a quoted string; anything else (a number, an array, an
+    // inline table) is not a slug column and is left untouched.
+    let after_eq = &code[eq + 1..];
+    let lead = after_eq.len() - after_eq.trim_start().len();
+    let vstart = eq + 1 + lead;
+    let vbytes = code.as_bytes();
+    let q = *vbytes.get(vstart)?;
+    if q != b'"' && q != b'\'' {
+        return None;
+    }
+    let mut j = vstart + 1;
+    while j < vbytes.len() {
+        let b = vbytes[j];
+        if b == b'\\' && q == b'"' {
+            j += 2;
+            continue;
+        }
+        if b == q {
+            let value = code[vstart + 1..j].to_string();
+            return Some((key, vstart..j + 1, value));
+        }
+        j += 1;
+    }
+    None
+}
+
+/// Rewrite `env`'s column from `old` to `new` in the first `[[kind]]` row that
+/// names it, preserving the line's indentation, quote style and any trailing
+/// comment. `None` when no such line exists — the caller appends a row instead.
+pub(crate) fn rewrite_row_column(
+    text: &str,
+    kind: &str,
+    env: &str,
+    old: &str,
+    new: &str,
+) -> Option<String> {
+    let mut lines: Vec<String> = text.split('\n').map(|s| s.to_string()).collect();
+    let mut in_kind = false;
+    for line in lines.iter_mut() {
+        if let Some(header) = array_table_header(line) {
+            in_kind = header == kind;
+            continue;
+        }
+        if !in_kind {
+            continue;
+        }
+        let Some((key, span, value)) = key_and_value_span(line) else {
+            continue;
+        };
+        if key != env || value != old {
+            continue;
+        }
+        let quote = &line[span.start..span.start + 1];
+        let replacement = format!("{quote}{}{quote}", escape_toml_str(new, quote));
+        let mut updated = String::with_capacity(line.len() + new.len());
+        updated.push_str(&line[..span.start]);
+        updated.push_str(&replacement);
+        updated.push_str(&line[span.end..]);
+        *line = updated;
+        return Some(lines.join("\n"));
+    }
+    None
+}
+
+/// Append a `[[kind]]` row carrying `cols` (env → slug). An empty `text` (no
+/// mapping file yet) gets the `version` header first. The existing text is
+/// never reflowed — the row is appended after a single blank line.
+pub(crate) fn append_row(text: &str, kind: &str, cols: &BTreeMap<String, String>) -> String {
+    let mut out = String::new();
+    if text.trim().is_empty() {
+        out.push_str(&format!("version = {}\n", default_generic_mapping_version()));
+    } else {
+        out.push_str(text);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    if !out.ends_with("\n\n") {
+        out.push('\n');
+    }
+    out.push_str(&format!("[[{kind}]]\n"));
+    for (env, slug) in cols {
+        out.push_str(&format!("{} = \"{}\"\n", toml_key(env), escape_toml_str(slug, "\"")));
+    }
+    out
+}
+
+/// A TOML bare key when the name allows it (`A-Za-z0-9_-`), quoted otherwise.
+fn toml_key(name: &str) -> String {
+    let bare = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if bare {
+        name.to_string()
+    } else {
+        format!("\"{}\"", escape_toml_str(name, "\""))
+    }
+}
+
+/// Escape a string for the given quote style. Slugs are `[a-z0-9-]` in
+/// practice, so this only ever has to cover a hand-edited pathological value.
+fn escape_toml_str(s: &str, quote: &str) -> String {
+    if quote == "'" {
+        // Literal strings have no escapes at all; a value carrying the quote
+        // itself cannot be represented, so fall back to dropping it rather
+        // than emitting a file that no longer parses.
+        return s.replace('\'', "");
+    }
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -808,5 +1034,156 @@ version = 1
         // the kind and must load unchanged.
         let g: GenericMapping = toml::from_str("version = 2\n").unwrap();
         assert!(g.kind_rows("saved_views").unwrap().is_empty());
+    }
+
+    /// A hand-authored file, with the shapes a human actually writes: comments
+    /// above and beside rows, blank lines, and two kinds.
+    const HAND_AUTHORED: &str = r#"# Cross-env slug names. Hand-authored.
+version = 2
+
+# The invoice queue is named differently in prod.
+[[queues]]
+dev = "invoices"   # renamed in prod, see ticket
+prod = "invoices-prod"
+
+[[hooks]]
+dev = "invoices"
+prod = "invoices"
+"#;
+
+    #[test]
+    fn row_naming_finds_the_row_that_names_env_and_slug() {
+        let g: GenericMapping = toml::from_str(HAND_AUTHORED).unwrap();
+        assert_eq!(g.row_naming("queues", "dev", "invoices"), Some(0));
+        assert_eq!(g.row_naming("queues", "prod", "invoices-prod"), Some(0));
+        assert_eq!(g.row_naming("queues", "prod", "invoices"), None);
+        assert_eq!(g.row_naming("labels", "dev", "invoices"), None);
+    }
+
+    /// The whole point of the surgical edit: one value changes, every comment,
+    /// blank line, alignment and unrelated row survives byte-for-byte.
+    #[test]
+    fn rewrite_row_column_changes_only_that_column() {
+        let out =
+            rewrite_row_column(HAND_AUTHORED, "queues", "dev", "invoices", "vendor-invoices")
+                .expect("the row names (dev, invoices)");
+        assert!(
+            out.contains(r#"dev = "vendor-invoices"   # renamed in prod, see ticket"#),
+            "value replaced in place, comment and spacing kept: {out}"
+        );
+        // Everything else identical: diff the two line lists.
+        let before: Vec<&str> = HAND_AUTHORED.lines().collect();
+        let after: Vec<&str> = out.lines().collect();
+        assert_eq!(before.len(), after.len(), "no lines added or removed");
+        let changed: Vec<usize> = before
+            .iter()
+            .zip(&after)
+            .enumerate()
+            .filter(|(_, (b, a))| b != a)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(changed.len(), 1, "exactly one line changed: {changed:?}");
+    }
+
+    /// The hooks row names (dev, invoices) too. Rewriting `queues` must not
+    /// touch it — kind scoping is what keeps two objects that happen to share
+    /// a slug independent.
+    #[test]
+    fn rewrite_row_column_ignores_rows_of_another_kind() {
+        let out =
+            rewrite_row_column(HAND_AUTHORED, "queues", "dev", "invoices", "vendor-invoices")
+                .unwrap();
+        let g: GenericMapping = toml::from_str(&out).unwrap();
+        assert_eq!(g.hooks[0].get("dev").map(String::as_str), Some("invoices"));
+        assert_eq!(
+            g.queues[0].get("dev").map(String::as_str),
+            Some("vendor-invoices")
+        );
+    }
+
+    #[test]
+    fn rewrite_row_column_preserves_a_literal_quote_style() {
+        let text = "version = 2\n\n[[queues]]\ndev = 'invoices'\nprod = \"invoices\"\n";
+        let out = rewrite_row_column(text, "queues", "dev", "invoices", "vendor").unwrap();
+        assert!(out.contains("dev = 'vendor'"), "{out}");
+    }
+
+    #[test]
+    fn rewrite_row_column_is_none_when_no_row_names_the_slug() {
+        assert!(rewrite_row_column(HAND_AUTHORED, "queues", "dev", "nope", "x").is_none());
+        assert!(rewrite_row_column(HAND_AUTHORED, "labels", "dev", "invoices", "x").is_none());
+    }
+
+    /// A `#` inside a slug value must not be read as a comment, and a quoted
+    /// key must still match its env.
+    #[test]
+    fn rewrite_row_column_handles_quoted_keys_and_hashes_in_values() {
+        let text = "version = 2\n\n[[hooks]]\n\"dev-eu\" = \"a#b\"\nprod = \"a\"\n";
+        let out = rewrite_row_column(text, "hooks", "dev-eu", "a#b", "c").unwrap();
+        assert!(out.contains("\"dev-eu\" = \"c\""), "{out}");
+    }
+
+    #[test]
+    fn append_row_creates_a_versioned_file_from_nothing() {
+        let cols = BTreeMap::from([
+            ("dev".to_string(), "vendor-invoices".to_string()),
+            ("prod".to_string(), "invoices".to_string()),
+        ]);
+        let out = append_row("", "queues", &cols);
+        assert_eq!(
+            out,
+            "version = 2\n\n[[queues]]\ndev = \"vendor-invoices\"\nprod = \"invoices\"\n"
+        );
+        let g: GenericMapping = toml::from_str(&out).unwrap();
+        assert_eq!(g.row_naming("queues", "dev", "vendor-invoices"), Some(0));
+    }
+
+    #[test]
+    fn append_row_leaves_existing_bytes_untouched() {
+        let cols = BTreeMap::from([
+            ("dev".to_string(), "vendor".to_string()),
+            ("prod".to_string(), "v".to_string()),
+        ]);
+        let out = append_row(HAND_AUTHORED, "labels", &cols);
+        assert!(out.starts_with(HAND_AUTHORED), "existing text is a prefix");
+        assert!(out.ends_with("[[labels]]\ndev = \"vendor\"\nprod = \"v\"\n"), "{out}");
+    }
+
+    /// An env name that is not a bare TOML key still produces a loadable file.
+    #[test]
+    fn append_row_quotes_an_env_name_that_needs_it() {
+        let cols = BTreeMap::from([
+            ("dev eu".to_string(), "a".to_string()),
+            ("prod".to_string(), "b".to_string()),
+        ]);
+        let out = append_row("", "hooks", &cols);
+        assert!(out.contains("\"dev eu\" = \"a\""), "{out}");
+        let g: GenericMapping = toml::from_str(&out).unwrap();
+        assert_eq!(g.row_naming("hooks", "dev eu", "a"), Some(0));
+    }
+
+    /// The end state a doctor rename produces must be a file `migrate` can
+    /// use: it loads, it validates, and it orients to the rename.
+    #[test]
+    fn recorded_rows_load_validate_and_orient() {
+        let cols = BTreeMap::from([
+            ("dev".to_string(), "vendor-invoices".to_string()),
+            ("test".to_string(), "invoices".to_string()),
+            ("prod".to_string(), "invoices".to_string()),
+        ]);
+        let text = append_row("", "queues", &cols);
+        let g: GenericMapping = toml::from_str(&text).unwrap();
+        let envs = BTreeSet::from([
+            "dev".to_string(),
+            "test".to_string(),
+            "prod".to_string(),
+        ]);
+        assert!(g.validate(&envs).unwrap().is_empty(), "no warnings");
+        let m = g.orient("dev", "prod");
+        assert_eq!(
+            m.queues.get("vendor-invoices").map(String::as_str),
+            Some("invoices"),
+            "the promotion must target prod's existing slug"
+        );
     }
 }

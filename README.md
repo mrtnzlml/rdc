@@ -364,11 +364,20 @@ Slug alignment across envs lives in one hand-editable file,
 names its own slug. Objects whose slug is identical everywhere need no entry
 (they map 1:1). The file is often empty or absent.
 
+`rdc doctor <env>` maintains it. A rename is the one moment the correspondence
+between two envs' slugs is known — migrate strips `id`/`url` from an object it
+creates, so nothing in the target tree records it afterwards — and doctor
+writes the row then, for every env whose lockfile still holds the old slug.
+Rename in the source env, run `rdc doctor <src>`, and the promotion renames the
+target's object rather than deleting it and creating a new one.
+
 Re-running on an already-migrated snapshot is a no-op (matched objects keep the target's identity).
 
 ### Mirror semantics
 
 Without `--mirror`, migrate is additive — objects that exist only in the target are left intact and nothing is ever removed. That is the deliberate alternative for a target that legitimately holds work the source lacks. `--mirror` instead deletes target snapshot files with no source counterpart; those are local file removals, so they reach the tenant only when the following `rdc sync <tgt>` is given `--allow-deletes` (or you confirm its prompt). Review with `git diff` before syncing.
+
+`--mirror` refuses one shape outright: pruning a target object the target's lockfile still holds a live id for, while creating another of the same kind. That is what an unrecorded rename looks like, and pushing it deletes the target object — for a queue, its documents — and creates a replacement. The refusal names the mapping row that turns it back into a rename. Objects that really are unrelated pass with `--allow-recreate`.
 
 ### Selective migrate
 
@@ -500,7 +509,7 @@ rather than duplicating them.
 | `rdc auth <env>` | Set or refresh the API token for `<env>`. |
 | `rdc sync <env>` | Reconcile snapshot ↔ remote in one pass. |
 | `rdc migrate <src> <tgt>` | Copy one env's snapshot into another's, locally (slug remap, ref rewrite, overlay) — then push with `rdc sync <tgt>`. |
-| `rdc doctor <env>` | Offline check of the local snapshot — report unpushed local changes, realign stale slugs (cascade-aware), prune orphan base-cache entries. |
+| `rdc doctor <env>` | Offline check of the local snapshot — report unpushed local changes, realign stale slugs (cascade-aware) and record them in `.rdc/mapping.toml`, prune orphan base-cache entries. |
 | `rdc upgrade` | Self-update the binary. |
 
 Every command that writes to the remote takes `--dry-run`. Use `rdc <command> --help` for the full flag list.

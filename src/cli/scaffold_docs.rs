@@ -122,7 +122,15 @@ fn render_promote(envs: &BTreeMap<String, EnvConfig>) -> String {
          \n\
          Additive alternative: drop `--mirror` and `--allow-deletes` when {tgt}\n\
          legitimately holds objects {src} lacks — nothing is then pruned locally or\n\
-         deleted remotely."
+         deleted remotely.\n\
+         \n\
+         **Renaming an object.** Rename it in {src} (or let a tenant-side rename\n\
+         arrive with the next sync), then run `rdc doctor {src}`: it realigns the\n\
+         local slug and records the new name in `.rdc/mapping.toml`, so the\n\
+         promotion above renames {tgt}'s object instead of deleting it and creating\n\
+         a replacement. Renaming a queue any other way costs it its documents. If a\n\
+         rename ever reaches `--mirror` unrecorded, migrate refuses and says which\n\
+         row to add."
     )
 }
 

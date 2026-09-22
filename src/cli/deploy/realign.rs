@@ -32,10 +32,15 @@
 //! `email_templates`/`engine_fields` segments cascade) — so a rename never
 //! leaves a dangling per-env override for `rdc migrate` to silently drop. The
 //! rewrite is surgical (table headers only), preserving comments and values.
-//! The mapping (`.rdc/mapping.toml`, and any legacy `.rdc/map/*.toml`) is
-//! hand-authored and only warned about — `rdc migrate` no longer self-heals
-//! stale slug references in it.
+//! The generic mapping (`.rdc/mapping.toml`) is hand-authored, but a rename
+//! is RECORDED in it (`record_mapping_rows`): a slug that diverges from the
+//! other envs' gets a row naming each env's own slug, so the next `rdc
+//! migrate` renames the target object instead of pruning it and creating a
+//! new one — for a queue, a `DELETE` that purges its documents. The edit is
+//! surgical, like the overlay one. Legacy `.rdc/map/*.toml` files are only
+//! warned about; `rdc migrate` no longer self-heals stale slugs in them.
 
+use crate::mapping::GenericMapping;
 use crate::paths::Paths;
 use crate::slug::slugify;
 use crate::state::Lockfile;
@@ -544,6 +549,9 @@ pub struct ApplyStats {
     pub orphan_warnings: Vec<String>,
     /// One line per overlay.toml key auto-renamed to follow an applied rename.
     pub overlay_updates: Vec<String>,
+    /// One line per `.rdc/mapping.toml` row written so a cross-env promotion
+    /// renames the target object instead of deleting and recreating it.
+    pub mapping_updates: Vec<String>,
 }
 
 /// Apply the pending list. Mutates lockfile in place; caller is
@@ -572,6 +580,11 @@ pub fn apply(
     // overlay.toml keys in sync (rename `[hooks.<old>]` -> `[hooks.<new>]` etc.)
     // so a doctor rename never leaves a dangling override for `rdc migrate`.
     let mut applied_renames: Vec<PendingRename> = Vec::new();
+    // `.rdc/mapping.toml` (kind, old_key, new_key) pairs, collected INSIDE the
+    // loop: each rename's compound-key expansion has to see the lockfile as it
+    // stands right after that rename, so that composed renames (a workspace,
+    // then a queue under it) chain onto one row. See `mapping_pairs_for`.
+    let mut mapping_pairs: Vec<(&'static str, String, String)> = Vec::new();
 
     // Process in priority order: workspaces, queues, leaves. The list
     // is already sorted by `detect`.
@@ -596,6 +609,7 @@ pub fn apply(
                 stats.orphan_warnings.extend(orphan_msgs);
                 ref_subst.extend(ref_subst_pairs(&p));
                 prefix_subst.extend(compound_prefix_pairs(&p));
+                mapping_pairs.extend(mapping_pairs_for(&p, lockfile));
                 applied_renames.push(p.clone());
                 // Cascade in-memory pending updates: if we just renamed
                 // a workspace, later Queue / EmailTemplate entries
@@ -624,6 +638,26 @@ pub fn apply(
         let (overlay_updates, overlay_missed) = apply_overlay_rewrites(paths, &applied_renames)?;
         stats.overlay_updates.extend(overlay_updates);
         stats.orphan_warnings.extend(overlay_missed);
+    }
+
+    // Record the renames in `.rdc/mapping.toml`, so the next `rdc migrate`
+    // into another env renames that env's object rather than pruning it and
+    // creating a new one. Runs last: the lockfile and every on-disk path have
+    // settled by here, and a failure to record must not undo a rename.
+    if !mapping_pairs.is_empty() {
+        // Never fatal: the renames are already on disk, and `run_within_env`
+        // saves the lockfile only if `apply` returns Ok — failing here over an
+        // advisory file would strand the tree at the new slugs with the
+        // lockfile still on the old ones.
+        match record_mapping_rows(paths, &mapping_pairs) {
+            Ok((updates, warnings)) => {
+                stats.mapping_updates.extend(updates);
+                stats.orphan_warnings.extend(warnings);
+            }
+            Err(e) => stats.orphan_warnings.push(format!(
+                "  could not record the renames in .rdc/mapping.toml ({e:#});                  `rdc migrate` will refuse to promote them until you do"
+            )),
+        }
     }
 
     Ok(stats)
@@ -1375,17 +1409,19 @@ fn apply_overlay_rewrites(
     Ok((updated, missed))
 }
 
-/// Scan `.rdc/mapping.toml` (and any legacy `.rdc/map/*.toml` file) for
-/// textual references to the old slug; return one warning per file that
-/// matches. The mapping is hand-authored and `rdc migrate` no longer
-/// self-heals stale slug references, so we warn rather than rewrite.
-/// (overlay.toml is handled separately by [`apply_overlay_rewrites`], which
-/// renames its keys in place rather than warning.)
+/// Scan any legacy `.rdc/map/<a>-to-<b>.toml` file for textual references to
+/// the old slug; return one warning per file that matches.
+///
+/// The generic `.rdc/mapping.toml` is deliberately NOT scanned here: since
+/// `record_mapping_rows` maintains it, a warning would fire on the very rows
+/// this run just wrote. Legacy per-pair files have no maintainer — `rdc
+/// migrate` ignores them outright once the generic file exists — so a stale
+/// slug in one is still the user's to fix.
 fn collect_orphans(paths: &Paths, kind: &str, old: &str, out: &mut Vec<String>) {
     let needle = format!("\"{old}\"");
     let dotted = format!(".{old}]");
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    for path in list_mapping_files(paths) {
+    for path in paths.legacy_mapping_files() {
         if !path.exists() {
             continue;
         }
@@ -1402,24 +1438,6 @@ fn collect_orphans(paths: &Paths, kind: &str, old: &str, out: &mut Vec<String>) 
             }
         }
     }
-}
-
-fn list_mapping_files(paths: &Paths) -> Vec<std::path::PathBuf> {
-    let mut out = Vec::new();
-    let mapping_file = paths.mapping_file();
-    if mapping_file.exists() {
-        out.push(mapping_file);
-    }
-    let dir = paths.mapping_dir();
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        out.extend(
-            entries
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("toml")),
-        );
-    }
-    out
 }
 
 /// Entry point used by `rdc doctor <env>`.
@@ -1467,6 +1485,15 @@ pub async fn run_within_env(env: &str, check: bool, yes: bool) -> Result<()> {
             println!("{u}");
         }
     }
+    if !stats.mapping_updates.is_empty() {
+        println!(
+            "recorded in .rdc/mapping.toml, so `rdc migrate` renames these rather than \
+             deleting and recreating them:"
+        );
+        for u in &stats.mapping_updates {
+            println!("{u}");
+        }
+    }
     if !stats.orphan_warnings.is_empty() {
         println!("note: mapping / overlay files still reference renamed slugs:");
         for w in &stats.orphan_warnings {
@@ -1474,6 +1501,242 @@ pub async fn run_within_env(env: &str, check: bool, yes: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The `.rdc/mapping.toml` `(kind, old_key, new_key)` pairs one applied rename
+/// implies, expanded against the env's lockfile **as it stands right after
+/// that rename** — which is why the caller collects these inside the apply
+/// loop rather than once at the end. A workspace rename followed by a queue
+/// rename under it must produce `<old_ws>/<q>` → `<new_ws>/<q>` and then
+/// `<new_ws>/<old_q>` → `<new_ws>/<new_q>`, so that the two edits compose onto
+/// one row; expanding both against the final lockfile would invent a key that
+/// never existed in any env.
+///
+/// Mirrors [`overlay_rewrites_for`]'s cascade, over the mapping's kinds rather
+/// than the overlay's: the mapping has `workspaces` (overlays do not) and
+/// neither has `workflows` / `workflow_steps`, which no mapping row can name.
+fn mapping_pairs_for(
+    p: &PendingRename,
+    lockfile: &Lockfile,
+) -> Vec<(&'static str, String, String)> {
+    let whole = |kind: &'static str, old: &str, new: &str| {
+        vec![(kind, old.to_string(), new.to_string())]
+    };
+    // Every compound lockfile key of `kind` whose Nth `/`-segment is the NEW
+    // slug, paired with the key it had before the rename. The lockfile has
+    // already been rewritten by `apply_one`, so the new keys are what is
+    // there and the old ones are derived back.
+    let segment = |kind: &'static str, n: usize, old: &str, new: &str| {
+        let mut out: Vec<(&'static str, String, String)> = Vec::new();
+        let Some(by_slug) = lockfile.objects.get(kind) else {
+            return out;
+        };
+        for key in by_slug.keys() {
+            let parts: Vec<&str> = key.splitn(3, '/').collect();
+            if parts.get(n).copied() != Some(new) {
+                continue;
+            }
+            let mut owned: Vec<String> = parts.iter().map(|s| s.to_string()).collect();
+            owned[n] = old.to_string();
+            out.push((kind, owned.join("/"), key.clone()));
+        }
+        out
+    };
+    match p {
+        PendingRename::Hook { old, new } => whole("hooks", old, new),
+        PendingRename::Rule { old, new } => whole("rules", old, new),
+        PendingRename::Label { old, new } => whole("labels", old, new),
+        PendingRename::SavedView { old, new } => whole("saved_views", old, new),
+        // Already compound `<engine>/<field>` keys.
+        PendingRename::EngineField { old, new } => whole("engine_fields", old, new),
+        PendingRename::EmailTemplate { ws, q, old, new } => whole(
+            "email_templates",
+            &format!("{ws}/{q}/{old}"),
+            &format!("{ws}/{q}/{new}"),
+        ),
+        PendingRename::Engine { old, new } => {
+            let mut out = whole("engines", old, new);
+            out.extend(segment("engine_fields", 0, old, new));
+            out
+        }
+        PendingRename::Queue { old, new, .. } => {
+            // A queue owns its schema and inbox slug, and is the middle
+            // segment of every email template under it.
+            let mut out = whole("queues", old, new);
+            out.extend(whole("schemas", old, new));
+            out.extend(whole("inboxes", old, new));
+            out.extend(segment("email_templates", 1, old, new));
+            out
+        }
+        PendingRename::Workspace { old, new } => {
+            // A workspace rename moves no queue slug, but it IS the first
+            // segment of every email-template key under it.
+            let mut out = whole("workspaces", old, new);
+            out.extend(segment("email_templates", 0, old, new));
+            out
+        }
+        // Not mapping kinds: `rdc migrate` never remaps them.
+        PendingRename::Workflow { .. } | PendingRename::WorkflowStep { .. } => Vec::new(),
+    }
+}
+
+/// Record the applied renames in `.rdc/mapping.toml` so the next promotion
+/// PATCHes the target object's name instead of deleting it and creating a new
+/// one.
+///
+/// A rename in env `X` creates a divergence exactly against the envs that
+/// still hold the object under the old slug, so those are the envs a row must
+/// name — read off each one's lockfile, the same "the env has this object,
+/// live" test `rdc migrate`'s recreate guard applies to the target. An env
+/// with no lockfile entry has nothing to lose and gets no column.
+///
+/// Two shapes, mirroring `apply_overlay_rewrites`:
+///
+/// * a row already names `(X, old)` — the divergence was already recorded, so
+///   only X's column moves;
+/// * no row does — append one naming X's new slug plus every other env still
+///   on the old one.
+///
+/// Best effort throughout: no `rdc.toml`, no other env, a mapping file that
+/// does not parse, or a row that would break `(env, slug)` uniqueness all mean
+/// "record nothing and say so", never a failed realign. The rename itself is
+/// already on disk by this point.
+fn record_mapping_rows(
+    paths: &Paths,
+    pairs: &[(&'static str, String, String)],
+) -> Result<(Vec<String>, Vec<String>)> {
+    let mut updates: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    if pairs.is_empty() {
+        return Ok((updates, warnings));
+    }
+    let env = paths.env().to_string();
+    let Ok(cfg) = crate::config::ProjectConfig::load(&paths.project_config()) else {
+        return Ok((updates, warnings));
+    };
+    // Every OTHER env's lockfile: the authority on which envs hold an object
+    // that a promotion could destroy.
+    let others: Vec<(String, Lockfile)> = cfg
+        .envs
+        .keys()
+        .filter(|e| **e != env)
+        .filter_map(|e| {
+            let p = Paths::for_env(paths.root(), e);
+            Lockfile::load(&p.lockfile()).ok().map(|lf| (e.clone(), lf))
+        })
+        .collect();
+    if others.is_empty() {
+        return Ok((updates, warnings));
+    }
+
+    let path = paths.mapping_file();
+    let original = if path.exists() {
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?
+    } else {
+        String::new()
+    };
+    if !original.trim().is_empty() && toml::from_str::<GenericMapping>(&original).is_err() {
+        // Nothing is written: a file rdc cannot read is a file whose
+        // hand-authored rows it must not overwrite.
+        warnings.push(format!(
+            "  {} does not parse; the renames were NOT recorded there — \
+             `rdc migrate` may delete and recreate the renamed objects",
+            path.display()
+        ));
+        return Ok((updates, warnings));
+    }
+
+    let mut text = original.clone();
+    for (kind, old, new) in pairs {
+        // Re-parsed per pair: an earlier pair may have appended the very row
+        // this one has to rewrite (workspace rename, then a queue under it).
+        let g: GenericMapping = match toml::from_str(&text) {
+            Ok(g) => g,
+            Err(e) => {
+                warnings.push(format!(
+                    "  {} stopped parsing while recording ({e}); the remaining                      renames were not recorded",
+                    path.display()
+                ));
+                break;
+            }
+        };
+        if g.row_naming(kind, &env, old).is_some() {
+            match crate::mapping::rewrite_row_column(&text, kind, &env, old, new) {
+                Some(updated) => {
+                    text = updated;
+                    updates.push(format!(
+                        "  [[{kind}]] {env} = \"{old}\" -> \"{new}\""
+                    ));
+                }
+                None => warnings.push(format!(
+                    "  {} maps {kind}/{old} in a form this rewrite cannot reach; \
+                     update {env}'s column to '{new}' by hand",
+                    path.display()
+                )),
+            }
+            continue;
+        }
+        // No row yet: one is needed only for the envs that still hold the old
+        // slug. An env already naming that slug in some OTHER row of this kind
+        // is skipped — claiming it twice is exactly what `validate` rejects.
+        let mut cols: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        let mut conflicted: Vec<String> = Vec::new();
+        for (other, lf) in &others {
+            let live = lf
+                .objects
+                .get(*kind)
+                .and_then(|by_slug| by_slug.get(old.as_str()))
+                .is_some_and(|e| e.id != 0);
+            if !live {
+                continue;
+            }
+            if g.row_naming(kind, other, old).is_some() {
+                conflicted.push(other.clone());
+                continue;
+            }
+            cols.insert(other.clone(), old.clone());
+        }
+        if !conflicted.is_empty() {
+            warnings.push(format!(
+                "  {} already maps {kind}/{old} for env(s) {}; \
+                 record the rename to '{new}' there by hand",
+                path.display(),
+                conflicted.join(", "),
+            ));
+        }
+        if cols.is_empty() {
+            continue;
+        }
+        let envs_listed: Vec<String> = cols.keys().cloned().collect();
+        cols.insert(env.clone(), new.clone());
+        text = crate::mapping::append_row(&text, kind, &cols);
+        updates.push(format!(
+            "  + [[{kind}]] {env} = \"{new}\" (still \"{old}\" in {})",
+            envs_listed.join(", "),
+        ));
+    }
+
+    if text == original {
+        return Ok((updates, warnings));
+    }
+    // Never hand `rdc migrate` a file it will refuse: it parses the file AND
+    // rejects a kind that maps one `(env, slug)` in two rows, which is what a
+    // rename onto a slug some other row already claims would produce.
+    let known: BTreeSet<String> = cfg.envs.keys().cloned().collect();
+    let rejected = match toml::from_str::<GenericMapping>(&text) {
+        Ok(g) => g.validate(&known).err().map(|e| format!("{e}")),
+        Err(e) => Some(format!("{e}")),
+    };
+    if let Some(why) = rejected {
+        warnings.push(format!(
+            "  {} was left unchanged: the recorded rows would not load ({why})",
+            path.display()
+        ));
+        return Ok((Vec::new(), warnings));
+    }
+    crate::snapshot::writer::write_atomic(&path, text.as_bytes())?;
+    Ok((updates, warnings))
 }
 
 #[cfg(test)]
@@ -2679,10 +2942,17 @@ mod tests {
     }
 
     #[test]
-    fn collect_orphans_reports_stale_slug_in_mapping_toml() {
+    fn collect_orphans_reports_stale_slug_in_a_legacy_map_file() {
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = Paths::for_env(tmp.path(), "test");
-        std::fs::create_dir_all(paths.mapping_file().parent().unwrap()).unwrap();
+        std::fs::create_dir_all(paths.mapping_dir()).unwrap();
+        std::fs::write(
+            paths.mapping_dir().join("dev-to-prod.toml"),
+            "version = 1\n\n[hooks]\n\"old-hook\" = \"old-hook-prod\"\n",
+        )
+        .unwrap();
+        // The generic file names the same slug and must NOT be reported:
+        // `record_mapping_rows` maintains it.
         std::fs::write(
             paths.mapping_file(),
             "version = 2\n\n[[hooks]]\ndev = \"old-hook\"\nprod = \"old-hook-prod\"\n",
@@ -2691,8 +2961,8 @@ mod tests {
 
         let mut orphans = Vec::new();
         collect_orphans(&paths, "hooks", "old-hook", &mut orphans);
-        assert_eq!(orphans.len(), 1, "{orphans:?}");
-        assert!(orphans[0].contains("mapping.toml"), "{orphans:?}");
+        assert_eq!(orphans.len(), 1, "only the legacy file: {orphans:?}");
+        assert!(orphans[0].contains("dev-to-prod.toml"), "{orphans:?}");
         assert!(orphans[0].contains("hooks/old-hook"), "{orphans:?}");
     }
 
@@ -3088,5 +3358,586 @@ mod tests {
             );
             assert_eq!(actual, expected, "{kind}: realign hash must match the codec");
         }
+    }
+
+    // ---- `.rdc/mapping.toml` recording -------------------------------------
+
+    fn ent(id: u64) -> crate::state::ObjectEntry {
+        crate::state::ObjectEntry {
+            id,
+            modified_at: None,
+            modified_by: None,
+            content_hash: None,
+            secrets_hash: None,
+        }
+    }
+
+    /// One env's lockfile contents: `(kind, slug, id)` per tracked object.
+    type EnvObjects<'a> = (&'a str, &'a [(&'a str, &'a str, u64)]);
+
+    /// A project declaring `envs` in `rdc.toml`, each with a lockfile built
+    /// from `(kind, slug, id)` triples. The first env is the one being
+    /// realigned; the rest stand in for the envs a promotion would destroy.
+    fn project_with(envs: &[EnvObjects<'_>]) -> tempfile::TempDir {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = String::new();
+        for (env, entries) in envs {
+            cfg.push_str(&format!(
+                "[envs.{env}]\napi_base = \"https://api.example.com/v1\"\norg_id = 1\n\n"
+            ));
+            let p = Paths::for_env(tmp.path(), *env);
+            let mut lf = Lockfile::default();
+            for (kind, slug, id) in *entries {
+                lf.upsert(kind, slug, ent(*id));
+            }
+            lf.save(&p.lockfile()).unwrap();
+        }
+        std::fs::write(tmp.path().join("rdc.toml"), cfg).unwrap();
+        tmp
+    }
+
+    fn mapping_text(tmp: &tempfile::TempDir) -> String {
+        let path = Paths::for_env(tmp.path(), "dev").mapping_file();
+        std::fs::read_to_string(path).unwrap_or_default()
+    }
+
+    /// Lay a queue (+ schema, inbox, one email template) into `env`'s tree.
+    fn write_queue(paths: &Paths, ws: &str, q: &str, name: &str) {
+        let dir = paths.queue_dir(ws, q);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("queue.json"),
+            format!(r#"{{"id":1,"name":"{name}","queues":[],"workspace":null,"schema":null}}"#),
+        )
+        .unwrap();
+        std::fs::write(dir.join("schema.json"), b"{}").unwrap();
+        std::fs::write(dir.join("inbox.json"), b"{}").unwrap();
+        let tpl = paths.queue_email_templates_dir(ws, q);
+        std::fs::create_dir_all(&tpl).unwrap();
+        std::fs::write(tpl.join("welcome.json"), br#"{"id":4,"name":"Welcome"}"#).unwrap();
+    }
+
+    fn write_workspace(paths: &Paths, ws: &str, name: &str) {
+        std::fs::create_dir_all(paths.workspace_dir(ws)).unwrap();
+        std::fs::write(
+            paths.workspace_dir(ws).join("workspace.json"),
+            format!(r#"{{"id":9,"name":"{name}"}}"#),
+        )
+        .unwrap();
+    }
+
+    /// A queue rename diverges FOUR mapping kinds at once: the queue slug also
+    /// keys its schema and inbox, and is the middle segment of every email
+    /// template under it. Miss any one and `rdc migrate` prunes that object in
+    /// the target and creates a replacement.
+    #[test]
+    fn queue_rename_records_a_row_for_every_queue_keyed_kind() {
+        let tmp = project_with(&[
+            (
+                "dev",
+                &[
+                    ("workspaces", "ws1", 9),
+                    ("queues", "cost-invoices", 1),
+                    ("schemas", "cost-invoices", 2),
+                    ("inboxes", "cost-invoices", 3),
+                    ("email_templates", "ws1/cost-invoices/welcome", 4),
+                ],
+            ),
+            (
+                "prod",
+                &[
+                    ("queues", "cost-invoices", 501),
+                    ("schemas", "cost-invoices", 502),
+                    ("inboxes", "cost-invoices", 503),
+                    ("email_templates", "ws1/cost-invoices/welcome", 504),
+                ],
+            ),
+        ]);
+        let paths = Paths::for_env(tmp.path(), "dev");
+        write_workspace(&paths, "ws1", "Ws1");
+        write_queue(&paths, "ws1", "cost-invoices", "AP Invoices");
+        let mut lockfile = Lockfile::load(&paths.lockfile()).unwrap();
+
+        let pending = detect(&paths, &lockfile);
+        let stats = apply(&paths, &mut lockfile, pending, false).unwrap();
+        assert_eq!(stats.applied, 1, "one queue rename");
+
+        let g: GenericMapping = toml::from_str(&mapping_text(&tmp)).unwrap();
+        for kind in ["queues", "schemas", "inboxes"] {
+            let row = g
+                .kind_rows(kind)
+                .unwrap()
+                .first()
+                .unwrap_or_else(|| panic!("no {kind} row recorded"));
+            assert_eq!(row.get("dev").map(String::as_str), Some("ap-invoices"));
+            assert_eq!(row.get("prod").map(String::as_str), Some("cost-invoices"));
+        }
+        let row = &g.email_templates[0];
+        assert_eq!(
+            row.get("dev").map(String::as_str),
+            Some("ws1/ap-invoices/welcome")
+        );
+        assert_eq!(
+            row.get("prod").map(String::as_str),
+            Some("ws1/cost-invoices/welcome")
+        );
+    }
+
+    /// A workspace rename moves no queue slug, but it IS the first segment of
+    /// every email-template key under it — and the `workspaces` row itself
+    /// matters because a queue's target path is `workspaces/<ws>/queues/…`,
+    /// so without it the whole subtree is pruned and recreated.
+    #[test]
+    fn workspace_rename_records_its_row_and_the_template_segment() {
+        let tmp = project_with(&[
+            (
+                "dev",
+                &[
+                    ("workspaces", "old-ws", 9),
+                    ("queues", "invoices", 1),
+                    ("email_templates", "old-ws/invoices/welcome", 4),
+                ],
+            ),
+            (
+                "prod",
+                &[
+                    ("workspaces", "old-ws", 901),
+                    ("queues", "invoices", 501),
+                    ("email_templates", "old-ws/invoices/welcome", 504),
+                ],
+            ),
+        ]);
+        let paths = Paths::for_env(tmp.path(), "dev");
+        write_workspace(&paths, "old-ws", "Shared Services");
+        write_queue(&paths, "old-ws", "invoices", "Invoices");
+        let mut lockfile = Lockfile::load(&paths.lockfile()).unwrap();
+
+        let pending = detect(&paths, &lockfile);
+        let stats = apply(&paths, &mut lockfile, pending, false).unwrap();
+        assert_eq!(stats.applied, 1, "one workspace rename: {stats:?}");
+
+        let g: GenericMapping = toml::from_str(&mapping_text(&tmp)).unwrap();
+        let ws = &g.workspaces[0];
+        assert_eq!(ws.get("dev").map(String::as_str), Some("shared-services"));
+        assert_eq!(ws.get("prod").map(String::as_str), Some("old-ws"));
+        let tpl = &g.email_templates[0];
+        assert_eq!(
+            tpl.get("dev").map(String::as_str),
+            Some("shared-services/invoices/welcome")
+        );
+        assert_eq!(
+            tpl.get("prod").map(String::as_str),
+            Some("old-ws/invoices/welcome")
+        );
+        assert!(g.queues.is_empty(), "the queue slug did not change");
+    }
+
+    /// Both renamed in one run. The template key diverges twice, and the two
+    /// edits must land on ONE row — the second rewriting what the first
+    /// appended — or the mapping claims (dev, …) twice and stops validating.
+    #[test]
+    fn workspace_and_queue_renamed_together_compose_onto_one_template_row() {
+        let tmp = project_with(&[
+            (
+                "dev",
+                &[
+                    ("workspaces", "old-ws", 9),
+                    ("queues", "old-q", 1),
+                    ("schemas", "old-q", 2),
+                    ("inboxes", "old-q", 3),
+                    ("email_templates", "old-ws/old-q/welcome", 4),
+                ],
+            ),
+            (
+                "prod",
+                &[
+                    ("workspaces", "old-ws", 901),
+                    ("queues", "old-q", 501),
+                    ("schemas", "old-q", 502),
+                    ("inboxes", "old-q", 503),
+                    ("email_templates", "old-ws/old-q/welcome", 504),
+                ],
+            ),
+        ]);
+        let paths = Paths::for_env(tmp.path(), "dev");
+        write_workspace(&paths, "old-ws", "New Ws");
+        write_queue(&paths, "old-ws", "old-q", "New Q");
+        let mut lockfile = Lockfile::load(&paths.lockfile()).unwrap();
+
+        let pending = detect(&paths, &lockfile);
+        let stats = apply(&paths, &mut lockfile, pending, false).unwrap();
+        assert_eq!(stats.applied, 2, "workspace + queue: {stats:?}");
+
+        let text = mapping_text(&tmp);
+        let g: GenericMapping = toml::from_str(&text).unwrap();
+        assert_eq!(g.email_templates.len(), 1, "exactly one row: {text}");
+        let tpl = &g.email_templates[0];
+        assert_eq!(
+            tpl.get("dev").map(String::as_str),
+            Some("new-ws/new-q/welcome"),
+            "both segments followed the renames: {text}"
+        );
+        assert_eq!(
+            tpl.get("prod").map(String::as_str),
+            Some("old-ws/old-q/welcome"),
+            "prod still holds the original key: {text}"
+        );
+        let envs = std::collections::BTreeSet::from(["dev".to_string(), "prod".to_string()]);
+        assert!(g.validate(&envs).is_ok(), "the file must still validate");
+        // And the promotion it produces is a rename, not a recreate.
+        let m = g.orient("dev", "prod");
+        assert_eq!(m.queues.get("new-q").map(String::as_str), Some("old-q"));
+        assert_eq!(
+            m.workspaces.get("new-ws").map(String::as_str),
+            Some("old-ws")
+        );
+    }
+
+    /// No other env holds the object, so a promotion would CREATE it there
+    /// either way — there is no divergence to record and no file to write.
+    #[test]
+    fn records_no_row_for_an_env_that_never_had_the_object() {
+        let tmp = project_with(&[
+            ("dev", &[("hooks", "old-hook", 1)]),
+            ("prod", &[("hooks", "something-else", 501)]),
+        ]);
+        let paths = Paths::for_env(tmp.path(), "dev");
+        std::fs::create_dir_all(paths.hooks_dir()).unwrap();
+        std::fs::write(
+            paths.hooks_dir().join("old-hook.json"),
+            br#"{"id":1,"name":"New Hook","queues":[]}"#,
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::load(&paths.lockfile()).unwrap();
+
+        let pending = detect(&paths, &lockfile);
+        let stats = apply(&paths, &mut lockfile, pending, false).unwrap();
+        assert_eq!(stats.applied, 1);
+        assert!(
+            !paths.mapping_file().exists(),
+            "nothing to record: {}",
+            mapping_text(&tmp)
+        );
+        assert!(stats.mapping_updates.is_empty());
+    }
+
+    #[test]
+    fn records_nothing_when_the_project_has_one_env() {
+        let tmp = project_with(&[("dev", &[("hooks", "old-hook", 1)])]);
+        let paths = Paths::for_env(tmp.path(), "dev");
+        std::fs::create_dir_all(paths.hooks_dir()).unwrap();
+        std::fs::write(
+            paths.hooks_dir().join("old-hook.json"),
+            br#"{"id":1,"name":"New Hook","queues":[]}"#,
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::load(&paths.lockfile()).unwrap();
+        let pending = detect(&paths, &lockfile);
+        apply(&paths, &mut lockfile, pending, false).unwrap();
+        assert!(!paths.mapping_file().exists());
+    }
+
+    /// The divergence was already recorded by hand. Only dev's column moves —
+    /// the comment, the alignment and prod's own slug stay exactly as written.
+    #[test]
+    fn an_existing_row_is_rewritten_in_place_with_comments_kept() {
+        let tmp = project_with(&[
+            ("dev", &[("hooks", "old-hook", 1)]),
+            ("prod", &[("hooks", "hook-prod", 501)]),
+        ]);
+        let paths = Paths::for_env(tmp.path(), "dev");
+        std::fs::create_dir_all(paths.mapping_file().parent().unwrap()).unwrap();
+        std::fs::write(
+            paths.mapping_file(),
+            "version = 2\n\n# named differently in prod on purpose\n[[hooks]]\n\
+             dev = \"old-hook\"    # the source of truth\nprod = \"hook-prod\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(paths.hooks_dir()).unwrap();
+        std::fs::write(
+            paths.hooks_dir().join("old-hook.json"),
+            br#"{"id":1,"name":"New Hook","queues":[]}"#,
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::load(&paths.lockfile()).unwrap();
+
+        let pending = detect(&paths, &lockfile);
+        apply(&paths, &mut lockfile, pending, false).unwrap();
+
+        let text = mapping_text(&tmp);
+        assert!(
+            text.contains("dev = \"new-hook\"    # the source of truth"),
+            "value replaced, comment and spacing kept: {text}"
+        );
+        assert!(
+            text.contains("# named differently in prod on purpose"),
+            "{text}"
+        );
+        let g: GenericMapping = toml::from_str(&text).unwrap();
+        assert_eq!(g.hooks.len(), 1, "rewritten, not duplicated: {text}");
+        assert_eq!(g.hooks[0].get("prod").map(String::as_str), Some("hook-prod"));
+    }
+
+    /// An engine owns its fields' compound keys the same way a queue owns its
+    /// templates'.
+    #[test]
+    fn engine_rename_records_the_engine_and_its_fields() {
+        let tmp = project_with(&[
+            (
+                "dev",
+                &[
+                    ("engines", "old-engine", 1),
+                    ("engine_fields", "old-engine/total", 2),
+                ],
+            ),
+            (
+                "prod",
+                &[
+                    ("engines", "old-engine", 501),
+                    ("engine_fields", "old-engine/total", 502),
+                ],
+            ),
+        ]);
+        let paths = Paths::for_env(tmp.path(), "dev");
+        let dir = paths.engine_dir("old-engine");
+        std::fs::create_dir_all(paths.engine_fields_dir("old-engine")).unwrap();
+        std::fs::write(
+            dir.join("engine.json"),
+            br#"{"id":1,"name":"New Engine"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            paths.engine_fields_dir("old-engine").join("total.json"),
+            br#"{"id":2,"name":"total"}"#,
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::load(&paths.lockfile()).unwrap();
+
+        let pending = detect(&paths, &lockfile);
+        apply(&paths, &mut lockfile, pending, false).unwrap();
+
+        let g: GenericMapping = toml::from_str(&mapping_text(&tmp)).unwrap();
+        assert_eq!(
+            g.engines[0].get("dev").map(String::as_str),
+            Some("new-engine")
+        );
+        assert_eq!(
+            g.engines[0].get("prod").map(String::as_str),
+            Some("old-engine")
+        );
+        assert_eq!(
+            g.engine_fields[0].get("dev").map(String::as_str),
+            Some("new-engine/total")
+        );
+        assert_eq!(
+            g.engine_fields[0].get("prod").map(String::as_str),
+            Some("old-engine/total")
+        );
+    }
+
+    /// A file rdc cannot parse is a file rdc must not rewrite — the user's
+    /// hand-authored rows are worth more than the recording.
+    #[test]
+    fn a_mapping_file_that_does_not_parse_is_left_untouched() {
+        let tmp = project_with(&[
+            ("dev", &[("hooks", "old-hook", 1)]),
+            ("prod", &[("hooks", "old-hook", 501)]),
+        ]);
+        let paths = Paths::for_env(tmp.path(), "dev");
+        std::fs::create_dir_all(paths.mapping_file().parent().unwrap()).unwrap();
+        let garbage = "version = 2\n\n[[hooks]\ndev = broken\n";
+        std::fs::write(paths.mapping_file(), garbage).unwrap();
+        std::fs::create_dir_all(paths.hooks_dir()).unwrap();
+        std::fs::write(
+            paths.hooks_dir().join("old-hook.json"),
+            br#"{"id":1,"name":"New Hook","queues":[]}"#,
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::load(&paths.lockfile()).unwrap();
+
+        let pending = detect(&paths, &lockfile);
+        let stats = apply(&paths, &mut lockfile, pending, false).unwrap();
+        assert_eq!(mapping_text(&tmp), garbage, "file untouched");
+        assert!(
+            stats
+                .orphan_warnings
+                .iter()
+                .any(|w| w.contains("does not parse")),
+            "the user has to hear about it: {:?}",
+            stats.orphan_warnings
+        );
+    }
+
+    /// The generic mapping now has a maintainer, so the "update manually"
+    /// note must not fire on the rows this very run wrote.
+    #[test]
+    fn the_generic_mapping_file_is_never_reported_as_an_orphan() {
+        let tmp = project_with(&[
+            ("dev", &[("hooks", "old-hook", 1)]),
+            ("prod", &[("hooks", "old-hook", 501)]),
+        ]);
+        let paths = Paths::for_env(tmp.path(), "dev");
+        std::fs::create_dir_all(paths.hooks_dir()).unwrap();
+        std::fs::write(
+            paths.hooks_dir().join("old-hook.json"),
+            br#"{"id":1,"name":"New Hook","queues":[]}"#,
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::load(&paths.lockfile()).unwrap();
+        let pending = detect(&paths, &lockfile);
+        let stats = apply(&paths, &mut lockfile, pending, false).unwrap();
+
+        assert!(
+            !stats.mapping_updates.is_empty(),
+            "the row was recorded: {stats:?}"
+        );
+        assert!(
+            !stats
+                .orphan_warnings
+                .iter()
+                .any(|w| w.contains("mapping.toml")),
+            "no stale-slug note for the file we just maintained: {:?}",
+            stats.orphan_warnings
+        );
+    }
+
+    /// A dev → test → prod project: the row must name EVERY env still holding
+    /// the old slug, or the promotion that skips the named one recreates the
+    /// object there. An env that never had it stays out of the row.
+    #[test]
+    fn a_rename_records_one_column_per_env_that_still_holds_the_old_slug() {
+        let tmp = project_with(&[
+            ("dev", &[("hooks", "old-hook", 1)]),
+            ("test", &[("hooks", "old-hook", 301)]),
+            ("prod", &[("hooks", "old-hook", 501)]),
+            ("sandbox", &[("hooks", "unrelated", 701)]),
+        ]);
+        let paths = Paths::for_env(tmp.path(), "dev");
+        std::fs::create_dir_all(paths.hooks_dir()).unwrap();
+        std::fs::write(
+            paths.hooks_dir().join("old-hook.json"),
+            br#"{"id":1,"name":"New Hook","queues":[]}"#,
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::load(&paths.lockfile()).unwrap();
+
+        let pending = detect(&paths, &lockfile);
+        apply(&paths, &mut lockfile, pending, false).unwrap();
+
+        let text = mapping_text(&tmp);
+        let g: GenericMapping = toml::from_str(&text).unwrap();
+        assert_eq!(g.hooks.len(), 1, "one object, one row: {text}");
+        let row = &g.hooks[0];
+        assert_eq!(row.get("dev").map(String::as_str), Some("new-hook"));
+        assert_eq!(row.get("test").map(String::as_str), Some("old-hook"));
+        assert_eq!(row.get("prod").map(String::as_str), Some("old-hook"));
+        assert_eq!(row.get("sandbox"), None, "sandbox never had it: {text}");
+
+        // Both promotions are renames.
+        for tgt in ["test", "prod"] {
+            let m = g.orient("dev", tgt);
+            assert_eq!(
+                m.hooks.get("new-hook").map(String::as_str),
+                Some("old-hook"),
+                "dev -> {tgt}"
+            );
+        }
+    }
+
+    /// Another row of the same kind already claims `(prod, old)` — a second
+    /// row claiming it would make the file stop validating, so the envs that
+    /// can be recorded are, and the one that cannot is named.
+    #[test]
+    fn an_env_already_claimed_at_that_slug_is_warned_about_not_duplicated() {
+        let tmp = project_with(&[
+            ("dev", &[("hooks", "old-hook", 1)]),
+            ("test", &[("hooks", "old-hook", 301)]),
+            ("prod", &[("hooks", "old-hook", 501)]),
+        ]);
+        let paths = Paths::for_env(tmp.path(), "dev");
+        std::fs::create_dir_all(paths.mapping_file().parent().unwrap()).unwrap();
+        // Some OTHER object already maps prod's `old-hook`.
+        std::fs::write(
+            paths.mapping_file(),
+            "version = 2\n\n[[hooks]]\ntest = \"other\"\nprod = \"old-hook\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(paths.hooks_dir()).unwrap();
+        std::fs::write(
+            paths.hooks_dir().join("old-hook.json"),
+            br#"{"id":1,"name":"New Hook","queues":[]}"#,
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::load(&paths.lockfile()).unwrap();
+
+        let pending = detect(&paths, &lockfile);
+        let stats = apply(&paths, &mut lockfile, pending, false).unwrap();
+
+        let text = mapping_text(&tmp);
+        let g: GenericMapping = toml::from_str(&text).unwrap();
+        let envs = std::collections::BTreeSet::from([
+            "dev".to_string(),
+            "test".to_string(),
+            "prod".to_string(),
+        ]);
+        assert!(
+            g.validate(&envs).is_ok(),
+            "the file must still validate: {text}"
+        );
+        let new_row = g
+            .hooks
+            .iter()
+            .find(|r| r.get("dev").map(String::as_str) == Some("new-hook"))
+            .expect("the recordable half was recorded");
+        assert_eq!(new_row.get("test").map(String::as_str), Some("old-hook"));
+        assert_eq!(new_row.get("prod"), None, "prod is spoken for: {text}");
+        assert!(
+            stats
+                .orphan_warnings
+                .iter()
+                .any(|w| w.contains("already maps hooks/old-hook") && w.contains("prod")),
+            "and the user hears which env to fix: {:?}",
+            stats.orphan_warnings
+        );
+    }
+
+    /// A hand-edited mapping where another row already claims the slug this
+    /// rename moves onto. Writing the rewrite would map `(dev, new-hook)` in
+    /// two rows of one kind — which `rdc migrate` hard-errors on, so the whole
+    /// recording is dropped and the file is left exactly as the user wrote it.
+    #[test]
+    fn a_rewrite_that_would_claim_a_slug_twice_leaves_the_file_alone() {
+        let tmp = project_with(&[
+            ("dev", &[("hooks", "old-hook", 1)]),
+            ("prod", &[("hooks", "hook-prod", 501)]),
+        ]);
+        let paths = Paths::for_env(tmp.path(), "dev");
+        std::fs::create_dir_all(paths.mapping_file().parent().unwrap()).unwrap();
+        let before = "version = 2\n\n[[hooks]]\ndev = \"old-hook\"\nprod = \"hook-prod\"\n\n\
+                      [[hooks]]\ndev = \"new-hook\"\nprod = \"other-prod\"\n";
+        std::fs::write(paths.mapping_file(), before).unwrap();
+        std::fs::create_dir_all(paths.hooks_dir()).unwrap();
+        std::fs::write(
+            paths.hooks_dir().join("old-hook.json"),
+            br#"{"id":1,"name":"New Hook","queues":[]}"#,
+        )
+        .unwrap();
+        let mut lockfile = Lockfile::load(&paths.lockfile()).unwrap();
+
+        let pending = detect(&paths, &lockfile);
+        let stats = apply(&paths, &mut lockfile, pending, false).unwrap();
+
+        assert_eq!(mapping_text(&tmp), before, "the file is untouched");
+        assert!(stats.mapping_updates.is_empty(), "{stats:?}");
+        assert!(
+            stats
+                .orphan_warnings
+                .iter()
+                .any(|w| w.contains("left unchanged")),
+            "the user hears why: {:?}",
+            stats.orphan_warnings
+        );
+        // The rename itself still happened — recording is advisory.
+        assert!(paths.hooks_dir().join("new-hook.json").exists());
     }
 }

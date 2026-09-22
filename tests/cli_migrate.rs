@@ -9,7 +9,7 @@
 //! `rdc://` portable refs, run the transform, and assert the target snapshot's
 //! files land at remapped paths with remapped refs + applied overlays.
 
-use rdc::cli::migrate::Carry;
+use rdc::cli::migrate::{Carry, MirrorMode};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use tempfile::TempDir;
 
@@ -147,7 +147,7 @@ version = 1
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::SCORE_THRESHOLDS);
+    let result = rdc::cli::migrate::run("test", "prod", MirrorMode::Additive, false, vec![], Carry::SCORE_THRESHOLDS);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed offline");
 
@@ -212,7 +212,7 @@ fn migrate_dry_run_writes_nothing() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, true, vec![], Carry::SCORE_THRESHOLDS);
+    let result = rdc::cli::migrate::run("test", "prod", MirrorMode::Additive, true, vec![], Carry::SCORE_THRESHOLDS);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("dry-run migrate should succeed");
 
@@ -254,7 +254,7 @@ fn migrate_converts_legacy_mapping_unmatched_rename_is_harmless() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::SCORE_THRESHOLDS);
+    let result = rdc::cli::migrate::run("test", "prod", MirrorMode::Additive, false, vec![], Carry::SCORE_THRESHOLDS);
     std::env::set_current_dir(&prev).unwrap();
 
     // Migrate SUCCEEDS despite the unmatched entry.
@@ -309,7 +309,7 @@ fn migrate_dry_run_does_not_convert_or_delete_legacy_mapping_file() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, true, vec![], Carry::SCORE_THRESHOLDS);
+    let result = rdc::cli::migrate::run("test", "prod", MirrorMode::Additive, true, vec![], Carry::SCORE_THRESHOLDS);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("dry-run migrate should succeed");
 
@@ -351,7 +351,7 @@ fn migrate_only_restricts_to_selected_object() {
     let result = rdc::cli::migrate::run(
         "test",
         "prod",
-        false,
+        MirrorMode::Additive,
         false,
         vec!["hooks/keeper".into()],
         Carry::SCORE_THRESHOLDS,
@@ -419,7 +419,7 @@ fn migrate_only_includes_sidecars_of_selected_objects() {
     let result = rdc::cli::migrate::run(
         "test",
         "prod",
-        false,
+        MirrorMode::Additive,
         false,
         vec![
             "hooks/keeper".into(),
@@ -470,7 +470,7 @@ fn migrate_only_unknown_selector_errors() {
     let result = rdc::cli::migrate::run(
         "test",
         "prod",
-        false,
+        MirrorMode::Additive,
         false,
         vec!["hooks/does-not-exist".into()],
         Carry::SCORE_THRESHOLDS,
@@ -511,7 +511,7 @@ fn migrate_carries_manual_mdh_dataset_rows() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::SCORE_THRESHOLDS);
+    let result = rdc::cli::migrate::run("test", "prod", MirrorMode::Additive, false, vec![], Carry::SCORE_THRESHOLDS);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -559,7 +559,7 @@ fn migrate_only_selects_a_whole_mdh_dataset() {
     let result = rdc::cli::migrate::run(
         "test",
         "prod",
-        false,
+        MirrorMode::Additive,
         false,
         vec!["mdh/gl-codes".into()],
         Carry::SCORE_THRESHOLDS,
@@ -680,7 +680,7 @@ fn migrate_preserves_target_identity_for_matched_object() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::SCORE_THRESHOLDS);
+    let result = rdc::cli::migrate::run("test", "prod", MirrorMode::Additive, false, vec![], Carry::SCORE_THRESHOLDS);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -764,12 +764,12 @@ fn migrate_inbox_byte_deterministic_across_create_then_update() {
     std::env::set_current_dir(root).unwrap();
 
     // First migrate: target inbox does not exist yet → CREATE path.
-    rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::SCORE_THRESHOLDS)
+    rdc::cli::migrate::run("test", "prod", MirrorMode::Additive, false, vec![], Carry::SCORE_THRESHOLDS)
         .expect("first migrate should succeed");
     let after_create = std::fs::read(&inbox).expect("inbox written by first migrate");
 
     // Second migrate: target inbox now exists → MATCHED/UPDATE path.
-    rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::SCORE_THRESHOLDS)
+    rdc::cli::migrate::run("test", "prod", MirrorMode::Additive, false, vec![], Carry::SCORE_THRESHOLDS)
         .expect("second migrate should succeed");
     let after_update = std::fs::read(&inbox).expect("inbox present after second migrate");
 
@@ -846,7 +846,7 @@ fn migrate_ignores_score_thresholds_by_default() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::NONE);
+    let result = rdc::cli::migrate::run("test", "prod", MirrorMode::Additive, false, vec![], Carry::NONE);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -875,7 +875,7 @@ fn migrate_carries_score_thresholds_with_flag() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::SCORE_THRESHOLDS);
+    let result = rdc::cli::migrate::run("test", "prod", MirrorMode::Additive, false, vec![], Carry::SCORE_THRESHOLDS);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -950,7 +950,7 @@ fn migrate_ignores_queue_automation_by_default() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::NONE);
+    let result = rdc::cli::migrate::run("test", "prod", MirrorMode::Additive, false, vec![], Carry::NONE);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -973,7 +973,7 @@ fn migrate_carries_queue_automation_with_the_carry_group() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], carry);
+    let result = rdc::cli::migrate::run("test", "prod", MirrorMode::Additive, false, vec![], carry);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -999,7 +999,7 @@ fn migrate_drops_queue_automation_for_a_brand_new_target_queue() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::NONE);
+    let result = rdc::cli::migrate::run("test", "prod", MirrorMode::Additive, false, vec![], Carry::NONE);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -1029,7 +1029,7 @@ fn migrate_overlay_wins_over_the_automation_reconcile() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::NONE);
+    let result = rdc::cli::migrate::run("test", "prod", MirrorMode::Additive, false, vec![], Carry::NONE);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -1060,10 +1060,10 @@ fn migrate_automation_reconcile_is_idempotent() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::NONE)
+    rdc::cli::migrate::run("test", "prod", MirrorMode::Additive, false, vec![], Carry::NONE)
         .expect("first migrate");
     let first = std::fs::read(&out).expect("first output");
-    rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::NONE)
+    rdc::cli::migrate::run("test", "prod", MirrorMode::Additive, false, vec![], Carry::NONE)
         .expect("second migrate");
     let second = std::fs::read(&out).expect("second output");
     std::env::set_current_dir(&prev).unwrap();
@@ -1190,7 +1190,7 @@ fn migrate_carry_automation_leaves_score_thresholds_target_owned() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], carry);
+    let result = rdc::cli::migrate::run("test", "prod", MirrorMode::Additive, false, vec![], carry);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -1231,7 +1231,7 @@ fn migrate_only_refuses_a_new_queue_whose_schema_is_not_selected() {
     let result = rdc::cli::migrate::run(
         "test",
         "prod",
-        false,
+        MirrorMode::Additive,
         false,
         vec!["queues/invoices".to_string()],
         Carry::NONE,
@@ -1261,7 +1261,7 @@ fn migrate_only_accepts_a_new_queue_when_its_schema_is_selected_too() {
     let result = rdc::cli::migrate::run(
         "test",
         "prod",
-        false,
+        MirrorMode::Additive,
         false,
         vec!["queues/invoices".to_string(), "schemas/invoices".to_string()],
         Carry::NONE,
@@ -1287,7 +1287,7 @@ fn migrate_whole_snapshot_creates_a_new_queue_with_its_schema() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::NONE);
+    let result = rdc::cli::migrate::run("test", "prod", MirrorMode::Additive, false, vec![], Carry::NONE);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("a whole-snapshot migrate must succeed");
 
@@ -1388,7 +1388,7 @@ fn migrate_promoted_engine_clears_the_targets_generic_engine() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(&root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::NONE);
+    let result = rdc::cli::migrate::run("test", "prod", MirrorMode::Additive, false, vec![], Carry::NONE);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -1467,7 +1467,7 @@ fn migrate_ignores_inbox_email_prefix_by_default() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::NONE);
+    let result = rdc::cli::migrate::run("test", "prod", MirrorMode::Additive, false, vec![], Carry::NONE);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -1494,7 +1494,7 @@ fn migrate_keeps_source_inbox_email_prefix_for_new_object() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::NONE);
+    let result = rdc::cli::migrate::run("test", "prod", MirrorMode::Additive, false, vec![], Carry::NONE);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -1518,7 +1518,7 @@ fn migrate_fills_missing_email_prefix_on_an_undeployed_target_inbox() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::NONE);
+    let result = rdc::cli::migrate::run("test", "prod", MirrorMode::Additive, false, vec![], Carry::NONE);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -1540,7 +1540,7 @@ fn migrate_carries_inbox_email_prefix_with_flag() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry { email_prefixes: true, ..Carry::NONE });
+    let result = rdc::cli::migrate::run("test", "prod", MirrorMode::Additive, false, vec![], Carry { email_prefixes: true, ..Carry::NONE });
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -1568,7 +1568,7 @@ fn migrate_inbox_email_prefix_overlay_wins() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::NONE);
+    let result = rdc::cli::migrate::run("test", "prod", MirrorMode::Additive, false, vec![], Carry::NONE);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -1599,7 +1599,7 @@ fn migrate_overlay_wins_over_score_threshold_reconcile() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::NONE);
+    let result = rdc::cli::migrate::run("test", "prod", MirrorMode::Additive, false, vec![], Carry::NONE);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -1638,7 +1638,7 @@ fn migrate_overlay_wins_over_training_enabled_reconcile() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::NONE);
+    let result = rdc::cli::migrate::run("test", "prod", MirrorMode::Additive, false, vec![], Carry::NONE);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -1680,7 +1680,7 @@ fn migrate_strips_identity_for_new_object() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::SCORE_THRESHOLDS).expect("migrate ok");
+    rdc::cli::migrate::run("test", "prod", MirrorMode::Additive, false, vec![], Carry::SCORE_THRESHOLDS).expect("migrate ok");
     std::env::set_current_dir(&prev).unwrap();
 
     let h = read_json(&root.join("envs/prod/hooks/brand-new.json"));
@@ -1726,7 +1726,7 @@ fn migrate_overlay_shadow_replaces_formula_sidecar() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::SCORE_THRESHOLDS);
+    let result = rdc::cli::migrate::run("test", "prod", MirrorMode::Additive, false, vec![], Carry::SCORE_THRESHOLDS);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -1763,7 +1763,7 @@ fn migrate_overlay_shadow_replaces_hook_and_rule_code_and_leaves_others() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::SCORE_THRESHOLDS);
+    let result = rdc::cli::migrate::run("test", "prod", MirrorMode::Additive, false, vec![], Carry::SCORE_THRESHOLDS);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -1790,7 +1790,7 @@ fn migrate_overlay_dangling_shadow_is_a_hard_error_and_writes_nothing() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::SCORE_THRESHOLDS);
+    let result = rdc::cli::migrate::run("test", "prod", MirrorMode::Additive, false, vec![], Carry::SCORE_THRESHOLDS);
     std::env::set_current_dir(&prev).unwrap();
 
     let err = result.unwrap_err().to_string();
@@ -1815,7 +1815,7 @@ fn migrate_overlay_json_shadow_is_rejected() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::SCORE_THRESHOLDS);
+    let result = rdc::cli::migrate::run("test", "prod", MirrorMode::Additive, false, vec![], Carry::SCORE_THRESHOLDS);
     std::env::set_current_dir(&prev).unwrap();
 
     let err = result.unwrap_err().to_string();
@@ -1843,7 +1843,7 @@ fn migrate_overlay_only_excluded_shadow_does_not_error() {
     let result = rdc::cli::migrate::run(
         "test",
         "prod",
-        false,
+        MirrorMode::Additive,
         false,
         vec!["hooks/a".to_string()],
         Carry::SCORE_THRESHOLDS,
@@ -1900,7 +1900,7 @@ fn migrate_overlay_shadow_applies_at_renamed_target_path() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::SCORE_THRESHOLDS);
+    let result = rdc::cli::migrate::run("test", "prod", MirrorMode::Additive, false, vec![], Carry::SCORE_THRESHOLDS);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -1934,7 +1934,7 @@ fn migrate_overlay_shadow_replaces_nodejs_hook_js_sidecar() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", false, false, vec![], Carry::SCORE_THRESHOLDS);
+    let result = rdc::cli::migrate::run("test", "prod", MirrorMode::Additive, false, vec![], Carry::SCORE_THRESHOLDS);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate should succeed");
 
@@ -2010,7 +2010,7 @@ fn migrate_mirror_skips_second_unique_typed_template_per_queue() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", true, false, vec![], Carry::SCORE_THRESHOLDS);
+    let result = rdc::cli::migrate::run("test", "prod", MirrorMode::Mirror { allow_recreate: false }, false, vec![], Carry::SCORE_THRESHOLDS);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate --mirror should succeed");
 
@@ -2045,7 +2045,7 @@ fn migrate_keeps_unique_typed_duplicates_that_exist_on_target() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", true, false, vec![], Carry::SCORE_THRESHOLDS);
+    let result = rdc::cli::migrate::run("test", "prod", MirrorMode::Mirror { allow_recreate: false }, false, vec![], Carry::SCORE_THRESHOLDS);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate --mirror should succeed");
 
@@ -2073,7 +2073,7 @@ fn migrate_keeps_lowest_id_unique_typed_duplicate_on_fresh_target() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", true, false, vec![], Carry::SCORE_THRESHOLDS);
+    let result = rdc::cli::migrate::run("test", "prod", MirrorMode::Mirror { allow_recreate: false }, false, vec![], Carry::SCORE_THRESHOLDS);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate --mirror should succeed");
 
@@ -2100,7 +2100,7 @@ fn migrate_leaves_custom_type_duplicates_alone() {
     let _guard = cwd_lock();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(root).unwrap();
-    let result = rdc::cli::migrate::run("test", "prod", true, false, vec![], Carry::SCORE_THRESHOLDS);
+    let result = rdc::cli::migrate::run("test", "prod", MirrorMode::Mirror { allow_recreate: false }, false, vec![], Carry::SCORE_THRESHOLDS);
     std::env::set_current_dir(&prev).unwrap();
     result.expect("migrate --mirror should succeed");
 
@@ -2851,4 +2851,326 @@ fn migrate_warns_about_org_columns_absent_from_the_target_schemas() {
     let all = format!("{stdout}{stderr}");
     assert!(all.contains("not_in_prod"), "must name the missing schema_id: {all}");
     assert!(!all.contains("status"), "a meta column has no schema_id to check: {all}");
+}
+
+// --- the recreate guard -----------------------------------------------------
+//
+// A slug rename in the source env is invisible to `migrate`: it strips `id`
+// and `url` from an object it creates, so nothing in the target tree ties the
+// new slug to the object the target already has. `--mirror` therefore prunes
+// the old one and writes a new one, and the sync that follows DELETEs a live
+// queue (documents and all) and POSTs a replacement. These tests pin the
+// refusal, its escape hatch, and every shape that must NOT trip it.
+
+/// Write a queue (+ schema) under `env`'s workspace `ws`.
+fn write_queue_at(root: &std::path::Path, env: &str, ws: &str, slug: &str, name: &str) {
+    write(
+        &root.join(format!("envs/{env}/workspaces/{ws}/workspace.json")),
+        &serde_json::json!({ "name": "Main" }),
+    );
+    write(
+        &root.join(format!(
+            "envs/{env}/workspaces/{ws}/queues/{slug}/queue.json"
+        )),
+        &serde_json::json!({
+            "name": name,
+            "workspace": format!("rdc://workspaces/{ws}"),
+            "schema": format!("rdc://schemas/{slug}"),
+        }),
+    );
+    write(
+        &root.join(format!(
+            "envs/{env}/workspaces/{ws}/queues/{slug}/schema.json"
+        )),
+        &serde_json::json!({ "name": name, "content": [] }),
+    );
+}
+
+/// A target lockfile granting remote identity to `(kind, slug, id)` triples.
+fn write_lockfile(root: &std::path::Path, env: &str, entries: &[(&str, &str, u64)]) {
+    let mut objects: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    for (kind, slug, id) in entries {
+        objects
+            .entry(kind.to_string())
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                slug.to_string(),
+                serde_json::json!({"id": id, "modified_at": null, "content_hash": "x"}),
+            );
+    }
+    write(
+        &root.join(format!(".rdc/state/{env}.lock.json")),
+        &serde_json::json!({
+            "version": 3,
+            "api_base": "https://prod.example/api/v1",
+            "objects": objects,
+        }),
+    );
+}
+
+/// Source renamed `invoices` → `vendor-invoices`; prod still holds `invoices`
+/// with live ids. The one shape the guard exists for.
+fn renamed_queue_project() -> TempDir {
+    let project = init_two_env_project();
+    let root = project.path();
+    write_queue_at(root, "test", "main", "vendor-invoices", "Vendor Invoices");
+    write_queue_at(root, "prod", "main", "invoices", "Invoices");
+    write_lockfile(
+        root,
+        "prod",
+        &[
+            ("workspaces", "main", 501),
+            ("queues", "invoices", 502),
+            ("schemas", "invoices", 503),
+        ],
+    );
+    project
+}
+
+fn run_migrate(root: &std::path::Path, mirror: MirrorMode, dry_run: bool) -> anyhow::Result<()> {
+    let _guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+    let result = rdc::cli::migrate::run("test", "prod", mirror, dry_run, vec![], Carry::NONE);
+    std::env::set_current_dir(&prev).unwrap();
+    result
+}
+
+#[test]
+fn mirror_refuses_to_delete_a_live_target_object_while_creating_one() {
+    let project = renamed_queue_project();
+    let root = project.path();
+
+    let err = run_migrate(root, MirrorMode::Mirror { allow_recreate: false }, false)
+        .expect_err("the prune would destroy a live queue");
+    let msg = format!("{err:#}");
+    for want in [
+        "queues",
+        "invoices (id 502)",
+        "vendor-invoices",
+        "schemas",
+        "(id 503)",
+        ".rdc/mapping.toml",
+        "--allow-recreate",
+        "rdc doctor test",
+    ] {
+        assert!(msg.contains(want), "refusal must mention {want}:\n{msg}");
+    }
+    // A copyable row for the pair it found.
+    assert!(msg.contains("[[queues]]"), "{msg}");
+    assert!(msg.contains("test = \"vendor-invoices\""), "{msg}");
+    assert!(msg.contains("prod = \"invoices\""), "{msg}");
+
+    // And it refused BEFORE touching the target tree.
+    assert!(
+        root.join("envs/prod/workspaces/main/queues/invoices/queue.json")
+            .exists(),
+        "the target object must still be there"
+    );
+    assert!(
+        !root
+            .join("envs/prod/workspaces/main/queues/vendor-invoices/queue.json")
+            .exists(),
+        "and nothing may have been written"
+    );
+}
+
+/// `--dry-run` must forecast the refusal, not print a plan that a real run
+/// would then reject — and still write nothing.
+#[test]
+fn dry_run_forecasts_the_recreate_refusal() {
+    let project = renamed_queue_project();
+    let root = project.path();
+
+    let err = run_migrate(root, MirrorMode::Mirror { allow_recreate: false }, true)
+        .expect_err("--dry-run must forecast the refusal");
+    assert!(format!("{err:#}").contains("invoices (id 502)"));
+    assert!(
+        !root
+            .join("envs/prod/workspaces/main/queues/vendor-invoices/queue.json")
+            .exists()
+    );
+}
+
+/// The escape hatch, for objects that really are unrelated.
+#[test]
+fn allow_recreate_lets_the_prune_through() {
+    let project = renamed_queue_project();
+    let root = project.path();
+
+    run_migrate(root, MirrorMode::Mirror { allow_recreate: true }, false)
+        .expect("--allow-recreate authorises the prune");
+    assert!(
+        !root
+            .join("envs/prod/workspaces/main/queues/invoices/queue.json")
+            .exists(),
+        "the old target object is pruned"
+    );
+    assert!(
+        root.join("envs/prod/workspaces/main/queues/vendor-invoices/queue.json")
+            .exists(),
+        "and the new one written"
+    );
+}
+
+/// The payoff: with the row `rdc doctor` records, the same promotion keeps the
+/// target's slug and its remote identity, and only the name changes. Nothing
+/// is pruned, nothing is created — so nothing to guard against.
+#[test]
+fn a_recorded_mapping_row_turns_the_recreate_into_a_rename() {
+    let project = renamed_queue_project();
+    let root = project.path();
+    std::fs::create_dir_all(root.join(".rdc")).unwrap();
+    std::fs::write(
+        root.join(".rdc/mapping.toml"),
+        "version = 2\n\n[[queues]]\ntest = \"vendor-invoices\"\nprod = \"invoices\"\n\n\
+         [[schemas]]\ntest = \"vendor-invoices\"\nprod = \"invoices\"\n",
+    )
+    .unwrap();
+
+    run_migrate(root, MirrorMode::Mirror { allow_recreate: false }, false)
+        .expect("a recorded rename must migrate cleanly");
+
+    let q = read_json(&root.join("envs/prod/workspaces/main/queues/invoices/queue.json"));
+    assert_eq!(q["name"], "Vendor Invoices", "the new name promoted");
+    assert!(
+        !root
+            .join("envs/prod/workspaces/main/queues/vendor-invoices/queue.json")
+            .exists(),
+        "no second copy under the source's slug"
+    );
+}
+
+/// A prune with nothing created in that kind is an ordinary deletion — the
+/// user removed the object in the source on purpose. Not the guard's business.
+#[test]
+fn mirror_allows_a_deletion_with_no_create_in_that_kind() {
+    let project = init_two_env_project();
+    let root = project.path();
+    write_queue_at(root, "test", "main", "invoices", "Invoices");
+    write_queue_at(root, "prod", "main", "invoices", "Invoices");
+    // prod additionally holds a queue the source no longer has.
+    write_queue_at(root, "prod", "main", "retired", "Retired");
+    write_lockfile(
+        root,
+        "prod",
+        &[
+            ("workspaces", "main", 501),
+            ("queues", "invoices", 502),
+            ("schemas", "invoices", 503),
+            ("queues", "retired", 504),
+            ("schemas", "retired", 505),
+        ],
+    );
+
+    run_migrate(root, MirrorMode::Mirror { allow_recreate: false }, false)
+        .expect("a plain deletion must not be blocked");
+    assert!(
+        !root
+            .join("envs/prod/workspaces/main/queues/retired/queue.json")
+            .exists()
+    );
+}
+
+/// A create with nothing pruned is an ordinary addition.
+#[test]
+fn mirror_allows_a_create_with_no_prune() {
+    let project = init_two_env_project();
+    let root = project.path();
+    write_queue_at(root, "test", "main", "invoices", "Invoices");
+    write_queue_at(root, "test", "main", "orders", "Orders");
+    write_queue_at(root, "prod", "main", "invoices", "Invoices");
+    write_lockfile(
+        root,
+        "prod",
+        &[
+            ("workspaces", "main", 501),
+            ("queues", "invoices", 502),
+            ("schemas", "invoices", 503),
+        ],
+    );
+
+    run_migrate(root, MirrorMode::Mirror { allow_recreate: false }, false)
+        .expect("a plain addition must not be blocked");
+    assert!(
+        root.join("envs/prod/workspaces/main/queues/orders/queue.json")
+            .exists()
+    );
+}
+
+/// The pruned target file has no lockfile entry: it was never pushed, so the
+/// prune destroys no remote object and there is nothing to protect.
+#[test]
+fn mirror_allows_pruning_an_object_the_target_never_pushed() {
+    let project = renamed_queue_project();
+    let root = project.path();
+    // Same fixture, but prod's lockfile knows only the workspace.
+    write_lockfile(root, "prod", &[("workspaces", "main", 501)]);
+
+    run_migrate(root, MirrorMode::Mirror { allow_recreate: false }, false)
+        .expect("a local-only target file is free to prune");
+    assert!(
+        !root
+            .join("envs/prod/workspaces/main/queues/invoices/queue.json")
+            .exists()
+    );
+}
+
+/// A queue MOVING between two workspaces the target also has: the same
+/// `(kind, slug)` is pruned at its old path and written at its new one in the
+/// same run. `classify` derives a queue's slug from the queue component alone,
+/// so this is one object, not a delete plus a create.
+///
+/// The run also ADDS a queue, and that is the point: without it `created` is
+/// empty for `queues` and the guard could not fire whatever it did with the
+/// prune, so the test would pass without exercising the moved-object rule at
+/// all. Measured: drop that rule and this goes red only with `orders` here.
+#[test]
+fn a_queue_moving_between_workspaces_is_not_a_recreate() {
+    let project = init_two_env_project();
+    let root = project.path();
+    // Source: the queue now lives under `second`; both workspaces exist.
+    write_queue_at(root, "test", "second", "invoices", "Invoices");
+    write_queue_at(root, "test", "main", "orders", "Orders");
+    write(
+        &root.join("envs/test/workspaces/main/workspace.json"),
+        &serde_json::json!({ "name": "Main" }),
+    );
+    // Target: it still sits under `main`.
+    write_queue_at(root, "prod", "main", "invoices", "Invoices");
+    write(
+        &root.join("envs/prod/workspaces/second/workspace.json"),
+        &serde_json::json!({ "name": "Main" }),
+    );
+    write_lockfile(
+        root,
+        "prod",
+        &[
+            ("workspaces", "main", 501),
+            ("workspaces", "second", 506),
+            ("queues", "invoices", 502),
+            ("schemas", "invoices", 503),
+        ],
+    );
+
+    run_migrate(root, MirrorMode::Mirror { allow_recreate: false }, false)
+        .expect("moving an object is not recreating it");
+    assert!(
+        root.join("envs/prod/workspaces/second/queues/invoices/queue.json")
+            .exists(),
+        "written at the new path"
+    );
+    assert!(
+        root.join("envs/prod/workspaces/main/queues/orders/queue.json")
+            .exists(),
+        "and the genuinely new queue created"
+    );
+    assert!(
+        !root
+            .join("envs/prod/workspaces/main/queues/invoices/queue.json")
+            .exists(),
+        "pruned from the old one"
+    );
 }

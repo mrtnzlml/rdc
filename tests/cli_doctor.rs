@@ -178,3 +178,190 @@ async fn doctor_reports_field_exceeding_api_length_limit() {
         .stderr(predicate::str::contains("2406"))
         .stderr(predicate::str::contains("2000"));
 }
+
+/// The chain the guard exists for, end to end and entirely offline: a queue is
+/// renamed in `dev`, `rdc doctor dev` realigns the slug AND records the
+/// divergence, and the next `rdc migrate dev prod --mirror` therefore renames
+/// prod's queue instead of pruning it and creating a new one.
+///
+/// Step 4 is a second assertion in disguise: with no recorded row migrate now
+/// REFUSES this promotion outright, so a regression in the recording turns
+/// this test red at the migrate, not only at the mapping-file check.
+#[test]
+fn doctor_records_a_rename_so_the_next_promotion_renames_instead_of_recreating() {
+    let project = TempDir::new().unwrap();
+    let root = project.path();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(root)
+        .args([
+            "init",
+            "--env",
+            "dev=https://dev.example/api/v1:1",
+            "--env",
+            "prod=https://prod.example/api/v1:2",
+        ])
+        .assert()
+        .success();
+
+    let write = |path: std::path::PathBuf, body: serde_json::Value| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, serde_json::to_vec_pretty(&body).unwrap()).unwrap();
+    };
+    for env in ["dev", "prod"] {
+        let e = root.join(format!("envs/{env}"));
+        // A pulled snapshot carries its own `id` and a portable own-`url`;
+        // migrate rewrites the id to the TARGET's when it has one, which is
+        // what step 4 asserts.
+        let base = if env == "dev" { 1 } else { 500 };
+        write(
+            e.join("workspaces/main/workspace.json"),
+            serde_json::json!({ "id": base, "url": "rdc://workspaces/main", "name": "Main" }),
+        );
+        write(
+            e.join("workspaces/main/queues/invoices/queue.json"),
+            serde_json::json!({
+                "id": base + 1,
+                "url": "rdc://queues/invoices",
+                "name": "Invoices",
+                "workspace": "rdc://workspaces/main",
+                "schema": "rdc://schemas/invoices",
+            }),
+        );
+        write(
+            e.join("workspaces/main/queues/invoices/schema.json"),
+            serde_json::json!({
+                "id": base + 2,
+                "url": "rdc://schemas/invoices",
+                "name": "Invoices",
+                "content": [],
+            }),
+        );
+        // Both envs hold the object remotely; prod's ids are what a mistaken
+        // promotion would DELETE.
+        write(
+            root.join(format!(".rdc/state/{env}.lock.json")),
+            serde_json::json!({
+                "version": 3,
+                "api_base": format!("https://{env}.example/api/v1"),
+                "objects": {
+                    "workspaces": { "main": { "id": base, "modified_at": null } },
+                    "queues": { "invoices": { "id": base + 1, "modified_at": null } },
+                    "schemas": { "invoices": { "id": base + 2, "modified_at": null } },
+                },
+            }),
+        );
+    }
+
+    // 1. Rename the queue in dev — the local `name` changes, the slug lags.
+    let qpath = root.join("envs/dev/workspaces/main/queues/invoices/queue.json");
+    let mut q: serde_json::Value = serde_json::from_slice(&std::fs::read(&qpath).unwrap()).unwrap();
+    q["name"] = serde_json::json!("Vendor Invoices");
+    std::fs::write(&qpath, serde_json::to_vec_pretty(&q).unwrap()).unwrap();
+
+    // 2. doctor realigns the slug...
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(root)
+        .args(["doctor", "dev", "--yes"])
+        .assert()
+        .success();
+    assert!(
+        root.join("envs/dev/workspaces/main/queues/vendor-invoices/queue.json")
+            .exists(),
+        "the dev tree moved to the new slug"
+    );
+
+    // 3. ...and records the divergence, one row per queue-keyed kind.
+    let mapping = std::fs::read_to_string(root.join(".rdc/mapping.toml"))
+        .expect("doctor must have written .rdc/mapping.toml");
+    for kind in ["queues", "schemas", "inboxes"] {
+        // `inboxes` has no lockfile entry here, so only queues/schemas appear.
+        if kind == "inboxes" {
+            continue;
+        }
+        assert!(
+            mapping.contains(&format!("[[{kind}]]")),
+            "no {kind} row recorded:\n{mapping}"
+        );
+    }
+    assert!(mapping.contains("dev = \"vendor-invoices\""), "{mapping}");
+    assert!(mapping.contains("prod = \"invoices\""), "{mapping}");
+
+    // 4. The promotion is now a rename: prod keeps its slug (and so its ids),
+    //    and only the name travels.
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(root)
+        .args(["migrate", "dev", "prod", "--mirror", "--yes"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("0 pruned"));
+
+    let prod_q: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.join("envs/prod/workspaces/main/queues/invoices/queue.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(prod_q["name"], "Vendor Invoices", "the new name promoted");
+    assert_eq!(prod_q["id"], 501, "onto prod's own object");
+    assert!(
+        !root
+            .join("envs/prod/workspaces/main/queues/vendor-invoices")
+            .exists(),
+        "no second queue under the source's slug"
+    );
+}
+
+/// `doctor --dry-run` previews the rename and writes no mapping row.
+#[test]
+fn doctor_dry_run_records_no_mapping_row() {
+    let project = TempDir::new().unwrap();
+    let root = project.path();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(root)
+        .args([
+            "init",
+            "--env",
+            "dev=https://dev.example/api/v1:1",
+            "--env",
+            "prod=https://prod.example/api/v1:2",
+        ])
+        .assert()
+        .success();
+    std::fs::create_dir_all(root.join("envs/dev/hooks")).unwrap();
+    std::fs::write(
+        root.join("envs/dev/hooks/old-hook.json"),
+        br#"{"id":1,"name":"New Hook","queues":[]}"#,
+    )
+    .unwrap();
+    for (env, id) in [("dev", 1), ("prod", 501)] {
+        std::fs::create_dir_all(root.join(".rdc/state")).unwrap();
+        std::fs::write(
+            root.join(format!(".rdc/state/{env}.lock.json")),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 3,
+                "api_base": format!("https://{env}.example/api/v1"),
+                "objects": { "hooks": { "old-hook": { "id": id, "modified_at": null } } },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(root)
+        .args(["doctor", "dev", "--dry-run"])
+        .assert()
+        .success();
+
+    assert!(
+        !root.join(".rdc/mapping.toml").exists(),
+        "a dry run must write nothing"
+    );
+    assert!(
+        root.join("envs/dev/hooks/old-hook.json").exists(),
+        "and must not move the file either"
+    );
+}
