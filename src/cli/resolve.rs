@@ -1523,6 +1523,34 @@ pub fn format_user_choices(users: &[crate::model::User], self_user_id: Option<u6
         .collect()
 }
 
+/// The `token_owner` picker's question.
+///
+/// Composed here rather than inline at the `inquire` call so the text can be
+/// pinned (`testdata/prompt_pins/token_owner.txt`): `inquire` draws its widget
+/// straight to the terminal, leaving no sink a test could capture.
+pub(crate) fn token_owner_question(slug: &str, tgt_env: &str) -> String {
+    format!("Pick the token_owner for store extension '{slug}' on {tgt_env}")
+}
+
+/// The picker's option list: every candidate user, then the way out.
+pub(crate) fn token_owner_options(
+    users: &[crate::model::User],
+    self_user_id: Option<u64>,
+) -> Vec<String> {
+    let mut options = format_user_choices(users, self_user_id);
+    options.push(TOKEN_OWNER_ABORT.to_string());
+    options
+}
+
+/// Last entry in the picker; picking it cancels the promotion.
+pub(crate) const TOKEN_OWNER_ABORT: &str = "abort the promotion";
+/// Help line `inquire` renders under the picker.
+pub(crate) const TOKEN_OWNER_HELP: &str =
+    "used as the API service account for the extension's calls (usually a system user)";
+/// Follow-up confirmation once a user has been picked.
+pub(crate) const TOKEN_OWNER_APPLY_ALL: &str =
+    "Apply this choice to all remaining store extensions in this deploy?";
+
 /// Prompt interactively. Returns `Some((picked_user_url, apply_to_all))`
 /// or `None` if the user aborted. Non-TTY callers must skip this and
 /// check the overlay state up-front.
@@ -1540,15 +1568,11 @@ pub fn prompt_token_owner(
     use inquire::{Confirm, Select};
 
     let sorted = sort_users_for_picker(users);
-    let mut options = format_user_choices(users, self_user_id);
-    let abort_label = "abort the promotion".to_string();
-    options.push(abort_label.clone());
+    let options = token_owner_options(users, self_user_id);
+    let prompt = token_owner_question(slug, tgt_env);
 
-    let prompt = format!("Pick the token_owner for store extension '{slug}' on {tgt_env}");
-    let help = "used as the API service account for the extension's calls (usually a system user)";
-
-    let answer = match Select::new(&prompt, options.clone())
-        .with_help_message(help)
+    let answer = match Select::new(&prompt, options)
+        .with_help_message(TOKEN_OWNER_HELP)
         .raw_prompt()
     {
         Ok(opt) => opt,
@@ -1558,18 +1582,17 @@ pub fn prompt_token_owner(
         Err(e) => return Err(anyhow::anyhow!("prompt failed: {e}")),
     };
 
-    if answer.value == abort_label {
+    if answer.value == TOKEN_OWNER_ABORT {
         return Ok(None);
     }
     let chosen = sorted
         .get(answer.index)
         .ok_or_else(|| anyhow::anyhow!("internal: picker index {} out of range", answer.index))?;
 
-    let apply_all =
-        Confirm::new("Apply this choice to all remaining store extensions in this deploy?")
-            .with_default(false)
-            .prompt()
-            .unwrap_or(false);
+    let apply_all = Confirm::new(TOKEN_OWNER_APPLY_ALL)
+        .with_default(false)
+        .prompt()
+        .unwrap_or(false);
     Ok(Some((chosen.url.clone(), apply_all)))
 }
 
@@ -1583,6 +1606,35 @@ pub enum AnomalyCure {
     Reinstall,
     Skip,
 }
+
+/// The cure picker's question. Shows the `config.private` and has-code
+/// signals so the operator can decide. Composed here for the same reason as
+/// [`token_owner_question`].
+pub(crate) fn anomaly_cure_question(slug: &str, hook: &crate::model::Hook) -> String {
+    let private = hook
+        .config
+        .get("private")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let has_code = hook
+        .config
+        .get("code")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    format!(
+        "Cure for hooks/{slug} (id {}, name {:?}, type {}, config.private={private}, has config.code={has_code})?",
+        hook.id, hook.name, hook.hook_type
+    )
+}
+
+/// The cure picker's options, in the order the answer index maps to
+/// `Convert` / `Reinstall` / `Skip`.
+pub(crate) const ANOMALY_CURE_OPTIONS: [&str; 3] = [
+    "[c] Convert to custom (one PATCH, id preserved)",
+    "[r] Reinstall as store extension (new id, rewires dependents)",
+    "[s] Skip this hook",
+];
 
 /// Per-hook interactive prompt. Non-TTY → `Convert` is the default,
 /// unless `RDC_DOCTOR_CURE` env var selects another option:
@@ -1601,28 +1653,9 @@ pub fn prompt_anomaly_cure(
         });
     }
     // TTY mode: use the project's existing prompt library (`inquire`,
-    // matching `prompt_token_owner` above). Show config.private and
-    // has-code signals so the operator can decide.
-    let private = hook
-        .config
-        .get("private")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let has_code = hook
-        .config
-        .get("code")
-        .and_then(|v| v.as_str())
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
-    let prompt = format!(
-        "Cure for hooks/{slug} (id {}, name {:?}, type {}, config.private={private}, has config.code={has_code})?",
-        hook.id, hook.name, hook.hook_type
-    );
-    let options = vec![
-        "[c] Convert to custom (one PATCH, id preserved)",
-        "[r] Reinstall as store extension (new id, rewires dependents)",
-        "[s] Skip this hook",
-    ];
+    // matching `prompt_token_owner` above).
+    let prompt = anomaly_cure_question(slug, hook);
+    let options = ANOMALY_CURE_OPTIONS.to_vec();
     use inquire::error::InquireError;
     // Ctrl-C / Esc → Skip (not error). The caller's loop persists the
     // lockfile after each successful cure, so mapping cancellation to
@@ -1788,6 +1821,7 @@ pub fn colorize_dim(text: &str, mode: ColorMode) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::prompt_pin::{inquire_shape, pin, redact_tempdir};
     use std::io::Cursor;
 
 
@@ -3467,7 +3501,7 @@ mod tests {
         .unwrap();
 
         let actual = redact_tempdir(&String::from_utf8_lossy(&out), dir.path());
-        insta_like_pin("conflict", &actual);
+        pin("conflict", &actual);
     }
 
     #[test]
@@ -3491,31 +3525,232 @@ mod tests {
         .unwrap();
 
         let actual = redact_tempdir(&String::from_utf8_lossy(&out), dir.path());
-        insta_like_pin("remote_delete", &actual);
+        pin("remote_delete", &actual);
     }
 
-    /// Replaces the process-specific tempdir prefix with a stable
-    /// placeholder so a pin captured against a `tempfile::tempdir()` fixture
-    /// is reproducible across runs (and machines) instead of embedding a
-    /// fresh random path every time.
-    fn redact_tempdir(actual: &str, tmp: &std::path::Path) -> String {
-        actual.replace(&tmp.display().to_string(), "TMPDIR")
+    // --- prompt pins --------------------------------------------------------
+    //
+    // One file per prompt under `testdata/prompt_pins/`, so the whole
+    // interactive surface is readable without running the binary. See
+    // `crate::cli::prompt_pin` for the two file shapes and for how to accept
+    // a deliberate change (`RDC_UPDATE_PINS=1`).
+
+    /// Two-hunk fixture. The display sorts keys, so `a` and `name` differ
+    /// with an unchanged `b` line BETWEEN them: adjacent changed lines are
+    /// one `Replace` op, and it takes an equal line in the middle for the
+    /// resolver to count two hunks and offer `[h]`.
+    const TWO_HUNK_LOCAL: &[u8] = br#"{"a":1,"b":2,"name":"Invoices"}"#;
+    const TWO_HUNK_REMOTE: &[u8] = br#"{"a":9,"b":2,"name":"Invoices EU"}"#;
+
+    /// Writes `bytes` to `<dir>/queues/invoices.json` and returns the path.
+    fn conflict_fixture(dir: &std::path::Path, bytes: &[u8]) -> std::path::PathBuf {
+        let local = dir.join("queues/invoices.json");
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        std::fs::write(&local, bytes).unwrap();
+        local
     }
 
-    /// Writes the captured text to `testdata/prompt_pins/<name>.txt` on
-    /// first run and compares against it afterwards. Deliberately a plain
-    /// file rather than a new dev-dependency: the point is a byte record
-    /// that survives a refactor, and `git diff` on the file is the review.
-    fn insta_like_pin(name: &str, actual: &str) {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("testdata/prompt_pins")
-            .join(format!("{name}.txt"));
-        if !path.exists() {
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(&path, actual).unwrap();
-            panic!("wrote a new pin at {}; re-run to verify it", path.display());
-        }
-        let expected = std::fs::read_to_string(&path).unwrap();
-        pretty_assertions::assert_eq!(expected, actual, "prompt bytes moved: {name}");
+    /// Single-hunk conflict answered with an unrecognized key: pins the hint
+    /// that lists the keys, and the re-prompt after it. The multi-hunk hint
+    /// is a different string and is pinned by `conflict_multi_hunk`.
+    #[test]
+    fn conflict_unrecognized_key_bytes_are_pinned() {
+        use std::io::Cursor;
+        let dir = tempfile::tempdir().unwrap();
+        let local = conflict_fixture(dir.path(), b"{\"name\":\"Invoices\"}");
+
+        let mut out: Vec<u8> = Vec::new();
+        let _ = prompt_resolve_with_color(
+            Cursor::new(b"z\ns\n"),
+            &mut out,
+            1,
+            1,
+            ObjectRef { kind: "queues", slug: "invoices" },
+            &local,
+            b"{\"name\":\"Invoices EU\"}",
+            "dev",
+            ColorMode::Plain,
+        )
+        .unwrap();
+
+        let actual = redact_tempdir(&String::from_utf8_lossy(&out), dir.path());
+        pin("conflict_unrecognized", &actual);
+    }
+
+    /// Multi-hunk conflict: the header carries the hunk count and the menu
+    /// gains `[h]`. Answered with an unrecognized key first, so the pin also
+    /// records the hint variant that names `h`.
+    #[test]
+    fn conflict_multi_hunk_prompt_bytes_are_pinned() {
+        use std::io::Cursor;
+        let dir = tempfile::tempdir().unwrap();
+        let local = conflict_fixture(dir.path(), TWO_HUNK_LOCAL);
+
+        let mut out: Vec<u8> = Vec::new();
+        let _ = prompt_resolve_with_color(
+            Cursor::new(b"z\ns\n"),
+            &mut out,
+            2,
+            7,
+            ObjectRef { kind: "queues", slug: "invoices" },
+            &local,
+            TWO_HUNK_REMOTE,
+            "dev",
+            ColorMode::Plain,
+        )
+        .unwrap();
+
+        let actual = redact_tempdir(&String::from_utf8_lossy(&out), dir.path());
+        pin("conflict_multi_hunk", &actual);
+    }
+
+    /// Conflict with the bulk options offered: the `[K]`/`[R]` line above the
+    /// menu, the impact summary, and the `Continue? [y/N] >` confirmation.
+    #[test]
+    fn conflict_bulk_prompt_bytes_are_pinned() {
+        use std::io::Cursor;
+        let dir = tempfile::tempdir().unwrap();
+        let local = conflict_fixture(dir.path(), b"{\"name\":\"Invoices\"}");
+        let bulk = BulkPrompt {
+            keep_local_summary: "         3 more conflicts would keep the local file".to_string(),
+            use_remote_summary: "         3 more conflicts would take dev's copy".to_string(),
+        };
+
+        let mut out: Vec<u8> = Vec::new();
+        let r = prompt_resolve_with_bytes_and_color(
+            Cursor::new(b"K\ny\n"),
+            &mut out,
+            1,
+            4,
+            ObjectRef { kind: "queues", slug: "invoices" },
+            &local,
+            b"{\"name\":\"Invoices\"}",
+            b"{\"name\":\"Invoices EU\"}",
+            "dev",
+            ColorMode::Plain,
+            Some(&bulk),
+        )
+        .unwrap();
+        assert!(matches!(r, Resolution::KeepLocalAll));
+
+        let actual = redact_tempdir(&String::from_utf8_lossy(&out), dir.path());
+        pin("conflict_bulk", &actual);
+    }
+
+    /// The per-hunk walker reached through `[h]`: one prompt per hunk, each
+    /// with its line range and up to three lines of context.
+    #[test]
+    fn hunk_by_hunk_prompt_bytes_are_pinned() {
+        use std::io::Cursor;
+        let dir = tempfile::tempdir().unwrap();
+        let local = conflict_fixture(dir.path(), TWO_HUNK_LOCAL);
+
+        let mut out: Vec<u8> = Vec::new();
+        // `h` enters the walker; then one decision per hunk.
+        let _ = prompt_resolve_with_color(
+            Cursor::new(b"h\nk\nr\n"),
+            &mut out,
+            1,
+            1,
+            ObjectRef { kind: "queues", slug: "invoices" },
+            &local,
+            TWO_HUNK_REMOTE,
+            "dev",
+            ColorMode::Plain,
+        )
+        .unwrap();
+
+        let actual = redact_tempdir(&String::from_utf8_lossy(&out), dir.path());
+        pin("hunk_by_hunk", &actual);
+    }
+
+    /// The remote-delete prompt with the bulk options offered.
+    #[test]
+    fn remote_delete_bulk_prompt_bytes_are_pinned() {
+        use std::io::Cursor;
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("labels/audit-hold.json");
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        std::fs::write(&local, b"{\"name\":\"Audit hold\"}").unwrap();
+        let bulk = BulkPrompt {
+            keep_local_summary: "         2 more deletions would be restored on dev".to_string(),
+            use_remote_summary: "         2 more local files would be deleted".to_string(),
+        };
+
+        let mut out: Vec<u8> = Vec::new();
+        let r = prompt_remote_delete_with_color(
+            Cursor::new(b"R\ny\n"),
+            &mut out,
+            ObjectRef { kind: "labels", slug: "audit-hold" },
+            &local,
+            "dev",
+            ColorMode::Plain,
+            Some(&bulk),
+        )
+        .unwrap();
+        assert!(matches!(r, Resolution::KeepRemoteAll));
+
+        let actual = redact_tempdir(&String::from_utf8_lossy(&out), dir.path());
+        pin("remote_delete_bulk", &actual);
+    }
+
+    /// `inquire` prompt, so the pin is the question and options rdc composes,
+    /// then the help line and the follow-up confirmation. `inquire`'s own
+    /// widget chrome is not rdc's and is not pinned.
+    #[test]
+    fn token_owner_prompt_text_is_pinned() {
+        let users: Vec<crate::model::User> = serde_json::from_value(serde_json::json!([
+            {
+                "id": 41,
+                "url": "https://api.example.com/v1/users/41",
+                "username": "ada@acme.test",
+                "email": "ada@acme.test",
+                "first_name": "Ada",
+                "last_name": "Lovelace",
+                "is_active": true,
+                "groups": ["https://api.example.com/v1/groups/3"]
+            },
+            {
+                "id": 42,
+                "url": "https://api.example.com/v1/users/42",
+                "username": "system_user__0f21",
+                "is_active": true,
+                "groups": ["https://api.example.com/v1/groups/3"]
+            }
+        ]))
+        .unwrap();
+
+        let text = format!(
+            "{}\n  help: {}\n\nthen: {}",
+            inquire_shape(
+                &token_owner_question("sftp-import", "prod"),
+                &token_owner_options(&users, Some(42)),
+            ),
+            TOKEN_OWNER_HELP,
+            TOKEN_OWNER_APPLY_ALL,
+        );
+        pin("token_owner", &text);
+    }
+
+    /// Same `inquire` shape for the doctor's per-hook cure picker.
+    #[test]
+    fn anomaly_cure_prompt_text_is_pinned() {
+        let hook: crate::model::Hook = serde_json::from_value(serde_json::json!({
+            "id": 9137,
+            "url": "https://api.example.com/v1/hooks/9137",
+            "name": "Master data import",
+            "type": "function",
+            "config": {
+                "private": true,
+                "code": "def rossum_hook_request_handler(payload):\n    return {}\n"
+            }
+        }))
+        .unwrap();
+
+        let options: Vec<String> = ANOMALY_CURE_OPTIONS.iter().map(|s| s.to_string()).collect();
+        pin(
+            "anomaly_cure",
+            &inquire_shape(&anomaly_cure_question("master-data-import", &hook), &options),
+        );
     }
 }

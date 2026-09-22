@@ -1,0 +1,7 @@
+Pick the token_owner for store extension 'sftp-import' on prod
+  system_user__0f21   [admin, active, you]   https://api.example.com/v1/users/42
+  Ada Lovelace <ada@acme.test>   [admin, active]   https://api.example.com/v1/users/41
+  abort the promotion
+  help: used as the API service account for the extension's calls (usually a system user)
+
+then: Apply this choice to all remaining store extensions in this deploy?

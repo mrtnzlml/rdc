@@ -1,0 +1,12 @@
+
+[1/4]  conflict
+         prompt queues   invoices        +1    -1
+         ⎿ TMPDIR/queues/invoices.json   - local  + dev
+           1   1 │   {
+           2     │ -   "name": "Invoices"
+               2 │ +   "name": "Invoices EU"
+           3   3 │   }
+
+[K] keep ALL local  [R] use dev for ALL
+[k] keep local  [r] use dev  [e] edit  [s] skip (shadow file)  [a] abort >          3 more conflicts would keep the local file
+Continue? [y/N] > 

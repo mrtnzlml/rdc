@@ -2,6 +2,23 @@ use crate::config::ProjectConfig;
 use anyhow::{Context, Result, anyhow};
 use std::io::IsTerminal;
 
+/// The picker's option list: every env defined in `cfg` except `exclude`,
+/// sorted.
+///
+/// Lifted out of [`pick_env_excluding`] so the picker's content can be pinned
+/// (`testdata/prompt_pins/env_picker.txt`): `inquire` draws its widget
+/// straight to the terminal, leaving no sink a test could capture.
+fn picker_options(cfg: &ProjectConfig, exclude: &[&str]) -> Vec<String> {
+    let mut envs: Vec<String> = cfg
+        .envs
+        .keys()
+        .filter(|n| !exclude.contains(&n.as_str()))
+        .cloned()
+        .collect();
+    envs.sort();
+    envs
+}
+
 /// Resolve an `env` argument for a command. If the user passed an explicit
 /// value, return it. Otherwise load `rdc.toml` and present an interactive
 /// picker. Non-TTY contexts (CI / piped) get a clear error pointing at
@@ -31,13 +48,7 @@ pub fn pick_env_excluding(
     let cwd = std::env::current_dir().context("getting current directory")?;
     let cfg_path = cwd.join("rdc.toml");
     let cfg = ProjectConfig::load(&cfg_path)?;
-    let mut envs: Vec<String> = cfg
-        .envs
-        .keys()
-        .filter(|n| !exclude.contains(&n.as_str()))
-        .cloned()
-        .collect();
-    envs.sort();
+    let envs = picker_options(&cfg, exclude);
 
     if envs.is_empty() {
         if exclude.is_empty() {
@@ -79,5 +90,37 @@ pub fn pick_env_excluding(
             Err(anyhow!("cancelled"))
         }
         Err(e) => Err(anyhow!("prompt failed: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::prompt_pin::{inquire_shape, pin};
+
+    fn three_envs() -> ProjectConfig {
+        toml::from_str(
+            "[envs.prod]\napi_base = \"https://api.example.com/v1\"\norg_id = 1\n\n\
+             [envs.dev]\napi_base = \"https://api.example.com/v1\"\norg_id = 2\n\n\
+             [envs.test]\napi_base = \"https://api.example.com/v1\"\norg_id = 3\n",
+        )
+        .unwrap()
+    }
+
+    /// `inquire` prompt, so the pin is the question and the options rdc
+    /// composes. Both forms are pinned: the plain picker, and the one
+    /// `rdc migrate` uses, which hides the env already chosen as the source.
+    #[test]
+    fn env_picker_prompt_text_is_pinned() {
+        let cfg = three_envs();
+        let text = format!(
+            "{}\n\n{}",
+            inquire_shape("Which env to sync?", &picker_options(&cfg, &[])),
+            inquire_shape(
+                "Migrate to which env (target)?",
+                &picker_options(&cfg, &["dev"]),
+            ),
+        );
+        pin("env_picker", &text);
     }
 }

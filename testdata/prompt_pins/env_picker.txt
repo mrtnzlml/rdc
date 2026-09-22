@@ -1,0 +1,8 @@
+Which env to sync?
+  dev
+  prod
+  test
+
+Migrate to which env (target)?
+  prod
+  test

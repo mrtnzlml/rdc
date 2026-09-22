@@ -1,0 +1,4 @@
+Cure for hooks/master-data-import (id 9137, name "Master data import", type function, config.private=true, has config.code=true)?
+  [c] Convert to custom (one PATCH, id preserved)
+  [r] Reinstall as store extension (new id, rewires dependents)
+  [s] Skip this hook

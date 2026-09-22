@@ -330,9 +330,11 @@ impl Log {
     }
 
     /// Construct a Log that writes into the given sink and reports a
-    /// fixed time on every `event()` call. Test-only.
+    /// fixed time on every `event()` call. Test-only. `pub(crate)` because
+    /// the prompt pins in other modules need event lines that do not move
+    /// with the wall clock.
     #[cfg(test)]
-    fn for_test_with_time(
+    pub(crate) fn for_test_with_time(
         color: ColorMode,
         sink: Box<dyn Write + Send>,
         time: std::time::SystemTime,

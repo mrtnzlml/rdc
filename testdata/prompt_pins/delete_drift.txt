@@ -1,0 +1,3 @@
+
+hooks/legacy-export: local file deleted, but remote has been modified since the last pull.
+[k]eep delete  [r]estore  [s]kip  [a]bort > 

@@ -917,6 +917,18 @@ fn cascade_pending(rest: &mut [PendingRename], applied: &PendingRename) {
     }
 }
 
+/// The question [`prompt_rename`] asks, one per pending rename.
+///
+/// Composed here rather than inline so the text can be pinned
+/// (`testdata/prompt_pins/rename_apply.txt`): the prompt writes to the
+/// process's own stderr, which a test cannot capture.
+fn rename_question(p: &PendingRename, n: usize, total: usize) -> String {
+    format!("[{n}/{total}] apply {}? [y/N] ", p.describe())
+}
+
+/// Shown when the answer is neither `y` nor `n`, before asking again.
+const RENAME_REASK: &str = "  please answer y or n";
+
 fn prompt_rename(p: &PendingRename, n: usize, total: usize) -> Result<bool> {
     if !std::io::stdin().is_terminal() {
         // No-TTY path shouldn't reach here (caller passes interactive=false),
@@ -927,7 +939,7 @@ fn prompt_rename(p: &PendingRename, n: usize, total: usize) -> Result<bool> {
     let mut stderr = std::io::stderr();
     let mut line = String::new();
     loop {
-        write!(stderr, "[{n}/{total}] apply {}? [y/N] ", p.describe())?;
+        write!(stderr, "{}", rename_question(p, n, total))?;
         stderr.flush().ok();
         line.clear();
         if stdin.lock().read_line(&mut line)? == 0 {
@@ -941,7 +953,7 @@ fn prompt_rename(p: &PendingRename, n: usize, total: usize) -> Result<bool> {
             Some('y') | Some('Y') => return Ok(true),
             Some('n') | Some('N') => return Ok(false),
             _ => {
-                writeln!(stderr, "  please answer y or n")?;
+                writeln!(stderr, "{RENAME_REASK}")?;
             }
         }
     }
@@ -1928,6 +1940,20 @@ mod tests {
         let got = lf.objects.get("hooks").unwrap().get("new").unwrap();
         assert_eq!(got.id, 42);
         assert_eq!(got.content_hash.as_deref(), Some("abc"));
+    }
+
+    /// Byte-exact pin of the rename prompt and of the line shown after an
+    /// answer that is neither `y` nor `n`. See `crate::cli::prompt_pin`.
+    #[test]
+    fn rename_prompt_text_is_pinned() {
+        let p = PendingRename::Hook {
+            old: "sftp-import-initial-load".into(),
+            new: "sftp-import-master-data".into(),
+        };
+        crate::cli::prompt_pin::pin(
+            "rename_apply",
+            &format!("{}\n{RENAME_REASK}", rename_question(&p, 2, 5)),
+        );
     }
 
     #[test]

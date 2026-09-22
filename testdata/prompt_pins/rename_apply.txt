@@ -1,0 +1,2 @@
+[2/5] apply hooks/sftp-import-initial-load -> sftp-import-master-data? [y/N] 
+  please answer y or n

@@ -810,6 +810,24 @@ mod tests {
         }
     }
 
+    /// Byte-exact pin of the MDH row-delete gate. See
+    /// `crate::cli::prompt_pin`.
+    #[tokio::test]
+    async fn mdh_row_delete_prompt_bytes_are_pinned() {
+        let buf = Buf::default();
+        let log = crate::cli::prompt_pin::pinned_log(Box::new(buf.clone()));
+        let route = std::sync::Arc::new(crate::cli::prompt_pin::CannedRoute("y"));
+
+        let proceed = crate::cli::stdin_coord::with_route(route, async {
+            prompt_confirm_row_deletes(&log, "vendors", 12)
+        })
+        .await
+        .unwrap();
+        assert!(proceed);
+
+        crate::cli::prompt_pin::pin("mdh_row_delete", &buf.text());
+    }
+
     /// Genuine coverage for the MDH row-delete gate's `announce`: drives
     /// `prompt_confirm_row_deletes` for real through an installed route and
     /// asserts both that the question text reaches the log sink and that

@@ -940,6 +940,29 @@ mod tests {
         }
     }
 
+    /// Byte-exact pin of the MDH index-drop gate. See
+    /// `crate::cli::prompt_pin`.
+    #[tokio::test]
+    async fn mdh_index_drop_prompt_bytes_are_pinned() {
+        let buf = Buf::default();
+        let log = crate::cli::prompt_pin::pinned_log(Box::new(buf.clone()));
+        let route = std::sync::Arc::new(crate::cli::prompt_pin::CannedRoute("y"));
+
+        let proceed = crate::cli::stdin_coord::with_route(route, async {
+            prompt_confirm_index_drops(
+                &log,
+                "vendors",
+                &["idx_vendor_no".to_string()],
+                &["srch_name".to_string()],
+            )
+        })
+        .await
+        .unwrap();
+        assert!(proceed);
+
+        crate::cli::prompt_pin::pin("mdh_index_drop", &buf.text());
+    }
+
     /// Same regression as the object-delete gate: the index-drop list was
     /// `eprintln!`, invisible to an embedder.
     #[test]

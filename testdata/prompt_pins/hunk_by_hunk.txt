@@ -1,0 +1,31 @@
+
+[1/1]  conflict
+         prompt queues   invoices        +2    -2   2 hunks
+         ⎿ TMPDIR/queues/invoices.json   - local  + dev
+           1   1 │   {
+           2     │ -   "a": 1,
+               2 │ +   "a": 9,
+           3   3 │     "b": 2,
+           4     │ -   "name": "Invoices"
+               4 │ +   "name": "Invoices EU"
+           5   5 │   }
+
+[k] keep local  [r] use dev  [e] edit  [h] hunk-by-hunk  [s] skip (shadow file)  [a] abort > 
+[hunk 1/2]  TMPDIR/queues/invoices.json  (line 2)
+           1   1 │   {
+           2     │ -   "a": 1,
+               2 │ +   "a": 9,
+           3   3 │     "b": 2,
+           4   4 │     "name": "Invoices"
+           5   5 │   }
+
+[k] keep local  [r] use dev  [e] edit  [b] both  [s] skip  [a] abort > 
+[hunk 2/2]  TMPDIR/queues/invoices.json  (line 4)
+           1   1 │   {
+           2   2 │     "a": 1,
+           3   3 │     "b": 2,
+           4     │ -   "name": "Invoices"
+               4 │ +   "name": "Invoices EU"
+           5   5 │   }
+
+[k] keep local  [r] use dev  [e] edit  [b] both  [s] skip  [a] abort > 

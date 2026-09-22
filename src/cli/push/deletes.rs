@@ -661,6 +661,45 @@ mod tests {
         );
     }
 
+    /// Byte-exact pin of the object-delete gate: the event line, one row per
+    /// tombstone in delete order, and the question. See
+    /// `crate::cli::prompt_pin`.
+    #[tokio::test]
+    async fn delete_gate_prompt_bytes_are_pinned() {
+        let buf = Buf::default();
+        let log = crate::cli::prompt_pin::pinned_log(Box::new(buf.clone()));
+        let route = std::sync::Arc::new(crate::cli::prompt_pin::CannedRoute("y"));
+
+        let mut t = Tombstones::default();
+        t.hooks.insert("legacy-export".to_string(), 9137);
+        t.queues.insert("invoices".to_string(), 4210);
+        let out = crate::cli::stdin_coord::with_route(route, async {
+            confirm_or_refuse(&t, true, false, &log)
+        })
+        .await
+        .unwrap();
+        assert!(matches!(out, ConfirmOutcome::Proceed));
+
+        crate::cli::prompt_pin::pin("delete_gate", &buf.text());
+    }
+
+    /// Byte-exact pin of the delete-drift resolver.
+    #[tokio::test]
+    async fn delete_drift_prompt_bytes_are_pinned() {
+        let buf = Buf::default();
+        let log = crate::cli::prompt_pin::pinned_log(Box::new(buf.clone()));
+        let route = std::sync::Arc::new(crate::cli::prompt_pin::CannedRoute("k"));
+
+        let choice = crate::cli::stdin_coord::with_route(route, async {
+            resolve_delete_drift(&log, true, "hooks", "legacy-export")
+        })
+        .await
+        .unwrap();
+        assert!(matches!(choice, DeleteDriftChoice::KeepDelete));
+
+        crate::cli::prompt_pin::pin("delete_drift", &buf.text());
+    }
+
     /// Same genuine-coverage shape for the delete-drift resolver.
     #[tokio::test]
     async fn delete_drift_announces_and_writes_the_question() {

@@ -1,0 +1,4 @@
+09:41:05 delete 2 object(s) would be DELETED from the remote
+         delete hooks    legacy-export               id 9137
+         delete queues   invoices                    id 4210
+Proceed with deletion? [y/N] 
