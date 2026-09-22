@@ -91,187 +91,187 @@ const CLI_STYLES: Styles = Styles::styled()
 // rest of this file: every sentence names something the code actually does.
 //
 // A `&str` constant rather than a doc comment because clap_derive folds a doc
-// comment's single newlines into spaces, which would collapse the two layout
-// blocks below into paragraphs.
-const ROOT_LONG_ABOUT: &str = r#"Rossum Deployment as Code — keep a Rossum organization's configuration in git
-and reconcile it with the live tenant.
+// comment's single newlines into spaces, which would collapse the layout
+// blocks below into paragraphs. Hard-wrapped at 78 columns for the same
+// reason: clap is built without `wrap_help`, so it prints what is written
+// here.
+const ROOT_LONG_ABOUT: &str = r#"Rossum Deployment as Code. Keeps a Rossum organization's configuration in git
+and reconciles it with the live tenant.
 
-A project is a directory holding:
+A project is a directory with these files:
 
-  rdc.toml                    one [envs.<env>] block per environment, each
-                              carrying an api_base and an org_id.
-  envs/<env>/                 the snapshot: one JSON file per object, plus
-                              Python/JavaScript sidecars for hook code, rule
-                              trigger conditions and queue formulas.
-  envs/<env>/_index.md        generated inventory of the env — every object,
-                              its path, and what it references. Read this
-                              first; every sync rewrites it.
-  envs/<env>/overlay.toml     per-env field values, applied by migrate only.
-  secrets/<env>.secrets.json  cached API token (gitignored, mode 0600 on Unix).
-  .rdc/state/<env>.lock.json  slug -> remote id, plus the base hashes the
-                              three-way merge compares against. rdc owns it.
-  .rdc/mapping.toml           slug names that differ between envs. Hand-
-                              editable; `rdc doctor` also writes to it.
+  rdc.toml                    one [envs.<env>] block per environment. Each
+                              one gives an api_base and an org_id.
+  envs/<env>/                 the snapshot. One JSON file per object, plus
+                              .py/.js files for hook code, rule trigger
+                              conditions and queue formulas.
+  envs/<env>/_index.md        a list of every object in the env, its path,
+                              and what it references. Read this first. Every
+                              sync rewrites it.
+  envs/<env>/overlay.toml     per-env field values. Only migrate applies
+                              them.
+  secrets/<env>.secrets.json  the cached API token. Gitignored, mode 0600 on
+                              Unix.
+  .rdc/state/<env>.lock.json  slug -> remote id, and the base hashes the
+                              three-way merge needs. rdc owns this file.
+  .rdc/mapping.toml           slug names that differ between envs. You can
+                              edit it; `rdc doctor` writes to it too.
 
 Two commands do the work:
 
-  rdc sync <env>              reconcile one env against its tenant in a single
-                              pass — resolve conflicts, push local edits, then
-                              pull remote ones.
-  rdc migrate <src> <tgt>     copy one env's snapshot onto another's, entirely
-                              offline. A promotion is therefore a file
-                              transform you read with `git diff`, followed by
-                              a `rdc sync <tgt>` you can dry-run first.
+  rdc sync <env>              reconcile one env against its tenant in one
+                              pass: conflicts, then push, then pull.
+  rdc migrate <src> <tgt>     copy one env's snapshot onto another's. No
+                              remote calls: read it with `git diff`, then
+                              run `rdc sync <tgt>` to push it.
 
 rdc manages workspaces, queues, schemas, inboxes, email templates, hooks,
 rules, labels, saved views, engines, engine fields, organization settings and
-Master Data Hub datasets. Workflows and workflow steps are pulled but never
-written — the Rossum API rejects PATCH on them.
+Master Data Hub datasets. It pulls workflows and workflow steps but never
+writes them, because the Rossum API rejects PATCH on both.
 
-With no terminal attached (CI, or an agent shelling out):
+With no terminal attached (CI, or an agent):
 
-  * Credentials come from $RDC_TOKEN_<ENV>, or from $RDC_USER_<ENV> plus
-    $RDC_PASS_<ENV> when rdc should log in itself. <ENV> is the env name
-    uppercased with every non-alphanumeric character replaced by '_', so env
-    `dev-us` reads $RDC_TOKEN_DEV_US.
-  * Pass <env> explicitly to every command that takes one. There is no picker
-    and no single-env default without a terminal.
+  * Credentials come from $RDC_TOKEN_<ENV>, or from $RDC_USER_<ENV> and
+    $RDC_PASS_<ENV>, which rdc exchanges for a token. <ENV> is the env name
+    in upper case, with every non-alphanumeric character replaced by '_'.
+    Env `dev-us` reads $RDC_TOKEN_DEV_US.
+  * Name <env> on every command that takes one. There is no picker, and no
+    default for a single env.
   * `rdc sync --conflict <strategy>` decides objects that changed on both
-    sides. Without it they are parked under .rdc/conflicts/<env>/ and the
-    local file is kept.
+    sides. Without it, rdc parks them under .rdc/conflicts/<env>/ and keeps
+    the local file.
   * `rdc sync --allow-deletes` is required before any remote DELETE. `--yes`
     does not grant it.
-  * Any failure exits 1 with the reason on stderr. ANSI styling is dropped
-    when the stream it would colour is not a terminal, and by setting
-    NO_COLOR to a non-empty value."#;
+  * Failures exit 1, with the reason on stderr. Colour is off when the
+    output is not a terminal, or NO_COLOR is set to a non-empty value."#;
 
 const INIT_LONG_ABOUT: &str = r#"Bootstrap an rdc project in the current directory, or add environments to an
 existing one.
 
-Writes rdc.toml, a scaffold (CLAUDE.md, README.md, .gitlab-ci.yml, .gitignore,
-.gitattributes and the pytest formula/hook test harness), a secrets/
-directory, and an empty envs/<env>/ tree per new environment. Re-running on an
-existing project refreshes only the generated regions inside those files, and
-adds any rdc line .gitignore or .gitattributes is missing — see --force.
+Writes rdc.toml, a scaffold (CLAUDE.md, README.md, .gitlab-ci.yml,
+.gitignore, .gitattributes, and the pytest harness for testing formulas and
+hooks), a secrets/ directory, and an empty envs/<env>/ tree per new
+environment. On an existing project it refreshes only the generated regions
+in those files, and adds any rdc line missing from .gitignore or
+.gitattributes. See --force.
 
-For each new env it then tries to authenticate: $RDC_TOKEN_<ENV> if that is
-set, otherwise a masked prompt when a terminal is attached. A token that fails
-validation is reported and the project files stay; re-run `rdc auth <env>`
-once the credential is sorted out. With a terminal attached and at least one
-env authenticated, init offers to run the first sync for you.
+For each new env it then tries to authenticate. It uses $RDC_TOKEN_<ENV> if
+that is set, otherwise a masked prompt when a terminal is attached. If the
+token fails validation, rdc reports it and keeps the project files; run
+`rdc auth <env>` once the credential is sorted out. With a terminal and at
+least one env authenticated, init offers to run the first sync.
 
-Without a terminal, `--env` is required and nothing is prompted for."#;
+Without a terminal, `--env` is required and rdc prompts for nothing."#;
 
 const SYNC_LONG_ABOUT: &str = r#"Reconcile the local snapshot and the env's remote state in one pass.
 
 One cycle, in order:
 
-  1. Scan envs/<env>/ and refuse, before any remote write, on the defects that
-     are decidable offline: invalid JSON, a field past the Rossum API's length
-     limit, a field the API demands on create, a structural problem in the
-     organization's settings, a saved view that is not shared, and a queue
-     binding more than one engine. (--dry-run lists these instead of failing;
-     --no-push skips the check, having nothing to half-apply.)
-  2. List the env and classify every object by comparing local bytes, the
-     lockfile's base hash and the remote — a three-way merge.
-  3. Resolve the objects that changed on both sides (see --conflict).
-  4. Delete, for each object whose local file is gone: children before
-     parents, and only once --allow-deletes or the batch prompt says so.
-  5. Push local creates and edits, parents before children.
+  1. Scan envs/<env>/ for problems rdc can find offline: invalid JSON, a
+     field past the API's length limit, a field the API needs on create, a
+     broken organization `settings` structure, a saved view that is not
+     shared, a queue bound to more than one engine. Any one stops the run
+     before the first remote write. (--dry-run lists them instead.
+     --no-push skips the check.)
+  2. List the env. Classify every object by comparing the local file, the
+     lockfile's base hash and the remote copy. That is a three-way merge.
+  3. Resolve the objects that changed on both sides. See --conflict.
+  4. Delete the objects whose local file is gone: children before parents,
+     and only after --allow-deletes or the batch prompt.
+  5. Push local creates and edits: parents before children.
   6. Pull remote creates and edits into the snapshot.
   7. Rewrite envs/<env>/_index.md and the lockfile.
 
-Push runs before pull, so a local edit reaches the tenant even on a cycle that
-also has remote changes to bring down. Master Data Hub datasets bypass this
-classifier and run their own staged push/pull inside the same cycle.
+Push runs before pull, so a local edit reaches the tenant even on a cycle
+that also brings remote changes down. Master Data Hub datasets skip this
+classifier and run their own push and pull inside the same cycle.
 
-An object that changed on both sides is never resolved silently. On a terminal
-the inline resolver opens; otherwise the env's copy is parked under
-.rdc/conflicts/<env>/, the local file is left as it is, and the lockfile's
-base hash is held back so the next sync raises the same conflict again.
+rdc never resolves a both-sides change on its own. On a terminal it opens the
+inline resolver. Otherwise it writes the env's copy to .rdc/conflicts/<env>/,
+leaves the local file alone, and holds the lockfile's base hash back, so the
+next sync raises the same conflict again.
 
-Deleting takes two deliberate acts: remove the local file, then authorise the
-DELETE with --allow-deletes (or answer the batch prompt on a terminal). The
-lockfile entry left behind by the removed file is what makes it a delete
-rather than an untracked file."#;
+Deleting takes two steps: remove the local file, then allow the DELETE with
+--allow-deletes (or answer the batch prompt on a terminal). What makes it a
+delete, and not an untracked file, is the lockfile entry the removed file
+leaves behind."#;
 
 const MIGRATE_LONG_ABOUT: &str = r#"Migrate a source env's snapshot into a target env's snapshot, locally.
 
-Zero remote calls. Copies envs/<src>/ onto envs/<tgt>/, renaming slugs
-wherever .rdc/mapping.toml records that the two envs name an object
-differently (identical slugs need no entry), rewriting portable
-`rdc://<kind>/<slug>` references from src slugs to tgt slugs, and applying
-envs/<tgt>/overlay.toml. Fields each organization tunes for itself are left to
-the target — see --carry.
+No remote calls. Copies envs/<src>/ onto envs/<tgt>/, then renames slugs
+where .rdc/mapping.toml says the two envs name an object differently
+(identical slugs need no entry), rewrites portable `rdc://<kind>/<slug>`
+references from src slugs to tgt slugs, and applies envs/<tgt>/overlay.toml.
+Fields that each organization tunes for itself stay with the target. See
+--carry.
 
-Review the result with `git diff`, then run `rdc sync <tgt>` to push it (sync
-creates objects in dependency order). A promotion is therefore two reviewable
-steps: this offline file transform, and a push you can dry-run.
+Read the result with `git diff`, then run `rdc sync <tgt>` to push it. Sync
+creates objects in dependency order. A promotion is therefore two steps you
+can review: this offline file transform, and a push you can dry-run.
 
 Per-env code overrides: a file at envs/<tgt>/overlay/<relpath> replaces the
-migrated sidecar at <relpath> — a hook's or rule's .py/.js, a queue's
-formulas/<field>.py, or an MDH dataset's data.jsonl. A file under overlay/
-that overrides no migrated sidecar aborts the migration."#;
+migrated sidecar at <relpath>. A sidecar is a hook's or rule's .py/.js, a
+queue's formulas/<field>.py, or an MDH dataset's data.jsonl. A file under
+overlay/ that overrides no migrated sidecar stops the migration."#;
 
 const AUTH_LONG_ABOUT: &str = r#"Set or refresh an env's API token.
 
-The token is validated with GET /organizations/<org_id> before anything is
-written, so a typo is caught immediately. It is then written to
-secrets/<env>.secrets.json, which `rdc init` gitignores, with mode 0600 on
-Unix.
+rdc validates the token with GET /organizations/<org_id> before writing
+anything, so a typo is caught at once. It then writes the token to
+secrets/<env>.secrets.json, with mode 0600 on Unix. `rdc init` gitignores
+that directory.
 
-Three ways to supply a credential:
+Three ways to give a credential:
 
-  --token <T>      use this token as given.
+  --token <T>      use this token as it is.
   --username <U>   read a password (masked prompt on a terminal, otherwise
                    stdin), exchange it at POST /v1/auth/login, and cache the
-                   issued token with an expiry 162 hours out.
+                   token with an expiry 162 hours out.
   neither          read a token from stdin, e.g. `rdc auth dev < token.txt`.
 
-This is only one of the places rdc looks, and not the one a pipeline should
-use. Every command resolves a token in this order: $RDC_TOKEN_<ENV>; then an
-unexpired token in secrets/<env>.secrets.json; then a username and password,
-taken from that same file or from $RDC_USER_<ENV> plus $RDC_PASS_<ENV>, which
-rdc exchanges for a token itself. A pipeline that sets those variables never
-needs `rdc auth`."#;
+This is only one of the places rdc looks. Every command looks for a token in
+this order: $RDC_TOKEN_<ENV>; an unexpired token in
+secrets/<env>.secrets.json; a username and password, from that same file or
+from $RDC_USER_<ENV> and $RDC_PASS_<ENV>. A pipeline that sets those
+variables never needs `rdc auth`."#;
 
 const DOCTOR_LONG_ABOUT: &str = r#"Diagnose and repair the local snapshot for <env> in one pass. Fully offline:
-no API calls and no prompts. It WRITES unless --dry-run is passed.
+no API calls, no prompts. It writes unless you pass --dry-run.
 
-It reports, changing nothing:
+It reports these, and changes nothing:
 
-  * local objects whose content differs from the lockfile base — what is on
-    disk but not yet on the tenant;
+  * local objects that differ from the lockfile base: on disk, not yet on
+    the tenant;
   * a field longer than the Rossum API's limit for that field;
-  * a field the API requires on create that a to-be-created object lacks;
-  * a queue binding more than one engine, which the API rejects.
+  * a field the API needs on create that a new object does not have;
+  * a queue bound to more than one engine, which the API rejects.
 
-`rdc sync <env>` refuses to push while any of the last three stands, and
-finding them here costs no network round-trip. None is auto-fixable —
-shortening prose or choosing an engine is your call, not a mechanical rewrite.
+`rdc sync <env>` refuses to push while any of the last three is there.
+Finding them here costs no network call. rdc cannot fix them: shortening
+text, or picking one engine, is your decision.
 
-It then repairs, automatically:
+It repairs these on its own:
 
-  * a file whose slug no longer matches its JSON `name` — renamed, cascading
-    through a queue's or workspace's whole subtree, with each rename recorded
-    in .rdc/mapping.toml so a later `rdc migrate` renames the target env's
-    object instead of deleting it and creating a replacement;
-  * a base-cache entry under .rdc/state/<env>.base/ with no counterpart left
-    in the env tree.
+  * a file whose slug no longer matches its JSON `name`. rdc renames it, and
+    a queue or workspace rename moves the whole subtree. Each rename goes
+    into .rdc/mapping.toml, so a later `rdc migrate` renames the target env's
+    object instead of deleting it and creating a new one;
+  * a base-cache entry under .rdc/state/<env>.base/ whose object is gone from
+    the env tree.
 
-Both repairs read the lockfile, so both are skipped when the env has none yet;
-the run says so. Create one with `rdc sync <env>`."#;
+Both repairs read the lockfile. When the env has none yet, rdc skips them and
+says so. Run `rdc sync <env>` to create one."#;
 
 const UPGRADE_LONG_ABOUT: &str = r#"Replace the running rdc binary with a release build.
 
 Asks the GitHub API for the release, downloads the asset built for this
-platform, and swaps the binary in place atomically — keeping the one it
-replaced as <install_dir>/rdc.bak for a one-shot rollback.
+platform, and swaps the binary in place atomically. It keeps the binary it
+replaced as <install_dir>/rdc.bak, so you can roll back once.
 
-Two installs are refused rather than overwritten, each with the manual
-commands printed in its place: a binary under the cargo bin directory, which
-`cargo install` owns, and a binary in a directory this process cannot write
-to."#;
+rdc refuses two kinds of install instead of overwriting them, and prints the
+manual commands in their place: a binary under the cargo bin directory, which
+`cargo install` owns, and a binary in a directory it cannot write to."#;
 
 // `infer_subcommands` lets an unambiguous prefix stand in for a verb: `rdc i`
 // is `rdc init`, `rdc do` is `rdc doctor`. Exact names still win outright, so
@@ -290,18 +290,17 @@ to."#;
     infer_subcommands = true,
 )]
 pub struct Cli {
-    /// Answer sync's blocking prompts without reading stdin: an object that
-    /// changed on both sides takes the shadow-file fallback instead of opening
-    /// the resolver, and every drift check resolves to "skip" rather than
-    /// asking. It does NOT authorise deletion — with tombstones pending and no
-    /// `--allow-deletes`, sync fails instead of prompting.
+    /// Answer sync's blocking prompts without reading stdin. A both-sides
+    /// change takes the shadow-file fallback instead of the resolver, and
+    /// every drift check answers "skip". It does NOT allow deletion: with
+    /// tombstones pending and no `--allow-deletes`, sync fails instead of
+    /// prompting.
     ///
-    /// Accepted by every command so a pipeline can pass it uniformly, but only
-    /// `rdc sync` reads it. `init`, `auth`, `doctor` and `migrate` decide for
-    /// themselves whether a terminal is attached, so `rdc init --yes` still
-    /// opens the wizard.
+    /// Every command accepts it, so a pipeline can pass it everywhere. Only
+    /// `rdc sync` reads it: `init`, `auth`, `doctor` and `migrate` check for
+    /// a terminal themselves, so `rdc init --yes` still opens the wizard.
     ///
-    /// Already implied whenever stdin or stderr is not a terminal.
+    /// Already in effect when stdin or stderr is not a terminal.
     #[arg(long, global = true)]
     pub yes: bool,
 
@@ -315,76 +314,76 @@ pub enum Command {
     /// to an existing one.
     #[command(long_about = INIT_LONG_ABOUT)]
     Init {
-        /// Environment to define, as `<env>=<api_base>:<org_id>` — for example
-        /// `dev=https://api.elis.rossum.ai/v1:123456`. The org id is the digits
-        /// after the last colon; everything between `=` and that colon is the
-        /// API base URL. Repeat the flag to define several envs at once. Omit
-        /// it entirely and init prompts for them, which needs a terminal.
+        /// Environment to define, as `<env>=<api_base>:<org_id>`. For example
+        /// `dev=https://api.elis.rossum.ai/v1:123456`. The org id is the
+        /// digits after the last colon; everything between `=` and that colon
+        /// is the API base URL. Repeat the flag to define several envs. Leave
+        /// it out and init prompts for them, which needs a terminal.
         #[arg(long = "env", value_name = "ENV_SPEC")]
         envs: Vec<String>,
         /// Rewrite the scaffold files this binary carries a template for.
         ///
         /// It does not rewrite a `CLAUDE.md`, `README.md` or `.gitlab-ci.yml`
-        /// that already carries the `rdc:` region markers: every init refreshes
-        /// those regions and leaves the rest of the file alone, with or without
-        /// this flag. `--force` rewrites such a file only when the markers are
-        /// absent, and always rewrites the test harness — `testkit/`,
-        /// `conftest.py`, `pytest.ini` and `requirements-dev.txt` — so hand
-        /// edits there are lost. `.gitignore` and `.gitattributes` only ever
-        /// gain their missing rdc lines.
+        /// that already has the `rdc:` region markers. Every init refreshes
+        /// those regions and leaves the rest of the file alone, with or
+        /// without this flag. `--force` rewrites such a file only when the
+        /// markers are missing. It always rewrites the test harness —
+        /// `testkit/`, `conftest.py`, `pytest.ini` and
+        /// `requirements-dev.txt` — so edits there are lost. `.gitignore` and
+        /// `.gitattributes` only ever gain the rdc lines they are missing.
         ///
-        /// With no `--env`, this is all init does: no wizard, no auth, no sync,
-        /// and `rdc.toml` is left untouched.
+        /// With no `--env`, this is all init does: no wizard, no auth, no
+        /// sync, and `rdc.toml` is untouched.
         #[arg(long)]
         force: bool,
     },
     /// Reconcile the local snapshot and the env's remote state in one pass.
     #[command(long_about = SYNC_LONG_ABOUT)]
     Sync {
-        /// Environment to sync, as named in `rdc.toml`. With a terminal
-        /// attached, omitting it opens a picker — or takes the only env when
-        /// exactly one is defined. Without a terminal it is required.
+        /// Environment to sync, as named in `rdc.toml`. With a terminal,
+        /// leaving it out opens a picker, or takes the only env when just one
+        /// is defined. Without a terminal it is required.
         #[arg(add = ArgValueCandidates::new(env_name_candidates))]
         env: Option<String>,
-        /// Print the plan and exit, writing nothing locally or remotely. Still
-        /// needs a token: the plan is computed against a live listing of the
-        /// env.
+        /// Print the plan and exit. Writes nothing, locally or remotely. It
+        /// still needs a token, because it lists the env to build the plan.
         #[arg(long = "dry-run")]
         dry_run: bool,
-        /// Authorise remote DELETEs for the objects whose local file is gone.
-        /// Without it a terminal gets one `[y/N]` prompt covering the whole
-        /// batch, and a run with no terminal fails rather than deleting.
+        /// Allow remote DELETEs for the objects whose local file is gone.
+        /// Without it, a terminal gets one `[y/N]` prompt for the whole
+        /// batch, and a run with no terminal fails instead of deleting.
         #[arg(long = "allow-deletes")]
         allow_deletes: bool,
-        /// Audit mode: pull remote changes into the snapshot and never write to
-        /// the remote.
+        /// Audit mode. Pull remote changes into the snapshot and never write
+        /// to the remote.
         #[arg(long = "no-push", conflicts_with = "no_pull")]
         no_push: bool,
-        /// Deploy mode: push local edits and do not apply remote edits to the
-        /// snapshot. Local files are still written where the push itself
-        /// produces content — a created object's server-assigned `id` and `url`
-        /// are recorded on disk.
+        /// Deploy mode. Push local edits and do not apply remote edits to the
+        /// snapshot. rdc still writes local files where the push itself
+        /// produces content: a created object's server-assigned `id` and
+        /// `url` go to disk.
         #[arg(long = "no-pull", conflicts_with = "no_push")]
         no_pull: bool,
         /// Resolve every object that changed on both sides without reading
-        /// stdin, overriding the inline resolver even on a terminal:
-        /// `use-remote` overwrites the local file with the env's copy,
-        /// `keep-local` keeps the local file and pushes it to the env, and
-        /// `skip` parks the env's copy under `.rdc/conflicts/<env>/` and leaves
-        /// the local file alone. Omit the flag and a terminal prompts while
-        /// everything else skips. Not supported together with `--watch`.
+        /// stdin. This overrides the inline resolver, even on a terminal.
+        /// `use-remote` overwrites the local file with the env's copy.
+        /// `keep-local` keeps the local file and pushes it to the env. `skip`
+        /// writes the env's copy to `.rdc/conflicts/<env>/` and leaves the
+        /// local file alone. Leave the flag out and a terminal prompts, while
+        /// everything else skips. Cannot be used with `--watch`.
         #[arg(long = "conflict", value_enum, conflicts_with = "watch")]
         conflict: Option<ConflictStrategy>,
-        /// Watch local files and poll the env continuously, reconciling on each
-        /// event. On a terminal, pressing Enter runs a cycle immediately
-        /// (ignored while one is already running).
+        /// Watch local files and poll the env, reconciling on each event. On
+        /// a terminal, press Enter to run a cycle at once; that is ignored
+        /// while a cycle is already running.
         #[arg(long = "watch", conflicts_with_all = ["dry_run"])]
         watch: bool,
-        /// How often watch mode polls the env for remote drift. Accepts `30s`,
-        /// `2m`, `1h`; a bare number is read as seconds. Requires `--watch`.
+        /// How often watch mode polls the env for remote drift. Accepts
+        /// `30s`, `2m`, `1h`. A bare number means seconds. Requires
+        /// `--watch`.
         #[arg(long = "poll-interval", value_name = "DURATION", default_value = "60s", requires = "watch")]
         poll_interval: String,
-        /// Stop watch mode polling the env, while it keeps reconciling on local
+        /// Stop watch mode polling the env. It keeps reconciling on local
         /// file events. Requires `--watch`.
         #[arg(long = "no-poll", requires = "watch", conflicts_with = "poll_interval")]
         no_poll: bool,
@@ -392,37 +391,38 @@ pub enum Command {
         /// Requires `--watch`.
         #[arg(short = 'v', long = "verbose", requires = "watch")]
         verbose: bool,
-        /// Stop watch mode ringing the terminal bell when a cycle blocks for
-        /// input (a conflict, delete, drift or token prompt). The bell rings by
-        /// default on a terminal. Requires `--watch`.
+        /// Stop watch mode ringing the terminal bell when a cycle waits for
+        /// input (a conflict, delete, drift or token prompt). The bell rings
+        /// by default on a terminal. Requires `--watch`.
         #[arg(long = "no-bell", requires = "watch")]
         no_bell: bool,
     },
     /// Migrate a source env's snapshot into a target env's snapshot, locally.
     #[command(long_about = MIGRATE_LONG_ABOUT)]
     Migrate {
-        /// Source environment, e.g. `test`. With a terminal attached, omitting
-        /// it opens a picker; without one it is required.
+        /// Source environment, e.g. `test`. With a terminal, leaving it out
+        /// opens a picker. Without a terminal it is required.
         #[arg(add = ArgValueCandidates::new(env_name_candidates))]
         src: Option<String>,
-        /// Target environment, e.g. `prod`. With a terminal attached, omitting
-        /// it opens a picker; without one it is required.
+        /// Target environment, e.g. `prod`. With a terminal, leaving it out
+        /// opens a picker. Without a terminal it is required.
         #[arg(add = ArgValueCandidates::new(env_name_candidates))]
         tgt: Option<String>,
-        /// Mirror semantics: delete tgt snapshot objects that don't exist in
-        /// src. Default is additive (extras in tgt are left intact). The
-        /// deletions are local file removals — review `git diff` before sync.
+        /// Mirror semantics: delete tgt snapshot objects that src does not
+        /// have. The default is additive, which leaves extras in tgt alone.
+        /// The deletions are local file removals — read `git diff` before you
+        /// sync.
         ///
-        /// Refuses when a prune would destroy a LIVE target object while
-        /// creating another of the same kind: that is what an unrecorded slug
+        /// rdc refuses when a prune would destroy a LIVE target object while
+        /// creating another of the same kind. That is what an unrecorded slug
         /// rename looks like, and pushing it deletes the target object (for a
         /// queue, its documents) and creates a replacement.
         #[arg(long)]
         mirror: bool,
-        /// Proceed with a `--mirror` prune that deletes live target objects
-        /// while creating others of the same kind. Only for objects that
-        /// really are unrelated — a renamed one belongs in `.rdc/mapping.toml`
-        /// instead, which `rdc doctor` records for you.
+        /// Go ahead with a `--mirror` prune that deletes live target objects
+        /// while creating others of the same kind. Use it only for objects
+        /// that really are unrelated. A renamed one belongs in
+        /// `.rdc/mapping.toml`, which `rdc doctor` writes for you.
         #[arg(long = "allow-recreate", requires = "mirror")]
         allow_recreate: bool,
         /// Print the plan (per-file source -> target remap, prunes) and exit
@@ -430,12 +430,12 @@ pub enum Command {
         #[arg(long = "dry-run")]
         dry_run: bool,
         /// Limit the migration to the given `<kind>/<slug>` selectors.
-        /// Repeatable. Globs: `*` matches within the slug segment (e.g.
-        /// `hooks/*`, `schemas/cost-*`). Cross-kind: `*/cost-invoices`. A
-        /// selector that matches no object in either snapshot is an error, so a
-        /// typo can't quietly migrate nothing. Selection is per object: it does
-        /// not pull a queue's schema along. Without any `--only`, migrate
-        /// operates on the whole snapshot.
+        /// Repeatable. `*` matches inside the slug segment, e.g. `hooks/*` or
+        /// `schemas/cost-*`; `*/cost-invoices` matches across kinds. A
+        /// selector that matches nothing in either snapshot is an error, so a
+        /// typo cannot quietly migrate nothing. Selection is per object: it
+        /// does not bring a queue's schema along. Without `--only`, migrate
+        /// works on the whole snapshot.
         #[arg(long = "only", value_name = "SELECTOR", action = clap::ArgAction::Append)]
         only: Vec<String>,
         /// Carry a group of the target env's own fields from the source env
@@ -443,26 +443,26 @@ pub enum Command {
         /// `--carry score-thresholds,automation`.
         ///
         /// By default migrate leaves each group to the TARGET env, because
-        /// these are tuned per organization rather than promoted with the
-        /// solution: a matched target keeps its own values, and a brand-new
+        /// each organization tunes these rather than promoting them with the
+        /// solution. A matched target keeps its own values, and a brand-new
         /// object drops the fields so the server's defaults apply.
         ///
         /// * `score-thresholds` — a datapoint's `score_threshold` and a
         ///   queue's `default_score_threshold`.
         ///
         /// * `email-prefixes` — an inbox's `email_prefix`, the left-hand side
-        ///   of its public address (`<email_prefix>-<hash>@<host>`): carrying
+        ///   of its public address (`<email_prefix>-<hash>@<host>`). Carrying
         ///   it re-addresses the target's mailbox, so mail to the old address
-        ///   stops arriving. A brand-new inbox keeps the source's regardless,
-        ///   because the field is mandatory on create.
+        ///   stops arriving. A brand-new inbox keeps the source's value
+        ///   either way, because the field is mandatory on create.
         ///
         /// * `automation` — a queue's `automation_enabled`,
         ///   `automation_level` and `quality_spot_check_percentage`.
         ///
         /// * `all` — every group above.
         ///
-        /// To give a target env its own value deliberately, declare it in that
-        /// env's `overlay.toml`: an overlay wins over both the reconcile and
+        /// To give a target env its own value on purpose, declare it in that
+        /// env's `overlay.toml`. An overlay wins over both the reconcile and
         /// this flag.
         #[arg(
             long = "carry",
@@ -476,16 +476,16 @@ pub enum Command {
     /// Set or refresh an env's API token.
     #[command(long_about = AUTH_LONG_ABOUT)]
     Auth {
-        /// Environment to authenticate, as named in `rdc.toml`. With a terminal
-        /// attached, omitting it opens a picker — or takes the only env when
-        /// exactly one is defined. Without a terminal it is required.
+        /// Environment to authenticate, as named in `rdc.toml`. With a
+        /// terminal, leaving it out opens a picker, or takes the only env
+        /// when just one is defined. Without a terminal it is required.
         #[arg(add = ArgValueCandidates::new(env_name_candidates))]
         env: Option<String>,
         /// Use this token instead of reading one from stdin. Validated before
-        /// it is written.
+        /// rdc writes it.
         #[arg(long, conflicts_with = "username")]
         token: Option<String>,
-        /// Log in as this user instead of supplying a token: rdc reads the
+        /// Log in as this user instead of giving a token. rdc reads the
         /// password (masked prompt on a terminal, otherwise stdin) and
         /// exchanges the pair at POST /v1/auth/login.
         #[arg(long, conflicts_with = "token")]
@@ -494,9 +494,9 @@ pub enum Command {
     /// Diagnose and repair the local snapshot for `<env>` in one offline pass.
     #[command(long_about = DOCTOR_LONG_ABOUT)]
     Doctor {
-        /// Environment to check, as named in `rdc.toml`. With a terminal
-        /// attached, omitting it opens a picker — or takes the only env when
-        /// exactly one is defined. Without a terminal it is required.
+        /// Environment to check, as named in `rdc.toml`. With a terminal,
+        /// leaving it out opens a picker, or takes the only env when just one
+        /// is defined. Without a terminal it is required.
         #[arg(add = ArgValueCandidates::new(env_name_candidates))]
         env: Option<String>,
         /// Report every step without writing. Doctor writes by default.
@@ -506,12 +506,12 @@ pub enum Command {
     /// Replace the running rdc binary with a release build.
     #[command(long_about = UPGRADE_LONG_ABOUT)]
     Upgrade {
-        /// Install this version instead of the newest release (an emergency
-        /// downgrade; you may need to re-pull afterward). Accepts `0.11.0` or
+        /// Install this version instead of the newest release. An emergency
+        /// downgrade; you may need to re-pull afterwards. Accepts `0.11.0` or
         /// `v0.11.0`.
         #[arg(long)]
         version: Option<String>,
-        /// Report whether a newer release exists and exit without installing
+        /// Report whether a newer release exists, and exit without installing
         /// anything.
         #[arg(long)]
         check: bool,
