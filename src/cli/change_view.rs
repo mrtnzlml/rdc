@@ -591,7 +591,10 @@ pub fn render_diff_body(left: &str, right: &str, is_json: bool, mode: ColorMode)
             }
         }
     }
-    let w = max_line.to_string().len().max(3);
+    // Exactly as wide as the highest line number needs. The floor used to be
+    // three digits, which cost four columns of gutter on every diff of a file
+    // under 100 lines — most of them — before a single character of content.
+    let w = max_line.to_string().len();
     let plain = mode == ColorMode::Plain;
     let ind = " ".repeat(INDENT);
 
@@ -973,13 +976,15 @@ mod tests {
     fn gutter_splits_old_and_new_columns() {
         let out = render_diff_body(L, R, true, ColorMode::Plain);
         let lines: Vec<&str> = out.lines().collect();
+        // A 4-line fixture needs one digit per column, so the gutter is
+        // `old new` in three characters.
         // Context row carries both numbers.
-        assert_eq!(&lines[0][9..16], "  1   1", "context gutter: {:?}", lines[0]);
+        assert_eq!(&lines[0][9..12], "1 1", "context gutter: {:?}", lines[0]);
         // Delete carries old only; insert carries new only.
-        assert_eq!(&lines[1][9..16], "  2    ", "delete gutter: {:?}", lines[1]);
-        assert_eq!(&lines[2][9..16], "      2", "insert gutter: {:?}", lines[2]);
+        assert_eq!(&lines[1][9..12], "2  ", "delete gutter: {:?}", lines[1]);
+        assert_eq!(&lines[2][9..12], "  2", "insert gutter: {:?}", lines[2]);
         // The same number therefore never appears twice meaning two things.
-        assert_ne!(&lines[1][9..16], &lines[2][9..16]);
+        assert_ne!(&lines[1][9..12], &lines[2][9..12]);
     }
 
     #[test]

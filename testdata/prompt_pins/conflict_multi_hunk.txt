@@ -2,13 +2,13 @@
 [2/7]    conflict
          prompt queues   invoices        +2    -2   2 hunks
          ⎿ TMPDIR/queues/invoices.json   - local  + dev
-           1   1 │   {
-           2     │ -   "a": 1,
-               2 │ +   "a": 9,
-           3   3 │     "b": 2,
-           4     │ -   "name": "Invoices"
-               4 │ +   "name": "Invoices EU"
-           5   5 │   }
+         1 1 │   {
+         2   │ -   "a": 1,
+           2 │ +   "a": 9,
+         3 3 │     "b": 2,
+         4   │ -   "name": "Invoices"
+           4 │ +   "name": "Invoices EU"
+         5 5 │   }
 
 [k] keep local (push it to dev)   [r] use dev (overwrite local)
 [e] edit in $EDITOR   [h] one change at a time   [s] decide later

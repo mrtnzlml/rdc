@@ -2,36 +2,36 @@
 [1/1]    conflict
          prompt queues   invoices        +2    -2   2 hunks
          ⎿ TMPDIR/queues/invoices.json   - local  + dev
-           1   1 │   {
-           2     │ -   "a": 1,
-               2 │ +   "a": 9,
-           3   3 │     "b": 2,
-           4     │ -   "name": "Invoices"
-               4 │ +   "name": "Invoices EU"
-           5   5 │   }
+         1 1 │   {
+         2   │ -   "a": 1,
+           2 │ +   "a": 9,
+         3 3 │     "b": 2,
+         4   │ -   "name": "Invoices"
+           4 │ +   "name": "Invoices EU"
+         5 5 │   }
 
 [k] keep local (push it to dev)   [r] use dev (overwrite local)
 [e] edit in $EDITOR   [h] one change at a time   [s] decide later
 [a] abort the sync
 > 
 [1/2]    change in TMPDIR/queues/invoices.json (line 2)
-           1   1 │   {
-           2     │ -   "a": 1,
-               2 │ +   "a": 9,
-           3   3 │     "b": 2,
-           4   4 │     "name": "Invoices"
-           5   5 │   }
+         1 1 │   {
+         2   │ -   "a": 1,
+           2 │ +   "a": 9,
+         3 3 │     "b": 2,
+         4 4 │     "name": "Invoices"
+         5 5 │   }
 
 [k] keep local   [r] use dev   [e] edit in $EDITOR   [b] keep both
 [s] leave the conflict markers   [a] abort the sync
 > 
 [2/2]    change in TMPDIR/queues/invoices.json (line 4)
-           1   1 │   {
-           2   2 │     "a": 1,
-           3   3 │     "b": 2,
-           4     │ -   "name": "Invoices"
-               4 │ +   "name": "Invoices EU"
-           5   5 │   }
+         1 1 │   {
+         2 2 │     "a": 1,
+         3 3 │     "b": 2,
+         4   │ -   "name": "Invoices"
+           4 │ +   "name": "Invoices EU"
+         5 5 │   }
 
 [k] keep local   [r] use dev   [e] edit in $EDITOR   [b] keep both
 [s] leave the conflict markers   [a] abort the sync

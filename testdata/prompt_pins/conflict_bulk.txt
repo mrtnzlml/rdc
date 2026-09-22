@@ -2,10 +2,10 @@
 [1/4]    conflict
          prompt queues   invoices        +1    -1
          ⎿ TMPDIR/queues/invoices.json   - local  + dev
-           1   1 │   {
-           2     │ -   "name": "Invoices"
-               2 │ +   "name": "Invoices EU"
-           3   3 │   }
+         1 1 │   {
+         2   │ -   "name": "Invoices"
+           2 │ +   "name": "Invoices EU"
+         3 3 │   }
 
 [K] keep ALL local   [R] use dev for ALL
 [k] keep local (push it to dev)   [r] use dev (overwrite local)
