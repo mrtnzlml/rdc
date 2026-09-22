@@ -498,12 +498,14 @@ fn count_conflict_hunks(local: &[u8], remote: &[u8]) -> usize {
 pub fn prompt_remote_delete<R: BufRead, W: Write>(
     input: R,
     output: W,
+    index: usize,
+    total: usize,
     obj: ObjectRef<'_>,
     local_path: &Path,
     env: &str,
 ) -> Result<Resolution> {
     let mode = detect_color_mode();
-    prompt_remote_delete_with_color(input, output, obj, local_path, env, mode, None)
+    prompt_remote_delete_with_color(input, output, index, total, obj, local_path, env, mode, None)
 }
 
 /// Color-aware variant. Tests pin the mode; production goes through
@@ -511,6 +513,8 @@ pub fn prompt_remote_delete<R: BufRead, W: Write>(
 pub fn prompt_remote_delete_with_color<R: BufRead, W: Write>(
     mut input: R,
     mut output: W,
+    index: usize,
+    total: usize,
     obj: ObjectRef<'_>,
     local_path: &Path,
     env: &str,
@@ -539,7 +543,7 @@ pub fn prompt_remote_delete_with_color<R: BufRead, W: Write>(
     writeln!(
         output,
         "{}",
-        colorize_header(&format!("deleted on {env}"), mode)
+        colorize_header(&format!("[{index}/{total}]  deleted on {env}"), mode)
     )?;
     let (added, removed) = count_changes(&shown, "");
     let row = ChangeRow {
@@ -1630,10 +1634,17 @@ pub(crate) fn anomaly_cure_question(slug: &str, hook: &crate::model::Hook) -> St
 
 /// The cure picker's options, in the order the answer index maps to
 /// `Convert` / `Reinstall` / `Skip`.
+///
+/// No `[c]` / `[r]` / `[s]` prefixes, because this is an `inquire::Select`
+/// and they would be a lie: typing filters the list on a case-insensitive
+/// SUBSTRING of the whole label and resets the highlight to the first match,
+/// so `r` matched "Convert" (the "r" in the word) and `s` matched
+/// "preserved" — two of the three advertised letters selected Convert. The
+/// list is answered with the arrow keys and Enter.
 pub(crate) const ANOMALY_CURE_OPTIONS: [&str; 3] = [
-    "[c] Convert to custom (one PATCH, id preserved)",
-    "[r] Reinstall as store extension (new id, rewires dependents)",
-    "[s] Skip this hook",
+    "Convert to custom (one PATCH, id preserved)",
+    "Reinstall as store extension (new id, rewires dependents)",
+    "Skip this hook",
 ];
 
 /// Per-hook interactive prompt. Non-TTY → `Convert` is the default,
@@ -2387,6 +2398,8 @@ mod tests {
         let res = prompt_remote_delete_with_color(
             input,
             &mut out,
+            1,
+            1,
             ObjectRef { kind: "queues", slug: "invoices" },
             &local,
             "production",
@@ -2418,7 +2431,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let input = Cursor::new(b"k\n");
         let res =
-            prompt_remote_delete_with_color(input, &mut out, ObjectRef { kind: "queues", slug: "invoices" }, &local, "test", ColorMode::Plain, None)
+            prompt_remote_delete_with_color(input, &mut out, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &local, "test", ColorMode::Plain, None)
                 .unwrap();
         assert!(matches!(res, Resolution::KeepLocal));
     }
@@ -2432,7 +2445,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let input = Cursor::new(b"r\n");
         let res =
-            prompt_remote_delete_with_color(input, &mut out, ObjectRef { kind: "queues", slug: "invoices" }, &local, "test", ColorMode::Plain, None)
+            prompt_remote_delete_with_color(input, &mut out, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &local, "test", ColorMode::Plain, None)
                 .unwrap();
         assert!(matches!(res, Resolution::KeepRemote));
     }
@@ -2446,7 +2459,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let input = Cursor::new(b"a\n");
         let res =
-            prompt_remote_delete_with_color(input, &mut out, ObjectRef { kind: "queues", slug: "invoices" }, &local, "test", ColorMode::Plain, None)
+            prompt_remote_delete_with_color(input, &mut out, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &local, "test", ColorMode::Plain, None)
                 .unwrap();
         assert!(matches!(res, Resolution::Abort));
     }
@@ -3444,7 +3457,7 @@ mod tests {
         };
         let input = Cursor::new(b"R\ny\n");
         let mut out: Vec<u8> = Vec::new();
-        let r = prompt_remote_delete_with_color(input, &mut out, ObjectRef { kind: "queues", slug: "invoices" }, &path, "prod", ColorMode::Plain, Some(&bulk)).unwrap();
+        let r = prompt_remote_delete_with_color(input, &mut out, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path, "prod", ColorMode::Plain, Some(&bulk)).unwrap();
         assert!(matches!(r, Resolution::KeepRemoteAll));
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("[R] use prod for ALL"), "bulk options must be shown: {s}");
@@ -3462,7 +3475,7 @@ mod tests {
         std::fs::write(&path, b"{\"a\":1}\n").unwrap();
         let input = Cursor::new(b"r\n");
         let mut out: Vec<u8> = Vec::new();
-        let r = prompt_remote_delete_with_color(input, &mut out, ObjectRef { kind: "queues", slug: "invoices" }, &path, "prod", ColorMode::Plain, None).unwrap();
+        let r = prompt_remote_delete_with_color(input, &mut out, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path, "prod", ColorMode::Plain, None).unwrap();
         assert!(matches!(r, Resolution::KeepRemote));
     }
 
@@ -3516,6 +3529,8 @@ mod tests {
         let _ = prompt_remote_delete_with_color(
             Cursor::new(b"s\n"),
             &mut out,
+            1,
+            1,
             ObjectRef { kind: "labels", slug: "audit-hold" },
             &local,
             "dev",
@@ -3678,9 +3693,12 @@ mod tests {
         };
 
         let mut out: Vec<u8> = Vec::new();
+        // 1 of 3: the bulk options only appear when more than one remains.
         let r = prompt_remote_delete_with_color(
             Cursor::new(b"R\ny\n"),
             &mut out,
+            1,
+            3,
             ObjectRef { kind: "labels", slug: "audit-hold" },
             &local,
             "dev",

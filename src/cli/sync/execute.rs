@@ -2253,8 +2253,11 @@ async fn prune_mdh_orphans<R: BufRead>(
 
     let env = ctx.paths.env().to_string();
     let mut pruned = 0usize;
+    // Position in the orphan list, so the prompt can say which of how many
+    // this is — the same counter the conflict prompt shows.
+    let orphan_total = orphan_slugs.len();
 
-    for slug in orphan_slugs {
+    for (orphan_idx, slug) in orphan_slugs.into_iter().enumerate() {
         let indexes_path = ctx.paths.dataset_dir(&slug).join("indexes.json");
 
         // Both-sides-agree deletion: lockfile entry but no local file.
@@ -2313,6 +2316,8 @@ async fn prune_mdh_orphans<R: BufRead>(
             let r = prompt_remote_delete(
                 &mut input,
                 progress.writer(),
+                orphan_idx + 1,
+                orphan_total,
                 ObjectRef { kind: "mdh", slug: &slug },
                 &indexes_for_prompt,
                 &env,
@@ -3176,6 +3181,8 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                         let r = prompt_remote_delete_with_color(
                             &mut input,
                             progress.writer(),
+                            processed_lerd + processed_ldre + 1,
+                            lerd_total + ldre_total,
                             ObjectRef { kind: &it.kind, slug: &it.slug },
                             &local_for_prompt,
                             &env,

@@ -1,5 +1,5 @@
 
-deleted on dev
+[1/1]  deleted on dev
          prompt labels   audit-hold       0    -3
          ⎿ TMPDIR/labels/audit-hold.json   - local  + dev (deleted)
            1     │ - {
