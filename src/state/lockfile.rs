@@ -317,8 +317,8 @@ fn to_hex(digest: &[u8]) -> String {
 /// post-extraction `schema.json` bytes plus each formula file (path + body).
 /// Formulas must be passed sorted by `field_id` for determinism.
 ///
-/// Algorithm matches the documentation on `write_schema` in
-/// `src/snapshot/schema.rs`:
+/// The inputs are the split `write_schema_bytes` in `src/snapshot/schema.rs`
+/// writes to disk. The hash is:
 ///
 /// ```text
 /// SHA-256(

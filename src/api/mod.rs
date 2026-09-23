@@ -4,11 +4,11 @@ pub mod rate_limit;
 pub mod retry;
 
 pub use data_storage::DataStorageClient;
-pub use error::{anyhow_has_status, anyhow_status_env, ApiError};
+pub use error::{anyhow_has_status, ApiError};
 pub use rate_limit::RateLimiter;
 
 use crate::model::{
-    EmailTemplate, Engine, EngineField, Hook, HookTemplate, Inbox, Label, Organization, Queue,
+    EmailTemplate, Engine, EngineField, Hook, Inbox, Label, Organization, Queue,
     Rule, SavedView, Schema, Workflow, WorkflowStep, Workspace,
 };
 use crate::api::retry::ProgressHandle;
@@ -25,12 +25,6 @@ pub struct RossumClient {
     base_url: String,
     token: String,
     http: Client,
-    /// Env name (e.g. `"dev-eu"`) attached to errors as
-    /// `ApiError::Status { env, .. }` so a caller juggling multiple clients
-    /// can attribute a 401 back to the right env and refresh its token.
-    /// `None` — the state every command is in today — means errors are not
-    /// env-tagged. Set only via [`RossumClient::with_env_label`].
-    env: Option<String>,
     /// Per-token client-side rate limiter. Defaults to the
     /// `default.core_api` policy Rossum enforces server-side (10 req/s,
     /// burst 10). `Arc` so all in-flight calls share one bucket; two
@@ -114,20 +108,7 @@ impl RossumClient {
         let http = build_http_client()?;
         let limiter =
             (!is_loopback_base(&base_url)).then(|| Arc::new(RateLimiter::rossum_core_api()));
-        Ok(Self { base_url, token, http, env: None, limiter })
-    }
-
-    /// Attach an env label so any non-2xx error this client produces
-    /// carries the env name in its `ApiError::Status { env, .. }`, so a
-    /// retry wrapper knows which env's token to refresh on a 401.
-    ///
-    /// Written for a command holding two clients (src + tgt). The command
-    /// that did — `deploy` — was replaced by the offline `rdc migrate`,
-    /// which opens no client at all, so this has **no caller today**; it is
-    /// kept for the next multi-env caller rather than as live behavior.
-    pub fn with_env_label(mut self, env: impl Into<String>) -> Self {
-        self.env = Some(env.into());
-        self
+        Ok(Self { base_url, token, http, limiter })
     }
 
     // --- list endpoints (paginated) -----------------------------------
@@ -174,10 +155,6 @@ impl RossumClient {
 
     pub async fn list_email_templates(&self, progress: ProgressHandle) -> Result<Vec<EmailTemplate>> {
         self.list_paginated("/email_templates", progress).await
-    }
-
-    pub async fn list_hook_templates(&self, progress: ProgressHandle) -> Result<Vec<HookTemplate>> {
-        self.list_paginated("/hook_templates", progress).await
     }
 
     pub async fn list_inboxes(&self, progress: ProgressHandle) -> Result<Vec<Inbox>> {
@@ -270,16 +247,12 @@ impl RossumClient {
 
     // --- update endpoints (PATCH) -------------------------------------
 
-    pub async fn update_hook(&self, id: u64, hook: &Hook, progress: ProgressHandle) -> Result<Hook> {
-        self.patch_json(&format!("/hooks/{id}"), hook, progress).await
-    }
-
     /// `PATCH /hooks/<id>` with a raw JSON body. Used when the outbound
     /// payload contains fields not represented on the `Hook` model —
     /// notably the write-only top-level `secrets` map, which `GET /hooks`
     /// never returns and which therefore has no place on the typed
-    /// model. The body is sent through the same retry pipeline as
-    /// `update_hook` and the response is decoded back to a `Hook`.
+    /// model. The body is sent through the same retry pipeline as the
+    /// typed `update_*` methods and the response is decoded back to a `Hook`.
     pub async fn update_hook_value(&self, id: u64, body: &serde_json::Value, progress: ProgressHandle) -> Result<Hook> {
         self.patch_json(&format!("/hooks/{id}"), body, progress).await
     }
@@ -300,15 +273,6 @@ impl RossumClient {
         self.patch_json(&format!("/inboxes/{id}"), inbox, progress).await
     }
 
-    /// Partial-body variant: PATCH with a hand-built `serde_json::Value`.
-    /// Written so a cross-env caller could strip per-env fields like `email`
-    /// (auto-assigned at create, immutable in practice; sending the src
-    /// env's value cross-env at best is ignored, at worst rewrites the
-    /// tgt inbox's email). That caller was the retired `deploy`; nothing reaches
-    /// this today. Mirror of [`Self::update_hook_value`].
-    pub async fn update_inbox_value(&self, id: u64, body: &serde_json::Value, progress: ProgressHandle) -> Result<Inbox> {
-        self.patch_json(&format!("/inboxes/{id}"), body, progress).await
-    }
 
     pub async fn update_email_template(&self, id: u64, t: &EmailTemplate, progress: ProgressHandle) -> Result<EmailTemplate> {
         self.patch_json(&format!("/email_templates/{id}"), t, progress).await
@@ -323,10 +287,6 @@ impl RossumClient {
     }
 
     /// `PATCH /saved_views/{id}`.
-    ///
-    /// There is no `delete_saved_view`: `push::deletes` issues DELETE through
-    /// the generic `delete_path("/{kind}/{id}")`, and the kind string
-    /// `saved_views` is already the correct path segment.
     pub async fn update_saved_view(&self, id: u64, view: &SavedView, progress: ProgressHandle) -> Result<SavedView> {
         self.patch_json(&format!("/saved_views/{id}"), view, progress).await
     }
@@ -355,14 +315,6 @@ impl RossumClient {
         self.patch_json(&format!("/engine_fields/{id}"), field, progress).await
     }
 
-    /// Partial-body variant: PATCH with a hand-built `serde_json::Value`.
-    /// Useful when the caller needs to omit immutable fields like `name`
-    /// (Rossum rejects renaming an existing engine field with 400). Mirror
-    /// of [`Self::update_hook_value`]. No caller today — the engine-field
-    /// driver strips `name` through `strip_for_cross_env_patch` instead.
-    pub async fn update_engine_field_value(&self, id: u64, body: &serde_json::Value, progress: ProgressHandle) -> Result<EngineField> {
-        self.patch_json(&format!("/engine_fields/{id}"), body, progress).await
-    }
 
     // --- delete endpoints (DELETE) ------------------------------------
     //
@@ -371,6 +323,8 @@ impl RossumClient {
     // deletion, or the tgt-only objects `rdc migrate --mirror` pruned from
     // the target snapshot. Always gated: an interactive `[y/N]` on a TTY,
     // and `--allow-deletes` otherwise. Nothing else in rdc issues a DELETE.
+    // There are no per-kind wrappers: the kind string is already the path
+    // segment, so every caller builds `/{kind}/{id}` itself.
 
     /// Generic DELETE `<base>/<path>`. Accepts 204 (deleted) and 404
     /// (already gone) as success; surfaces every other non-2xx.
@@ -389,39 +343,9 @@ impl RossumClient {
             return Ok(());
         }
         let body = resp.text().await.unwrap_or_default();
-        Err(ApiError::Status { status: status.as_u16(), body, env: self.env.clone() }.into())
+        Err(ApiError::Status { status: status.as_u16(), body }.into())
     }
 
-    pub async fn delete_hook(&self, id: u64, progress: ProgressHandle) -> Result<()> {
-        self.delete_path(&format!("/hooks/{id}"), progress).await
-    }
-    pub async fn delete_workspace(&self, id: u64, progress: ProgressHandle) -> Result<()> {
-        self.delete_path(&format!("/workspaces/{id}"), progress).await
-    }
-    pub async fn delete_queue(&self, id: u64, progress: ProgressHandle) -> Result<()> {
-        self.delete_path(&format!("/queues/{id}"), progress).await
-    }
-    pub async fn delete_schema(&self, id: u64, progress: ProgressHandle) -> Result<()> {
-        self.delete_path(&format!("/schemas/{id}"), progress).await
-    }
-    pub async fn delete_inbox(&self, id: u64, progress: ProgressHandle) -> Result<()> {
-        self.delete_path(&format!("/inboxes/{id}"), progress).await
-    }
-    pub async fn delete_email_template(&self, id: u64, progress: ProgressHandle) -> Result<()> {
-        self.delete_path(&format!("/email_templates/{id}"), progress).await
-    }
-    pub async fn delete_rule(&self, id: u64, progress: ProgressHandle) -> Result<()> {
-        self.delete_path(&format!("/rules/{id}"), progress).await
-    }
-    pub async fn delete_label(&self, id: u64, progress: ProgressHandle) -> Result<()> {
-        self.delete_path(&format!("/labels/{id}"), progress).await
-    }
-    pub async fn delete_engine(&self, id: u64, progress: ProgressHandle) -> Result<()> {
-        self.delete_path(&format!("/engines/{id}"), progress).await
-    }
-    pub async fn delete_engine_field(&self, id: u64, progress: ProgressHandle) -> Result<()> {
-        self.delete_path(&format!("/engine_fields/{id}"), progress).await
-    }
 
     // --- private helpers ----------------------------------------------
 
@@ -514,7 +438,7 @@ impl RossumClient {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status { status: status.as_u16(), body, env: self.env.clone() }.into());
+            return Err(ApiError::Status { status: status.as_u16(), body }.into());
         }
         resp.json::<T>().await
             .with_context(|| format!("decoding response from {url}"))
@@ -559,7 +483,7 @@ impl RossumClient {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status { status: status.as_u16(), body, env: self.env.clone() }.into());
+            return Err(ApiError::Status { status: status.as_u16(), body }.into());
         }
         resp.json::<TResp>().await
             .with_context(|| format!("decoding PATCH response from {url}"))
@@ -588,7 +512,7 @@ impl RossumClient {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status { status: status.as_u16(), body, env: self.env.clone() }.into());
+            return Err(ApiError::Status { status: status.as_u16(), body }.into());
         }
         resp.json::<TResp>().await
             .with_context(|| format!("decoding POST response from {url}"))
@@ -627,7 +551,6 @@ pub async fn login(api_base: &str, username: &str, password: &str) -> Result<Str
         return Err(ApiError::Status {
             status: status.as_u16(),
             body: body_text,
-            env: None,
         }
         .into());
     }

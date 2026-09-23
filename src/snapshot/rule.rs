@@ -16,23 +16,6 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use std::path::Path;
 
-/// Write a rule to disk: a JSON file under `<dir>/<slug>.json` and, if
-/// the rule has a `trigger_condition`, a sibling `<dir>/<slug>.py` file.
-/// The `trigger_condition` field is stripped from the JSON to avoid
-/// duplication; the `.py` file becomes the source of truth.
-///
-/// Returns the JSON bytes written (post-extraction, with trailing newline).
-pub fn write_rule(dir: &Path, slug: &str, r: &Rule) -> Result<Vec<u8>> {
-    let (json_bytes, code) = serialize_rule(r)?;
-    write_atomic(&dir.join(format!("{slug}.json")), &json_bytes)?;
-    if let Some(code) = code {
-        // Byte-exact: preserve the trigger_condition string as-is so the
-        // round-trip is identity.
-        write_atomic(&dir.join(format!("{slug}.py")), code.as_bytes())?;
-    }
-    Ok(json_bytes)
-}
-
 /// Remove a string `trigger_condition` from a serialized rule Value and
 /// return it for the sidecar.
 fn split_rule_trigger_condition(json_value: &mut Value) -> Option<String> {
@@ -99,22 +82,39 @@ pub fn read_rule_value(dir: &Path, slug: &str) -> Result<Value> {
     Ok(value)
 }
 
-/// Read a rule back from disk into a typed `Rule`. Splices `<slug>.py`
-/// back into `trigger_condition` first, so the in-memory `Rule` is
-/// byte-for-byte equivalent to what was originally serialized.
-pub fn read_rule(dir: &Path, slug: &str) -> Result<Rule> {
-    let value = read_rule_value(dir, slug)?;
-    let json_path = dir.join(format!("{slug}.json"));
-    let rule: Rule = serde_json::from_value(value)
-        .with_context(|| format!("deserializing rule from {}", json_path.display()))?;
-    Ok(rule)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::TempDir;
+
+    /// Write a rule to disk: a JSON file under `<dir>/<slug>.json` and, if
+    /// the rule has a `trigger_condition`, a sibling `<dir>/<slug>.py` file.
+    /// The `trigger_condition` field is stripped from the JSON to avoid
+    /// duplication; the `.py` file becomes the source of truth.
+    ///
+    /// Returns the JSON bytes written (post-extraction, with trailing newline).
+    fn write_rule(dir: &Path, slug: &str, r: &Rule) -> Result<Vec<u8>> {
+        let (json_bytes, code) = serialize_rule(r)?;
+        write_atomic(&dir.join(format!("{slug}.json")), &json_bytes)?;
+        if let Some(code) = code {
+            // Byte-exact: preserve the trigger_condition string as-is so the
+            // round-trip is identity.
+            write_atomic(&dir.join(format!("{slug}.py")), code.as_bytes())?;
+        }
+        Ok(json_bytes)
+    }
+
+    /// Read a rule back from disk into a typed `Rule`. Splices `<slug>.py`
+    /// back into `trigger_condition` first, so the in-memory `Rule` is
+    /// byte-for-byte equivalent to what was originally serialized.
+    fn read_rule(dir: &Path, slug: &str) -> Result<Rule> {
+        let value = read_rule_value(dir, slug)?;
+        let json_path = dir.join(format!("{slug}.json"));
+        let rule: Rule = serde_json::from_value(value)
+            .with_context(|| format!("deserializing rule from {}", json_path.display()))?;
+        Ok(rule)
+    }
 
     fn sample_with_code() -> Rule {
         let v = json!({

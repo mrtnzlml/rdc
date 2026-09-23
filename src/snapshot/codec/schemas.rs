@@ -27,10 +27,6 @@ use crate::snapshot::codec::{DiskArtifact, KindCodec};
 pub struct Schemas;
 
 impl KindCodec for Schemas {
-    fn kind(&self) -> &'static str {
-        "schemas"
-    }
-
     fn disk_bytes(&self, value: &Value) -> anyhow::Result<DiskArtifact> {
         let schema: crate::model::Schema = serde_json::from_value(value.clone())
             .context("deserializing schema value for disk_bytes")?;
@@ -49,10 +45,6 @@ impl KindCodec for Schemas {
             .collect();
 
         Ok(DiskArtifact { json, sidecars })
-    }
-
-    fn create_body(&self, body: &mut Value) {
-        crate::snapshot::create::strip_for_create(body, "schemas");
     }
 
     fn cross_env_body(&self, body: &mut Value) {

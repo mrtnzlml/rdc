@@ -65,8 +65,8 @@ fn write_secrets_file_full(
 /// preserving any existing `api_token` / `expires_at` already in the file.
 /// Used by the desktop app at Add Connection / Edit Credentials time.
 ///
-/// rdc's own `resolve_token` (which `cli::sync::embed::sync_no_push`
-/// transitively calls) reads these fields and runs the standard
+/// rdc's own `resolve_token` (which the desktop bridge calls before each
+/// sync) reads these fields and runs the standard
 /// `NeedsLogin` → `POST /v1/auth/login` → cache flow when the token is
 /// missing or expired.
 pub fn save_password_credentials(
@@ -418,21 +418,9 @@ pub const UNFILLED_SENTINEL: &str = "<unfilled>";
 pub struct HookSecrets {
     /// slug → (key → value).
     by_slug: BTreeMap<String, BTreeMap<String, String>>,
-    /// Path the values came from. `None` when the file did not exist —
-    /// distinguishes "no file" from "file with empty hooks map".
-    source: Option<PathBuf>,
 }
 
 impl HookSecrets {
-    /// Look up the raw K/V map for a hook slug (values may include the
-    /// unfilled sentinel). `None` when the slug has no entry; callers
-    /// should treat that the same as "no secrets to send". Use
-    /// [`Self::filled_kv_for_slug`] when the sentinel must be stripped
-    /// before sending values to the API.
-    pub fn for_slug(&self, slug: &str) -> Option<&BTreeMap<String, String>> {
-        self.by_slug.get(slug)
-    }
-
     /// Owned K/V map containing only the keys the user has actually
     /// filled in (i.e. the value is not the unfilled sentinel). Used
     /// by the push injection sites that must never leak the sentinel
@@ -453,18 +441,6 @@ impl HookSecrets {
     /// typo slugs that don't match any hook on push.
     pub fn slugs(&self) -> impl Iterator<Item = &String> {
         self.by_slug.keys()
-    }
-
-    /// Full slug → K/V map, sentinel values included. Exposed so a caller can
-    /// produce an output merged with what is already on disk without
-    /// re-reading the file.
-    pub fn entries(&self) -> &BTreeMap<String, BTreeMap<String, String>> {
-        &self.by_slug
-    }
-
-    /// True if the file existed on disk (even if it had no hooks).
-    pub fn was_loaded(&self) -> bool {
-        self.source.is_some()
     }
 }
 
@@ -489,10 +465,7 @@ pub fn load_hook_secrets(project_root: &Path, env: &str) -> Result<HookSecrets> 
     let raw = std::fs::read_to_string(&path)
         .with_context(|| format!("reading {}", path.display()))?;
     if raw.trim().is_empty() {
-        return Ok(HookSecrets {
-            by_slug: BTreeMap::new(),
-            source: Some(path),
-        });
+        return Ok(HookSecrets::default());
     }
     #[derive(Deserialize)]
     struct File {
@@ -501,10 +474,7 @@ pub fn load_hook_secrets(project_root: &Path, env: &str) -> Result<HookSecrets> 
     }
     let f: File = serde_json::from_str(&raw)
         .with_context(|| format!("parsing {}", path.display()))?;
-    Ok(HookSecrets {
-        by_slug: f.hooks,
-        source: Some(path),
-    })
+    Ok(HookSecrets { by_slug: f.hooks })
 }
 
 /// The stub `rdc init` (and the first `rdc sync`) drops at
@@ -673,9 +643,8 @@ mod tests {
     fn hook_secrets_missing_file_is_empty() {
         let dir = TempDir::new().unwrap();
         let s = load_hook_secrets(dir.path(), "dev").unwrap();
-        assert!(s.for_slug("anything").is_none());
+        assert!(!s.by_slug.contains_key("anything"));
         assert_eq!(s.slugs().count(), 0);
-        assert!(!s.was_loaded(), "missing file should report not-loaded");
     }
 
     #[test]
@@ -693,28 +662,25 @@ mod tests {
         )
         .unwrap();
         let s = load_hook_secrets(dir.path(), "dev").unwrap();
-        let mdh = s.for_slug("master-data-hub").expect("mdh entry");
+        let mdh = s.by_slug.get("master-data-hub").expect("mdh entry");
         assert_eq!(mdh.get("mdh_api_token").map(String::as_str), Some("abc"));
         assert_eq!(mdh.get("mdh_endpoint").map(String::as_str), Some("https://x"));
-        let slack = s.for_slug("notify-slack").expect("slack entry");
+        let slack = s.by_slug.get("notify-slack").expect("slack entry");
         assert_eq!(slack.get("signing_secret").map(String::as_str), Some("xyz"));
-        assert!(s.for_slug("unrelated").is_none());
+        assert!(!s.by_slug.contains_key("unrelated"));
         let slugs: Vec<&String> = s.slugs().collect();
         assert_eq!(slugs.len(), 2, "should report both slugs (sorted)");
-        assert!(s.was_loaded());
     }
 
     #[test]
     fn hook_secrets_empty_file_is_loaded_but_empty() {
         // An empty file is a valid "I have a project-level secrets
-        // file but no values yet" state — distinct from "file missing"
-        // because the user has signalled intent by creating it.
+        // file but no values yet" state, not a parse error.
         let dir = TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join("secrets")).unwrap();
         std::fs::write(dir.path().join("secrets/dev.hook-secrets.json"), "").unwrap();
         let s = load_hook_secrets(dir.path(), "dev").unwrap();
         assert_eq!(s.slugs().count(), 0);
-        assert!(s.was_loaded(), "empty file is still loaded, just has no entries");
     }
 
     #[test]
@@ -741,7 +707,6 @@ mod tests {
         std::fs::write(dir.path().join("secrets/dev.hook-secrets.json"), "{}").unwrap();
         let s = load_hook_secrets(dir.path(), "dev").unwrap();
         assert_eq!(s.slugs().count(), 0);
-        assert!(s.was_loaded());
     }
 
     #[test]
@@ -762,9 +727,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         write_hook_secrets_stub(dir.path(), "test-eu").unwrap();
         let s = load_hook_secrets(dir.path(), "test-eu").unwrap();
-        assert!(s.was_loaded(), "the stub is a real file, not a missing one");
         assert_eq!(s.slugs().count(), 0, "the \"//\" key must not read as a slug");
-        assert!(s.entries().is_empty());
     }
 
     /// The stub tells the reader the shape and names the sentinel, because the

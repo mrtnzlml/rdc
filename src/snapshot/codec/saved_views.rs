@@ -8,16 +8,12 @@ use serde_json::Value;
 use crate::overlay::Overlay;
 use crate::paths::Paths;
 use crate::snapshot::codec::{DiskArtifact, KindCodec};
-use crate::snapshot::create::{strip_for_create, strip_for_cross_env_patch};
+use crate::snapshot::create::strip_for_cross_env_patch;
 use crate::snapshot::key_order::strip_hidden_fields;
 
 pub struct SavedViews;
 
 impl KindCodec for SavedViews {
-    fn kind(&self) -> &'static str {
-        "saved_views"
-    }
-
     fn disk_bytes(&self, value: &Value) -> anyhow::Result<DiskArtifact> {
         let mut v = value.clone();
         strip_hidden_fields(&mut v);
@@ -34,10 +30,6 @@ impl KindCodec for SavedViews {
         let mut json = serde_json::to_vec_pretty(&v)?;
         json.push(b'\n');
         Ok(DiskArtifact { json, sidecars: vec![] })
-    }
-
-    fn create_body(&self, body: &mut Value) {
-        strip_for_create(body, "saved_views");
     }
 
     fn cross_env_body(&self, body: &mut Value) {

@@ -7,18 +7,8 @@ use std::path::Path;
 /// `(schema JSON bytes, [(field_id, formula bytes)])` — the on-disk split form.
 type SchemaJsonAndFormulas = (Vec<u8>, Vec<(String, Vec<u8>)>);
 
-/// Write a schema to `<queue_dir>/schema.json`, extracting any formula field
-/// `formula` strings into `<queue_dir>/formulas/<field_id>.py` files.
-/// Returns the post-extraction JSON bytes (used for content_hash via
-/// `crate::state::schema_combined_hash` together with the formula bytes).
-pub fn write_schema(queue_dir: &Path, schema: &Schema) -> Result<Vec<u8>> {
-    let (bytes, formulas) = serialize_schema(schema)?;
-    write_schema_bytes(queue_dir, &bytes, &formulas)?;
-    Ok(bytes)
-}
-
-/// Write pre-serialized schema bytes + formulas. Bypasses the typed
-/// re-serialize done by `write_schema` — used by the pull driver, which
+/// Write pre-serialized schema bytes + formulas, without a typed
+/// re-serialize — used by the pull driver, which
 /// hands in the codec's canonical JSON Value (noise redacted, formulas
 /// extracted, refs portabilized).
 pub fn write_schema_bytes(
@@ -108,16 +98,6 @@ pub fn read_schema_value(queue_dir: &Path) -> Result<Value> {
     Ok(value)
 }
 
-/// Read a schema from disk into a typed `Schema`. Convenience wrapper
-/// around `read_schema_value` + typed deserialize.
-pub fn read_schema(queue_dir: &Path) -> Result<Schema> {
-    let value = read_schema_value(queue_dir)?;
-    let json_path = queue_dir.join("schema.json");
-    let schema: Schema = serde_json::from_value(value)
-        .with_context(|| format!("deserializing schema from {}", json_path.display()))?;
-    Ok(schema)
-}
-
 /// Walk schema `content[]`, extract every datapoint `formula` (removing it
 /// from the JSON), and return `(field_id, code_bytes)` sorted by id.
 fn split_schema_formulas(value: &mut Value) -> Vec<(String, Vec<u8>)> {
@@ -149,7 +129,6 @@ pub fn serialize_schema(schema: &Schema) -> Result<SchemaJsonAndFormulas> {
 
     Ok((bytes, formulas))
 }
-
 
 /// Walk the on-disk `<queue_dir>/formulas/` directory and return
 /// `(field_id, bytes)` pairs sorted by `field_id`. Returns an empty vec if the
@@ -292,6 +271,26 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::TempDir;
+
+    /// Write a schema to `<queue_dir>/schema.json`, extracting any formula field
+    /// `formula` strings into `<queue_dir>/formulas/<field_id>.py` files.
+    /// Returns the post-extraction JSON bytes (used for content_hash via
+    /// `crate::state::schema_combined_hash` together with the formula bytes).
+    fn write_schema(queue_dir: &Path, schema: &Schema) -> Result<Vec<u8>> {
+        let (bytes, formulas) = serialize_schema(schema)?;
+        write_schema_bytes(queue_dir, &bytes, &formulas)?;
+        Ok(bytes)
+    }
+
+    /// Read a schema from disk into a typed `Schema`. Convenience wrapper
+    /// around `read_schema_value` + typed deserialize.
+    fn read_schema(queue_dir: &Path) -> Result<Schema> {
+        let value = read_schema_value(queue_dir)?;
+        let json_path = queue_dir.join("schema.json");
+        let schema: Schema = serde_json::from_value(value)
+            .with_context(|| format!("deserializing schema from {}", json_path.display()))?;
+        Ok(schema)
+    }
 
     fn sample_with_formula() -> Schema {
         let v = json!({

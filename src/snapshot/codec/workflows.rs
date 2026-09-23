@@ -6,16 +6,12 @@ use serde_json::Value;
 
 use crate::paths::Paths;
 use crate::snapshot::codec::{DiskArtifact, KindCodec};
-use crate::snapshot::create::{strip_for_create, strip_for_cross_env_patch};
+use crate::snapshot::create::strip_for_cross_env_patch;
 use crate::snapshot::key_order::strip_hidden_fields;
 
 pub struct Workflows;
 
 impl KindCodec for Workflows {
-    fn kind(&self) -> &'static str {
-        "workflows"
-    }
-
     fn disk_bytes(&self, value: &Value) -> anyhow::Result<DiskArtifact> {
         let mut v = value.clone();
         // No redaction for workflows — `redact_on_pull("workflows")` is empty.
@@ -26,10 +22,6 @@ impl KindCodec for Workflows {
             json,
             sidecars: vec![],
         })
-    }
-
-    fn create_body(&self, body: &mut Value) {
-        strip_for_create(body, "workflows");
     }
 
     fn cross_env_body(&self, body: &mut Value) {

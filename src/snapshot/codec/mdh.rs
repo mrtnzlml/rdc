@@ -3,7 +3,7 @@
 //! Archetype: **flat plain, pull-only, sidecar-free**, with a kind-specific
 //! server-managed-field strip moved here from the pull driver
 //! (`src/cli/pull/mdh.rs`). Creating / cross-env-deploying index sets is not
-//! an rdc push kind, so `create_body` / `cross_env_body` are no-ops.
+//! an rdc push kind, so `cross_env_body` is a no-op.
 //!
 //! `disk_bytes` takes the index set as a `serde_json::Value`, deserializes it
 //! into the typed `IndexSet`, strips server-managed fields, and re-serializes —
@@ -27,10 +27,6 @@ use crate::snapshot::key_order::strip_hidden_fields;
 pub struct Mdh;
 
 impl KindCodec for Mdh {
-    fn kind(&self) -> &'static str {
-        "mdh"
-    }
-
     fn disk_bytes(&self, value: &Value) -> anyhow::Result<DiskArtifact> {
         // Deserialize into the typed set, apply the same server-managed strip
         // the pull driver applied before writing `indexes.json`, then
@@ -52,11 +48,6 @@ impl KindCodec for Mdh {
             json,
             sidecars: vec![],
         })
-    }
-
-    fn create_body(&self, _body: &mut Value) {
-        // Pull-only kind: index sets are reconciled by the MDH-specific push
-        // path, not the generic create-body flow. No-op.
     }
 
     fn cross_env_body(&self, _body: &mut Value) {
@@ -168,11 +159,6 @@ mod tests {
     }
 
     #[test]
-    fn kind_is_mdh() {
-        assert_eq!(Mdh.kind(), "mdh");
-    }
-
-    #[test]
     fn id_and_v_stripped_from_disk() {
         let art = Mdh.disk_bytes(&raw_index_set()).unwrap();
         assert!(art.sidecars.is_empty(), "mdh index set is sidecar-free");
@@ -207,14 +193,9 @@ mod tests {
     }
 
     #[test]
-    fn create_and_cross_env_bodies_are_noops() {
+    fn cross_env_body_is_a_noop() {
         let before = raw_index_set();
         let mut v = before.clone();
-        Mdh.create_body(&mut v);
-        assert_eq!(
-            v, before,
-            "create_body must be a no-op for the pull-only mdh kind"
-        );
         Mdh.cross_env_body(&mut v);
         assert_eq!(v, before, "cross_env_body must be a no-op");
     }

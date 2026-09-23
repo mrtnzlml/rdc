@@ -41,38 +41,6 @@ fn runtime_to_extension(runtime: &str) -> &'static str {
     }
 }
 
-/// Write a hook to disk: a JSON file under `<dir>/<slug>.json` and, if the hook
-/// has inline code, a sibling `<slug>.<ext>` file. The extension is derived
-/// from `config.runtime` — `.js` for Node.js runtimes (anything starting
-/// with `node`, case-insensitive), `.py` otherwise. The `code` field of
-/// `config` is stripped from the JSON to avoid duplication; the sidecar
-/// file becomes the source of truth.
-///
-/// If a stale sidecar with the *other* extension exists (e.g. a `.py`
-/// from when the hook used Python), it is removed so the snapshot stays
-/// canonical.
-///
-/// Returns the JSON bytes written (post-extraction, with trailing newline).
-pub fn write_hook(dir: &Path, slug: &str, hook: &Hook) -> Result<Vec<u8>> {
-    let (json_bytes, code) = serialize_hook(hook)?;
-    write_atomic(&dir.join(format!("{slug}.json")), &json_bytes)?;
-    let ext = hook_code_extension(hook);
-    if let Some(code) = code {
-        // Write code bytes exactly as received. Preserves byte-exact round-trip
-        // through the codec (read_hook returns Hook with identical config.code).
-        write_atomic(&dir.join(format!("{slug}.{ext}")), code.as_bytes())?;
-    }
-    // Sweep a stale sidecar with the opposite extension (runtime change,
-    // or a botched manual edit). The current sidecar — if any — is the
-    // canonical form for this runtime.
-    let other_ext = other_extension(ext);
-    let stale = dir.join(format!("{slug}.{other_ext}"));
-    if stale.exists() {
-        let _ = std::fs::remove_file(&stale);
-    }
-    Ok(json_bytes)
-}
-
 /// Remove `config.code` (a string) from a serialized hook Value and return
 /// it for the sidecar.
 fn split_hook_code(json_value: &mut Value) -> Option<String> {
@@ -167,7 +135,7 @@ pub fn write_hook_code(dir: &Path, slug: &str, code: &str, ext: &str) -> Result<
 /// If the runtime-derived sidecar is missing, falls back to the *other*
 /// extension. This is defensive — it handles the case where a user
 /// switched `config.runtime` in JSON but hasn't renamed the sidecar yet.
-/// The next `write_hook` normalizes the layout.
+/// The next pull or push write-back normalizes the layout.
 pub fn read_hook_value(dir: &Path, slug: &str) -> Result<Value> {
     let json_path = dir.join(format!("{slug}.json"));
     let raw = std::fs::read_to_string(&json_path)
@@ -190,7 +158,7 @@ pub fn read_hook_value(dir: &Path, slug: &str) -> Result<Value> {
     if let Some(p) = code_path {
         let code =
             std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
-        // The sidecar file is the byte-exact canonical form (write_hook
+        // The sidecar file is the byte-exact canonical form (every writer
         // preserves bytes). No trailing-newline normalization on read either.
         if let Some(config) = value.get_mut("config").and_then(|c| c.as_object_mut()) {
             config.insert("code".to_string(), Value::String(code));
@@ -198,20 +166,6 @@ pub fn read_hook_value(dir: &Path, slug: &str) -> Result<Value> {
     }
 
     Ok(value)
-}
-
-/// Read a hook back from disk into a typed `Hook`. Splices the sidecar
-/// code file (`.py` or `.js`) back into `config.code` first, so the
-/// in-memory `Hook` is byte-for-byte equivalent to what was originally
-/// serialized. Fails if required typed fields are missing — callers that
-/// need to mutate the untyped JSON before typing should use
-/// `read_hook_value` + `from_value` instead.
-pub fn read_hook(dir: &Path, slug: &str) -> Result<Hook> {
-    let value = read_hook_value(dir, slug)?;
-    let json_path = dir.join(format!("{slug}.json"));
-    let hook: Hook = serde_json::from_value(value)
-        .with_context(|| format!("deserializing hook from {}", json_path.display()))?;
-    Ok(hook)
 }
 
 /// Helper: given one of `"py"` / `"js"`, return the other. Used when
@@ -226,6 +180,52 @@ mod tests {
     use crate::model::Hook;
     use serde_json::json;
     use tempfile::TempDir;
+
+    /// Write a hook to disk: a JSON file under `<dir>/<slug>.json` and, if the hook
+    /// has inline code, a sibling `<slug>.<ext>` file. The extension is derived
+    /// from `config.runtime` — `.js` for Node.js runtimes (anything starting
+    /// with `node`, case-insensitive), `.py` otherwise. The `code` field of
+    /// `config` is stripped from the JSON to avoid duplication; the sidecar
+    /// file becomes the source of truth.
+    ///
+    /// If a stale sidecar with the *other* extension exists (e.g. a `.py`
+    /// from when the hook used Python), it is removed so the snapshot stays
+    /// canonical.
+    ///
+    /// Returns the JSON bytes written (post-extraction, with trailing newline).
+    fn write_hook(dir: &Path, slug: &str, hook: &Hook) -> Result<Vec<u8>> {
+        let (json_bytes, code) = serialize_hook(hook)?;
+        write_atomic(&dir.join(format!("{slug}.json")), &json_bytes)?;
+        let ext = hook_code_extension(hook);
+        if let Some(code) = code {
+            // Write code bytes exactly as received. Preserves byte-exact round-trip
+            // through the codec (read_hook returns Hook with identical config.code).
+            write_atomic(&dir.join(format!("{slug}.{ext}")), code.as_bytes())?;
+        }
+        // Sweep a stale sidecar with the opposite extension (runtime change,
+        // or a botched manual edit). The current sidecar — if any — is the
+        // canonical form for this runtime.
+        let other_ext = other_extension(ext);
+        let stale = dir.join(format!("{slug}.{other_ext}"));
+        if stale.exists() {
+            let _ = std::fs::remove_file(&stale);
+        }
+        Ok(json_bytes)
+    }
+
+    /// Read a hook back from disk into a typed `Hook`. Splices the sidecar
+    /// code file (`.py` or `.js`) back into `config.code` first, so the
+    /// in-memory `Hook` is byte-for-byte equivalent to what was originally
+    /// serialized. Fails if required typed fields are missing — callers that
+    /// need to mutate the untyped JSON before typing should use
+    /// `read_hook_value` + `from_value` instead.
+    fn read_hook(dir: &Path, slug: &str) -> Result<Hook> {
+        let value = read_hook_value(dir, slug)?;
+        let json_path = dir.join(format!("{slug}.json"));
+        let hook: Hook = serde_json::from_value(value)
+            .with_context(|| format!("deserializing hook from {}", json_path.display()))?;
+        Ok(hook)
+    }
 
     fn sample_hook() -> Hook {
         let v = json!({

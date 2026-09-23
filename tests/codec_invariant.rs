@@ -637,7 +637,7 @@ fn workspaces_invariants() {
 }
 
 /// Engine fields: no redaction, no sidecars, modified_at stripped.
-/// `name` kept by create_body but stripped by cross_env_body.
+/// `name` kept by strip_for_create but stripped by cross_env_body.
 #[test]
 fn engine_fields_invariants() {
     let c = codec("engine_fields").expect("engine_fields codec must be registered");
@@ -659,12 +659,12 @@ fn engine_fields_invariants() {
         "engine_fields must produce no sidecars"
     );
 
-    // create_body keeps name
+    // strip_for_create keeps name
     let mut body = v.clone();
-    c.create_body(&mut body);
+    rdc::snapshot::create::strip_for_create(&mut body, "engine_fields");
     assert!(
         body.get("name").is_some(),
-        "create_body must keep name for engine_fields"
+        "strip_for_create must keep name for engine_fields"
     );
 
     // cross_env_body strips name
@@ -723,7 +723,7 @@ fn workflow_steps_invariants() {
 }
 
 /// Inboxes: no redaction, no sidecars, modified_at stripped,
-/// email stripped by create_body.
+/// email stripped by strip_for_create.
 #[test]
 fn inboxes_invariants() {
     let c = codec("inboxes").expect("inboxes codec must be registered");
@@ -742,17 +742,17 @@ fn inboxes_invariants() {
     );
     assert!(art.sidecars.is_empty(), "inboxes must produce no sidecars");
 
-    // Verify create_body strips the email field.
+    // Verify strip_for_create strips the email field.
     let mut body = v.clone();
-    c.create_body(&mut body);
+    rdc::snapshot::create::strip_for_create(&mut body, "inboxes");
     assert!(
         body.get("email").is_none(),
-        "create_body must strip the server-assigned email field"
+        "strip_for_create must strip the server-assigned email field"
     );
 }
 
 /// Email templates: no redaction, no sidecars, modified_at stripped,
-/// triggers stripped by create_body.
+/// triggers stripped by strip_for_create.
 #[test]
 fn email_templates_invariants() {
     let c = codec("email_templates").expect("email_templates codec must be registered");
@@ -774,18 +774,17 @@ fn email_templates_invariants() {
         "email_templates must produce no sidecars"
     );
 
-    // Verify create_body strips triggers.
+    // Verify strip_for_create strips triggers.
     let mut body = v.clone();
-    c.create_body(&mut body);
+    rdc::snapshot::create::strip_for_create(&mut body, "email_templates");
     assert!(
         body.get("triggers").is_none(),
-        "create_body must strip the non-deployable triggers sub-resource"
+        "strip_for_create must strip the non-deployable triggers sub-resource"
     );
 }
 
 /// Organization: no redaction, no sidecars, modified_at stripped recursively,
-/// create_body is a no-op (rdc never POSTs an organization), and
-/// cross_env_body retains only `settings` (so `migrate` can promote that
+/// and cross_env_body retains only `settings` (so `migrate` can promote that
 /// subtree while `reconcile_target_identity` restores the target's own
 /// identity, `ui_settings`, and `metadata`).
 #[test]
@@ -809,18 +808,11 @@ fn organization_invariants() {
         "organization must produce no sidecars"
     );
 
-    // rdc never creates an organization.
-    let mut body = v.clone();
-    c.create_body(&mut body);
-    assert_eq!(
-        body, v,
-        "create_body must be a no-op: rdc never POSTs an organization"
-    );
-
     // Cross-env promotion carries `settings` and nothing else — everything
     // else (id, url, name, users, the stamps, ...) is either read-only or
     // per-env state that `reconcile_target_identity` restores from the
     // target's own organization.json.
+    let mut body = v.clone();
     c.cross_env_body(&mut body);
     assert_eq!(
         body,
@@ -830,7 +822,7 @@ fn organization_invariants() {
 }
 
 /// MDH: `_id_` and `v` stripped from disk bytes; no sidecars; no-op
-/// create/cross_env bodies.
+/// cross_env body.
 #[test]
 fn mdh_invariants() {
     let c = codec("mdh").expect("mdh codec must be registered");
@@ -853,13 +845,8 @@ fn mdh_invariants() {
     );
     assert!(art.sidecars.is_empty(), "mdh must produce no sidecars");
 
-    // Pull-only: create_body and cross_env_body must not change the value.
+    // Pull-only: cross_env_body must not change the value.
     let mut body = v.clone();
-    c.create_body(&mut body);
-    assert_eq!(
-        body, v,
-        "create_body must be a no-op for the pull-only mdh kind"
-    );
     c.cross_env_body(&mut body);
     assert_eq!(
         body, v,

@@ -24,8 +24,6 @@
 //! and hiding fields on disk therefore does NOT produce drift on the
 //! next sync.
 
-use anyhow::{Context, Result};
-use serde::Serialize;
 use serde_json::Value;
 
 /// Server-managed keys removed from on-disk JSON before write. Both are
@@ -86,18 +84,6 @@ pub fn contains_hidden_fields(bytes: &[u8]) -> bool {
     value
         .as_object()
         .is_some_and(|map| HIDDEN_FIELDS.iter().any(|f| map.contains_key(*f)))
-}
-
-/// Serialize a typed value to canonical on-disk JSON bytes: convert via
-/// `to_value`, strip hidden fields, write pretty + trailing newline.
-/// Used by snapshot writers that don't need any per-kind extras (key
-/// ordering, code extraction) on top.
-pub fn serialize_for_disk(typed: &impl Serialize) -> Result<Vec<u8>> {
-    let mut value = serde_json::to_value(typed).context("serializing typed value")?;
-    strip_hidden_fields(&mut value);
-    let mut bytes = serde_json::to_vec_pretty(&value).context("serializing JSON")?;
-    bytes.push(b'\n');
-    Ok(bytes)
 }
 
 /// Reorder the top-level object's keys: `important` keys first, in the
@@ -259,23 +245,6 @@ mod tests {
         assert!(!contains_hidden_fields(b""));
     }
 
-    #[test]
-    fn serialize_for_disk_strips_modified_at() {
-        let v = json!({
-            "id": 1,
-            "modified_at": "2026-05-22T08:42:15Z",
-            "name": "n",
-            "modifier": "u",
-        });
-        let bytes = serialize_for_disk(&v).unwrap();
-        let out: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(
-            out,
-            json!({"id": 1, "name": "n", "modifier": "u"}),
-        );
-        // And the trailing newline is added.
-        assert_eq!(bytes.last(), Some(&b'\n'));
-    }
     #[test]
     fn strips_modified_by_from_top_level() {
         let mut v = json!({

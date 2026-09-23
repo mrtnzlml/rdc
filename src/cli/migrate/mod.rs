@@ -2293,8 +2293,9 @@ fn remove_key_everywhere(value: &mut serde_json::Value, key: &str) {
 ///   take the TARGET file's value (or drop the field if the target lacks it).
 ///   The deployable content — everything `cross_env_body` keeps, including
 ///   forward refs like a hook's `queues` — stays the source's.
-/// - **New** (no target file): strip the server-assigned fields to a clean
-///   create payload (`create_body`) so the subsequent `rdc sync` POSTs.
+/// - **New** (no target file): strip the server-assigned fields
+///   (`UNIVERSAL_SERVER_FIELDS`) to a clean create payload so the subsequent
+///   `rdc sync` POSTs.
 ///
 /// Returns whether the object was MATCHED — the target already held it, so
 /// every env field in `value` is now the target's own. `transform_file` needs

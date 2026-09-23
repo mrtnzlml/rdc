@@ -8,16 +8,12 @@ use serde_json::Value;
 use crate::overlay::Overlay;
 use crate::paths::Paths;
 use crate::snapshot::codec::{DiskArtifact, KindCodec};
-use crate::snapshot::create::{strip_for_create, strip_for_cross_env_patch};
+use crate::snapshot::create::strip_for_cross_env_patch;
 use crate::snapshot::key_order::strip_hidden_fields;
 
 pub struct Labels;
 
 impl KindCodec for Labels {
-    fn kind(&self) -> &'static str {
-        "labels"
-    }
-
     fn disk_bytes(&self, value: &Value) -> anyhow::Result<DiskArtifact> {
         let mut v = value.clone();
         strip_hidden_fields(&mut v);
@@ -27,10 +23,6 @@ impl KindCodec for Labels {
             json,
             sidecars: vec![],
         })
-    }
-
-    fn create_body(&self, body: &mut Value) {
-        strip_for_create(body, "labels");
     }
 
     fn cross_env_body(&self, body: &mut Value) {

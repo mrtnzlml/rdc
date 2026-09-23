@@ -8,16 +8,12 @@ use serde_json::Value;
 use crate::overlay::Overlay;
 use crate::paths::Paths;
 use crate::snapshot::codec::{DiskArtifact, KindCodec};
-use crate::snapshot::create::{redact_for_disk, strip_for_create, strip_for_cross_env_patch};
+use crate::snapshot::create::{redact_for_disk, strip_for_cross_env_patch};
 use crate::snapshot::key_order::strip_hidden_fields;
 
 pub struct Engines;
 
 impl KindCodec for Engines {
-    fn kind(&self) -> &'static str {
-        "engines"
-    }
-
     fn disk_bytes(&self, value: &Value) -> anyhow::Result<DiskArtifact> {
         let mut v = value.clone();
         redact_for_disk(&mut v, "engines");
@@ -28,10 +24,6 @@ impl KindCodec for Engines {
             json,
             sidecars: vec![],
         })
-    }
-
-    fn create_body(&self, body: &mut Value) {
-        strip_for_create(body, "engines");
     }
 
     fn cross_env_body(&self, body: &mut Value) {

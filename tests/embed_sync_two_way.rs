@@ -1,5 +1,5 @@
 //! A locally-edited object is PUSHED by `sync_logged`'s default options,
-//! where `sync_no_push` (tests/embed_sync.rs) leaves it alone. This is the
+//! where `no_push: true` (tests/embed_sync.rs) leaves it alone. This is the
 //! behaviour change the desktop app is adopting; pinned here so it cannot
 //! regress into silence.
 

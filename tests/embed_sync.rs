@@ -1,7 +1,7 @@
 //! End-to-end test of the embedding entry point against a wiremock'd
-//! Rossum. Exercises a no-push pull into a tempdir.
+//! Rossum. Exercises a no-push, non-interactive pull into a tempdir.
 
-use rdc::cli::sync::embed::sync_no_push;
+use rdc::cli::sync::embed::{sync_logged, EmbedSyncOptions};
 use tempfile::tempdir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -49,9 +49,10 @@ org_id = 1
     )
     .unwrap();
 
-    sync_no_push(cwd, "main", "fake-token")
+    let opts = EmbedSyncOptions { interactive: false, no_push: true, ..Default::default() };
+    sync_logged(cwd, "main", "fake-token", opts, Box::new(std::io::sink()))
         .await
-        .expect("sync_no_push succeeds");
+        .expect("no-push sync succeeds");
 
     assert!(cwd.join("envs/main/_index.md").exists());
     assert!(cwd.join("envs/main/organization.json").exists());

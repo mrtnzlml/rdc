@@ -28,16 +28,12 @@ use serde_json::Value;
 use crate::overlay::Overlay;
 use crate::paths::Paths;
 use crate::snapshot::codec::{DiskArtifact, KindCodec};
-use crate::snapshot::create::{strip_for_create, strip_for_cross_env_patch};
+use crate::snapshot::create::strip_for_cross_env_patch;
 use crate::snapshot::key_order::strip_hidden_fields;
 
 pub struct EmailTemplates;
 
 impl KindCodec for EmailTemplates {
-    fn kind(&self) -> &'static str {
-        "email_templates"
-    }
-
     fn disk_bytes(&self, value: &Value) -> anyhow::Result<DiskArtifact> {
         // Flat plain: no per-kind redaction (email_templates has no entry in
         // `create::redact_on_pull`). Only the universal hidden-field strip
@@ -50,13 +46,6 @@ impl KindCodec for EmailTemplates {
             json,
             sidecars: vec![],
         })
-    }
-
-    fn create_body(&self, body: &mut Value) {
-        // Strips the universal server fields plus `triggers`: `triggers`
-        // references a sub-resource kind that rdc doesn't pull or deploy,
-        // and shipping src trigger URLs to a target 400s with "Invalid hyperlink".
-        strip_for_create(body, "email_templates");
     }
 
     fn cross_env_body(&self, body: &mut Value) {
@@ -127,17 +116,20 @@ mod tests {
     }
 
     #[test]
-    fn create_body_strips_triggers_and_server_fields() {
+    fn create_strip_removes_triggers_and_server_fields() {
+        // `triggers` references a sub-resource kind that rdc doesn't pull or
+        // deploy; shipping src trigger URLs to a target 400s with "Invalid
+        // hyperlink".
         let mut v = sample_template();
-        EmailTemplates.create_body(&mut v);
+        crate::snapshot::create::strip_for_create(&mut v, "email_templates");
         let obj = v.as_object().unwrap();
         for f in ["id", "url", "modified_at", "triggers"] {
-            assert!(!obj.contains_key(f), "create_body must strip {f}");
+            assert!(!obj.contains_key(f), "the create strip must remove {f}");
         }
-        assert!(obj.contains_key("name"), "name must survive create_body");
+        assert!(obj.contains_key("name"), "name must survive the create strip");
         assert!(
             obj.contains_key("subject"),
-            "subject must survive create_body"
+            "subject must survive the create strip"
         );
     }
 
@@ -150,10 +142,5 @@ mod tests {
                 "/proj/envs/dev/workspaces/invoices-ap/queues/cost-invoices/email-templates/rejection-notice.json"
             )
         );
-    }
-
-    #[test]
-    fn kind_is_email_templates() {
-        assert_eq!(EmailTemplates.kind(), "email_templates");
     }
 }

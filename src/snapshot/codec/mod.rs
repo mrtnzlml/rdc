@@ -5,7 +5,6 @@
 //!
 //! * how the remote API body is transformed into on-disk bytes (`disk_bytes`),
 //! * how the on-disk bytes are hashed for the lockfile (`base_hash`),
-//! * what to strip before a create POST (`create_body`),
 //! * what to strip before a cross-env PATCH (`cross_env_body`),
 //! * which overlay section applies (`overlay`),
 //! * where on disk the primary JSON file lives (`path`).
@@ -53,9 +52,6 @@ pub struct DiskArtifact {
 /// Implementors are zero-sized structs (e.g. `pub struct Engines;`). The
 /// trait is object-safe so `codec()` can return `&'static dyn KindCodec`.
 pub trait KindCodec: Sync {
-    /// The Rossum kind string (e.g. `"engines"`).
-    fn kind(&self) -> &'static str;
-
     /// Transform a remote API body into the canonical on-disk representation.
     fn disk_bytes(&self, value: &Value) -> anyhow::Result<DiskArtifact>;
 
@@ -72,9 +68,6 @@ pub trait KindCodec: Sync {
         let art = self.disk_bytes(value)?;
         Ok(combined_hash(&art.json, &art.sidecars, lockfile))
     }
-
-    /// Strip server-managed fields from `body` before a create POST.
-    fn create_body(&self, body: &mut Value);
 
     /// Strip server-managed fields from `body` before a cross-env PATCH.
     fn cross_env_body(&self, body: &mut Value);

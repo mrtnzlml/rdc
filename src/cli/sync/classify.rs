@@ -22,13 +22,19 @@ pub enum SyncClass {
     BothDeleted,
 }
 
-/// A single classified item with the bytes / hashes needed by the executor.
+/// A single classified item: the class plus the three hashes it was derived
+/// from.
+///
+/// The executor reads only `kind`, `slug`, `class` and `base_hash`.
+/// `local_hash` and `remote_hash` are the classifier's inputs echoed back;
+/// nothing in the sync pipeline reads them — the classify property test and
+/// the sync regression tests do, to check and explain a classification.
 #[derive(Debug, Clone)]
 pub struct ClassifiedItem {
     pub kind: String,
     pub slug: String,
     pub class: SyncClass,
-    /// Hash of the local file (if any) at scan time. Used to detect mid-run drift.
+    /// Hash of the local file (if any) at scan time.
     pub local_hash: Option<String>,
     /// Hash of the remote body (if any) from the listing.
     pub remote_hash: Option<String>,
@@ -38,9 +44,6 @@ pub struct ClassifiedItem {
 
 /// Classify each `(kind, slug)` that appears in any of the three sources
 /// (remote listing, local scan changes/tombstones, lockfile entries).
-///
-/// Stub: Task 5 fills in the six simple classes; Task 6 the both-side cases;
-/// Task 7 the remote-delete + two double-conflict cases.
 pub fn classify(
     remote_hashes: &BTreeMap<(String, String), String>,
     scan_changes: &BTreeMap<(String, String), String>,

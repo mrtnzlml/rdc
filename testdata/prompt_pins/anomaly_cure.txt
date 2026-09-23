@@ -1,4 +1,0 @@
-hooks/master-data-import (id 9137, type function, private, has code) — what should rdc do?
-  Convert it to a custom hook (one PATCH, keeps the same id)
-  Reinstall it from the store (new id, rewires whatever points at it)
-  Leave it alone

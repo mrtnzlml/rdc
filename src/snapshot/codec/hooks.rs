@@ -9,16 +9,12 @@ use crate::model::Hook;
 use crate::overlay::Overlay;
 use crate::paths::Paths;
 use crate::snapshot::codec::{DiskArtifact, KindCodec};
-use crate::snapshot::create::{strip_for_create, strip_for_cross_env_patch};
+use crate::snapshot::create::strip_for_cross_env_patch;
 use crate::snapshot::hook::serialize_hook;
 
 pub struct Hooks;
 
 impl KindCodec for Hooks {
-    fn kind(&self) -> &'static str {
-        "hooks"
-    }
-
     fn disk_bytes(&self, value: &Value) -> anyhow::Result<DiskArtifact> {
         let hook: Hook = serde_json::from_value(value.clone())
             .with_context(|| "deserializing hook from API body")?;
@@ -29,10 +25,6 @@ impl KindCodec for Hooks {
             vec![]
         };
         Ok(DiskArtifact { json, sidecars })
-    }
-
-    fn create_body(&self, body: &mut Value) {
-        strip_for_create(body, "hooks");
     }
 
     fn cross_env_body(&self, body: &mut Value) {

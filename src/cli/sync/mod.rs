@@ -185,8 +185,8 @@ pub async fn run(
 ///
 /// **Caller contract:** the env lock (see `crate::cli::sync::lock::EnvLock`)
 /// MUST be held by the caller for the entire duration of this call.
-/// All three current callers — `cli::sync::run`, `cli::sync::watch::run_watch`,
-/// and `cli::sync::embed::sync_no_push` — acquire it before invoking. New
+/// Every current caller — `cli::sync::run`, the `cli::sync::watch` loop,
+/// and `cli::sync::embed::sync_logged` — acquires it before invoking. New
 /// callers must do the same.
 pub(crate) async fn run_cycle(
     env: &str,

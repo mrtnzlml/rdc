@@ -1206,13 +1206,6 @@ pub enum CombinedFileOutcome {
 }
 
 impl CombinedFileOutcome {
-    /// Borrow the bytes (used by callers to feed the combined-hash
-    /// helper) without consuming the outcome.
-    pub fn bytes(&self) -> &[u8] {
-        match self {
-            CombinedFileOutcome::Resolved(b) | CombinedFileOutcome::PreserveBase(b) => b,
-        }
-    }
     /// Consume and return the bytes.
     pub fn into_bytes(self) -> Vec<u8> {
         match self {
@@ -1443,99 +1436,6 @@ pub fn resolve_push_drift(
     }
 }
 
-/// Cure choice for an anomalous store-extension hook. `Convert` is
-/// the safe default (one PATCH, hook id preserved); `Reinstall` is
-/// the heavier option (new id, dependents rewired); `Skip` leaves
-/// it alone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AnomalyCure {
-    Convert,
-    Reinstall,
-    Skip,
-}
-
-/// The cure picker's question. Shows the `config.private` and has-code
-/// signals so the operator can decide. Composed here for the same reason as
-/// [`token_owner_question`].
-pub(crate) fn anomaly_cure_question(slug: &str, hook: &crate::model::Hook) -> String {
-    let private = hook
-        .config
-        .get("private")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let has_code = hook
-        .config
-        .get("code")
-        .and_then(|v| v.as_str())
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
-    let mut flags = vec![format!("id {}", hook.id), format!("type {}", hook.hook_type)];
-    if private {
-        flags.push("private".to_string());
-    }
-    if has_code {
-        flags.push("has code".to_string());
-    }
-    format!("hooks/{slug} ({}) — what should rdc do?", flags.join(", "))
-}
-
-/// The cure picker's options, in the order the answer index maps to
-/// `Convert` / `Reinstall` / `Skip`.
-///
-/// No `[c]` / `[r]` / `[s]` prefixes, because this is an `inquire::Select`
-/// and they would be a lie: typing filters the list on a case-insensitive
-/// SUBSTRING of the whole label and resets the highlight to the first match,
-/// so `r` matched "Convert" (the "r" in the word) and `s` matched
-/// "preserved" — two of the three advertised letters selected Convert. The
-/// list is answered with the arrow keys and Enter.
-pub(crate) const ANOMALY_CURE_OPTIONS: [&str; 3] = [
-    "Convert it to a custom hook (one PATCH, keeps the same id)",
-    "Reinstall it from the store (new id, rewires whatever points at it)",
-    "Leave it alone",
-];
-
-/// Per-hook interactive prompt. Non-TTY → `Convert` is the default,
-/// unless `RDC_DOCTOR_CURE` env var selects another option:
-/// `"reinstall"` → Reinstall, `"skip"` → Skip. Anything else → Convert.
-pub fn prompt_anomaly_cure(
-    slug: &str,
-    hook: &crate::model::Hook,
-    interactive: bool,
-) -> anyhow::Result<AnomalyCure> {
-    if !interactive {
-        let env_choice = std::env::var("RDC_DOCTOR_CURE").unwrap_or_default();
-        return Ok(match env_choice.as_str() {
-            "reinstall" => AnomalyCure::Reinstall,
-            "skip" => AnomalyCure::Skip,
-            _ => AnomalyCure::Convert,
-        });
-    }
-    // TTY mode: use the project's prompt library (`inquire`).
-    let prompt = anomaly_cure_question(slug, hook);
-    let options = ANOMALY_CURE_OPTIONS.to_vec();
-    use inquire::error::InquireError;
-    // Ctrl-C / Esc → Skip (not error). The caller's loop persists the
-    // lockfile after each successful cure, so mapping cancellation to
-    // Skip lets the operator abort mid-flight without losing
-    // bookkeeping for hooks already fixed — the current hook is left
-    // alone and the loop exits naturally on the next iteration if the
-    // user continues to cancel. Matches the cancel-handling pattern in
-    // `prompt_token_owner`, adapted from `Option<...>` to this fn's
-    // `Result<AnomalyCure>` return shape.
-    let answer = match inquire::Select::new(&prompt, options).raw_prompt() {
-        Ok(opt) => opt,
-        Err(InquireError::OperationCanceled) | Err(InquireError::OperationInterrupted) => {
-            return Ok(AnomalyCure::Skip);
-        }
-        Err(e) => return Err(anyhow::anyhow!("anomaly cure prompt: {e}")),
-    };
-    Ok(match answer.index {
-        0 => AnomalyCure::Convert,
-        1 => AnomalyCure::Reinstall,
-        _ => AnomalyCure::Skip,
-    })
-}
-
 /// Sentinel error type signaling the user picked `[a]bort` at any
 /// resolver prompt (pull or push). The pull / push runner downcasts to
 /// this and skips lockfile.save().
@@ -1678,7 +1578,7 @@ pub fn colorize_dim(text: &str, mode: ColorMode) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::prompt_pin::{Transcript, inquire_shape, pin, redact_tempdir};
+    use crate::cli::prompt_pin::{Transcript, pin, redact_tempdir};
     use std::io::Cursor;
 
 
@@ -1912,12 +1812,12 @@ mod tests {
         std::fs::write(&path, b"same\n").unwrap();
         let progress = crate::log::Log::new(ColorMode::Plain);
         let out = resolve_combined_file(1, 2, ObjectRef { kind: "queues", slug: "invoices" }, &path, b"same\n", b"same\n", true, &paths, &progress).unwrap();
-        assert_eq!(out.bytes(), b"same\n");
         // Bytes-equal sides are a "Resolved" outcome — caller may advance.
         assert!(
             !out.is_preserve_base(),
             "equal bytes must not preserve base"
         );
+        assert_eq!(out.into_bytes(), b"same\n");
         // No shadow file written.
         assert!(!paths.conflict_shadow_path(&path).exists());
     }
@@ -1932,13 +1832,13 @@ mod tests {
         let progress = crate::log::Log::new(ColorMode::Plain);
         let out =
             resolve_combined_file(1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path, b"local\n", b"remote\n", false, &paths, &progress).unwrap();
-        assert_eq!(out.bytes(), b"local\n");
         // Non-interactive shadow-skip MUST signal preserve-base so the
         // caller does not advance the entity's combined hash.
         assert!(
             out.is_preserve_base(),
             "non-interactive shadow-fallback must signal preserve-base"
         );
+        assert_eq!(out.into_bytes(), b"local\n");
         assert_eq!(
             std::fs::read(paths.conflict_shadow_path(&path)).unwrap(),
             b"remote\n"
@@ -3447,28 +3347,5 @@ mod tests {
 
         let actual = redact_tempdir(&t.text(), dir.path());
         pin("remote_delete_bulk", &actual);
-    }
-
-
-    /// Same `inquire` shape for the doctor's per-hook cure picker.
-    #[test]
-    fn anomaly_cure_prompt_text_is_pinned() {
-        let hook: crate::model::Hook = serde_json::from_value(serde_json::json!({
-            "id": 9137,
-            "url": "https://api.example.com/v1/hooks/9137",
-            "name": "Master data import",
-            "type": "function",
-            "config": {
-                "private": true,
-                "code": "def rossum_hook_request_handler(payload):\n    return {}\n"
-            }
-        }))
-        .unwrap();
-
-        let options: Vec<String> = ANOMALY_CURE_OPTIONS.iter().map(|s| s.to_string()).collect();
-        pin(
-            "anomaly_cure",
-            &inquire_shape(&anomaly_cure_question("master-data-import", &hook), &options),
-        );
     }
 }

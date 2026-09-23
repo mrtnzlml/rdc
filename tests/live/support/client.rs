@@ -165,22 +165,21 @@ impl LiveClient {
         Ok((id, url))
     }
 
+    /// DELETE through the same generic `delete_path` that `rdc sync`'s
+    /// delete phase uses; `RossumClient` has no per-kind delete wrappers.
     pub async fn delete(&self, kind: &str, id: u64) -> Result<()> {
         match kind {
-            "workspace" => self.inner.delete_workspace(id, None).await,
-            "queue" => self.inner.delete_queue(id, None).await,
-            "schema" => self.inner.delete_schema(id, None).await,
-            "hook" => self.inner.delete_hook(id, None).await,
-            "inbox" => self.inner.delete_inbox(id, None).await,
-            "label" => self.inner.delete_label(id, None).await,
-            "rule" => self.inner.delete_rule(id, None).await,
-            "email_template" => self.inner.delete_email_template(id, None).await,
-            // No `delete_saved_view` on `RossumClient` — `rdc` itself deletes
-            // saved views through the generic `delete_path`, and this test
-            // client does the same rather than adding a one-off wrapper.
+            "workspace" => self.inner.delete_path(&format!("/workspaces/{id}"), None).await,
+            "queue" => self.inner.delete_path(&format!("/queues/{id}"), None).await,
+            "schema" => self.inner.delete_path(&format!("/schemas/{id}"), None).await,
+            "hook" => self.inner.delete_path(&format!("/hooks/{id}"), None).await,
+            "inbox" => self.inner.delete_path(&format!("/inboxes/{id}"), None).await,
+            "label" => self.inner.delete_path(&format!("/labels/{id}"), None).await,
+            "rule" => self.inner.delete_path(&format!("/rules/{id}"), None).await,
+            "email_template" => self.inner.delete_path(&format!("/email_templates/{id}"), None).await,
             "saved_view" => self.inner.delete_path(&format!("/saved_views/{id}"), None).await,
-            "engine" => self.inner.delete_engine(id, None).await,
-            "engine_field" => self.inner.delete_engine_field(id, None).await,
+            "engine" => self.inner.delete_path(&format!("/engines/{id}"), None).await,
+            "engine_field" => self.inner.delete_path(&format!("/engine_fields/{id}"), None).await,
             other => Err(anyhow!("delete: unsupported kind '{other}'")),
         }
     }

@@ -5,19 +5,11 @@ pub enum ApiError {
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
 
-    /// HTTP failure. `env` is the rdc env name (e.g. `"dev-eu"`) the
-    /// failing call was made against, when the client knows it; it's
-    /// `None` for code paths that don't carry an env label. Surfacing the
-    /// env lets a caller that holds more than one client (a src + tgt pair)
-    /// attribute a 401 back to the right env on retry. No command does today
-    /// — `rdc migrate` is pure-local and every other command drives a single
-    /// env — so the label is unset in practice; see
-    /// [`crate::api::RossumClient::with_env_label`].
-    #[error("{}", render_status(*status, body, env.as_deref()))]
+    /// HTTP failure: the status code and the raw response body.
+    #[error("{}", render_status(*status, body))]
     Status {
         status: u16,
         body: String,
-        env: Option<String>,
     },
 
     #[error("response body could not be decoded as JSON: {0}")]
@@ -34,9 +26,8 @@ pub enum ApiError {
 /// `{"detail": …}` with a non-string value, non-JSON) falls back to the
 /// original verbatim form, so programmatic callers and unknown shapes are
 /// unaffected.
-fn render_status(status: u16, body: &str, env: Option<&str>) -> String {
-    let env_note = env.map(|e| format!(" (env '{e}')")).unwrap_or_default();
-    let header = format!("Rossum API{env_note} returned status {status}");
+fn render_status(status: u16, body: &str) -> String {
+    let header = format!("Rossum API returned status {status}");
     match parse_field_errors(body) {
         Some(fields) if !fields.is_empty() => {
             let mut out = format!("{header}:");
@@ -105,18 +96,6 @@ pub fn anyhow_has_status(err: &anyhow::Error, code: u16) -> bool {
     })
 }
 
-/// If the chain carries an `ApiError::Status` matching `code` AND that
-/// status was tagged with an `env`, return the env name. Used by deploy's
-/// two-env retry wrapper to attribute a 401 to either src or tgt.
-pub fn anyhow_status_env(err: &anyhow::Error, code: u16) -> Option<String> {
-    err.chain().find_map(|c| {
-        c.downcast_ref::<ApiError>().and_then(|api| match api {
-            ApiError::Status { status, env, .. } if *status == code => env.clone(),
-            _ => None,
-        })
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,7 +106,6 @@ mod tests {
         let err: anyhow::Error = anyhow!(ApiError::Status {
             status: 405,
             body: "method_not_allowed".into(),
-            env: None,
         });
         assert!(anyhow_has_status(&err, 405));
         assert!(!anyhow_has_status(&err, 403));
@@ -138,7 +116,6 @@ mod tests {
         let inner: anyhow::Error = anyhow!(ApiError::Status {
             status: 403,
             body: "forbidden".into(),
-            env: None,
         });
         let wrapped = inner.context("listing engines to verify no drift");
         assert!(anyhow_has_status(&wrapped, 403));
@@ -151,33 +128,10 @@ mod tests {
     }
 
     #[test]
-    fn anyhow_status_env_extracts_tag_for_matching_status() {
-        let err: anyhow::Error = anyhow!(ApiError::Status {
-            status: 401,
-            body: "Invalid token.".into(),
-            env: Some("test-eu".into()),
-        });
-        let wrapped = err.context("listing tgt hook templates for plan output");
-        assert_eq!(anyhow_status_env(&wrapped, 401).as_deref(), Some("test-eu"));
-        assert_eq!(anyhow_status_env(&wrapped, 403), None);
-    }
-
-    #[test]
-    fn anyhow_status_env_returns_none_when_status_has_no_env() {
-        let err: anyhow::Error = anyhow!(ApiError::Status {
-            status: 401,
-            body: "Invalid token.".into(),
-            env: None,
-        });
-        assert_eq!(anyhow_status_env(&err, 401), None);
-    }
-
-    #[test]
     fn status_display_unpacks_field_errors_with_hint() {
         let err = ApiError::Status {
             status: 400,
             body: r#"{"token_owner":["Invalid hyperlink - Object does not exist."]}"#.into(),
-            env: None,
         };
         let msg = err.to_string();
         assert!(msg.contains("returned status 400"), "{msg}");
@@ -194,10 +148,8 @@ mod tests {
         let err = ApiError::Status {
             status: 400,
             body: r#"{"name":["This field may not be blank."],"queues":["Invalid hyperlink - No URL match."]}"#.into(),
-            env: Some("prod".into()),
         };
         let msg = err.to_string();
-        assert!(msg.contains("(env 'prod')"), "{msg}");
         assert!(msg.contains("name: This field may not be blank."), "{msg}");
         assert!(msg.contains("queues: Invalid hyperlink - No URL match."), "{msg}");
     }
@@ -209,16 +161,14 @@ mod tests {
         let plain = ApiError::Status {
             status: 500,
             body: "Internal Server Error".into(),
-            env: Some("prod".into()),
         };
         assert_eq!(
             plain.to_string(),
-            "Rossum API (env 'prod') returned status 500: Internal Server Error"
+            "Rossum API returned status 500: Internal Server Error"
         );
         let nested = ApiError::Status {
             status: 400,
             body: r#"{"config":{"url":["bad"]}}"#.into(),
-            env: None,
         };
         assert_eq!(
             nested.to_string(),

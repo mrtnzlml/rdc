@@ -15,7 +15,7 @@ use crate::model::Rule;
 use crate::overlay::Overlay;
 use crate::paths::Paths;
 use crate::snapshot::codec::{DiskArtifact, KindCodec};
-use crate::snapshot::create::{strip_for_create, strip_for_cross_env_patch};
+use crate::snapshot::create::strip_for_cross_env_patch;
 use crate::snapshot::rule::serialize_rule;
 
 use anyhow::Context as _;
@@ -23,10 +23,6 @@ use anyhow::Context as _;
 pub struct Rules;
 
 impl KindCodec for Rules {
-    fn kind(&self) -> &'static str {
-        "rules"
-    }
-
     fn disk_bytes(&self, value: &Value) -> anyhow::Result<DiskArtifact> {
         let rule: Rule = serde_json::from_value(value.clone())
             .with_context(|| "deserializing rule from API body")?;
@@ -37,10 +33,6 @@ impl KindCodec for Rules {
             vec![]
         };
         Ok(DiskArtifact { json, sidecars })
-    }
-
-    fn create_body(&self, body: &mut Value) {
-        strip_for_create(body, "rules");
     }
 
     fn cross_env_body(&self, body: &mut Value) {

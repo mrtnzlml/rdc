@@ -7,9 +7,9 @@
 //!
 //! The caller supplies both explicitly. Everything else (fetch, decode,
 //! atomic write, lockfile, `_index.md`) reuses the existing sync/watch
-//! pipeline — [`sync_no_push`] runs it pull-only and non-interactive,
-//! [`sync_logged`] runs it under caller-supplied [`EmbedSyncOptions`]
-//! (two-way by default), and [`watch_logged`] runs it in a loop.
+//! pipeline — [`sync_logged`] runs it once under caller-supplied
+//! [`EmbedSyncOptions`] (two-way by default), and [`watch_logged`] runs it
+//! in a loop.
 
 use crate::cli::resolve::ConflictStrategy;
 use crate::cli::sync::CycleOutcome;
@@ -28,35 +28,6 @@ use std::time::Duration;
 /// only these five names are re-exported.
 pub use crate::cli::change_view::menu_one_line;
 pub use crate::cli::stdin_coord::{Prompt, PromptKey, PromptKind, PromptRoute, with_route};
-
-/// Run one no-push reconciliation cycle.
-///
-/// - `cwd`: project root containing `rdc.toml`.
-/// - `env`: env name (the desktop app always uses `"main"`).
-/// - `token`: pre-resolved API token; the secrets file is not touched.
-///
-/// Returns `CycleOutcome` with per-class counts. Errors propagate as
-/// `anyhow::Error`; the caller surfaces them to the user.
-pub async fn sync_no_push(cwd: &Path, env: &str, token: &str) -> Result<CycleOutcome> {
-    let paths = crate::paths::Paths::for_env(cwd, env);
-    let _lock = crate::cli::sync::lock::EnvLock::acquire(
-        &paths.env_lock(),
-        std::time::Duration::from_secs(30),
-    )?;
-    crate::cli::sync::run_cycle(
-        env,
-        false, // interactive
-        false, // dry_run
-        false, // allow_deletes
-        true,  // no_push  <-- the embedding contract
-        false, // no_pull
-        None,  // conflict_strategy (embedding never resolves BothDiverged interactively)
-        None,
-        Some(cwd),
-        Some(token.to_string()),
-    )
-    .await
-}
 
 /// How an embedder wants one reconciliation cycle run.
 ///

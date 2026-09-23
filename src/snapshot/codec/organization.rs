@@ -1,7 +1,7 @@
 //! [`KindCodec`] implementation for the `organization` kind.
 //!
 //! Archetype: **flat plain, pull-only**. There is exactly one organization per
-//! env, so rdc never *creates* it (`create_body` is a no-op). `migrate` walks
+//! env, so rdc never *creates* it. `migrate` walks
 //! it as a promotable object (`envs/<env>/organization.json`, slug `"self"`).
 //! `cross_env_body` defines what that cross-env promotion is allowed to carry
 //! — only the `settings` subtree, so identity/branding fields stay the
@@ -26,10 +26,6 @@ use crate::snapshot::key_order::strip_hidden_fields;
 pub struct Organization;
 
 impl KindCodec for Organization {
-    fn kind(&self) -> &'static str {
-        "organization"
-    }
-
     fn disk_bytes(&self, value: &Value) -> anyhow::Result<DiskArtifact> {
         // Flat plain: no per-kind redaction (organization has no entry in
         // `create::redact_on_pull`). Only the universal hidden-field strip
@@ -42,10 +38,6 @@ impl KindCodec for Organization {
             json,
             sidecars: vec![],
         })
-    }
-
-    fn create_body(&self, _body: &mut Value) {
-        // Pull-only kind: rdc never POSTs an organization. No-op.
     }
 
     fn cross_env_body(&self, body: &mut Value) {
@@ -135,14 +127,6 @@ mod tests {
     }
 
     #[test]
-    fn create_body_is_a_noop() {
-        let before = org_value();
-        let mut v = before.clone();
-        Organization.create_body(&mut v);
-        assert_eq!(v, before, "create_body must be a no-op: rdc never POSTs an organization");
-    }
-
-    #[test]
     fn cross_env_body_retains_only_settings() {
         let mut v = org_value();
         v["ui_settings"] = json!({ "theme": "white" });
@@ -168,11 +152,6 @@ mod tests {
         let expected = std::path::Path::new("/proj/envs/dev/organization.json");
         assert_eq!(Organization.path(&paths, "self"), expected);
         assert_eq!(Organization.path(&paths, "ignored"), expected);
-    }
-
-    #[test]
-    fn kind_is_organization() {
-        assert_eq!(Organization.kind(), "organization");
     }
 
     #[test]

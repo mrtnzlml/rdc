@@ -15,16 +15,12 @@ use serde_json::Value;
 use crate::overlay::Overlay;
 use crate::paths::Paths;
 use crate::snapshot::codec::{DiskArtifact, KindCodec};
-use crate::snapshot::create::{strip_for_create, strip_for_cross_env_patch};
+use crate::snapshot::create::strip_for_cross_env_patch;
 use crate::snapshot::key_order::strip_hidden_fields;
 
 pub struct Inboxes;
 
 impl KindCodec for Inboxes {
-    fn kind(&self) -> &'static str {
-        "inboxes"
-    }
-
     fn disk_bytes(&self, value: &Value) -> anyhow::Result<DiskArtifact> {
         let mut v = value.clone();
         strip_hidden_fields(&mut v);
@@ -34,12 +30,6 @@ impl KindCodec for Inboxes {
             json,
             sidecars: vec![],
         })
-    }
-
-    fn create_body(&self, body: &mut Value) {
-        // strip_for_create for "inboxes" removes the server-assigned `email`
-        // address along with the universal server fields (id, url, modified_at …).
-        strip_for_create(body, "inboxes");
     }
 
     fn cross_env_body(&self, body: &mut Value) {
@@ -105,19 +95,18 @@ mod tests {
     }
 
     #[test]
-    fn email_stripped_by_create_body() {
-        let codec = Inboxes;
+    fn email_stripped_by_create_strip() {
         let mut v = sample_inbox_value();
-        codec.create_body(&mut v);
+        crate::snapshot::create::strip_for_create(&mut v, "inboxes");
         let obj = v.as_object().unwrap();
         assert!(
             !obj.contains_key("email"),
-            "create_body must strip the server-assigned email; got: {obj:?}"
+            "the create strip must remove the server-assigned email; got: {obj:?}"
         );
         // Other user-editable fields survive.
         assert!(
             obj.contains_key("email_prefix"),
-            "email_prefix must survive create_body"
+            "email_prefix must survive the create strip"
         );
     }
 

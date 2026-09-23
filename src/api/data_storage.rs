@@ -399,7 +399,6 @@ impl DataStorageClient {
             body: format!(
                 "Data Storage API returned code='ok' but no `result` field for {path}",
             ),
-            env: None,
         })?;
         let typed: T = serde_json::from_value(result)
             .with_context(|| format!("decoding `result` field from {path}"))?;
@@ -444,7 +443,7 @@ impl DataStorageClient {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status { status: status.as_u16(), body, env: None }.into());
+            return Err(ApiError::Status { status: status.as_u16(), body }.into());
         }
         let env: Envelope<Value> = resp
             .json()
@@ -458,7 +457,6 @@ impl DataStorageClient {
             return Err(ApiError::Status {
                 status: status.as_u16(),
                 body: format!("Data Storage API returned code='{}', message='{}'", env.code, env.message),
-                env: None,
             }.into());
         }
         Ok((status, env))

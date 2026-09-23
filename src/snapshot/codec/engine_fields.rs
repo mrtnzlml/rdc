@@ -8,16 +8,12 @@ use serde_json::Value;
 use crate::overlay::Overlay;
 use crate::paths::Paths;
 use crate::snapshot::codec::{DiskArtifact, KindCodec};
-use crate::snapshot::create::{strip_for_create, strip_for_cross_env_patch};
+use crate::snapshot::create::strip_for_cross_env_patch;
 use crate::snapshot::key_order::strip_hidden_fields;
 
 pub struct EngineFields;
 
 impl KindCodec for EngineFields {
-    fn kind(&self) -> &'static str {
-        "engine_fields"
-    }
-
     fn disk_bytes(&self, value: &Value) -> anyhow::Result<DiskArtifact> {
         let mut v = value.clone();
         // No redaction for engine_fields — `redact_on_pull("engine_fields")` is empty.
@@ -28,10 +24,6 @@ impl KindCodec for EngineFields {
             json,
             sidecars: vec![],
         })
-    }
-
-    fn create_body(&self, body: &mut Value) {
-        strip_for_create(body, "engine_fields");
     }
 
     fn cross_env_body(&self, body: &mut Value) {
@@ -98,12 +90,11 @@ mod tests {
         assert_eq!(out["field_type"], json!("string"));
     }
 
-    /// `create_body` must keep `name` (only cross-env strips it).
+    /// The create strip must keep `name` (only cross-env strips it).
     #[test]
-    fn create_body_keeps_name() {
-        let codec = EngineFields;
+    fn create_strip_keeps_name() {
         let mut v = sample_engine_field();
-        codec.create_body(&mut v);
+        crate::snapshot::create::strip_for_create(&mut v, "engine_fields");
         let obj = v.as_object().unwrap();
         assert!(!obj.contains_key("id"), "create strips id");
         assert!(!obj.contains_key("url"), "create strips url");

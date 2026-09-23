@@ -67,7 +67,7 @@ async fn a_label_round_trips_over_http() {
     let listed = c.list_labels(None).await.expect("relist");
     assert_eq!(listed[0].extra.get("color"), Some(&json!("#00ff00")));
 
-    c.delete_label(1, None).await.expect("delete");
+    c.delete_path("/labels/1", None).await.expect("delete");
     assert!(c.list_labels(None).await.expect("relist").is_empty());
 }
 
