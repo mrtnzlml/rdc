@@ -240,6 +240,16 @@ pub(crate) async fn run_cycle(
         renderer.unwrap_or_else(|| Log::new(crate::cli::resolve::detect_color_mode()));
     let started = std::time::Instant::now();
 
+    // The two per-env files nobody finds on their own: `envs/<env>/overlay.toml`
+    // and `secrets/<env>.hook-secrets.json`. Both are created-if-absent and
+    // inert, so this only ever adds a file that was not there. Sync writes them
+    // (and not just `rdc init`) because the secrets file is gitignored — a clone
+    // never inherits one — and an existing project re-runs `init` only when it
+    // adds an env. Skipped under `--dry-run`, which promises to write nothing.
+    if !dry_run {
+        crate::cli::init::write_env_scaffolds(&cwd, env)?;
+    }
+
     // Phase 0: offline pre-flight. Scanning the local tree needs nothing
     // but the lockfile, and both validations below are decidable from
     // local bytes — so they run before the token is resolved and before a

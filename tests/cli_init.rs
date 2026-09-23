@@ -65,6 +65,20 @@ fn init_creates_expected_files() {
     assert!(body.contains("`envs/<env>/_index.md`"));
     assert!(body.contains("rdc sync"));
     assert!(body.contains("Conflicts & drift"));
+
+    // The two files a user used to have to find out about: both scaffolded,
+    // both carrying their own format. The overlay's examples stay commented
+    // (an uncommented slug names no real object and migrate rejects it), so
+    // assert on the comment text rather than on a parsed key.
+    let overlay = std::fs::read_to_string(dir.path().join("envs/dev/overlay.toml")).unwrap();
+    assert!(overlay.contains("version = 1"), "{overlay}");
+    assert!(overlay.contains("MIGRATE-ONLY"), "{overlay}");
+    assert!(overlay.contains("# [queues.invoices]"), "{overlay}");
+
+    let hook_secrets =
+        std::fs::read_to_string(dir.path().join("secrets/dev.hook-secrets.json")).unwrap();
+    assert!(hook_secrets.contains(r#""hooks": {}"#), "{hook_secrets}");
+    assert!(hook_secrets.contains("<unfilled>"), "{hook_secrets}");
 }
 
 #[test]

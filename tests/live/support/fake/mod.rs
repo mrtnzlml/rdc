@@ -233,12 +233,11 @@ fn route(st: &mut OrgState, req: &Request) -> ResponseTemplate {
                 return err_response(ApiError::not_found());
             };
             if extra_segment {
-                // A real sub-resource endpoint exists here for at least one
-                // kind — `GET /hooks/<id>/secrets_keys`
-                // (`get_hook_secrets_keys`, `src/api/mod.rs:223`), which
-                // `rdc` calls on the deploy path — and stage 2 may model it.
-                // But answering it with the parent object, the way this used
-                // to fall through and do, is worse than a 404: a caller
+                // Real sub-resource endpoints exist here for at least one
+                // kind — `GET /hooks/<id>/secrets_keys` returns a list of
+                // secret key names — and stage 2 may model one. But
+                // answering it with the parent object, the way this used to
+                // fall through and do, is worse than a 404: a caller
                 // expecting a list of key names would get a hook object
                 // instead of an honest failure.
                 return err_response(ApiError::not_found());

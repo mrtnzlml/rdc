@@ -17,7 +17,7 @@ enum InitMode {
 
 /// What a scaffold writer did to its file, for the `--force` summary.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Scaffolded {
+pub(crate) enum Scaffolded {
     Created,
     /// Existing file replaced with the current template (`--force` only).
     Rewritten,
@@ -28,7 +28,7 @@ enum Scaffolded {
 }
 
 impl Scaffolded {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Scaffolded::Created => "created",
             Scaffolded::Rewritten => "rewritten",
@@ -110,14 +110,14 @@ pub async fn run(env_specs: Vec<String>, force: bool) -> Result<()> {
         cfg.save(&cfg_path)?;
     }
 
-    let mut scaffold: Vec<(&str, Scaffolded)> = vec![
-        (".gitignore", write_gitignore(&cwd)?),
-        (".gitattributes", write_gitattributes(&cwd)?),
-        ("CLAUDE.md", write_claude_md(&cwd, &cfg, force)?),
-        ("README.md", write_readme(&cwd, &cfg, force)?),
-        (".gitlab-ci.yml", write_gitlab_ci(&cwd, &cfg, force)?),
+    let mut scaffold: Vec<(String, Scaffolded)> = vec![
+        (".gitignore".into(), write_gitignore(&cwd)?),
+        (".gitattributes".into(), write_gitattributes(&cwd)?),
+        ("CLAUDE.md".into(), write_claude_md(&cwd, &cfg, force)?),
+        ("README.md".into(), write_readme(&cwd, &cfg, force)?),
+        (".gitlab-ci.yml".into(), write_gitlab_ci(&cwd, &cfg, force)?),
     ];
-    scaffold.extend(write_testkit(&cwd, force)?);
+    scaffold.extend(write_testkit(&cwd, force)?.into_iter().map(|(n, o)| (n.into(), o)));
     std::fs::create_dir_all(cwd.join("secrets"))
         .with_context(|| format!("creating {}", cwd.join("secrets").display()))?;
     for env in &new_env_names {
@@ -126,6 +126,12 @@ pub async fn run(env_specs: Vec<String>, force: bool) -> Result<()> {
             .with_context(|| format!("creating {}", paths.env_root().display()))?;
         std::fs::create_dir_all(paths.hooks_dir())
             .with_context(|| format!("creating {}", paths.hooks_dir().display()))?;
+    }
+    // Every env, not just the ones this run added: a project that predates
+    // these two files gets them on its next `rdc init` (including a bare
+    // `--force` regenerate) rather than only when it happens to add an env.
+    for env in cfg.envs.keys() {
+        scaffold.extend(write_env_scaffolds(&cwd, env)?);
     }
 
     // The per-file summary is the whole output of a regenerate-only run, and
@@ -703,6 +709,45 @@ fn write_testkit(root: &Path, force: bool) -> Result<Vec<(&'static str, Scaffold
         .collect()
 }
 
+/// Write the two per-env files a user would otherwise have to know exist:
+/// `envs/<env>/overlay.toml` and `secrets/<env>.hook-secrets.json`. Both are
+/// written as self-documenting, inert stubs — the overlay declares only
+/// `version = 1` and comments, the secrets file only an empty `hooks` map —
+/// so a project that never touches either behaves exactly as it did before.
+///
+/// **Create-if-absent, with no `--force` escape hatch**, unlike every other
+/// scaffold. `overlay.toml` holds hand-written per-env overrides and the
+/// secrets file holds values that exist nowhere else (Rossum never returns
+/// them, and the file is gitignored), so for these two there is no version of
+/// "regenerate it from the template" that is not data loss.
+///
+/// `rdc sync` calls this too. The overlay is committed, so `rdc init` alone
+/// would be enough for it — but the secrets file is gitignored, so a clone
+/// would never inherit one, and an existing project only re-runs `init` when
+/// it adds an env.
+pub(crate) fn write_env_scaffolds(
+    root: &Path,
+    env: &str,
+) -> Result<Vec<(String, Scaffolded)>> {
+    let paths = Paths::for_env(root, env);
+
+    let overlay = paths.overlay_file();
+    let overlay_outcome = if overlay.exists() {
+        Scaffolded::Unchanged
+    } else {
+        write_atomic(&overlay, OVERLAY_TEMPLATE.as_bytes())?;
+        Scaffolded::Created
+    };
+
+    let created = crate::secrets::write_hook_secrets_stub(root, env)?;
+    let secrets_outcome = if created { Scaffolded::Created } else { Scaffolded::Unchanged };
+
+    Ok(vec![
+        (format!("envs/{env}/overlay.toml"), overlay_outcome),
+        (format!("secrets/{env}.hook-secrets.json"), secrets_outcome),
+    ])
+}
+
 /// `write_template_file`'s force semantics against bytes already in hand.
 fn write_template_file_bytes(
     path: &Path,
@@ -911,12 +956,21 @@ pub fn write_scaffold_files(
     tolerate("README.md", write_readme(cwd, &cfg, false));
     tolerate(".gitlab-ci.yml", write_gitlab_ci(cwd, &cfg, false));
     write_testkit(cwd, false)?;
+    write_env_scaffolds(cwd, env_name)?;
     Ok(())
 }
 
 /// The GitLab CI pipeline `rdc init` drops into a project, embedded from the
 /// repo's `templates/gitlab-ci.yml` (see [`write_gitlab_ci`]).
 pub(crate) const GITLAB_CI_TEMPLATE: &str = include_str!("../../templates/gitlab-ci.yml");
+
+/// The commented `overlay.toml` every env gets (see [`write_env_scaffolds`]),
+/// embedded from `templates/overlay.toml` like the pipeline is.
+///
+/// Everything in it is a comment except `version = 1` — which is not
+/// decoration: `Overlay::version` has no serde default, so a comments-only
+/// file would fail to parse and take `rdc migrate` down with it.
+pub(crate) const OVERLAY_TEMPLATE: &str = include_str!("../../templates/overlay.toml");
 
 /// The Python test harness `rdc init` scaffolds, embedded from `templates/`
 /// like the pipeline is, so the shipped copy and the repo copy cannot drift.
@@ -965,10 +1019,16 @@ testkit/                                  formula/hook test harness (real txscri
 tests/                                    your own tests (this is where they go)
 requirements-dev.txt                      pinned pytest + txscript for the CI test job
 secrets/<env>.secrets.json                API tokens (gitignored)
+secrets/<env>.hook-secrets.json           hook secret values (gitignored); one
+                                          entry per hook slug, never copied
+                                          between envs, never read back from
+                                          Rossum -- this file is the only copy
 envs/<env>/
   _index.md                               auto-regenerated; do not edit
   organization.json
-  overlay.toml                            optional per-env field overrides
+  overlay.toml                            per-env overrides applied by
+                                          `rdc migrate`; the file explains its
+                                          own format
   workspaces/<ws>/
     workspace.json
     queues/<q>/
@@ -1008,7 +1068,8 @@ envs/<env>/
 | Rule config (name, queues) | `envs/<env>/rules/<slug>.json` | `rdc sync <env>` |
 | Label name / colour | `envs/<env>/labels/<slug>.json` | `rdc sync <env>` |
 | Email template | `envs/<env>/workspaces/<ws>/queues/<q>/email-templates/<slug>.json` | `rdc sync <env>` |
-| Per-env override only | `envs/<env>/overlay.toml` | `rdc sync <env>` |
+| A value this env must keep across promotions | `envs/<env>/overlay.toml` | `rdc migrate <src> <env>` |
+| A hook's secret values | `secrets/<env>.hook-secrets.json` | `rdc sync <env>` |
 
 ## Testing formulas and hooks
 
@@ -1135,7 +1196,9 @@ prompt is `[k]` (force-push), `[r]` (adopt remote), `[s]` (skip),
 - `.rdc/state/<env>.lock.json` (slug↔id and base hashes; rdc owns this)
 - `.rdc/conflicts/<env>/` (the remote side of an unresolved conflict;
   either consume the changes or delete the file)
-- Contents of `secrets/` (gitignored API tokens)
+- `secrets/<env>.secrets.json` (rdc's token cache). Its neighbour
+  `secrets/<env>.hook-secrets.json` IS yours to edit — that is where hook
+  secret values go, and nothing else has a copy of them
 
 ## Known limitations
 
@@ -1174,6 +1237,8 @@ mod tests {
             "conftest.py",
             "pytest.ini",
             "requirements-dev.txt",
+            "envs/main/overlay.toml",
+            "secrets/main.hook-secrets.json",
         ] {
             assert!(dir.path().join(name).exists(), "{name} should be written");
         }
@@ -1345,6 +1410,61 @@ mod tests {
             Scaffolded::Rewritten
         );
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "body\n");
+    }
+
+    /// `version = 1` in the template is load-bearing, not decoration:
+    /// `Overlay::version` has no serde default, so a comments-only file fails
+    /// to parse and would take `rdc migrate` down on every project that
+    /// scaffolded one. The other half is that EVERY example stays commented —
+    /// an uncommented one names a slug no env has, which migrate rejects.
+    #[test]
+    fn embedded_overlay_template_loads_as_an_empty_overlay() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = dir.path().join("overlay.toml");
+        std::fs::write(&p, OVERLAY_TEMPLATE).unwrap();
+
+        let ov = crate::overlay::Overlay::load(&p)
+            .expect("the scaffolded overlay must parse")
+            .expect("the file is present");
+        assert_eq!(ov.version, crate::overlay::OVERLAY_VERSION);
+        assert!(
+            ov.hooks.is_empty()
+                && ov.queues.is_empty()
+                && ov.inboxes.is_empty()
+                && ov.saved_views.is_empty()
+                && ov.organization.is_empty(),
+            "every example must still be commented out: {ov:?}"
+        );
+    }
+
+    /// Once written, both files hold the user's own data — hand-written
+    /// overrides, and secret values that exist in no other copy. So unlike
+    /// every other scaffold they have no `--force` path back to the template.
+    #[test]
+    fn write_env_scaffolds_creates_both_then_never_touches_them() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let first = write_env_scaffolds(dir.path(), "dev").unwrap();
+        assert!(
+            first.iter().all(|(_, o)| *o == Scaffolded::Created),
+            "{first:?}"
+        );
+
+        let overlay = dir.path().join("envs/dev/overlay.toml");
+        let secrets = dir.path().join("secrets/dev.hook-secrets.json");
+        std::fs::write(&overlay, "version = 1
+
+[queues.invoices]
+name = \"mine\"
+").unwrap();
+        std::fs::write(&secrets, r#"{"hooks":{"h":{"k":"kept"}}}"#).unwrap();
+
+        let again = write_env_scaffolds(dir.path(), "dev").unwrap();
+        assert!(
+            again.iter().all(|(_, o)| *o == Scaffolded::Unchanged),
+            "{again:?}"
+        );
+        assert!(std::fs::read_to_string(&overlay).unwrap().contains("mine"));
+        assert!(std::fs::read_to_string(&secrets).unwrap().contains("kept"));
     }
 
     /// Smoke-check the `include_str!` target: the constant is the real pipeline,

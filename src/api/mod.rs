@@ -206,20 +206,6 @@ impl RossumClient {
         self.get_json(&format!("{}/schemas/{id}", self.base_url), progress).await
     }
 
-    /// `GET /hooks/<id>/secrets_keys` — list the secret key names
-    /// configured on a hook. The Rossum API returns the keys only, never
-    /// the values (those are server-side encrypted). Used by deploy to
-    /// check that the target env has values for every key the source
-    /// hook depends on before any write hits the target.
-    ///
-    /// Path note: the Rossum endpoint is `/secrets_keys` (with `s` on
-    /// `secrets`, no hyphen) — verified against the live API and the
-    /// existing rossum-api MCP server source. The simpler-looking
-    /// variants (`/secrets`, `/secret_keys`, `/secret-keys`) all 404.
-    pub async fn get_hook_secrets_keys(&self, id: u64, progress: ProgressHandle) -> Result<Vec<String>> {
-        self.get_json(&format!("{}/hooks/{id}/secrets_keys", self.base_url), progress).await
-    }
-
     // --- create endpoints ---------------------------------------------
 
     pub async fn create_hook(&self, body: &serde_json::Value, progress: ProgressHandle) -> Result<Hook> {

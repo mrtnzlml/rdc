@@ -153,11 +153,9 @@ async fn a_non_numeric_sub_path_is_not_a_create() {
 
 /// The companion case: the tail here parses fine, but a segment survives
 /// PAST it. `GET /hooks/<id>/secrets_keys` is the real endpoint this
-/// protects (`get_hook_secrets_keys`, `src/api/mod.rs:223`), which `rdc`
-/// calls on the deploy path — a stage-2 fake may eventually model it as a
-/// list of key names, but until then answering it with the parent hook
-/// object would be a confusing decode error where a caller expects an
-/// honest 404.
+/// protects — a stage-2 fake may eventually model it as a list of key
+/// names, but until then answering it with the parent hook object would be
+/// a confusing decode error where a caller expects an honest 404.
 #[tokio::test]
 async fn a_segment_past_the_id_is_not_a_route() {
     let fake = FakeOrg::start().await;

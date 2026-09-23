@@ -1,0 +1,45 @@
+# Per-env overrides, applied by `rdc migrate <src> <this-env>`.
+#
+# `rdc migrate` copies another env's snapshot into this one. Every value
+# declared here is written over the promoted value, so it survives promotion:
+# token owners, external URLs, thresholds, per-env names.
+#
+# Overlays are MIGRATE-ONLY. `rdc sync` neither applies nor strips them — the
+# files under this env's directory are the truth for what gets pushed.
+#
+# Shape: a `[<kind>.<slug>]` table, then one line per field. Values deep-merge
+# onto the object, so a nested table sets one nested field and leaves its
+# siblings alone; an array replaces the whole array. The reserved slug `"*"` is
+# a kind-wide default, and a real slug wins over it. Precedence, highest first:
+# per-object override, kind-wide `"*"`, whatever migrate would have promoted.
+#
+# A slug naming no object in this env is a hard error, so keep the examples
+# below commented until you mean them.
+#
+# Kinds, and what each is keyed by:
+#
+#   hooks, rules, labels, queues, engines, saved_views   its own slug
+#   schemas, inboxes                                     the QUEUE's slug
+#   email_templates            "<workspace>/<queue>/<template>"
+#   engine_fields              "<engine>/<field>"
+#   organization               a singleton — no slug layer
+#
+# [hooks."*"]
+# token_owner = "https://acme.rossum.app/api/v1/users/12345"
+#
+# [hooks.export-to-erp]
+# config = { url = "https://erp.example.com/this-env/hook" }
+#
+# [queues.invoices]
+# automation_level = "confident"
+#
+# [inboxes.invoices]
+# email_prefix = "acme-this-env"
+#
+# [saved_views.awaiting-approval]
+# queues_filter = ["rdc://queues/invoices"]
+#
+# [organization.settings]
+# ...
+
+version = 1

@@ -228,6 +228,67 @@ async fn mock_empty_lists_except(server: &MockServer, override_paths: &[&str]) {
     }
 }
 
+/// `secrets/<env>.hook-secrets.json` is gitignored, so a clone never inherits
+/// one and `rdc init` alone would leave every teammate to discover the file on
+/// their own. Sync therefore writes both per-env scaffolds too — but not under
+/// `--dry-run`, which promises to write nothing.
+#[tokio::test]
+async fn sync_restores_the_per_env_scaffolds_but_not_on_a_dry_run() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+    mock_empty_lists_except(&server, &[]).await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    // Stand in for a fresh clone (gitignored secrets file absent) plus a
+    // project that predates the overlay scaffold.
+    let overlay = project.path().join("envs/dev/overlay.toml");
+    let hook_secrets = project.path().join("secrets/dev.hook-secrets.json");
+    std::fs::remove_file(&overlay).unwrap();
+    std::fs::remove_file(&hook_secrets).unwrap();
+
+    let _cwd_guard = cwd_lock();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    rdc::cli::sync::run("dev", false, /* dry_run = */ true, false, false, false, None)
+        .await
+        .expect("dry run should succeed");
+    assert!(!overlay.exists(), "--dry-run must write nothing");
+    assert!(!hook_secrets.exists(), "--dry-run must write nothing");
+
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
+        .await
+        .expect("sync should succeed");
+    assert!(overlay.exists(), "sync should restore the overlay scaffold");
+    assert!(
+        hook_secrets.exists(),
+        "sync should restore the hook-secrets stub a clone never inherited"
+    );
+
+    // Inert: an empty overlay leaves migrate alone, and a stub with no slugs
+    // leaves push alone.
+    let body = std::fs::read_to_string(&overlay).unwrap();
+    assert!(body.contains("version = 1"), "{body}");
+    let stub: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&hook_secrets).unwrap()).unwrap();
+    assert!(stub["hooks"].as_object().unwrap().is_empty(), "{stub}");
+}
+
 /// Pull-side RemoteCreate: env exposes a label that doesn't exist locally
 /// and isn't in the lockfile. `sync` must classify it `RemoteCreate` and
 /// write the JSON to disk. No API mutations are issued.

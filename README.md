@@ -446,6 +446,32 @@ Scoped to deployable content: env/identity fields (`id`, `url`, `organization`, 
 
 An overlay pin beats the remap, which is the escape hatch both for a large integer that is not a reference and for a deliberate per-env divergence (a target env routing a feed to a *different* queue than the source does).
 
+### Per-env overlays
+
+Some values must differ per env and must keep differing after every promotion: an external URL, a token owner, an automation level, an inbox prefix. Those live in `envs/<env>/overlay.toml`, which `rdc init` and `rdc sync` scaffold for every env with its own format documented inside it.
+
+Overlays are **migrate-only**. `rdc sync` neither applies nor strips them — each env's files on disk are the truth for what is pushed, so a snapshot always shows that env's real values. What an overlay does is win over the value `rdc migrate` was about to promote:
+
+```toml
+# envs/prod/overlay.toml
+version = 1
+
+[hooks."*"]
+token_owner = "https://acme.rossum.app/api/v1/users/12345"
+
+[hooks.export-to-erp]
+config = { url = "https://erp.example.com/prod/hook" }
+
+[queues.invoices]
+automation_level = "confident"
+```
+
+Each table is `[<kind>.<slug>]`, then one line per field. Values are deep-merged onto the object, so a nested table sets one nested field and leaves its siblings alone; an array replaces the whole array. The reserved slug `"*"` is a kind-wide default. Precedence, highest first: per-object override, kind-wide `"*"`, whatever migrate would have promoted — including over the [target-owned reconciles](#fields-the-target-env-owns) below.
+
+Most kinds are keyed by their own slug. The exceptions: `schemas` and `inboxes` take the **queue's** slug (a queue owns one of each), `email_templates` take `"<workspace>/<queue>/<template>"`, `engine_fields` take `"<engine>/<field>"`, and `organization` is a singleton with no slug layer at all.
+
+A key naming no object in the env is a hard error, naming the slugs that do exist — a silently-ignored typo would mean the promotion quietly overwrote the value you thought you had pinned. `rdc doctor` rewrites overlay keys when it realigns a renamed slug.
+
 ### Fields the target env owns
 
 Some fields are tuned per organization rather than promoted with the solution, so migrate leaves them to the **target** env: a matched target keeps its own value, and a brand-new object drops the field so the server's default applies. Name a group with `--carry` to promote the source env's values instead:
@@ -495,7 +521,18 @@ An overlay value always wins over these reconciles — that is the documented pr
 
 ### Hook secrets
 
-Hook secret values are never copied between envs — they live in each env's gitignored `secrets/<env>.hook-secrets.json`. On push, `rdc sync` injects only filled values; keys still holding the placeholder sentinel are skipped, so a half-edited template never leaks a literal to the API.
+Hook secret values are never copied between envs — they live in each env's gitignored `secrets/<env>.hook-secrets.json`, which `rdc init` and `rdc sync` scaffold as an empty stub carrying its own instructions. Rossum never returns a secret value, so that file is the only copy there is.
+
+```json
+{
+  "hooks": {
+    "master-data-hub": { "mdh_api_token": "abc\u2026" },
+    "notify-slack":    { "signing_secret": "<unfilled>" }
+  }
+}
+```
+
+On push, `rdc sync` injects only filled values; a key still holding the `"<unfilled>"` sentinel is skipped, so a half-edited file never leaks a literal to the API.
 
 ### Replicate an existing env into a new one
 
