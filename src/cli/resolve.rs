@@ -25,7 +25,7 @@
 //! callers fall through to shadow-file (legacy behavior, CI-safe).
 
 use anyhow::{Context, Result};
-use crate::cli::change_view::{ChangeRow, RowVerb, RowWidths, count_changes, menu_one_line, render_connector, render_diff_body, render_menu, render_prompt_header, render_reask, render_row};
+use crate::cli::change_view::{ChangeRow, RowWidths, count_changes, menu_one_line, render_connector, render_diff_body, render_menu, render_prompt_header, render_reask, render_row};
 use crate::cli::stdin_coord::{Prompt, PromptKey, PromptKind};
 use similar::{Algorithm, TextDiff};
 use std::io::{BufRead, IsTerminal, Write};
@@ -347,7 +347,7 @@ pub fn prompt_resolve_with_bytes_and_color<R: BufRead, W: Write>(
     let (added, removed) = count_changes(&left, &right);
     let hunk_note = format!("{hunk_count} hunks");
     let row = ChangeRow {
-        verb: RowVerb::Prompt,
+        verb: None,
         kind: obj.kind,
         name: obj.slug,
         added: Some(added),
@@ -531,7 +531,7 @@ pub fn prompt_remote_delete_with_color<R: BufRead, W: Write>(
     )?;
     let (added, removed) = count_changes(&shown, "");
     let row = ChangeRow {
-        verb: RowVerb::Prompt,
+        verb: None,
         kind: obj.kind,
         name: obj.slug,
         added: Some(added),
@@ -1678,7 +1678,7 @@ pub fn colorize_dim(text: &str, mode: ColorMode) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::prompt_pin::{inquire_shape, pin, redact_tempdir};
+    use crate::cli::prompt_pin::{Transcript, inquire_shape, pin, redact_tempdir};
     use std::io::Cursor;
 
 
@@ -3231,16 +3231,16 @@ mod tests {
     /// and nothing that is an artifact of this test run.
     #[test]
     fn conflict_prompt_bytes_are_pinned() {
-        use std::io::Cursor;
+        
         let dir = tempfile::tempdir().unwrap();
         let local = dir.path().join("queues/invoices.json");
         std::fs::create_dir_all(local.parent().unwrap()).unwrap();
         std::fs::write(&local, b"{\"name\":\"Invoices\"}").unwrap();
 
-        let mut out: Vec<u8> = Vec::new();
+        let t = Transcript::new();
         let _ = prompt_resolve_with_color(
-            Cursor::new(b"s\n"),
-            &mut out,
+            t.input("s\n"),
+            t.output(),
             1,
             1,
             ObjectRef { kind: "queues", slug: "invoices" },
@@ -3251,22 +3251,22 @@ mod tests {
         )
         .unwrap();
 
-        let actual = redact_tempdir(&String::from_utf8_lossy(&out), dir.path());
+        let actual = redact_tempdir(&t.text(), dir.path());
         pin("conflict", &actual);
     }
 
     #[test]
     fn remote_delete_prompt_bytes_are_pinned() {
-        use std::io::Cursor;
+        
         let dir = tempfile::tempdir().unwrap();
         let local = dir.path().join("labels/audit-hold.json");
         std::fs::create_dir_all(local.parent().unwrap()).unwrap();
         std::fs::write(&local, b"{\"name\":\"Audit hold\"}").unwrap();
 
-        let mut out: Vec<u8> = Vec::new();
+        let t = Transcript::new();
         let _ = prompt_remote_delete_with_color(
-            Cursor::new(b"s\n"),
-            &mut out,
+            t.input("s\n"),
+            t.output(),
             1,
             1,
             ObjectRef { kind: "labels", slug: "audit-hold" },
@@ -3277,7 +3277,7 @@ mod tests {
         )
         .unwrap();
 
-        let actual = redact_tempdir(&String::from_utf8_lossy(&out), dir.path());
+        let actual = redact_tempdir(&t.text(), dir.path());
         pin("remote_delete", &actual);
     }
 
@@ -3308,14 +3308,14 @@ mod tests {
     /// is a different string and is pinned by `conflict_multi_hunk`.
     #[test]
     fn conflict_unrecognized_key_bytes_are_pinned() {
-        use std::io::Cursor;
+        
         let dir = tempfile::tempdir().unwrap();
         let local = conflict_fixture(dir.path(), b"{\"name\":\"Invoices\"}");
 
-        let mut out: Vec<u8> = Vec::new();
+        let t = Transcript::new();
         let _ = prompt_resolve_with_color(
-            Cursor::new(b"z\ns\n"),
-            &mut out,
+            t.input("z\ns\n"),
+            t.output(),
             1,
             1,
             ObjectRef { kind: "queues", slug: "invoices" },
@@ -3326,7 +3326,7 @@ mod tests {
         )
         .unwrap();
 
-        let actual = redact_tempdir(&String::from_utf8_lossy(&out), dir.path());
+        let actual = redact_tempdir(&t.text(), dir.path());
         pin("conflict_unrecognized", &actual);
     }
 
@@ -3335,14 +3335,14 @@ mod tests {
     /// records the hint variant that names `h`.
     #[test]
     fn conflict_multi_hunk_prompt_bytes_are_pinned() {
-        use std::io::Cursor;
+        
         let dir = tempfile::tempdir().unwrap();
         let local = conflict_fixture(dir.path(), TWO_HUNK_LOCAL);
 
-        let mut out: Vec<u8> = Vec::new();
+        let t = Transcript::new();
         let _ = prompt_resolve_with_color(
-            Cursor::new(b"z\ns\n"),
-            &mut out,
+            t.input("z\ns\n"),
+            t.output(),
             2,
             7,
             ObjectRef { kind: "queues", slug: "invoices" },
@@ -3353,7 +3353,7 @@ mod tests {
         )
         .unwrap();
 
-        let actual = redact_tempdir(&String::from_utf8_lossy(&out), dir.path());
+        let actual = redact_tempdir(&t.text(), dir.path());
         pin("conflict_multi_hunk", &actual);
     }
 
@@ -3361,7 +3361,7 @@ mod tests {
     /// menu, the impact summary, and the `Continue? [y/N] >` confirmation.
     #[test]
     fn conflict_bulk_prompt_bytes_are_pinned() {
-        use std::io::Cursor;
+        
         let dir = tempfile::tempdir().unwrap();
         let local = conflict_fixture(dir.path(), b"{\"name\":\"Invoices\"}");
         // The real builder, not a stand-in: its summary is a question plus
@@ -3370,10 +3370,10 @@ mod tests {
         let bulk = crate::cli::sync::execute::build_bulk_prompt("dev", 4, 0, 0)
             .expect("more than one conflict remains");
 
-        let mut out: Vec<u8> = Vec::new();
+        let t = Transcript::new();
         let r = prompt_resolve_with_bytes_and_color(
-            Cursor::new(b"K\ny\n"),
-            &mut out,
+            t.input("K\ny\n"),
+            t.output(),
             1,
             4,
             ObjectRef { kind: "queues", slug: "invoices" },
@@ -3387,7 +3387,7 @@ mod tests {
         .unwrap();
         assert!(matches!(r, Resolution::KeepLocalAll));
 
-        let actual = redact_tempdir(&String::from_utf8_lossy(&out), dir.path());
+        let actual = redact_tempdir(&t.text(), dir.path());
         pin("conflict_bulk", &actual);
     }
 
@@ -3395,15 +3395,15 @@ mod tests {
     /// with its line range and up to three lines of context.
     #[test]
     fn hunk_by_hunk_prompt_bytes_are_pinned() {
-        use std::io::Cursor;
+        
         let dir = tempfile::tempdir().unwrap();
         let local = conflict_fixture(dir.path(), TWO_HUNK_LOCAL);
 
-        let mut out: Vec<u8> = Vec::new();
+        let t = Transcript::new();
         // `h` enters the walker; then one decision per hunk.
         let _ = prompt_resolve_with_color(
-            Cursor::new(b"h\nk\nr\n"),
-            &mut out,
+            t.input("h\nk\nr\n"),
+            t.output(),
             1,
             1,
             ObjectRef { kind: "queues", slug: "invoices" },
@@ -3414,14 +3414,14 @@ mod tests {
         )
         .unwrap();
 
-        let actual = redact_tempdir(&String::from_utf8_lossy(&out), dir.path());
+        let actual = redact_tempdir(&t.text(), dir.path());
         pin("hunk_by_hunk", &actual);
     }
 
     /// The remote-delete prompt with the bulk options offered.
     #[test]
     fn remote_delete_bulk_prompt_bytes_are_pinned() {
-        use std::io::Cursor;
+        
         let dir = tempfile::tempdir().unwrap();
         let local = dir.path().join("labels/audit-hold.json");
         std::fs::create_dir_all(local.parent().unwrap()).unwrap();
@@ -3429,11 +3429,11 @@ mod tests {
         let bulk = crate::cli::sync::execute::build_bulk_prompt("dev", 0, 3, 0)
             .expect("more than one conflict remains");
 
-        let mut out: Vec<u8> = Vec::new();
+        let t = Transcript::new();
         // 1 of 3: the bulk options only appear when more than one remains.
         let r = prompt_remote_delete_with_color(
-            Cursor::new(b"R\ny\n"),
-            &mut out,
+            t.input("R\ny\n"),
+            t.output(),
             1,
             3,
             ObjectRef { kind: "labels", slug: "audit-hold" },
@@ -3445,7 +3445,7 @@ mod tests {
         .unwrap();
         assert!(matches!(r, Resolution::KeepRemoteAll));
 
-        let actual = redact_tempdir(&String::from_utf8_lossy(&out), dir.path());
+        let actual = redact_tempdir(&t.text(), dir.path());
         pin("remote_delete_bulk", &actual);
     }
 

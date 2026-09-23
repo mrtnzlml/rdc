@@ -821,7 +821,7 @@ mod tests {
     async fn mdh_row_delete_prompt_bytes_are_pinned() {
         let buf = Buf::default();
         let log = crate::cli::prompt_pin::pinned_log(Box::new(buf.clone()));
-        let route = std::sync::Arc::new(crate::cli::prompt_pin::CannedRoute("y"));
+        let route = std::sync::Arc::new(crate::cli::prompt_pin::CannedRoute::echoing("y", buf.0.clone()));
 
         let proceed = crate::cli::stdin_coord::with_route(route, async {
             prompt_confirm_row_deletes(&log, "vendors", 12)

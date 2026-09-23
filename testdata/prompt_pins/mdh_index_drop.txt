@@ -2,4 +2,4 @@
          drop   mdh      vendors                    regular index 'idx_vendor_no'
          drop   mdh      vendors                    search index 'srch_name'
 [y] drop them   [n] cancel (default)
-> 
+> y

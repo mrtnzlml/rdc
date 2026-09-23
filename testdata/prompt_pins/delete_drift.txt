@@ -1,5 +1,5 @@
 09:41:05 warn   hooks/legacy-export was deleted here, but changed on the remote since the last pull
-         prompt hooks    legacy-export
+         hooks    legacy-export
 [k] delete it remotely too   [r] restore the local file   [s] decide later
 [a] abort the sync
-> 
+> k

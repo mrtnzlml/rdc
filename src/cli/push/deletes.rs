@@ -117,7 +117,7 @@ pub fn confirm_or_refuse(
         let note = format!("id {id}");
         progress.row(&render_row(
             &ChangeRow {
-                verb: RowVerb::Delete,
+                verb: Some(RowVerb::Delete),
                 kind,
                 name: slug,
                 // A tombstone is decided from the lockfile; rdc holds no body
@@ -386,7 +386,7 @@ fn resolve_delete_drift(
         );
         return Ok(DeleteDriftChoice::Skip);
     }
-    use crate::cli::change_view::{ChangeRow, RowVerb, RowWidths, render_row};
+    use crate::cli::change_view::{ChangeRow, RowWidths, render_row};
     // Event line, row, menu — the shape every other prompt uses. This one
     // used to be a bare sentence with no row, the only object-scoped prompt
     // that never said which object in the same columns as the rest.
@@ -397,7 +397,7 @@ fn resolve_delete_drift(
     let mode = crate::cli::resolve::detect_color_mode();
     progress.row(&render_row(
         &ChangeRow {
-            verb: RowVerb::Prompt,
+            verb: None,
             kind,
             name: slug,
             added: None,
@@ -694,7 +694,7 @@ mod tests {
     async fn delete_gate_prompt_bytes_are_pinned() {
         let buf = Buf::default();
         let log = crate::cli::prompt_pin::pinned_log(Box::new(buf.clone()));
-        let route = std::sync::Arc::new(crate::cli::prompt_pin::CannedRoute("y"));
+        let route = std::sync::Arc::new(crate::cli::prompt_pin::CannedRoute::echoing("y", buf.0.clone()));
 
         let mut t = Tombstones::default();
         t.hooks.insert("legacy-export".to_string(), 9137);
@@ -714,7 +714,7 @@ mod tests {
     async fn delete_drift_prompt_bytes_are_pinned() {
         let buf = Buf::default();
         let log = crate::cli::prompt_pin::pinned_log(Box::new(buf.clone()));
-        let route = std::sync::Arc::new(crate::cli::prompt_pin::CannedRoute("k"));
+        let route = std::sync::Arc::new(crate::cli::prompt_pin::CannedRoute::echoing("k", buf.0.clone()));
 
         let choice = crate::cli::stdin_coord::with_route(route, async {
             resolve_delete_drift(&log, true, "hooks", "legacy-export")

@@ -20,10 +20,11 @@
 //!   the terminal with no sink to capture, so the pin records the strings rdc
 //!   composes and nothing of inquire's chrome.
 //!
-//! A pin holds only the bytes rdc writes. Where a question is followed
-//! immediately by more output, the newline the terminal echoes when the user
-//! presses Enter is absent — the answer arrives from a `Cursor`, which echoes
-//! nothing.
+//! A pin is a TRANSCRIPT: what the prompt wrote and what was typed back,
+//! interleaved as a terminal shows them. [`Transcript`] echoes each answer
+//! into the same buffer the prompt writes to, exactly as a terminal echoes a
+//! keypress. Without that, a pin could show `(unrecognized; pick one of
+//! k/r/e/s/a)` without showing which key provoked it.
 //!
 //! Accepting a deliberate change to a prompt:
 //!
@@ -84,11 +85,112 @@ pub(crate) fn pin(name: &str, actual: &str) {
 /// A [`crate::cli::stdin_coord::PromptRoute`] that answers every prompt with
 /// the same canned string, so a destructive gate can be driven to completion
 /// with no terminal attached.
-pub(crate) struct CannedRoute(pub &'static str);
+pub(crate) struct CannedRoute {
+    answer: &'static str,
+    sink: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl CannedRoute {
+    /// `sink` is the same buffer the gate's `Log` writes to, so the answer
+    /// lands in the record next to the question — see [`Transcript`].
+    pub(crate) fn echoing(
+        answer: &'static str,
+        sink: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    ) -> Self {
+        Self { answer, sink }
+    }
+}
 
 impl crate::cli::stdin_coord::PromptRoute for CannedRoute {
     fn ask(&self, _prompt: &crate::cli::stdin_coord::Prompt) -> Option<String> {
-        Some(self.0.to_string())
+        let mut g = self.sink.lock().unwrap();
+        g.extend_from_slice(self.answer.as_bytes());
+        g.push(b'\n');
+        drop(g);
+        Some(self.answer.to_string())
+    }
+}
+
+/// A terminal transcript for the prompts that take a reader and a writer.
+///
+/// `input` serves the canned keystrokes and echoes each one into the shared
+/// buffer as it is read; `output` is what the prompt writes to. `text` is the
+/// two interleaved, which is what gets pinned.
+pub(crate) struct Transcript {
+    buf: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+}
+
+impl Transcript {
+    pub(crate) fn new() -> Self {
+        Self { buf: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())) }
+    }
+
+    /// `keys` is what the user types, newline-separated, e.g. `"z\ns\n"`.
+    pub(crate) fn input(&self, keys: &str) -> TranscriptInput {
+        TranscriptInput {
+            inner: std::io::Cursor::new(keys.as_bytes().to_vec()),
+            sink: self.buf.clone(),
+        }
+    }
+
+    pub(crate) fn output(&self) -> TranscriptOutput {
+        TranscriptOutput { sink: self.buf.clone() }
+    }
+
+    pub(crate) fn text(&self) -> String {
+        String::from_utf8_lossy(&self.buf.borrow()).into_owned()
+    }
+}
+
+pub(crate) struct TranscriptInput {
+    inner: std::io::Cursor<Vec<u8>>,
+    sink: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+}
+
+impl std::io::Read for TranscriptInput {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        std::io::Read::read(&mut self.inner, out)
+    }
+}
+
+impl std::io::BufRead for TranscriptInput {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        std::io::BufRead::fill_buf(&mut self.inner)
+    }
+
+    fn consume(&mut self, n: usize) {
+        std::io::BufRead::consume(&mut self.inner, n)
+    }
+
+    /// Overridden to echo. Every prompt reads its answer through this one
+    /// method, so this is the only place a keystroke can enter the record.
+    fn read_line(&mut self, out: &mut String) -> std::io::Result<usize> {
+        let before = out.len();
+        let n = std::io::BufRead::read_line(&mut self.inner, out)?;
+        if n > 0 {
+            let typed = &out[before..];
+            let mut sink = self.sink.borrow_mut();
+            sink.extend_from_slice(typed.as_bytes());
+            if !typed.ends_with('\n') {
+                sink.push(b'\n');
+            }
+        }
+        Ok(n)
+    }
+}
+
+pub(crate) struct TranscriptOutput {
+    sink: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+}
+
+impl std::io::Write for TranscriptOutput {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.sink.borrow_mut().extend_from_slice(b);
+        Ok(b.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 

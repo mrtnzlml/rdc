@@ -754,7 +754,7 @@ fn report_pending_index_drops(
         let note = format!("{what} '{name}'");
         progress.row(&render_row(
             &ChangeRow {
-                verb: RowVerb::Drop,
+                verb: Some(RowVerb::Drop),
                 kind: "mdh",
                 name: collection_name,
                 // An index has no body, so a line count would be meaningless.
@@ -964,7 +964,7 @@ mod tests {
     async fn mdh_index_drop_prompt_bytes_are_pinned() {
         let buf = Buf::default();
         let log = crate::cli::prompt_pin::pinned_log(Box::new(buf.clone()));
-        let route = std::sync::Arc::new(crate::cli::prompt_pin::CannedRoute("y"));
+        let route = std::sync::Arc::new(crate::cli::prompt_pin::CannedRoute::echoing("y", buf.0.clone()));
 
         let proceed = crate::cli::stdin_coord::with_route(route, async {
             prompt_confirm_index_drops(

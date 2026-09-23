@@ -1,6 +1,6 @@
 
 [1/1]    conflict
-         prompt queues   invoices        +2    -2   2 hunks
+         queues   invoices        +2    -2   2 hunks
          ⎿ TMPDIR/queues/invoices.json   - local  + dev
          1 1 │   {
          2   │ -   "a": 1,
@@ -13,7 +13,8 @@
 [k] keep local (push it to dev)   [r] use dev (overwrite local)
 [e] edit in $EDITOR   [h] one change at a time   [s] decide later
 [a] abort the sync
-> 
+> h
+
 [1/2]    change in TMPDIR/queues/invoices.json (line 2)
          1 1 │   {
          2   │ -   "a": 1,
@@ -24,7 +25,8 @@
 
 [k] keep local   [r] use dev   [e] edit in $EDITOR   [b] keep both
 [s] leave the conflict markers   [a] abort the sync
-> 
+> k
+
 [2/2]    change in TMPDIR/queues/invoices.json (line 4)
          1 1 │   {
          2 2 │     "a": 1,
@@ -35,4 +37,4 @@
 
 [k] keep local   [r] use dev   [e] edit in $EDITOR   [b] keep both
 [s] leave the conflict markers   [a] abort the sync
-> 
+> r

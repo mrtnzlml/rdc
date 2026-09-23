@@ -356,6 +356,12 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
         .iter()
         .filter(|it| it.class == SyncClass::LocalDeleteRemoteEdit)
         .count();
+    // The counter spans BOTH prompting phases. This one runs first and
+    // `resolve_remote_deletes` continues from where it stops, so a reader
+    // answering `[5/8]` is not told a moment later that they are back at
+    // `[1/3]` — and the count matches the bulk summary, which has always
+    // spoken of "all N remaining conflicts" across the same three classes.
+    let prompt_total = total + lerd_total + ldre_total;
 
     let env = ctx.paths.env().to_string();
     // Prompt output goes through the renderer, not raw stderr: under
@@ -689,7 +695,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
             it,
             refs,
             idx + 1,
-            total,
+            prompt_total,
             &mut input,
             &mut prompt_out,
             interactive,
@@ -2440,6 +2446,13 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
         .iter()
         .filter(|it| it.class == SyncClass::LocalDeleteRemoteEdit)
         .count();
+    // `resolve_conflicts` ran first and numbered its items 1..=content, so
+    // this phase continues the same counter rather than restarting it.
+    let content_total = classified
+        .iter()
+        .filter(|it| it.class == SyncClass::BothDiverged)
+        .count();
+    let prompt_total = content_total + lerd_total + ldre_total;
     let mut processed_lerd = 0usize;
     let mut processed_ldre = 0usize;
 
@@ -3194,8 +3207,8 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                         let r = prompt_remote_delete_with_color(
                             &mut input,
                             progress.writer(),
-                            processed_lerd + processed_ldre + 1,
-                            lerd_total + ldre_total,
+                            content_total + processed_lerd + processed_ldre + 1,
+                            prompt_total,
                             ObjectRef { kind: &it.kind, slug: &it.slug },
                             &local_for_prompt,
                             &env,

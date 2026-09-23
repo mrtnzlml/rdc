@@ -499,7 +499,7 @@ pub(crate) async fn run_cycle(
                 for (verb, kind, name, note) in &rows {
                     progress.row(&render_row(
                         &ChangeRow {
-                            verb: *verb,
+                            verb: Some(*verb),
                             kind,
                             name,
                             added: None,

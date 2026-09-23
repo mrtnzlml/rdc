@@ -183,7 +183,9 @@ pub enum RowVerb {
     /// `RemoteEdit` / `RemoteCreate` / `RemoteDelete` — write locally.
     Pull,
     /// Any class that stops to ask: `BothDiverged`,
-    /// `LocalEditRemoteDelete`, `LocalDeleteRemoteEdit`.
+    /// `LocalEditRemoteDelete`, `LocalDeleteRemoteEdit`. Reads `decide`,
+    /// because that is what has to happen to the row and it is the reader
+    /// who does it — the other verbs all name something rdc will do.
     Prompt,
     /// An MDH index that would be dropped.
     Drop,
@@ -198,7 +200,7 @@ impl RowVerb {
             RowVerb::Post => "post",
             RowVerb::Delete => "delete",
             RowVerb::Pull => "pull",
-            RowVerb::Prompt => "prompt",
+            RowVerb::Prompt => "decide",
             RowVerb::Drop => "drop",
         }
     }
@@ -216,7 +218,13 @@ impl RowVerb {
 
 /// One object's line in a plan, a gate, or above a diff.
 pub struct ChangeRow<'a> {
-    pub verb: RowVerb,
+    /// What will happen to this object, or `None` when nothing is decided
+    /// yet AND the header above already said what this is — a prompt's own
+    /// row, where a verb would only repeat the header a line later. `None`
+    /// drops the column rather than blanking it, so the object starts at
+    /// the left of the block. A plan keeps its verbs: there the rows are
+    /// mixed, and the column is the only thing telling them apart.
+    pub verb: Option<RowVerb>,
     /// Plural registry name, verbatim from `kinds.rs` — never hand-built, which
     /// is what stops the plan and the executor disagreeing about whether it is
     /// `hooks` or `hook`.
@@ -312,9 +320,11 @@ pub fn render_row(row: &ChangeRow<'_>, w: RowWidths, mode: ColorMode) -> String 
     let plain = mode == ColorMode::Plain;
     let mut out = " ".repeat(INDENT);
 
-    out.push_str(&row.verb.colorize(mode));
-    out.push_str(&" ".repeat(VERB_W.saturating_sub(row.verb.token().chars().count())));
-    out.push(' ');
+    if let Some(verb) = row.verb {
+        out.push_str(&verb.colorize(mode));
+        out.push_str(&" ".repeat(VERB_W.saturating_sub(verb.token().chars().count())));
+        out.push(' ');
+    }
 
     if plain {
         out.push_str(row.kind);
@@ -750,7 +760,7 @@ mod tests {
 
     fn sample<'a>(note: Option<&'a str>) -> ChangeRow<'a> {
         ChangeRow {
-            verb: RowVerb::Patch,
+            verb: Some(RowVerb::Patch),
             kind: "rules",
             name: "finance-totals",
             added: Some(4),
@@ -808,7 +818,7 @@ mod tests {
     #[test]
     fn compound_name_dims_container_segments() {
         let row = ChangeRow {
-            verb: RowVerb::Patch,
+            verb: Some(RowVerb::Patch),
             kind: "email_templates",
             name: "main/invoices/reminder",
             added: Some(2),
@@ -825,7 +835,7 @@ mod tests {
     #[test]
     fn absent_counts_render_blank() {
         let row = ChangeRow {
-            verb: RowVerb::Drop,
+            verb: Some(RowVerb::Drop),
             kind: "mdh",
             name: "vendors",
             added: None,
@@ -840,7 +850,7 @@ mod tests {
     #[test]
     fn zero_counts_render_a_bare_zero() {
         let row = ChangeRow {
-            verb: RowVerb::Delete,
+            verb: Some(RowVerb::Delete),
             kind: "hooks",
             name: "legacy-export",
             added: Some(0),
@@ -858,7 +868,7 @@ mod tests {
             sample(Some("412ms")),
             sample(None),
             ChangeRow {
-                verb: RowVerb::Drop,
+                verb: Some(RowVerb::Drop),
                 kind: "mdh",
                 name: "a/b/c",
                 added: None,
@@ -911,7 +921,7 @@ mod tests {
         let render = |name: &str| {
             render_row(
                 &ChangeRow {
-                    verb: RowVerb::Pull,
+                    verb: Some(RowVerb::Pull),
                     kind: "email_templates",
                     name,
                     added: None,

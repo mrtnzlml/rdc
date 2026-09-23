@@ -27,7 +27,10 @@ class _Frame extends StatelessWidget {
     this.busy = false,
     this.actions,
     this.maxWidth = 440,
-  }) : assert(actions != null || primaryLabel != null, 'either actions, or primaryLabel/onPrimary, is required');
+  }) : assert(
+         actions != null || primaryLabel != null,
+         'either actions, or primaryLabel/onPrimary, is required',
+       );
   final String title;
   final Widget child;
   final String? primaryLabel;
@@ -42,7 +45,10 @@ class _Frame extends StatelessWidget {
     return Dialog(
       backgroundColor: c.bgCard,
       surfaceTintColor: Colors.transparent,
-      shape: RoundedRectangleBorder(side: BorderSide(color: c.border), borderRadius: BorderRadius.circular(10)),
+      shape: RoundedRectangleBorder(
+        side: BorderSide(color: c.border),
+        borderRadius: BorderRadius.circular(10),
+      ),
       child: ConstrainedBox(
         constraints: BoxConstraints(maxWidth: maxWidth),
         child: Column(
@@ -52,25 +58,39 @@ class _Frame extends StatelessWidget {
               padding: const EdgeInsets.fromLTRB(20, 18, 20, 6),
               child: Align(
                 alignment: Alignment.centerLeft,
-                child: Text(title, style: TextStyle(color: c.textPrimary, fontSize: 16, fontWeight: FontWeight.w600)),
+                child: Text(
+                  title,
+                  style: TextStyle(color: c.textPrimary, fontSize: 16, fontWeight: FontWeight.w600),
+                ),
               ),
             ),
-            Flexible(child: SingleChildScrollView(padding: const EdgeInsets.fromLTRB(20, 8, 20, 8), child: child)),
+            Flexible(
+              child: SingleChildScrollView(padding: const EdgeInsets.fromLTRB(20, 8, 20, 8), child: child),
+            ),
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 8, 16, 14),
               child: actions != null
                   ? Wrap(alignment: WrapAlignment.end, spacing: 8, runSpacing: 8, children: actions!)
-                  : Row(children: [
-                      const Spacer(),
-                      TextButton(onPressed: () => Navigator.of(context).pop(false), child: const Text('Cancel')),
-                      const SizedBox(width: 8),
-                      FilledButton(
-                        onPressed: busy ? null : onPrimary,
-                        child: busy
-                            ? const SizedBox(width: 15, height: 15, child: CircularProgressIndicator(strokeWidth: 2))
-                            : Text(primaryLabel!),
-                      ),
-                    ]),
+                  : Row(
+                      children: [
+                        const Spacer(),
+                        TextButton(
+                          onPressed: () => Navigator.of(context).pop(false),
+                          child: const Text('Cancel'),
+                        ),
+                        const SizedBox(width: 8),
+                        FilledButton(
+                          onPressed: busy ? null : onPrimary,
+                          child: busy
+                              ? const SizedBox(
+                                  width: 15,
+                                  height: 15,
+                                  child: CircularProgressIndicator(strokeWidth: 2),
+                                )
+                              : Text(primaryLabel!),
+                        ),
+                      ],
+                    ),
             ),
           ],
         ),
@@ -103,7 +123,15 @@ class _Field extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(label, style: TextStyle(color: c.textSecondary, fontSize: 11.5, fontWeight: FontWeight.w600, letterSpacing: 0.3)),
+          Text(
+            label,
+            style: TextStyle(
+              color: c.textSecondary,
+              fontSize: 11.5,
+              fontWeight: FontWeight.w600,
+              letterSpacing: 0.3,
+            ),
+          ),
           const SizedBox(height: 6),
           TextField(
             controller: controller,
@@ -119,8 +147,14 @@ class _Field extends StatelessWidget {
               contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
               filled: true,
               fillColor: c.bgBase,
-              enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: BorderSide(color: c.border)),
-              focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: BorderSide(color: c.accent)),
+              enabledBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(6),
+                borderSide: BorderSide(color: c.border),
+              ),
+              focusedBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(6),
+                borderSide: BorderSide(color: c.accent),
+              ),
             ),
           ),
         ],
@@ -150,7 +184,14 @@ class _AuthToggle extends StatelessWidget {
               border: Border.all(color: sel ? c.accent : c.border),
               borderRadius: BorderRadius.circular(6),
             ),
-            child: Text(label, style: TextStyle(color: sel ? Colors.white : c.textSecondary, fontSize: 12.5, fontWeight: FontWeight.w600)),
+            child: Text(
+              label,
+              style: TextStyle(
+                color: sel ? Colors.white : c.textSecondary,
+                fontSize: 12.5,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
           ),
         ),
       );
@@ -158,11 +199,28 @@ class _AuthToggle extends StatelessWidget {
 
     return Padding(
       padding: const EdgeInsets.only(bottom: 12),
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Text('AUTHENTICATION', style: TextStyle(color: c.textSecondary, fontSize: 11.5, fontWeight: FontWeight.w600, letterSpacing: 0.3)),
-        const SizedBox(height: 6),
-        Row(children: [opt(AuthKind.token, 'API token'), const SizedBox(width: 8), opt(AuthKind.password, 'Username & password')]),
-      ]),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'AUTHENTICATION',
+            style: TextStyle(
+              color: c.textSecondary,
+              fontSize: 11.5,
+              fontWeight: FontWeight.w600,
+              letterSpacing: 0.3,
+            ),
+          ),
+          const SizedBox(height: 6),
+          Row(
+            children: [
+              opt(AuthKind.token, 'API token'),
+              const SizedBox(width: 8),
+              opt(AuthKind.password, 'Username & password'),
+            ],
+          ),
+        ],
+      ),
     );
   }
 }
@@ -176,7 +234,11 @@ class _ErrLine extends StatelessWidget {
     return Container(
       margin: const EdgeInsets.only(top: 4),
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-      decoration: BoxDecoration(color: c.dangerBg, border: Border.all(color: c.dangerBorder), borderRadius: BorderRadius.circular(6)),
+      decoration: BoxDecoration(
+        color: c.dangerBg,
+        border: Border.all(color: c.dangerBorder),
+        borderRadius: BorderRadius.circular(6),
+      ),
       child: SelectableText(text, style: TextStyle(color: c.dangerFg, fontSize: 12)),
     );
   }
@@ -249,20 +311,23 @@ class _AddConnectionDialogState extends State<AddConnectionDialog> {
       primaryLabel: 'Create',
       busy: _busy,
       onPrimary: _submit,
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        _Field(label: 'PROJECT NAME', controller: _name, autofocus: true),
-        _Field(label: 'ENVIRONMENT NAME', controller: _envName, hint: 'e.g. prod'),
-        _Field(label: 'API BASE URL', controller: _apiBase),
-        _Field(label: 'ORGANIZATION ID', controller: _orgId, keyboardType: TextInputType.number),
-        _AuthToggle(value: _auth, onChanged: (a) => setState(() => _auth = a)),
-        if (_auth == AuthKind.token)
-          _Field(label: 'API TOKEN', controller: _token, obscure: true)
-        else ...[
-          _Field(label: 'USERNAME', controller: _username),
-          _Field(label: 'PASSWORD', controller: _password, obscure: true),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _Field(label: 'PROJECT NAME', controller: _name, autofocus: true),
+          _Field(label: 'ENVIRONMENT NAME', controller: _envName, hint: 'e.g. prod'),
+          _Field(label: 'API BASE URL', controller: _apiBase),
+          _Field(label: 'ORGANIZATION ID', controller: _orgId, keyboardType: TextInputType.number),
+          _AuthToggle(value: _auth, onChanged: (a) => setState(() => _auth = a)),
+          if (_auth == AuthKind.token)
+            _Field(label: 'API TOKEN', controller: _token, obscure: true)
+          else ...[
+            _Field(label: 'USERNAME', controller: _username),
+            _Field(label: 'PASSWORD', controller: _password, obscure: true),
+          ],
+          if (_error != null) _ErrLine(_error!),
         ],
-        if (_error != null) _ErrLine(_error!),
-      ]),
+      ),
     );
   }
 }
@@ -333,19 +398,22 @@ class _AddEnvDialogState extends State<AddEnvDialog> {
       primaryLabel: 'Add',
       busy: _busy,
       onPrimary: _submit,
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        _Field(label: 'ENVIRONMENT NAME', controller: _envName, autofocus: true, hint: 'e.g. prod'),
-        _Field(label: 'API BASE URL', controller: _apiBase),
-        _Field(label: 'ORGANIZATION ID', controller: _orgId, keyboardType: TextInputType.number),
-        _AuthToggle(value: _auth, onChanged: (a) => setState(() => _auth = a)),
-        if (_auth == AuthKind.token)
-          _Field(label: 'API TOKEN', controller: _token, obscure: true)
-        else ...[
-          _Field(label: 'USERNAME', controller: _username),
-          _Field(label: 'PASSWORD', controller: _password, obscure: true),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _Field(label: 'ENVIRONMENT NAME', controller: _envName, autofocus: true, hint: 'e.g. prod'),
+          _Field(label: 'API BASE URL', controller: _apiBase),
+          _Field(label: 'ORGANIZATION ID', controller: _orgId, keyboardType: TextInputType.number),
+          _AuthToggle(value: _auth, onChanged: (a) => setState(() => _auth = a)),
+          if (_auth == AuthKind.token)
+            _Field(label: 'API TOKEN', controller: _token, obscure: true)
+          else ...[
+            _Field(label: 'USERNAME', controller: _username),
+            _Field(label: 'PASSWORD', controller: _password, obscure: true),
+          ],
+          if (_error != null) _ErrLine(_error!),
         ],
-        if (_error != null) _ErrLine(_error!),
-      ]),
+      ),
     );
   }
 }
@@ -422,21 +490,32 @@ class _EditConnectionDialogState extends State<EditConnectionDialog> {
       primaryLabel: 'Save',
       busy: _busy,
       onPrimary: _submit,
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        _Field(label: 'PROJECT NAME', controller: _name, autofocus: true),
-        _Field(label: 'ENVIRONMENT NAME', controller: _envName, hint: 'e.g. prod'),
-        _Field(label: 'API BASE URL', controller: _apiBase),
-        _Field(label: 'ORGANIZATION ID', controller: _orgId, keyboardType: TextInputType.number),
-        _AuthToggle(value: _auth, onChanged: (a) => setState(() => _auth = a)),
-        if (_auth == AuthKind.token)
-          _Field(label: 'API TOKEN', controller: _token, obscure: true, hint: 'leave blank to keep current')
-        else ...[
-          _Field(label: 'USERNAME', controller: _username, hint: 'leave blank to keep current'),
-          _Field(label: 'PASSWORD', controller: _password, obscure: true, hint: 'leave blank to keep current'),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _Field(label: 'PROJECT NAME', controller: _name, autofocus: true),
+          _Field(label: 'ENVIRONMENT NAME', controller: _envName, hint: 'e.g. prod'),
+          _Field(label: 'API BASE URL', controller: _apiBase),
+          _Field(label: 'ORGANIZATION ID', controller: _orgId, keyboardType: TextInputType.number),
+          _AuthToggle(value: _auth, onChanged: (a) => setState(() => _auth = a)),
+          if (_auth == AuthKind.token)
+            _Field(label: 'API TOKEN', controller: _token, obscure: true, hint: 'leave blank to keep current')
+          else ...[
+            _Field(label: 'USERNAME', controller: _username, hint: 'leave blank to keep current'),
+            _Field(
+              label: 'PASSWORD',
+              controller: _password,
+              obscure: true,
+              hint: 'leave blank to keep current',
+            ),
+          ],
+          Text(
+            'Leave credentials blank to keep the current ones.',
+            style: TextStyle(color: c.textSecondary, fontSize: 11.5),
+          ),
+          if (_error != null) _ErrLine(_error!),
         ],
-        Text('Leave credentials blank to keep the current ones.', style: TextStyle(color: c.textSecondary, fontSize: 11.5)),
-        if (_error != null) _ErrLine(_error!),
-      ]),
+      ),
     );
   }
 }
@@ -510,9 +589,9 @@ class TwoWayNoticeDialog extends StatelessWidget {
     final c = MdhColors.of(context);
     final opening = forWatch
         ? 'Watching "$projectName" starts by syncing it, which sends your local '
-            'changes under envs/ to the Rossum organization, and pulls its changes back.'
+              'changes under envs/ to the Rossum organization, and pulls its changes back.'
         : 'Syncing "$projectName" sends your local changes under envs/ to the '
-            'Rossum organization, and pulls its changes back.';
+              'Rossum organization, and pulls its changes back.';
     return _Frame(
       title: 'Sync writes to Rossum',
       primaryLabel: forWatch ? 'Watch' : 'Sync',
@@ -542,12 +621,7 @@ class TwoWayNoticeDialog extends StatelessWidget {
 /// without an answer while the worker thread behind it stays parked waiting
 /// for one, and would render a key ("Cancel") the core never offered.
 class PromptDialog extends StatelessWidget {
-  const PromptDialog({
-    super.key,
-    required this.prompt,
-    required this.logTail,
-    required this.onAnswer,
-  });
+  const PromptDialog({super.key, required this.prompt, required this.logTail, required this.onAnswer});
 
   final PendingPrompt prompt;
   final List<String> logTail;
@@ -561,37 +635,45 @@ class PromptDialog extends StatelessWidget {
       spans.addAll(ansiSpans(logTail[i], c, 12.5));
       if (i < logTail.length - 1) spans.add(const TextSpan(text: '\n'));
     }
-    return _Frame(
-      title: '${prompt.title} · ${prompt.env}',
-      maxWidth: 560,
-      actions: [
-        for (final k in prompt.keys)
-          MdhBtn(
-            label: '[${k.key}] ${k.label}',
-            primary: k.key == 'n' || k.key == 's',
-            onTap: () => onAnswer(k.key),
+    // The letters on the buttons are the terminal's, and now they work here
+    // too: a label that says `[k]` and answers to nothing is the same lie as
+    // a picker advertising keys it never bound.
+    return CallbackShortcuts(
+      bindings: {for (final k in prompt.keys) CharacterActivator(k.key): () => onAnswer(k.key)},
+      child: Focus(
+        autofocus: true,
+        child: _Frame(
+          title: '${prompt.title} · ${prompt.env}',
+          maxWidth: 560,
+          actions: [
+            for (final k in prompt.keys)
+              MdhBtn(
+                label: '[${k.key}] ${k.label}',
+                primary: k.key == 'n' || k.key == 's',
+                onTap: () => onAnswer(k.key),
+              ),
+          ],
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: double.infinity,
+                constraints: const BoxConstraints(maxHeight: 260),
+                decoration: BoxDecoration(
+                  color: c.bgCode,
+                  border: Border.all(color: c.borderCard),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
+                child: SingleChildScrollView(child: SelectableText.rich(TextSpan(children: spans))),
+              ),
+              // No question line: `prompt.question` is the same choices the
+              // buttons below already carry, plus a `> ` that means nothing
+              // outside a terminal.
+            ],
           ),
-      ],
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Container(
-            width: double.infinity,
-            constraints: const BoxConstraints(maxHeight: 260),
-            decoration: BoxDecoration(
-              color: c.bgCode,
-              border: Border.all(color: c.borderCard),
-              borderRadius: BorderRadius.circular(6),
-            ),
-            padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
-            child: SingleChildScrollView(
-              child: SelectableText.rich(TextSpan(children: spans)),
-            ),
-          ),
-          const SizedBox(height: 12),
-          SelectableText(prompt.question, style: monoStyle(c.textSecondary, 12.5)),
-        ],
+        ),
       ),
     );
   }

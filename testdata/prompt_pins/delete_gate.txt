@@ -2,4 +2,4 @@
          delete hooks    legacy-export               id 9137
          delete queues   invoices                    id 4210
 [y] delete them   [n] cancel (default)
-> 
+> y
