@@ -150,7 +150,10 @@ pub fn confirm_or_refuse(
     // after it, which a timestamped event line cannot do. Under `Log::new`
     // the renderer's sink is stderr, so the terminal sees the same bytes.
     let keys = vec![
-        crate::cli::stdin_coord::PromptKey::new('y', "delete them"),
+        crate::cli::stdin_coord::PromptKey::new(
+            'y',
+            if n == 1 { "delete it" } else { "delete them" },
+        ),
         crate::cli::stdin_coord::PromptKey::new('n', "cancel (default)"),
     ];
     crate::cli::stdin_coord::announce(crate::cli::stdin_coord::Prompt {
@@ -664,7 +667,7 @@ mod tests {
 
         let text = buf.text();
         assert!(
-            text.contains("[y] delete them   [n] cancel (default)"),
+            text.contains("[y] delete it   [n] cancel (default)"),
             "question missing from the sink: {text:?}"
         );
 
@@ -673,12 +676,12 @@ mod tests {
         assert_eq!(seen[0].kind, crate::cli::stdin_coord::PromptKind::DeleteGate);
         assert_eq!(
             seen[0].question,
-            "[y] delete them  [n] cancel (default) > "
+            "[y] delete it  [n] cancel (default) > "
         );
         assert_eq!(
             seen[0].keys,
             vec![
-                crate::cli::stdin_coord::PromptKey::new('y', "delete them"),
+                crate::cli::stdin_coord::PromptKey::new('y', "delete it"),
                 crate::cli::stdin_coord::PromptKey::new('n', "cancel (default)"),
             ]
         );

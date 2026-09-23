@@ -313,16 +313,33 @@ unattended and repeatedly.
 When both local and the env have changed since the last sync, an inline resolver opens for each conflicting file:
 
 ```
-[k] keep local  [r] use test  [e] edit  [s] skip (shadow file)  [a] abort >
+[2/7]    conflict
+         prompt queues   invoices        +1    -1
+         ⎿ envs/test/queues/invoices.json   - local  + test
+         1 1 │   {
+         2   │ -   "name": "Invoices"
+           2 │ +   "name": "Invoices EU"
+         3 3 │   }
+
+[k] keep local (push it to test)   [r] use test (overwrite local)
+[e] edit in $EDITOR   [s] decide later   [a] abort the sync
+>
 ```
+
+The position is `[2/7]`, the row names the object and the size of the change,
+the connector says which side is which, and the choices say what each one
+does:
 
 - `k` — push local bytes to the env.
 - `r` — overwrite local with the env's bytes.
 - `e` — open `$EDITOR` on git-style conflict markers.
-- `s` — skip; the env's bytes land at `<file>.<env-name>` for review.
-- `a` — abort.
+- `s` — decide later; the env's bytes are parked under `.rdc/conflicts/<env>/`
+  and the local file is left alone.
+- `a` — abort the sync.
 
-Multi-hunk bodies additionally offer `[h] hunk-by-hunk` to walk the differences one at a time.
+When the bodies differ in more than one place, `[h] one change at a time`
+walks them one hunk at a time. When more than one conflict is left, `[K]` and
+`[R]` answer for all of them after a confirmation.
 
 ### Create or delete
 
@@ -331,10 +348,10 @@ Author a new JSON file (omit `id` and `url` — the server assigns them) and `rd
 ```sh
 $ rm envs/test/labels/audit-hold.json
 $ rdc sync test
-! The following 1 object(s) would be DELETED from the remote:
-  - labels/audit-hold (id 10198)
-
-Proceed with deletion? [y/N] y
+12:04:31 delete 1 object would be DELETED from the remote
+         delete labels   audit-hold                  id 10198
+[y] delete it   [n] cancel (default)
+> y
 ```
 
 ## `rdc migrate`

@@ -8,13 +8,16 @@ import 'package:flutter_test/flutter_test.dart';
 PendingPrompt _conflict() => PendingPrompt(
       id: BigInt.one,
       kind: PromptKindDto.conflict,
-      question: '[k] keep local  [r] use dev  [s] skip (shadow file)  [a] abort > ',
-      // What the bridge offers after stripping [e] and [h].
+      // What the bridge offers after stripping [e] and [h] — and the
+      // question it rebuilds from exactly those keys, so the line never
+      // names a choice this surface has no button for.
+      question: '[k] keep local (push it to dev)  [r] use dev (overwrite local)'
+          '  [s] decide later  [a] abort the sync > ',
       keys: [
-        PromptChoice(key: 'k', label: 'keep local'),
-        PromptChoice(key: 'r', label: 'use dev'),
-        PromptChoice(key: 's', label: 'skip (shadow file)'),
-        PromptChoice(key: 'a', label: 'abort'),
+        PromptChoice(key: 'k', label: 'keep local (push it to dev)'),
+        PromptChoice(key: 'r', label: 'use dev (overwrite local)'),
+        PromptChoice(key: 's', label: 'decide later'),
+        PromptChoice(key: 'a', label: 'abort the sync'),
       ],
       folder: '/tmp/acme',
       env: 'dev',
@@ -39,10 +42,10 @@ void main() {
     // above restates every key on one line (as the CLI printed it), so a
     // substring search matches both that line and the button — only an
     // exact match isolates the button itself.
-    expect(find.text('[k] keep local'), findsOneWidget);
-    expect(find.text('[r] use dev'), findsOneWidget);
-    expect(find.text('[s] skip (shadow file)'), findsOneWidget);
-    expect(find.text('[a] abort'), findsOneWidget);
+    expect(find.text('[k] keep local (push it to dev)'), findsOneWidget);
+    expect(find.text('[r] use dev (overwrite local)'), findsOneWidget);
+    expect(find.text('[s] decide later'), findsOneWidget);
+    expect(find.text('[a] abort the sync'), findsOneWidget);
     // One button per key, no more, no fewer — a stray extra button would
     // otherwise pass the four checks above unnoticed.
     expect(find.byType(MdhBtn), findsNWidgets(prompt.keys.length));
@@ -51,7 +54,7 @@ void main() {
     expect(find.textContaining('[e]'), findsNothing);
     expect(find.textContaining('[h]'), findsNothing);
 
-    await t.tap(find.text('[r] use dev'));
+    await t.tap(find.text('[r] use dev (overwrite local)'));
     await t.pump();
     expect(answered, 'r');
   });

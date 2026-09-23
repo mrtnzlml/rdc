@@ -26,6 +26,7 @@ use std::time::Duration;
 /// `CoordinatorStdin`, `read_line_coordinated` — is the CLI's own
 /// terminal-stdin machinery and is deliberately NOT part of this surface;
 /// only these five names are re-exported.
+pub use crate::cli::change_view::menu_one_line;
 pub use crate::cli::stdin_coord::{Prompt, PromptKey, PromptKind, PromptRoute, with_route};
 
 /// Run one no-push reconciliation cycle.

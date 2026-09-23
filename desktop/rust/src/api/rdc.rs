@@ -709,10 +709,20 @@ impl<S: PromptSink + Send + Sync> rdc::cli::sync::embed::PromptRoute for SinkPro
         // `PromptResolved` from the displaced generation could clear the
         // live generation's prompt out from under the user.
         let id = crate::watch_registry::next_prompt_id();
-        let keys: Vec<PromptChoice> = prompt
+        // `[e]` opens $EDITOR and `[h]` walks hunks on a terminal; neither
+        // works here, and `ask` rejects them below. The question is rebuilt
+        // from what SURVIVES the filter — cloning the terminal's own line
+        // would name two choices this surface does not offer, and the dialog
+        // renders that line verbatim.
+        let offered: Vec<rdc::cli::sync::embed::PromptKey> = prompt
             .keys
             .iter()
             .filter(|k| !matches!(k.key, 'e' | 'h'))
+            .cloned()
+            .collect();
+        let question = rdc::cli::sync::embed::menu_one_line(&offered);
+        let keys: Vec<PromptChoice> = offered
+            .iter()
             .map(|k| PromptChoice {
                 key: k.key.to_string(),
                 label: k.label.clone(),
@@ -739,7 +749,7 @@ impl<S: PromptSink + Send + Sync> rdc::cli::sync::embed::PromptRoute for SinkPro
         if !self.sink.emit(SyncPhase::Prompt {
             id,
             kind: kind_to_dto(prompt.kind),
-            question: prompt.question.clone(),
+            question,
             keys,
         }) {
             return None; // Dart stream gone: degrade to EOF (skip / N).

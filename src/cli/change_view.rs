@@ -142,7 +142,7 @@ pub(crate) fn render_menu(keys: &[PromptKey], mode: ColorMode) -> String {
 /// `question`. An embedder renders one line plus its own buttons, so it
 /// wants the unwrapped form — and deriving both from one `keys` slice is
 /// what keeps the dialog and the terminal from drifting apart.
-pub(crate) fn menu_one_line(keys: &[PromptKey]) -> String {
+pub fn menu_one_line(keys: &[PromptKey]) -> String {
     let mut s = String::new();
     for k in keys {
         if !s.is_empty() {

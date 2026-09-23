@@ -327,7 +327,10 @@ fn prompt_confirm_row_deletes(
     progress.with_prompt(|| -> Result<bool> {
         use std::io::Write;
         let keys = vec![
-            crate::cli::stdin_coord::PromptKey::new('y', "delete them"),
+            crate::cli::stdin_coord::PromptKey::new(
+                'y',
+                if pending == 1 { "delete it" } else { "delete them" },
+            ),
             crate::cli::stdin_coord::PromptKey::new('n', "cancel (default)"),
         ];
         crate::cli::stdin_coord::announce(crate::cli::stdin_coord::Prompt {

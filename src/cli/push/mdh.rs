@@ -780,7 +780,14 @@ fn prompt_confirm_index_drops(
     progress.with_prompt(|| -> Result<bool> {
         use std::io::Write;
         let keys = vec![
-            crate::cli::stdin_coord::PromptKey::new('y', "drop them"),
+            crate::cli::stdin_coord::PromptKey::new(
+                'y',
+                if pending_regular.len() + pending_search.len() == 1 {
+                    "drop it"
+                } else {
+                    "drop them"
+                },
+            ),
             crate::cli::stdin_coord::PromptKey::new('n', "cancel (default)"),
         ];
         crate::cli::stdin_coord::announce(crate::cli::stdin_coord::Prompt {
@@ -1653,18 +1660,18 @@ mod tests {
 
         let text = buf.text();
         assert!(
-            text.contains("[y] drop them   [n] cancel (default)"),
+            text.contains("[y] drop it   [n] cancel (default)"),
             "question missing from the sink: {text:?}"
         );
 
         let seen = route.seen.lock().unwrap();
         assert_eq!(seen.len(), 1, "expected exactly one announce: {seen:?}");
         assert_eq!(seen[0].kind, crate::cli::stdin_coord::PromptKind::MdhIndexDrop);
-        assert_eq!(seen[0].question, "[y] drop them  [n] cancel (default) > ");
+        assert_eq!(seen[0].question, "[y] drop it  [n] cancel (default) > ");
         assert_eq!(
             seen[0].keys,
             vec![
-                crate::cli::stdin_coord::PromptKey::new('y', "drop them"),
+                crate::cli::stdin_coord::PromptKey::new('y', "drop it"),
                 crate::cli::stdin_coord::PromptKey::new('n', "cancel (default)"),
             ]
         );

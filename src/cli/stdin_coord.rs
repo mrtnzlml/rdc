@@ -68,8 +68,13 @@ pub enum PromptKind {
     Unknown,
 }
 
-/// What a blocked prompt is asking, in machine-readable form. `question` is
-/// the same string the terminal shows, trailing `"> "` and all.
+/// What a blocked prompt is asking, in machine-readable form.
+///
+/// `question` is the choices on ONE line, trailing `"> "` and all
+/// (`change_view::menu_one_line`) — for a consumer that renders a question
+/// plus its own buttons. The terminal shows the same choices wrapped over
+/// several lines (`change_view::render_menu`); both are built from `keys`,
+/// so they cannot drift apart.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prompt {
     pub kind: PromptKind,
