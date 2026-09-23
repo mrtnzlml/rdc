@@ -1443,137 +1443,6 @@ pub fn resolve_push_drift(
     }
 }
 
-fn sort_users_for_picker(users: &[crate::model::User]) -> Vec<&crate::model::User> {
-    let mut v: Vec<&crate::model::User> = users.iter().collect();
-    v.sort_by_key(|u| {
-        if u.is_system_user() {
-            0u8
-        } else if u.is_admin() {
-            1
-        } else {
-            2
-        }
-    });
-    v
-}
-
-/// Build the per-user labels for the token_owner picker. Users come back
-/// in priority order (system → admin → other) so the recommended pick is
-/// at the top. Each label is a single-line summary that fits in an
-/// inquire `Select`.
-pub fn format_user_choices(users: &[crate::model::User], self_user_id: Option<u64>) -> Vec<String> {
-    let sorted = sort_users_for_picker(users);
-    sorted
-        .iter()
-        .map(|u| {
-            let mut tags = Vec::new();
-            if u.is_admin() {
-                tags.push("admin");
-            }
-            if u.is_active {
-                tags.push("active");
-            }
-            if Some(u.id) == self_user_id {
-                tags.push("you");
-            }
-            let tags = tags.join(", ");
-            let display = if u.first_name.is_empty() && u.last_name.is_empty() {
-                u.username.clone()
-            } else {
-                format!("{} {}", u.first_name, u.last_name)
-                    .trim()
-                    .to_string()
-            };
-            // Two real users can share first+last name; the email is
-            // the only field guaranteed unique per Rossum user. Render
-            // it next to the display name (`<email>`, git-author style)
-            // when present and not already what `display` collapsed to
-            // (system accounts often have email == username, no point
-            // showing the same string twice).
-            let email_suffix = u
-                .email
-                .as_deref()
-                .filter(|e| !e.is_empty() && *e != display)
-                .map(|e| format!(" <{e}>"))
-                .unwrap_or_default();
-            format!("{display}{email_suffix}   [{tags}]   {}", u.url)
-        })
-        .collect()
-}
-
-/// The `token_owner` picker's question.
-///
-/// Composed here rather than inline at the `inquire` call so the text can be
-/// pinned (`testdata/prompt_pins/token_owner.txt`): `inquire` draws its widget
-/// straight to the terminal, leaving no sink a test could capture.
-pub(crate) fn token_owner_question(slug: &str, tgt_env: &str) -> String {
-    format!("Pick the token_owner for store extension '{slug}' on {tgt_env}")
-}
-
-/// The picker's option list: every candidate user, then the way out.
-pub(crate) fn token_owner_options(
-    users: &[crate::model::User],
-    self_user_id: Option<u64>,
-) -> Vec<String> {
-    let mut options = format_user_choices(users, self_user_id);
-    options.push(TOKEN_OWNER_ABORT.to_string());
-    options
-}
-
-/// Last entry in the picker; picking it cancels the promotion.
-pub(crate) const TOKEN_OWNER_ABORT: &str = "abort the promotion";
-/// Help line `inquire` renders under the picker.
-pub(crate) const TOKEN_OWNER_HELP: &str =
-    "used as the API service account for the extension's calls (usually a system user)";
-/// Follow-up confirmation once a user has been picked.
-pub(crate) const TOKEN_OWNER_APPLY_ALL: &str =
-    "Apply this choice to all remaining store extensions in this deploy?";
-
-/// Prompt interactively. Returns `Some((picked_user_url, apply_to_all))`
-/// or `None` if the user aborted. Non-TTY callers must skip this and
-/// check the overlay state up-front.
-///
-/// **No caller today.** This was the store-extension step of the retired
-/// `deploy` command; a `token_owner` is now declared per env in
-/// `overlay.toml` (`[hooks."*"] token_owner`, or per hook).
-pub fn prompt_token_owner(
-    slug: &str,
-    tgt_env: &str,
-    users: &[crate::model::User],
-    self_user_id: Option<u64>,
-) -> anyhow::Result<Option<(String, bool)>> {
-    use inquire::error::InquireError;
-    use inquire::{Confirm, Select};
-
-    let sorted = sort_users_for_picker(users);
-    let options = token_owner_options(users, self_user_id);
-    let prompt = token_owner_question(slug, tgt_env);
-
-    let answer = match Select::new(&prompt, options)
-        .with_help_message(TOKEN_OWNER_HELP)
-        .raw_prompt()
-    {
-        Ok(opt) => opt,
-        Err(InquireError::OperationCanceled) | Err(InquireError::OperationInterrupted) => {
-            return Ok(None);
-        }
-        Err(e) => return Err(anyhow::anyhow!("prompt failed: {e}")),
-    };
-
-    if answer.value == TOKEN_OWNER_ABORT {
-        return Ok(None);
-    }
-    let chosen = sorted
-        .get(answer.index)
-        .ok_or_else(|| anyhow::anyhow!("internal: picker index {} out of range", answer.index))?;
-
-    let apply_all = Confirm::new(TOKEN_OWNER_APPLY_ALL)
-        .with_default(false)
-        .prompt()
-        .unwrap_or(false);
-    Ok(Some((chosen.url.clone(), apply_all)))
-}
-
 /// Cure choice for an anomalous store-extension hook. `Convert` is
 /// the safe default (one PATCH, hook id preserved); `Reinstall` is
 /// the heavier option (new id, dependents rewired); `Skip` leaves
@@ -1641,8 +1510,7 @@ pub fn prompt_anomaly_cure(
             _ => AnomalyCure::Convert,
         });
     }
-    // TTY mode: use the project's existing prompt library (`inquire`,
-    // matching `prompt_token_owner` above).
+    // TTY mode: use the project's prompt library (`inquire`).
     let prompt = anomaly_cure_question(slug, hook);
     let options = ANOMALY_CURE_OPTIONS.to_vec();
     use inquire::error::InquireError;
@@ -2207,117 +2075,9 @@ mod tests {
         assert!(!s.contains("\x1b["), "expected no SGR codes: {s:?}");
     }
 
-    #[test]
-    fn picker_renders_users_in_priority_order() {
-        use crate::model::User;
-        let users: Vec<User> = serde_json::from_value(serde_json::json!([
-            {"id": 100, "url": "u100", "username": "alice@x", "first_name": "Alice", "last_name": "",
-             "is_active": true, "groups": ["https://x/groups/3"]},
-            {"id": 938493, "url": "u938493", "username": "system_user__abc", "first_name": "SYS",
-             "last_name": "USER", "is_active": true, "groups": ["https://x/groups/3"]},
-            {"id": 200, "url": "u200", "username": "bob@x", "first_name": "Bob", "last_name": "",
-             "is_active": true, "groups": ["https://x/groups/3"]}
-        ])).unwrap();
-        let choices = format_user_choices(&users, Some(938493));
-        // System user first.
-        assert!(
-            choices[0].contains("u938493"),
-            "system_user should be ranked first, got {:?}",
-            choices
-        );
-        assert!(
-            choices.iter().any(|c| c.contains("u100")),
-            "alice should be present"
-        );
-        // Active session's own user tagged.
-        assert!(
-            choices[0].contains("you"),
-            "self user should be tagged, got {:?}",
-            choices[0]
-        );
-    }
 
-    #[test]
-    fn picker_includes_email_for_disambiguation() {
-        // Two real users can share first+last name; email is the unique
-        // identifier the operator can use to tell them apart.
-        use crate::model::User;
-        let users: Vec<User> = serde_json::from_value(serde_json::json!([
-            {"id": 100, "url": "u100", "username": "alice@a.com",
-             "email": "alice@a.com",
-             "first_name": "Alice", "last_name": "Smith",
-             "is_active": true, "groups": ["https://x/groups/3"]},
-            {"id": 200, "url": "u200", "username": "alice@b.com",
-             "email": "alice@b.com",
-             "first_name": "Alice", "last_name": "Smith",
-             "is_active": true, "groups": ["https://x/groups/3"]}
-        ]))
-        .unwrap();
-        let choices = format_user_choices(&users, None);
-        // Each line carries its own email so the operator can pick.
-        assert!(
-            choices
-                .iter()
-                .any(|c| c.contains("Alice Smith <alice@a.com>")),
-            "expected '<alice@a.com>' in some line, got {:?}",
-            choices,
-        );
-        assert!(
-            choices
-                .iter()
-                .any(|c| c.contains("Alice Smith <alice@b.com>")),
-            "expected '<alice@b.com>' in some line, got {:?}",
-            choices,
-        );
-    }
 
-    #[test]
-    fn picker_omits_email_when_absent_or_equal_to_display() {
-        // System users typically have no separate email (just the
-        // synthetic `system_user__<hash>` username). Don't render an
-        // empty `<>` or a redundant duplicate.
-        use crate::model::User;
-        let users: Vec<User> = serde_json::from_value(serde_json::json!([
-            {"id": 1, "url": "u1", "username": "system_user__abc",
-             "first_name": "SYS", "last_name": "USER",
-             "is_active": true, "groups": ["https://x/groups/3"]},
-            {"id": 2, "url": "u2", "username": "name-as-username",
-             "email": "name-as-username",
-             "first_name": "", "last_name": "",
-             "is_active": true, "groups": ["https://x/groups/3"]}
-        ]))
-        .unwrap();
-        let choices = format_user_choices(&users, None);
-        for c in &choices {
-            assert!(!c.contains("<>"), "no empty email markers: {:?}", c);
-        }
-        // For the username-only user, display == email; suppress the
-        // duplicate.
-        let same = choices
-            .iter()
-            .find(|c| c.contains("name-as-username"))
-            .unwrap();
-        assert!(
-            !same.contains("<name-as-username>"),
-            "should suppress redundant `<email>` when it equals display, got {:?}",
-            same,
-        );
-    }
 
-    #[test]
-    fn picker_skips_you_tag_when_self_id_is_none() {
-        use crate::model::User;
-        let users: Vec<User> = serde_json::from_value(serde_json::json!([
-            {"id": 100, "url": "u100", "username": "alice@x", "first_name": "Alice", "last_name": "",
-             "is_active": true, "groups": ["https://x/groups/3"]}
-        ])).unwrap();
-        let choices = format_user_choices(&users, None);
-        assert!(
-            !choices[0].contains("you"),
-            "no self_id → no 'you' tag, got {:?}",
-            choices[0]
-        );
-    }
 
     #[test]
     fn prompt_resolve_uses_env_name_in_labels() {
@@ -3689,43 +3449,6 @@ mod tests {
         pin("remote_delete_bulk", &actual);
     }
 
-    /// `inquire` prompt, so the pin is the question and options rdc composes,
-    /// then the help line and the follow-up confirmation. `inquire`'s own
-    /// widget chrome is not rdc's and is not pinned.
-    #[test]
-    fn token_owner_prompt_text_is_pinned() {
-        let users: Vec<crate::model::User> = serde_json::from_value(serde_json::json!([
-            {
-                "id": 41,
-                "url": "https://api.example.com/v1/users/41",
-                "username": "ada@acme.test",
-                "email": "ada@acme.test",
-                "first_name": "Ada",
-                "last_name": "Lovelace",
-                "is_active": true,
-                "groups": ["https://api.example.com/v1/groups/3"]
-            },
-            {
-                "id": 42,
-                "url": "https://api.example.com/v1/users/42",
-                "username": "system_user__0f21",
-                "is_active": true,
-                "groups": ["https://api.example.com/v1/groups/3"]
-            }
-        ]))
-        .unwrap();
-
-        let text = format!(
-            "{}\n  help: {}\n\nthen: {}",
-            inquire_shape(
-                &token_owner_question("sftp-import", "prod"),
-                &token_owner_options(&users, Some(42)),
-            ),
-            TOKEN_OWNER_HELP,
-            TOKEN_OWNER_APPLY_ALL,
-        );
-        pin("token_owner", &text);
-    }
 
     /// Same `inquire` shape for the doctor's per-hook cure picker.
     #[test]

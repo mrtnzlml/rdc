@@ -9,7 +9,7 @@ pub use rate_limit::RateLimiter;
 
 use crate::model::{
     EmailTemplate, Engine, EngineField, Hook, HookTemplate, Inbox, Label, Organization, Queue,
-    Rule, SavedView, Schema, User, Workflow, WorkflowStep, Workspace,
+    Rule, SavedView, Schema, Workflow, WorkflowStep, Workspace,
 };
 use crate::api::retry::ProgressHandle;
 use anyhow::{Context, Result};
@@ -182,10 +182,6 @@ impl RossumClient {
 
     pub async fn list_inboxes(&self, progress: ProgressHandle) -> Result<Vec<Inbox>> {
         self.list_paginated("/inboxes", progress).await
-    }
-
-    pub async fn list_users(&self, progress: ProgressHandle) -> Result<Vec<User>> {
-        self.list_paginated("/users", progress).await
     }
 
     // --- get endpoints ------------------------------------------------

@@ -643,32 +643,6 @@ async fn list_hook_templates_paginates() {
     assert!(templates.iter().any(|t| t.name == "Master Data Hub"));
 }
 
-#[tokio::test]
-async fn list_users_paginates() {
-    use rdc::model::User;
-    use serde_json::json;
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/api/v1/users"))
-        .and(header("Authorization", "token TEST_TOKEN"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "pagination": { "next": null },
-            "results": [
-                {"id": 938493, "url": format!("{}/api/v1/users/938493", server.uri()),
-                 "username": "system_user__a556534d", "is_active": true,
-                 "groups": [format!("{}/api/v1/groups/3", server.uri())]},
-                {"id": 200001, "url": format!("{}/api/v1/users/200001", server.uri()),
-                 "username": "alice@example.org", "is_active": true,
-                 "groups": [format!("{}/api/v1/groups/3", server.uri())]}
-            ]
-        })))
-        .mount(&server).await;
-
-    let client = RossumClient::new(format!("{}/api/v1", server.uri()), "TEST_TOKEN".into()).unwrap();
-    let users: Vec<User> = client.list_users(None).await.unwrap();
-    assert_eq!(users.len(), 2);
-    assert!(users.iter().any(|u| u.is_system_user()));
-}
 
 #[tokio::test]
 async fn login_posts_credentials_and_returns_key() {
