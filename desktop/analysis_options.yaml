@@ -15,6 +15,10 @@ analyzer:
     # app's source; it has its own package and its own (noisy) analysis.
     - rust_builder/**
     - lib/src/rust/**
+    - build/**
+    - windows/**
+    - macos/**
+    - linux/**
 
 linter:
   # The lint rules applied to this project can be customized in the

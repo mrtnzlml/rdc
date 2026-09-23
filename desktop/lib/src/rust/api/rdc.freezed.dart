@@ -1,6 +1,6 @@
 // GENERATED CODE - DO NOT MODIFY BY HAND
 // coverage:ignore-file
-// ignore_for_file: type=lint
+// ignore_for_file: type=lint, type=warning, deprecated_member_use, deprecated_member_use_from_same_package
 // ignore_for_file: unused_element, deprecated_member_use, deprecated_member_use_from_same_package, use_function_type_syntax_for_parameters, unnecessary_const, avoid_init_to_null, invalid_override_different_default_values_named, prefer_expression_function_bodies, annotate_overrides, invalid_annotation_target, unnecessary_question_mark
 
 part of 'rdc.dart';
@@ -9,6 +9,7 @@ part of 'rdc.dart';
 // FreezedGenerator
 // **************************************************************************
 
+// GENERATED CODE - DO NOT MODIFY BY HAND
 // dart format off
 T _$identity<T>(T value) => value;
 /// @nodoc
@@ -20,7 +21,7 @@ mixin _$SyncPhase {
 
 @override
 bool operator ==(Object other) {
-  return identical(this, other) || (other.runtimeType == runtimeType&&other is SyncPhase);
+    return identical(this, other) || (other.runtimeType == runtimeType&&other is SyncPhase);
 }
 
 
@@ -29,7 +30,7 @@ int get hashCode => runtimeType.hashCode;
 
 @override
 String toString() {
-  return 'SyncPhase()';
+    return 'SyncPhase()';
 }
 
 
@@ -221,7 +222,7 @@ class SyncPhase_Started extends SyncPhase {
 
 @override
 bool operator ==(Object other) {
-  return identical(this, other) || (other.runtimeType == runtimeType&&other is SyncPhase_Started);
+    return identical(this, other) || (other.runtimeType == runtimeType&&other is SyncPhase_Started);
 }
 
 
@@ -230,7 +231,7 @@ int get hashCode => runtimeType.hashCode;
 
 @override
 String toString() {
-  return 'SyncPhase.started()';
+    return 'SyncPhase.started()';
 }
 
 
@@ -258,16 +259,18 @@ $SyncPhase_LogCopyWith<SyncPhase_Log> get copyWith => _$SyncPhase_LogCopyWithImp
 
 @override
 bool operator ==(Object other) {
-  return identical(this, other) || (other.runtimeType == runtimeType&&other is SyncPhase_Log&&(identical(other.line, line) || other.line == line));
+    return identical(this, other) || (other.runtimeType == runtimeType&&other is SyncPhase_Log&&(identical(other.line, line) || other.line == line));
 }
 
 
 @override
-int get hashCode => Object.hash(runtimeType,line);
+int get hashCode {
+    return Object.hash(runtimeType,line);
+}
 
 @override
 String toString() {
-  return 'SyncPhase.log(line: $line)';
+    return 'SyncPhase.log(line: $line)';
 }
 
 
@@ -309,7 +312,7 @@ as String,
 
 
 class SyncPhase_Prompt extends SyncPhase {
-  const SyncPhase_Prompt({required this.id, required this.kind, required this.question, required final  List<PromptChoice> keys}): _keys = keys,super._();
+  const SyncPhase_Prompt({required this.id, required this.kind, required this.question, required  List<PromptChoice> keys}): _keys = keys,super._();
   
 
  final  BigInt id;
@@ -333,16 +336,18 @@ $SyncPhase_PromptCopyWith<SyncPhase_Prompt> get copyWith => _$SyncPhase_PromptCo
 
 @override
 bool operator ==(Object other) {
-  return identical(this, other) || (other.runtimeType == runtimeType&&other is SyncPhase_Prompt&&(identical(other.id, id) || other.id == id)&&(identical(other.kind, kind) || other.kind == kind)&&(identical(other.question, question) || other.question == question)&&const DeepCollectionEquality().equals(other._keys, _keys));
+    return identical(this, other) || (other.runtimeType == runtimeType&&other is SyncPhase_Prompt&&(identical(other.id, id) || other.id == id)&&(identical(other.kind, kind) || other.kind == kind)&&(identical(other.question, question) || other.question == question)&&const DeepCollectionEquality().equals(other.keys, _keys));
 }
 
 
 @override
-int get hashCode => Object.hash(runtimeType,id,kind,question,const DeepCollectionEquality().hash(_keys));
+int get hashCode {
+    return Object.hash(runtimeType,id,kind,question,const DeepCollectionEquality().hash(_keys));
+}
 
 @override
 String toString() {
-  return 'SyncPhase.prompt(id: $id, kind: $kind, question: $question, keys: $keys)';
+    return 'SyncPhase.prompt(id: $id, kind: $kind, question: $question, keys: $keys)';
 }
 
 
@@ -402,16 +407,18 @@ $SyncPhase_PromptResolvedCopyWith<SyncPhase_PromptResolved> get copyWith => _$Sy
 
 @override
 bool operator ==(Object other) {
-  return identical(this, other) || (other.runtimeType == runtimeType&&other is SyncPhase_PromptResolved&&(identical(other.id, id) || other.id == id));
+    return identical(this, other) || (other.runtimeType == runtimeType&&other is SyncPhase_PromptResolved&&(identical(other.id, id) || other.id == id));
 }
 
 
 @override
-int get hashCode => Object.hash(runtimeType,id);
+int get hashCode {
+    return Object.hash(runtimeType,id);
+}
 
 @override
 String toString() {
-  return 'SyncPhase.promptResolved(id: $id)';
+    return 'SyncPhase.promptResolved(id: $id)';
 }
 
 
@@ -468,16 +475,18 @@ $SyncPhase_IdleCopyWith<SyncPhase_Idle> get copyWith => _$SyncPhase_IdleCopyWith
 
 @override
 bool operator ==(Object other) {
-  return identical(this, other) || (other.runtimeType == runtimeType&&other is SyncPhase_Idle&&(identical(other.nextPollSecs, nextPollSecs) || other.nextPollSecs == nextPollSecs));
+    return identical(this, other) || (other.runtimeType == runtimeType&&other is SyncPhase_Idle&&(identical(other.nextPollSecs, nextPollSecs) || other.nextPollSecs == nextPollSecs));
 }
 
 
 @override
-int get hashCode => Object.hash(runtimeType,nextPollSecs);
+int get hashCode {
+    return Object.hash(runtimeType,nextPollSecs);
+}
 
 @override
 String toString() {
-  return 'SyncPhase.idle(nextPollSecs: $nextPollSecs)';
+    return 'SyncPhase.idle(nextPollSecs: $nextPollSecs)';
 }
 
 
@@ -534,16 +543,18 @@ $SyncPhase_DoneCopyWith<SyncPhase_Done> get copyWith => _$SyncPhase_DoneCopyWith
 
 @override
 bool operator ==(Object other) {
-  return identical(this, other) || (other.runtimeType == runtimeType&&other is SyncPhase_Done&&(identical(other.fileCount, fileCount) || other.fileCount == fileCount));
+    return identical(this, other) || (other.runtimeType == runtimeType&&other is SyncPhase_Done&&(identical(other.fileCount, fileCount) || other.fileCount == fileCount));
 }
 
 
 @override
-int get hashCode => Object.hash(runtimeType,fileCount);
+int get hashCode {
+    return Object.hash(runtimeType,fileCount);
+}
 
 @override
 String toString() {
-  return 'SyncPhase.done(fileCount: $fileCount)';
+    return 'SyncPhase.done(fileCount: $fileCount)';
 }
 
 
@@ -600,16 +611,18 @@ $SyncPhase_ErrorCopyWith<SyncPhase_Error> get copyWith => _$SyncPhase_ErrorCopyW
 
 @override
 bool operator ==(Object other) {
-  return identical(this, other) || (other.runtimeType == runtimeType&&other is SyncPhase_Error&&(identical(other.message, message) || other.message == message));
+    return identical(this, other) || (other.runtimeType == runtimeType&&other is SyncPhase_Error&&(identical(other.message, message) || other.message == message));
 }
 
 
 @override
-int get hashCode => Object.hash(runtimeType,message);
+int get hashCode {
+    return Object.hash(runtimeType,message);
+}
 
 @override
 String toString() {
-  return 'SyncPhase.error(message: $message)';
+    return 'SyncPhase.error(message: $message)';
 }
 
 
@@ -661,7 +674,7 @@ class SyncPhase_Stopped extends SyncPhase {
 
 @override
 bool operator ==(Object other) {
-  return identical(this, other) || (other.runtimeType == runtimeType&&other is SyncPhase_Stopped);
+    return identical(this, other) || (other.runtimeType == runtimeType&&other is SyncPhase_Stopped);
 }
 
 
@@ -670,7 +683,7 @@ int get hashCode => runtimeType.hashCode;
 
 @override
 String toString() {
-  return 'SyncPhase.stopped()';
+    return 'SyncPhase.stopped()';
 }
 
 

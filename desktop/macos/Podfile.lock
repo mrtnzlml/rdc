@@ -14,7 +14,7 @@ EXTERNAL SOURCES:
     :path: Flutter/ephemeral/.symlinks/plugins/rdc_bridge/macos
 
 SPEC CHECKSUMS:
-  FlutterMacOS: d0db08ddef1a9af05a5ec4b724367152bb0500b1
+  FlutterMacOS: c232990155153907050900a2e175c7773903ba4e
   rdc_bridge: 9be144c55f558ccc8cb867a73ab0343b3867055b
 
 PODFILE CHECKSUM: a5bf8054f1a5473562e9c4ea80f7a1ea23f3c3f3
