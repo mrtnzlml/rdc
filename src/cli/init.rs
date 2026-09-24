@@ -1487,7 +1487,7 @@ mod tests {
         std::fs::remove_file(&legacy).unwrap();
         let (_, o) = write_mapping_scaffold(dir.path()).unwrap();
         assert_eq!(o, Scaffolded::Created);
-        std::fs::write(&mapping, "version = 2\n\n[[hooks]]\ndev = \"a\"\nprod = \"b\"\n").unwrap();
+        std::fs::write(&mapping, "version = 1\n\n[[hooks]]\ndev = \"a\"\nprod = \"b\"\n").unwrap();
         let (_, o) = write_mapping_scaffold(dir.path()).unwrap();
         assert_eq!(o, Scaffolded::Unchanged);
         assert!(std::fs::read_to_string(&mapping).unwrap().contains("[[hooks]]"));

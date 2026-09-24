@@ -2204,7 +2204,7 @@ fn migrate_warns_about_leftover_legacy_files_beside_generic_mapping() {
     // files are still converted into.
     std::fs::write(
         root.join(".rdc/mapping.toml"),
-        "version = 2\n\n[[hooks]]\ntest = \"a\"\nprod = \"b\"\n",
+        "version = 1\n\n[[hooks]]\ntest = \"a\"\nprod = \"b\"\n",
     )
     .unwrap();
     let map_dir = root.join(".rdc/map");
@@ -2261,7 +2261,7 @@ fn migrate_warns_when_mapping_source_slug_is_absent() {
     std::fs::create_dir_all(root.join(".rdc")).unwrap();
     std::fs::write(
         root.join(".rdc/mapping.toml"),
-        "version = 2\n\n[[queues]]\ntest = \"ghost\"\nprod = \"ghost-prod\"\n",
+        "version = 1\n\n[[queues]]\ntest = \"ghost\"\nprod = \"ghost-prod\"\n",
     )
     .unwrap();
 
@@ -2737,7 +2737,7 @@ fn migrate_mirror_accepts_a_saved_view_ref_to_a_queue_whose_workspace_moved() {
     std::fs::create_dir_all(root.join(".rdc")).unwrap();
     std::fs::write(
         root.join(".rdc/mapping.toml"),
-        "version = 2\n\n[[workspaces]]\ntest = \"main\"\nprod = \"main-v2\"\n",
+        "version = 1\n\n[[workspaces]]\ntest = \"main\"\nprod = \"main-v2\"\n",
     )
     .unwrap();
 
@@ -3178,7 +3178,7 @@ fn a_recorded_mapping_row_turns_the_recreate_into_a_rename() {
     std::fs::create_dir_all(root.join(".rdc")).unwrap();
     std::fs::write(
         root.join(".rdc/mapping.toml"),
-        "version = 2\n\n[[queues]]\ntest = \"vendor-invoices\"\nprod = \"invoices\"\n\n\
+        "version = 1\n\n[[queues]]\ntest = \"vendor-invoices\"\nprod = \"invoices\"\n\n\
          [[schemas]]\ntest = \"vendor-invoices\"\nprod = \"invoices\"\n",
     )
     .unwrap();

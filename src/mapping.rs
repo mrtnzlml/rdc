@@ -164,7 +164,7 @@ impl Mapping {
 /// Default for [`GenericMapping::version`] when a hand-authored
 /// `mapping.toml` omits the field entirely.
 fn default_generic_mapping_version() -> u32 {
-    2
+    1
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
@@ -198,7 +198,7 @@ pub struct GenericMapping {
 impl Default for GenericMapping {
     fn default() -> Self {
         Self {
-            version: 2,
+            version: 1,
             workspaces: Vec::new(),
             hooks: Vec::new(),
             rules: Vec::new(),
@@ -747,7 +747,7 @@ version = 1
         g.save(&path).unwrap();
 
         let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(raw.contains("version = 2"));
+        assert!(raw.contains("version = 1"));
         assert!(raw.contains("[[queues]]"));
         assert!(!raw.contains("[[labels]]"), "empty kinds are omitted");
 
@@ -759,7 +759,7 @@ version = 1
     fn generic_mapping_load_defaults_when_missing() {
         let dir = TempDir::new().unwrap();
         let g = GenericMapping::load(&dir.path().join("nope.toml")).unwrap();
-        assert_eq!(g.version, 2);
+        assert_eq!(g.version, 1);
         assert!(g.is_empty());
     }
 
@@ -769,7 +769,7 @@ version = 1
         // `version` entirely; it must still parse (defaulting to the current
         // schema version) instead of hard-failing on a missing field.
         let g: GenericMapping = toml::from_str("[[hooks]]\ndev = \"a\"\nprod = \"b\"\n").unwrap();
-        assert_eq!(g.version, 2);
+        assert_eq!(g.version, 1);
         assert_eq!(
             g.hooks,
             vec![BTreeMap::from([
@@ -977,7 +977,7 @@ version = 1
         // Exhaustive struct literal: adding a mapping Vec field to
         // GenericMapping breaks THIS line until the author updates it.
         let full = GenericMapping {
-            version: 2,
+            version: 1,
             workspaces: vec![row()],
             hooks: vec![row()],
             rules: vec![row()],
@@ -1031,7 +1031,9 @@ version = 1
     #[test]
     fn a_mapping_toml_without_saved_views_still_parses() {
         // Backward compatibility: an existing project's mapping file predates
-        // the kind and must load unchanged.
+        // the kind and must load unchanged. It also says `version = 2`, the
+        // number the format carried before it was renumbered to 1 — nothing
+        // reads the field, so both keep loading.
         let g: GenericMapping = toml::from_str("version = 2\n").unwrap();
         assert!(g.kind_rows("saved_views").unwrap().is_empty());
     }
@@ -1039,7 +1041,7 @@ version = 1
     /// A hand-authored file, with the shapes a human actually writes: comments
     /// above and beside rows, blank lines, and two kinds.
     const HAND_AUTHORED: &str = r#"# Cross-env slug names. Hand-authored.
-version = 2
+version = 1
 
 # The invoice queue is named differently in prod.
 [[queues]]
@@ -1103,7 +1105,7 @@ prod = "invoices"
 
     #[test]
     fn rewrite_row_column_preserves_a_literal_quote_style() {
-        let text = "version = 2\n\n[[queues]]\ndev = 'invoices'\nprod = \"invoices\"\n";
+        let text = "version = 1\n\n[[queues]]\ndev = 'invoices'\nprod = \"invoices\"\n";
         let out = rewrite_row_column(text, "queues", "dev", "invoices", "vendor").unwrap();
         assert!(out.contains("dev = 'vendor'"), "{out}");
     }
@@ -1118,7 +1120,7 @@ prod = "invoices"
     /// key must still match its env.
     #[test]
     fn rewrite_row_column_handles_quoted_keys_and_hashes_in_values() {
-        let text = "version = 2\n\n[[hooks]]\n\"dev-eu\" = \"a#b\"\nprod = \"a\"\n";
+        let text = "version = 1\n\n[[hooks]]\n\"dev-eu\" = \"a#b\"\nprod = \"a\"\n";
         let out = rewrite_row_column(text, "hooks", "dev-eu", "a#b", "c").unwrap();
         assert!(out.contains("\"dev-eu\" = \"c\""), "{out}");
     }
@@ -1132,7 +1134,7 @@ prod = "invoices"
         let out = append_row("", "queues", &cols);
         assert_eq!(
             out,
-            "version = 2\n\n[[queues]]\ndev = \"vendor-invoices\"\nprod = \"invoices\"\n"
+            "version = 1\n\n[[queues]]\ndev = \"vendor-invoices\"\nprod = \"invoices\"\n"
         );
         let g: GenericMapping = toml::from_str(&out).unwrap();
         assert_eq!(g.row_naming("queues", "dev", "vendor-invoices"), Some(0));

@@ -21,7 +21,7 @@ const RENAMED_KINDS: [&str; 7] =
 /// Only slugs carrying `prefix` are mapped, so objects belonging to other runs
 /// (or pre-existing org content) are never named in the file.
 pub fn rename_mapping(lf_src: &Lockfile, prefix: &str, src: &str, tgt: &str, suffix: &str) -> String {
-    let mut out = String::from("version = 2\n\n");
+    let mut out = String::from("version = 1\n\n");
     for kind in RENAMED_KINDS {
         for slug in lockfile_keys(lf_src, kind)
             .into_iter()
@@ -76,7 +76,7 @@ mod tests {
     fn emits_one_row_per_object_in_the_generic_format() {
         let lf = lf_with("queues", &["rdc-it-x-invoices", "rdc-it-x-orders"]);
         let m = rename_mapping(&lf, "rdc-it-x-", "test", "prod", "-prod");
-        assert!(m.starts_with("version = 2\n"), "{m}");
+        assert!(m.starts_with("version = 1\n"), "{m}");
         assert!(
             m.contains("[[queues]]\ntest = \"rdc-it-x-invoices\"\nprod = \"rdc-it-x-invoices-prod\"\n"),
             "{m}"

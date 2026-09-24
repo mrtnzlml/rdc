@@ -3010,7 +3010,7 @@ mod tests {
         // `record_mapping_rows` maintains it.
         std::fs::write(
             paths.mapping_file(),
-            "version = 2\n\n[[hooks]]\ndev = \"old-hook\"\nprod = \"old-hook-prod\"\n",
+            "version = 1\n\n[[hooks]]\ndev = \"old-hook\"\nprod = \"old-hook-prod\"\n",
         )
         .unwrap();
 
@@ -3704,7 +3704,7 @@ mod tests {
         std::fs::create_dir_all(paths.mapping_file().parent().unwrap()).unwrap();
         std::fs::write(
             paths.mapping_file(),
-            "version = 2\n\n# named differently in prod on purpose\n[[hooks]]\n\
+            "version = 1\n\n# named differently in prod on purpose\n[[hooks]]\n\
              dev = \"old-hook\"    # the source of truth\nprod = \"hook-prod\"\n",
         )
         .unwrap();
@@ -3800,7 +3800,7 @@ mod tests {
         ]);
         let paths = Paths::for_env(tmp.path(), "dev");
         std::fs::create_dir_all(paths.mapping_file().parent().unwrap()).unwrap();
-        let garbage = "version = 2\n\n[[hooks]\ndev = broken\n";
+        let garbage = "version = 1\n\n[[hooks]\ndev = broken\n";
         std::fs::write(paths.mapping_file(), garbage).unwrap();
         std::fs::create_dir_all(paths.hooks_dir()).unwrap();
         std::fs::write(
@@ -3914,7 +3914,7 @@ mod tests {
         // Some OTHER object already maps prod's `old-hook`.
         std::fs::write(
             paths.mapping_file(),
-            "version = 2\n\n[[hooks]]\ntest = \"other\"\nprod = \"old-hook\"\n",
+            "version = 1\n\n[[hooks]]\ntest = \"other\"\nprod = \"old-hook\"\n",
         )
         .unwrap();
         std::fs::create_dir_all(paths.hooks_dir()).unwrap();
@@ -3968,7 +3968,7 @@ mod tests {
         ]);
         let paths = Paths::for_env(tmp.path(), "dev");
         std::fs::create_dir_all(paths.mapping_file().parent().unwrap()).unwrap();
-        let before = "version = 2\n\n[[hooks]]\ndev = \"old-hook\"\nprod = \"hook-prod\"\n\n\
+        let before = "version = 1\n\n[[hooks]]\ndev = \"old-hook\"\nprod = \"hook-prod\"\n\n\
                       [[hooks]]\ndev = \"new-hook\"\nprod = \"other-prod\"\n";
         std::fs::write(paths.mapping_file(), before).unwrap();
         std::fs::create_dir_all(paths.hooks_dir()).unwrap();

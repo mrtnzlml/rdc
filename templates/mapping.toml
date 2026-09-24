@@ -35,4 +35,4 @@
 # Kinds: workspaces, hooks, rules, labels, queues, schemas, inboxes,
 # email_templates, engines, engine_fields ("<engine>/<field>"), saved_views.
 
-version = 2
+version = 1
