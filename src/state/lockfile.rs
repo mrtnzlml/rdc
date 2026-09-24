@@ -28,26 +28,6 @@ pub struct Lockfile {
     pub api_base: String,
     /// Per object-type, a map of slug -> entry.
     pub objects: BTreeMap<String, BTreeMap<String, ObjectEntry>>,
-    /// Per object-type, a map of slug -> the source object `rdc migrate` last
-    /// produced this env's object from. Written by migrate, read only by its
-    /// `--mirror` guard: a slug the source no longer has is a rename when the
-    /// same source id still exists under another slug, and a real deletion
-    /// when that id is gone.
-    ///
-    /// Kept apart from `objects` because migrate writes an origin for an
-    /// object the target has not pushed yet, which has no `id` to put in an
-    /// entry. `default` + `skip_serializing_if` keep older lockfiles loading
-    /// and unmigrated envs byte-identical, at the SAME [`LOCKFILE_VERSION`].
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub origins: BTreeMap<String, BTreeMap<String, Origin>>,
-}
-
-/// Where a migrated object came from: the source env, and the source object's
-/// Rossum id in that env's lockfile.
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
-pub struct Origin {
-    pub env: String,
-    pub id: u64,
 }
 
 /// One row in the lockfile.
@@ -95,7 +75,6 @@ impl Default for Lockfile {
             version: LOCKFILE_VERSION,
             api_base: String::new(),
             objects: BTreeMap::new(),
-            origins: BTreeMap::new(),
         }
     }
 }

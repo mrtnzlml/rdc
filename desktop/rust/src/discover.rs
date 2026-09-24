@@ -87,7 +87,12 @@ pub(crate) fn inspect(folder: &Path) -> Option<Project> {
             } else {
                 AuthKindRaw::Token
             };
-            let last_sync_unix = last_sync_unix(folder, &name);
+            let last_sync_unix =
+                std::fs::metadata(folder.join(format!(".rdc/state/{name}.lock.json")))
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .and_then(|d| i64::try_from(d.as_secs()).ok());
             let file_count = count_files(&folder.join(format!("envs/{name}")));
             EnvInfo {
                 name,
@@ -103,26 +108,6 @@ pub(crate) fn inspect(folder: &Path) -> Option<Project> {
         folder: folder.to_path_buf(),
         envs,
     })
-}
-
-/// When the env's lockfile last changed, or `None` if it has never synced.
-///
-/// A lockfile that tracks no object has not been synced: `rdc migrate` creates
-/// one to record where the target's objects came from before the target's
-/// first sync. So the file existing is not enough. The mtime stays
-/// approximate either way: a `git pull` or a migrate that changes the lockfile
-/// moves it too.
-fn last_sync_unix(folder: &Path, env: &str) -> Option<i64> {
-    let path = folder.join(format!(".rdc/state/{env}.lock.json"));
-    let lockfile = rdc::state::Lockfile::load(&path).ok()?;
-    if lockfile.objects.values().all(|by_slug| by_slug.is_empty()) {
-        return None;
-    }
-    std::fs::metadata(&path)
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .and_then(|d| i64::try_from(d.as_secs()).ok())
 }
 
 pub(crate) fn count_files(p: &Path) -> u64 {
@@ -194,33 +179,6 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("not-a-project")).unwrap();
         let ps = scan(tmp.path());
         assert_eq!(ps.iter().map(|p| p.name()).collect::<Vec<_>>(), vec!["alpha", "zebra"]);
-    }
-
-    /// A lockfile that tracks nothing is the one `rdc migrate` writes before
-    /// the env's first sync, so the env still reads as never synced.
-    #[test]
-    fn a_lockfile_tracking_no_object_is_not_a_sync() {
-        let tmp = tempfile::tempdir().unwrap();
-        seed_env(tmp.path(), "acme", "prod", "https://p.test/api/v1", 2);
-        let state = tmp.path().join("acme/.rdc/state");
-        std::fs::create_dir_all(&state).unwrap();
-        let lock = state.join("prod.lock.json");
-
-        std::fs::write(
-            &lock,
-            r#"{"version":3,"objects":{},"origins":{"queues":{"invoices":{"env":"dev","id":1}}}}"#,
-        )
-        .unwrap();
-        let p = find(tmp.path(), "acme").unwrap();
-        assert_eq!(p.envs[0].last_sync_unix, None);
-
-        std::fs::write(
-            &lock,
-            r#"{"version":3,"objects":{"queues":{"invoices":{"id":501}}}}"#,
-        )
-        .unwrap();
-        let p = find(tmp.path(), "acme").unwrap();
-        assert!(p.envs[0].last_sync_unix.is_some());
     }
 
     #[test]

@@ -289,60 +289,6 @@ async fn sync_restores_the_per_env_scaffolds_but_not_on_a_dry_run() {
     assert!(stub["hooks"].as_object().unwrap().is_empty(), "{stub}");
 }
 
-/// `rdc migrate` creates a lockfile holding only `origins` for a target that
-/// has never synced. Sync must treat it like a missing one — and keep the
-/// origins when it writes the lockfile.
-#[tokio::test]
-async fn sync_accepts_a_lockfile_holding_only_origins_and_keeps_them() {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/api/v1/organizations/1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
-        .mount(&server)
-        .await;
-    mock_empty_lists_except(&server, &[]).await;
-
-    let project = TempDir::new().unwrap();
-    assert_cmd::Command::cargo_bin("rdc")
-        .unwrap()
-        .current_dir(project.path())
-        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
-        .assert()
-        .success();
-    std::fs::write(
-        project.path().join("secrets/dev.secrets.json"),
-        r#"{"api_token":"TEST_TOKEN"}"#,
-    )
-    .unwrap();
-    let lock = project.path().join(".rdc/state/dev.lock.json");
-    std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
-    let origins = serde_json::json!({ "queues": { "invoices": { "env": "test", "id": 100 } } });
-    std::fs::write(
-        &lock,
-        serde_json::to_vec(&serde_json::json!({
-            "version": 3,
-            "api_base": format!("{}/api/v1", server.uri()),
-            "objects": {},
-            "origins": origins,
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-
-    let _cwd_guard = cwd_lock();
-    std::env::set_current_dir(project.path()).unwrap();
-    rdc::cli::sync::run("dev", false, false, false, false, false, None)
-        .await
-        .expect("sync should succeed");
-
-    let lf: serde_json::Value = serde_json::from_slice(&std::fs::read(&lock).unwrap()).unwrap();
-    assert_eq!(lf["origins"], origins, "{lf:#}");
-    assert!(
-        lf["objects"].as_object().is_some_and(|o| !o.is_empty()),
-        "sync recorded what it pulled: {lf:#}"
-    );
-}
-
 /// Pull-side RemoteCreate: env exposes a label that doesn't exist locally
 /// and isn't in the lockfile. `sync` must classify it `RemoteCreate` and
 /// write the JSON to disk. No API mutations are issued.
