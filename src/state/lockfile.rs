@@ -327,7 +327,7 @@ fn to_hex(digest: &[u8]) -> String {
 ///     || ...   (continued for every formula, in field_id order)
 /// )
 /// ```
-/// EOF newlines in a code sidecar are not drift — see
+/// EOF newlines and CRLF line endings in a code sidecar are not drift — see
 /// [`crate::snapshot::codec::sidecar_bytes_for_hash`], the single definition
 /// shared with `KindCodec::base_hash` so both hashing paths agree.
 use crate::snapshot::codec::sidecar_bytes_for_hash as code_bytes_for_hash;
@@ -345,7 +345,7 @@ pub fn schema_combined_hash(
         let path = format!("formulas/{field_id}.py");
         hasher.update(path.as_bytes());
         hasher.update([0u8]);
-        hasher.update(code_bytes_for_hash(bytes));
+        hasher.update(&*code_bytes_for_hash(bytes));
     }
     to_hex(&hasher.finalize())
 }
@@ -377,7 +377,7 @@ pub fn hook_combined_hash(json_bytes: &[u8], code: &Option<String>, lockfile: &L
         hasher.update([0u8]);
         hasher.update(b"code");
         hasher.update([0u8]);
-        hasher.update(code_bytes_for_hash(code.as_bytes()));
+        hasher.update(&*code_bytes_for_hash(code.as_bytes()));
     }
     to_hex(&hasher.finalize())
 }
@@ -404,7 +404,7 @@ pub fn rule_combined_hash(json_bytes: &[u8], code: &Option<String>, lockfile: &L
         hasher.update([0u8]);
         hasher.update(b"trigger_condition");
         hasher.update([0u8]);
-        hasher.update(code_bytes_for_hash(code.as_bytes()));
+        hasher.update(&*code_bytes_for_hash(code.as_bytes()));
     }
     to_hex(&hasher.finalize())
 }

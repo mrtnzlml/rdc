@@ -5329,6 +5329,23 @@ async fn sync_hook_code_only_divergence_does_not_silently_push() {
 /// a silent edit of a file the user never changed, repeating on every save.
 #[tokio::test]
 async fn sync_ignores_an_editor_added_final_newline_in_a_hook_sidecar() {
+    assert_sidecar_rewrite_is_not_an_edit(b"def x():\n    return 1\n", "a trailing-newline-only").await;
+}
+
+/// Git rewrites line endings in the working tree (`core.autocrlf=true` is Git
+/// for Windows' default), so the same code checks out as CRLF on one machine
+/// and LF on another. If that counted as an edit, each teammate's sync would
+/// push their line endings over the other's, and the lockfile each commits
+/// would make the next machine push again, with nobody editing anything.
+#[tokio::test]
+async fn sync_ignores_crlf_line_endings_in_a_hook_sidecar() {
+    assert_sidecar_rewrite_is_not_an_edit(b"def x():\r\n    return 1\r\n", "a line-ending-only").await;
+}
+
+/// Pull a hook whose remote code never changes, rewrite its sidecar to
+/// `rewritten` (the same code), sync twice, and assert nothing reached the
+/// remote and the file was left as written.
+async fn assert_sidecar_rewrite_is_not_an_edit(rewritten: &'static [u8], what: &str) {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/api/v1/organizations/1"))
@@ -5394,8 +5411,8 @@ async fn sync_ignores_an_editor_added_final_newline_in_a_hook_sidecar() {
         b"def x():\n    return 1",
         "precondition: rdc writes sidecars without a terminating newline"
     );
-    // Simulate the editor save: identical code, one newline appended.
-    std::fs::write(&py_path, b"def x():\n    return 1\n").unwrap();
+    // Simulate the editor save or the checkout: identical code.
+    std::fs::write(&py_path, rewritten).unwrap();
 
     rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
@@ -5419,12 +5436,12 @@ async fn sync_ignores_an_editor_added_final_newline_in_a_hook_sidecar() {
         .count();
     assert_eq!(
         mutations, 0,
-        "a trailing-newline-only difference must not reach the remote; saw {mutations}"
+        "{what} difference must not reach the remote; saw {mutations}"
     );
     assert_eq!(
         std::fs::read(&py_path).unwrap(),
-        b"def x():\n    return 1\n",
-        "the user's file must be left exactly as saved — not rewritten without the newline"
+        rewritten,
+        "the user's file must be left exactly as written"
     );
     assert!(
         !project

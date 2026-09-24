@@ -104,17 +104,33 @@ pub trait KindCodec: Sync {
 /// Ignoring EOF newlines on both sides keeps the object Clean, the remote
 /// untouched, and the file exactly as the user saved it.
 ///
-/// ONLY newlines at EOF are ignored. Interior trailing whitespace — and a
-/// trailing space at EOF — are hashed verbatim: the API demonstrably
-/// preserves whitespace inside code bodies, and an earlier blanket
-/// trailing-whitespace trim silently corrupted real data (see
+/// CRLF counts as LF for the same reason: Git rewrites line endings in the
+/// working tree (`core.autocrlf`, on by default in Git for Windows), so the
+/// same code checks out as CRLF on one machine and LF on another. Hashed
+/// verbatim, each machine's sync would push its line endings over the
+/// other's. A lone `\r` is kept.
+///
+/// Nothing else is ignored. Interior trailing whitespace — and a trailing
+/// space at EOF — are hashed verbatim: the API demonstrably preserves
+/// whitespace inside code bodies, and an earlier blanket trailing-whitespace
+/// trim silently corrupted real data (see
 /// `snapshot::noise::trim_trailing_whitespace`).
-pub(crate) fn sidecar_bytes_for_hash(bytes: &[u8]) -> &[u8] {
+pub(crate) fn sidecar_bytes_for_hash(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     let mut end = bytes.len();
     while end > 0 && (bytes[end - 1] == b'\n' || bytes[end - 1] == b'\r') {
         end -= 1;
     }
-    &bytes[..end]
+    let body = &bytes[..end];
+    if !body.windows(2).any(|w| w == b"\r\n") {
+        return std::borrow::Cow::Borrowed(body);
+    }
+    let mut lf = Vec::with_capacity(body.len());
+    for (i, &b) in body.iter().enumerate() {
+        if !(b == b'\r' && body.get(i + 1) == Some(&b'\n')) {
+            lf.push(b);
+        }
+    }
+    std::borrow::Cow::Owned(lf)
 }
 
 /// Compute a combined SHA-256 over canonical JSON bytes and any sidecars.
@@ -137,7 +153,7 @@ pub fn combined_hash(
         hasher.update([0x00u8]);
         hasher.update(path.as_bytes());
         hasher.update([0x00u8]);
-        hasher.update(sidecar_bytes_for_hash(bytes));
+        hasher.update(&*sidecar_bytes_for_hash(bytes));
     }
     to_hex(&hasher.finalize())
 }
