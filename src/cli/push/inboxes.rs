@@ -240,7 +240,8 @@ async fn push_update_batch(
             // CREATE contract (`email` is server-assigned).
             let mut payload_to_send = payload_inbox;
             strip_patch_extra(&mut payload_to_send.extra, "inboxes", false);
-            let refetched = send_patch(client, id, &payload_to_send, progress).await?;
+            let refetched =
+                send_patch(client, id, q_slug, &payload_to_send, &remote_inbox, progress).await?;
             Ok(Prepared::Patched {
                 slug: q_slug.clone(),
                 updated: InboxPatched { refetched },
@@ -363,9 +364,12 @@ fn remote_artifact(remote: &crate::model::Inbox) -> Result<crate::snapshot::code
 async fn send_patch(
     client: &RossumClient,
     id: u64,
+    q_slug: &str,
     payload_to_send: &crate::model::Inbox,
+    remote_before: &crate::model::Inbox,
     progress: &Arc<Log>,
 ) -> Result<crate::model::Inbox> {
+    let payload_to_send = &omit_unchanged_email(payload_to_send, remote_before);
     let patch_result = client
         .update_inbox(id, payload_to_send, Some(progress.clone()))
         .await
@@ -387,10 +391,43 @@ async fn send_patch(
     // It sits HERE, immediately after the PATCH and inside whatever stage
     // called us, so on the concurrent path it overlaps with the siblings'
     // round trips instead of serializing on the apply stage.
-    client
+    let refetched = client
         .get_inbox(id, Some(progress.clone()))
         .await
-        .with_context(|| format!("GET /inboxes/{id} to re-baseline after push"))
+        .with_context(|| format!("GET /inboxes/{id} to re-baseline after push"))?;
+    let ignored = crate::cli::push::ignored_fields(
+        &serde_json::to_value(payload_to_send)?,
+        &serde_json::to_value(remote_before)?,
+        &serde_json::to_value(&refetched)?,
+    );
+    if !ignored.is_empty() {
+        progress.event(
+            Action::Warn,
+            &format!(
+                "inbox/{q_slug}: the server accepted the PATCH but kept its old value for {}",
+                ignored.join(", ")
+            ),
+        );
+    }
+    Ok(refetched)
+}
+
+/// The PATCH body minus `email` when the file still holds the remote's own
+/// address. Rossum derives `email` from `email_prefix`
+/// (`<email_prefix>-<hash>@<host>`), and a body carrying both gives `email`
+/// precedence — so re-sending the unchanged address silently reverts an
+/// edited prefix. Omitting it lets the server rebuild the address from the
+/// new prefix. An `email` the user edited by hand is still sent.
+fn omit_unchanged_email(
+    payload: &crate::model::Inbox,
+    remote_before: &crate::model::Inbox,
+) -> crate::model::Inbox {
+    let mut payload = payload.clone();
+    if payload.email == remote_before.email {
+        // Empty is skipped on serialize (see `model::Inbox::email`).
+        payload.email.clear();
+    }
+    payload
 }
 
 /// Write one re-fetched inbox back: canonical form to disk and the base cache,
@@ -530,7 +567,8 @@ async fn push_one_drifted(
     // Strip server-managed fields from `extra` so the PATCH matches the
     // CREATE contract (`email` is server-assigned).
     strip_patch_extra(&mut payload_to_send.extra, "inboxes", false);
-    let refetched = send_patch(client, id, &payload_to_send, progress).await?;
+    let refetched =
+        send_patch(client, id, q_slug, &payload_to_send, remote_inbox, progress).await?;
 
     write_back(paths, lockfile, q_slug, inbox_path, &refetched)?;
     progress.event(Action::Patch, &format!("inbox/{q_slug}"));
@@ -767,6 +805,124 @@ mod tests {
             lockfile.objects["inboxes"]["q-a"].content_hash.as_deref(),
             Some(expected.as_str()),
             "the recorded base must be the GET-derived one"
+        );
+    }
+
+    /// In-memory `Log` sink, so a test can read the warnings a push printed.
+    #[derive(Clone, Default)]
+    struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Push a local edit that changes only `email_prefix` from `acme-sandbox`
+    /// to `acme`, against a server whose re-fetched body reports
+    /// `prefix_after`. Returns the PATCH body and everything the push logged.
+    async fn push_prefix_edit(prefix_after: &str) -> (serde_json::Value, String) {
+        let server = MockServer::start().await;
+        let api = format!("{}/api/v1", server.uri());
+        let tmp = tempfile::tempdir().unwrap();
+        let (paths, mut lockfile, changes, mut remotes) = seed_inboxes(&tmp, &api, &["q-a"]);
+
+        // Re-seed the remote and its base with a prefix-derived address.
+        remotes[0]["email_prefix"] = serde_json::json!("acme-sandbox");
+        remotes[0]["email"] = serde_json::json!("acme-sandbox-1a2b3c@example.invalid");
+        let codec = crate::snapshot::codec::codec("inboxes").unwrap();
+        let art = codec.disk_bytes(&remotes[0]).unwrap();
+        let base = combined_hash(&art.json, &art.sidecars, &lockfile);
+        lockfile.objects.get_mut("inboxes").unwrap().get_mut("q-a").unwrap().content_hash =
+            Some(base);
+
+        let mut local = remotes[0].clone();
+        local["url"] = serde_json::json!("rdc://inboxes/q-a");
+        local.as_object_mut().unwrap().remove("id");
+        local["email_prefix"] = serde_json::json!("acme");
+        std::fs::write(&changes["q-a"], serde_json::to_vec_pretty(&local).unwrap()).unwrap();
+
+        let mut after = remotes[0].clone();
+        after["email_prefix"] = serde_json::json!(prefix_after);
+        after["email"] = serde_json::json!(format!("{prefix_after}-1a2b3c@example.invalid"));
+        Mock::given(method("GET"))
+            .and(path("/api/v1/inboxes/500"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(remotes[0].clone()))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        mount_get_and_patch(&server, 500, after.clone(), after, Default::default()).await;
+
+        let client = crate::api::RossumClient::new(api.clone(), "TEST".into()).unwrap();
+        let buf = Buf::default();
+        let progress = crate::log::Log::for_sink(
+            crate::cli::resolve::ColorMode::Plain,
+            Box::new(buf.clone()),
+        );
+        push(&paths, &client, &mut lockfile, false, &changes, &progress, "dev")
+            .await
+            .expect("push should succeed");
+
+        let requests = server.received_requests().await.unwrap();
+        let patch = requests
+            .iter()
+            .find(|r| r.method.as_str() == "PATCH")
+            .expect("one PATCH");
+        let body = serde_json::from_slice(&patch.body).unwrap();
+        let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        (body, text)
+    }
+
+    /// An edited `email_prefix` must reach the server without the stored
+    /// `email`: Rossum gives `email` precedence and rebuilds the prefix from
+    /// it, so a body carrying both answers 200 and changes nothing (verified
+    /// live).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn push_inboxes_sends_an_edited_prefix_without_the_unchanged_email() {
+        let (body, log) = push_prefix_edit("acme").await;
+        assert_eq!(body["email_prefix"], serde_json::json!("acme"), "body: {body}");
+        assert!(body.get("email").is_none(), "unchanged email must be omitted: {body}");
+        assert!(!log.contains("kept its old value"), "applied edit must not warn: {log}");
+    }
+
+    /// A 200 that leaves the field at its old value is reported, because the
+    /// write-back is about to overwrite the local edit with it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn push_inboxes_warns_when_the_server_keeps_the_old_value() {
+        let (_, log) = push_prefix_edit("acme-sandbox").await;
+        assert!(
+            log.contains("inbox/q-a: the server accepted the PATCH but kept its old value for email_prefix"),
+            "missing warning: {log}"
+        );
+    }
+
+    /// A hand-edited `email` is the user's change, so it is still sent.
+    #[test]
+    fn omit_unchanged_email_keeps_an_edited_email() {
+        let remote: crate::model::Inbox = serde_json::from_value(serde_json::json!({
+            "name": "In", "queues": [], "email": "old-1a2b3c@example.invalid"
+        }))
+        .unwrap();
+        let mut local = remote.clone();
+        assert!(omit_unchanged_email(&local, &remote).email.is_empty());
+        local.email = "new@example.invalid".into();
+        assert_eq!(omit_unchanged_email(&local, &remote).email, "new@example.invalid");
+    }
+
+    #[test]
+    fn ignored_fields_names_only_changes_the_server_kept_old() {
+        let before = serde_json::json!({ "id": 5, "name": "A", "email_prefix": "old", "filters": [] });
+        // `id: 0` is what a file without an id deserializes to; it is never sent.
+        let sent = serde_json::json!({ "id": 0, "name": "B", "email_prefix": "new", "filters": [] });
+        // `name` applied, `email_prefix` kept old, `filters` never changed.
+        let after = serde_json::json!({ "id": 5, "name": "B", "email_prefix": "old", "filters": [] });
+        assert_eq!(
+            crate::cli::push::ignored_fields(&sent, &before, &after),
+            vec!["email_prefix".to_string()]
         );
     }
 

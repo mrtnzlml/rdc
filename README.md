@@ -294,6 +294,14 @@ rdc sync test --dry-run
 
 Lists every change that would be sent — POSTs, PATCHes, DELETEs — without writing.
 
+### Trace HTTP requests
+
+```sh
+RDC_TRACE_HTTP=/tmp/rdc-trace.csv rdc sync test
+```
+
+The value is the **path of the file** to append to, so `RDC_TRACE_HTTP=1` writes a file named `1`. Each HTTP attempt adds one line, `epoch_ms,limiter_wait_ms,duration_ms,status,desc`, where `desc` is the method and URL. Request and response bodies are not recorded.
+
 ### Watch an environment
 
 ```sh

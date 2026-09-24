@@ -27,6 +27,31 @@ pub mod scan;
 mod schemas;
 mod workspaces;
 
+/// Top-level fields a PATCH asked to change that the server kept at their old
+/// value: `sent` differs from `before`, and `after` (the re-fetched body)
+/// still equals `before`. A 200 does not prove a field was applied, and the
+/// write-back would otherwise overwrite the local edit with the old value
+/// without a word.
+pub(crate) fn ignored_fields(
+    sent: &serde_json::Value,
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+) -> Vec<String> {
+    let Some(sent) = sent.as_object() else {
+        return Vec::new();
+    };
+    sent.iter()
+        // `patch_json` drops the self-identity before sending, so a local
+        // `id`/`url` never reached the server.
+        .filter(|(k, _)| !matches!(k.as_str(), "id" | "url"))
+        .filter(|(k, v)| {
+            let old = before.get(k.as_str());
+            old != Some(*v) && after.get(k.as_str()) == old
+        })
+        .map(|(k, _)| k.clone())
+        .collect()
+}
+
 /// Push phase: run each kind's push driver in dependency order. Called
 /// by `cli::sync::execute` after the classifier identifies local edits
 /// and creates; the executor builds a `ChangeList` from classified items
