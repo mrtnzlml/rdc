@@ -262,6 +262,9 @@ pub(crate) async fn run_cycle(
     // `push --dry-run` byte for byte. The scan result is also reused by
     // the classify phase below, so the tree is still walked and hashed
     // exactly once.
+    for (old, new) in crate::cli::push::scan::follow_moved_email_templates(&paths, &mut lockfile, dry_run) {
+        progress.event(Action::Info, &format!("email_templates/{old} moved to {new}"));
+    }
     let (_scanned, changes, tombstones) = crate::cli::push::scan::scan(&paths, &lockfile)?;
     let parse_errors = changes.json_parse_errors();
     let limit_violations = changes.field_limit_violations();

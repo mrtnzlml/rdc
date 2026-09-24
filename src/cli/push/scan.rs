@@ -671,6 +671,71 @@ pub fn scan(paths: &Paths, lockfile: &Lockfile) -> Result<(usize, ChangeList, To
     Ok((scanned, changes, tombstones))
 }
 
+/// Follow email templates whose queue moved to another workspace.
+///
+/// A template's lockfile key is `<ws>/<q>/<template>`, so moving a queue's
+/// directory to another workspace leaves every key pointing at a file that is
+/// gone, and the scan would read it as delete-plus-create: the templates are
+/// DELETEd and re-created with new ids, losing their triggers, and the two
+/// unique-typed ones fail to re-create at all. Queue slugs are unique across
+/// the env, so `<q>/<template>` alone identifies the file: a missing key whose
+/// file now sits under another workspace is re-keyed in place, and its base
+/// cache follows it unless `dry_run`, which writes nothing. When the new key
+/// is already recorded for the same id — a pull followed the queue there
+/// first — the stale key is dropped instead.
+///
+/// Returns the `(old, new)` keys it moved, for the caller to report.
+pub fn follow_moved_email_templates(
+    paths: &Paths,
+    lockfile: &mut Lockfile,
+    dry_run: bool,
+) -> Vec<(String, String)> {
+    let Some(map) = lockfile.objects.get("email_templates") else {
+        return Vec::new();
+    };
+    let mut moves = Vec::new();
+    for (key, entry) in map {
+        let parts: Vec<&str> = key.splitn(3, '/').collect();
+        let [ws, q, t] = parts[..] else { continue };
+        let file = format!("{t}.json");
+        if paths.queue_email_templates_dir(ws, q).join(&file).exists() {
+            continue;
+        }
+        let Ok(workspaces) = std::fs::read_dir(paths.workspaces_dir()) else { continue };
+        let found: Vec<String> = workspaces
+            .flatten()
+            .map(|w| w.file_name().to_string_lossy().to_string())
+            .filter(|w| w != ws && paths.queue_email_templates_dir(w, q).join(&file).exists())
+            .collect();
+        // Exactly one candidate, or it is not a move rdc can tell apart.
+        let [new_ws] = &found[..] else { continue };
+        let new_key = format!("{new_ws}/{q}/{t}");
+        match map.get(&new_key) {
+            Some(existing) if existing.id != entry.id => continue,
+            _ => moves.push((key.clone(), new_key, entry.clone(), ws.to_string(), new_ws.clone())),
+        }
+    }
+    let mut moved = Vec::new();
+    for (old, new, entry, old_ws, new_ws) in moves {
+        let m = lockfile.objects.get_mut("email_templates").expect("checked above");
+        m.remove(&old);
+        let t = old.rsplit('/').next().unwrap_or_default();
+        let q = old.split('/').nth(1).unwrap_or_default();
+        if !m.contains_key(&new) {
+            m.insert(new.clone(), entry);
+            let file = format!("{t}.json");
+            let from = paths.queue_email_templates_dir(&old_ws, q).join(&file);
+            let to = paths.queue_email_templates_dir(&new_ws, q).join(&file);
+            if !dry_run && let Ok(Some(base)) = crate::state::base_cache::read(paths, &from) {
+                let _ = crate::state::base_cache::write(paths, &to, &base);
+                let _ = crate::state::base_cache::forget(paths, &from);
+            }
+        }
+        moved.push((old, new));
+    }
+    moved
+}
+
 /// Cross-check the lockfile against the local snapshot: every lockfile
 /// entry without a corresponding on-disk file becomes a tombstone.
 ///

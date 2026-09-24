@@ -11,6 +11,7 @@ pub mod mdh;
 pub mod migrate_promotion;
 pub mod organization;
 pub mod ordering;
+pub mod queue_move;
 pub mod round_trip;
 pub mod saved_views;
 pub mod server_truth;
