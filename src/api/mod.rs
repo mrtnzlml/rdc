@@ -17,6 +17,26 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::sync::Arc;
 
+static CORE_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Write requests (POST, PATCH, DELETE) any `RossumClient` in this process
+/// has sent, counted per call whatever the outcome, since a request that
+/// errored may still have reached the server. Data Storage is left out: it
+/// sends reads as POSTs too, and no core object changes when a dataset does.
+///
+/// `sync::run_cycle` compares it before and after its execute phase. A cycle
+/// that wrote anything reads the env back, because a write can change objects
+/// rdc never touched: a queue's `rules` after a rule create, a queue's email
+/// templates after a queue create. Process-wide so that no write path can be
+/// missed; a concurrent cycle on another env costs at most one extra re-read.
+pub fn core_writes() -> u64 {
+    CORE_WRITES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn note_core_write() {
+    CORE_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Rossum API client. Holds a base URL (e.g. `https://X.rossum.app/api/v1`)
 /// and a static API token. Pagination is followed transparently for `list_*`
 /// methods; PATCH and POST calls go through shared `patch_json`/`post_json`
@@ -330,6 +350,7 @@ impl RossumClient {
     /// (already gone) as success; surfaces every other non-2xx.
     pub async fn delete_path(&self, path: &str, progress: ProgressHandle) -> Result<()> {
         let url = format!("{}{}", self.base_url, path);
+        note_core_write();
         let resp = retry::send_with_retry(
             || self.http
                 .delete(&url)
@@ -471,6 +492,7 @@ impl RossumClient {
         strip_self_identity(&mut body_value);
         ensure_no_residual_refs(path, &body_value)?;
         let url = format!("{}{}", self.base_url, path);
+        note_core_write();
         let resp = retry::send_with_retry(
             || self.http
                 .patch(&url)
@@ -500,6 +522,7 @@ impl RossumClient {
         // portable ref (it 400s opaquely as "Invalid hyperlink - No URL match").
         ensure_no_residual_refs(path, body)?;
         let url = format!("{}{}", self.base_url, path);
+        note_core_write();
         let resp = retry::send_with_retry(
             || self.http
                 .post(&url)

@@ -33,6 +33,12 @@ impl ApiError {
         ApiError { status: 404, body: json!({ "detail": "Not found." }) }
     }
 
+    /// `409 conflict_referenced`, as a DELETE of a schema a queue still
+    /// uses answers (observed live 2026-09-24).
+    pub fn conflict_referenced(detail: impl Into<String>) -> ApiError {
+        ApiError { status: 409, body: json!({ "detail": detail.into(), "code": "conflict_referenced" }) }
+    }
+
     pub fn unauthorized() -> ApiError {
         ApiError { status: 401, body: json!({ "detail": "Invalid token." }) }
     }
@@ -66,6 +72,10 @@ pub struct OrgState {
     clock: i64,
     /// Queue id -> requests still to survive before it actually goes.
     pending_delete: BTreeMap<u64, u8>,
+    /// Queue id -> the schema a draining queue still holds. Its GET shows
+    /// `schema: null`, yet the real API refuses that schema's DELETE with
+    /// `409` until the queue is purged (observed live 2026-09-24).
+    draining_schemas: BTreeMap<u64, String>,
     org: Value,
 }
 
@@ -88,6 +98,7 @@ impl OrgState {
             next_id: 1,
             clock: 0,
             pending_delete: BTreeMap::new(),
+            draining_schemas: BTreeMap::new(),
             org,
         }
     }
@@ -325,6 +336,7 @@ impl OrgState {
         // `schema.queues` must already be clean by the time anyone can next
         // observe either parent. See `src/cli/sync/mod.rs:861-864`.
         self.unlink(kind, id);
+        self.drop_refs_to(kind, id);
         if kind == "queues" {
             // `202 deletion_requested`: still listed for one more request,
             // but not unchanged. The real `GET /queues` answers with
@@ -354,6 +366,9 @@ impl OrgState {
                 .and_then(|m| m.get_mut(&id))
                 .and_then(|v| v.as_object_mut())
             {
+                if let Some(schema) = obj.get("schema").and_then(Value::as_str) {
+                    self.draining_schemas.insert(id, schema.to_string());
+                }
                 obj.insert("workspace".into(), Value::Null);
                 obj.insert("schema".into(), Value::Null);
                 obj.insert("status".into(), json!("deletion_requested"));
@@ -452,6 +467,7 @@ impl OrgState {
         }
         for id in done {
             self.pending_delete.remove(&id);
+            self.draining_schemas.remove(&id);
             self.cascade_queue_delete(id);
         }
     }
@@ -545,6 +561,14 @@ impl OrgState {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Whether a live or a draining queue uses `schema_url`.
+    pub fn schema_in_use(&self, schema_url: &str) -> bool {
+        self.draining_schemas.values().any(|s| s == schema_url)
+            || self.objects.get("queues").is_some_and(|m| {
+                m.values().any(|q| q.get("schema").and_then(Value::as_str) == Some(schema_url))
+            })
     }
 
     pub fn has_template_of_type(&self, queue_url: &str, ty: &str) -> bool {

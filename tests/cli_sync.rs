@@ -14,7 +14,7 @@
 //! Subsequent tasks fill in per-kind hashing (T14–17) and the executor
 //! (T14–17); their integration tests will live alongside this one.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use tempfile::TempDir;
 use wiremock::matchers::{method, path};
@@ -226,6 +226,47 @@ async fn mock_empty_lists_except(server: &MockServer, override_paths: &[&str]) {
             .mount(server)
             .await;
     }
+}
+
+/// A list mock that serves `before` until `written` is raised, then `after`.
+///
+/// A sync that writes to the env reads it back before it finishes (its settle
+/// pass). A mock that keeps serving the pre-write body tells that pass the
+/// server undid the write, and the pass pulls the old state back. A real
+/// server's GET sees its own writes; pair this with [`raises`] on the write
+/// mock to give a test the same property.
+fn until_written(
+    written: &Arc<AtomicBool>,
+    before: serde_json::Value,
+    after: serde_json::Value,
+) -> impl Fn(&Request) -> ResponseTemplate + Send + Sync + 'static {
+    let written = written.clone();
+    move |_: &Request| {
+        let body = if written.load(Ordering::SeqCst) { &after } else { &before };
+        ResponseTemplate::new(200).set_body_json(body)
+    }
+}
+
+/// The write half of [`until_written`]: answers `status` with `body` and
+/// raises `written`.
+fn raises(
+    written: &Arc<AtomicBool>,
+    status: u16,
+    body: serde_json::Value,
+) -> impl Fn(&Request) -> ResponseTemplate + Send + Sync + 'static {
+    let written = written.clone();
+    move |_: &Request| {
+        written.store(true, Ordering::SeqCst);
+        ResponseTemplate::new(status).set_body_json(&body)
+    }
+}
+
+/// A one-page list body.
+fn page(results: Vec<serde_json::Value>) -> serde_json::Value {
+    serde_json::json!({
+        "pagination": { "total": results.len(), "total_pages": 1, "next": null, "previous": null },
+        "results": results
+    })
 }
 
 /// `secrets/<env>.hook-secrets.json` is gitignored, so a clone never inherits
@@ -538,12 +579,6 @@ async fn sync_local_edit_only_patches_remote_label() {
             }
         ]
     });
-    Mock::given(method("GET"))
-        .and(path("/api/v1/labels"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&base_label))
-        .mount(&server)
-        .await;
-
     mock_empty_lists_except(&server, &["/api/v1/labels"]).await;
 
     // PATCH /labels/99: server confirms the edit. `.expect(1)` enforces
@@ -557,9 +592,15 @@ async fn sync_local_edit_only_patches_remote_label() {
         "color": patched_color,
         "modified_at": "2026-04-15T09:00:00Z"
     });
+    let patched = Arc::new(AtomicBool::new(false));
+    Mock::given(method("GET"))
+        .and(path("/api/v1/labels"))
+        .respond_with(until_written(&patched, base_label, page(vec![patch_response.clone()])))
+        .mount(&server)
+        .await;
     Mock::given(method("PATCH"))
         .and(path("/api/v1/labels/99"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&patch_response))
+        .respond_with(raises(&patched, 200, patch_response.clone()))
         .expect(1)
         .mount(&server)
         .await;
@@ -8468,13 +8509,6 @@ async fn push_engine_patch_redacts_agenda_id_on_disk() {
             }
         ]
     });
-    // The second GET /engines (drift check before PATCH) returns the same body.
-    Mock::given(method("GET"))
-        .and(path("/api/v1/engines"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&engines_body))
-        .mount(&server)
-        .await;
-
     mock_empty_lists_except(&server, &["/api/v1/engines"]).await;
 
     // PATCH response carries a fresh live agenda_id (as the server would in
@@ -8488,9 +8522,17 @@ async fn push_engine_patch_redacts_agenda_id_on_disk() {
         "agenda_id": patched_agenda_id,
         "modified_at": "2026-05-02T08:00:00Z"
     });
+    // The drift check before the PATCH sees the seed body; the read-back
+    // after it sees the PATCH.
+    let patched = Arc::new(AtomicBool::new(false));
+    Mock::given(method("GET"))
+        .and(path("/api/v1/engines"))
+        .respond_with(until_written(&patched, engines_body, page(vec![patch_response.clone()])))
+        .mount(&server)
+        .await;
     Mock::given(method("PATCH"))
         .and(path("/api/v1/engines/901"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&patch_response))
+        .respond_with(raises(&patched, 200, patch_response.clone()))
         .expect(1)
         .mount(&server)
         .await;
@@ -9284,9 +9326,23 @@ async fn sync_delete_skips_failed_and_continues_batch() {
             }
         ]
     });
+    // The listing drops a label once its DELETE succeeds, as the server's
+    // does, so the read-back after the deletes sees them gone.
+    let deleted: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    let gone = deleted.clone();
     Mock::given(method("GET"))
         .and(path("/api/v1/labels"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&labels_body))
+        .respond_with(move |_req: &Request| {
+            let gone = gone.lock().unwrap();
+            let results: Vec<serde_json::Value> = labels_body["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|l| !gone.contains(&l["id"].as_u64().unwrap()))
+                .cloned()
+                .collect();
+            ResponseTemplate::new(200).set_body_json(page(results))
+        })
         .mount(&server)
         .await;
 
@@ -9295,11 +9351,17 @@ async fn sync_delete_skips_failed_and_continues_batch() {
     // DELETE mocks: the two outer labels succeed (204), the middle one
     // rejects with a 400 carrying a Rossum-style detail body — exactly
     // the shape of the unique-type-template rejection from the live repro.
-    Mock::given(method("DELETE"))
-        .and(path("/api/v1/labels/51"))
-        .respond_with(ResponseTemplate::new(204))
-        .mount(&server)
-        .await;
+    for id in [51u64, 53] {
+        let record = deleted.clone();
+        Mock::given(method("DELETE"))
+            .and(path(format!("/api/v1/labels/{id}")))
+            .respond_with(move |_req: &Request| {
+                record.lock().unwrap().push(id);
+                ResponseTemplate::new(204)
+            })
+            .mount(&server)
+            .await;
+    }
     Mock::given(method("DELETE"))
         .and(path("/api/v1/labels/52"))
         .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
@@ -9307,12 +9369,6 @@ async fn sync_delete_skips_failed_and_continues_batch() {
         })))
         .mount(&server)
         .await;
-    Mock::given(method("DELETE"))
-        .and(path("/api/v1/labels/53"))
-        .respond_with(ResponseTemplate::new(204))
-        .mount(&server)
-        .await;
-
     let project = TempDir::new().unwrap();
 
     assert_cmd::Command::cargo_bin("rdc")
@@ -9725,9 +9781,9 @@ async fn push_create_rule() {
 /// refreshes it, and the Phase-1 catalog predates the POST — so before the
 /// fix the queue's on-disk snapshot only caught up on the *next* sync,
 /// leaving a single sync non-idempotent (the queue showed as changed on the
-/// immediate re-sync). The executor now re-fetches affected queues after the
-/// push (`pull::queues::refresh_backrefs`), so the back-ref lands in the SAME
-/// pass and the re-sync is a clean no-op.
+/// immediate re-sync). A sync that wrote now reads the env back before it
+/// finishes (`sync::settle_pass`), so the back-ref lands in the SAME run and
+/// the re-sync is a clean no-op.
 #[tokio::test]
 async fn push_create_rule_refreshes_target_queue_backref_same_pass() {
     let server = MockServer::start().await;
@@ -11325,18 +11381,27 @@ async fn sync_push_hook_run_after_deferred_relink_on_the_patch_path() {
         "modified_at": "2026-06-01T10:00:01Z"
     });
 
-    // Hook listing: alpha alone until zulu is created, both afterwards.
+    // Hook listing: alpha alone until zulu is created, both afterwards, and
+    // alpha linked to zulu once the relink PATCH (the second one) lands.
     let created = Arc::new(AtomicUsize::new(0));
+    let patch_calls = Arc::new(AtomicUsize::new(0));
     let seen = created.clone();
+    let patches_seen = patch_calls.clone();
     let a_list = alpha(serde_json::json!([]));
+    let a_list_linked = alpha(serde_json::json!([zulu_url.clone()]));
     let z_list = zulu.clone();
     Mock::given(method("GET"))
         .and(path("/api/v1/hooks"))
         .respond_with(move |_req: &Request| {
-            let results = if seen.load(Ordering::SeqCst) == 0 {
-                vec![a_list.clone()]
+            let a = if patches_seen.load(Ordering::SeqCst) >= 2 {
+                a_list_linked.clone()
             } else {
-                vec![a_list.clone(), z_list.clone()]
+                a_list.clone()
+            };
+            let results = if seen.load(Ordering::SeqCst) == 0 {
+                vec![a]
+            } else {
+                vec![a, z_list.clone()]
             };
             ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "pagination": { "next": null }, "results": results
@@ -11359,7 +11424,6 @@ async fn sync_push_hook_run_after_deferred_relink_on_the_patch_path() {
 
     // PATCH /hooks/901: the push PATCH (run_after deferred, so the remote keeps
     // its empty list), then the relink PATCH that actually sets the link.
-    let patch_calls = Arc::new(AtomicUsize::new(0));
     let pc = patch_calls.clone();
     let a_empty = alpha(serde_json::json!([]));
     let a_linked = alpha(serde_json::json!([zulu_url.clone()]));
@@ -11965,18 +12029,6 @@ async fn sync_push_email_template_posts_when_no_match() {
         "modified_at": "2026-04-20T08:00:00Z"
     });
 
-    let remote_other_for_list = remote_other_tpl.clone();
-    Mock::given(method("GET"))
-        .and(path("/api/v1/email_templates"))
-        .respond_with(move |_req: &Request| {
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "pagination": { "total": 1, "total_pages": 1, "next": null, "previous": null },
-                "results": [remote_other_for_list.clone()]
-            }))
-        })
-        .mount(&server)
-        .await;
-
     // POST must be called exactly once (no remote match → create new).
     let created_tpl = serde_json::json!({
         "id": 9001,
@@ -11987,9 +12039,19 @@ async fn sync_push_email_template_posts_when_no_match() {
         "type": "rejection_default",
         "modified_at": "2026-05-01T08:00:00Z"
     });
+    let created = Arc::new(AtomicBool::new(false));
+    Mock::given(method("GET"))
+        .and(path("/api/v1/email_templates"))
+        .respond_with(until_written(
+            &created,
+            page(vec![remote_other_tpl.clone()]),
+            page(vec![remote_other_tpl.clone(), created_tpl.clone()]),
+        ))
+        .mount(&server)
+        .await;
     Mock::given(method("POST"))
         .and(path("/api/v1/email_templates"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(&created_tpl))
+        .respond_with(raises(&created, 201, created_tpl.clone()))
         .expect(1)
         .mount(&server)
         .await;
@@ -13508,12 +13570,6 @@ async fn sync_local_edit_patches_a_saved_view() {
             }
         ]
     });
-    Mock::given(method("GET"))
-        .and(path("/api/v1/saved_views"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&base_view))
-        .mount(&server)
-        .await;
-
     mock_empty_lists_except(&server, &["/api/v1/saved_views"]).await;
 
     // PATCH /saved_views/21: server confirms the edit. `.expect(1)` enforces
@@ -13529,9 +13585,15 @@ async fn sync_local_edit_patches_a_saved_view() {
         "query": { "$and": [ { "status": { "$in": ["to_review"] } } ] },
         "modified_at": "2026-08-02T10:00:00Z"
     });
+    let patched = Arc::new(AtomicBool::new(false));
+    Mock::given(method("GET"))
+        .and(path("/api/v1/saved_views"))
+        .respond_with(until_written(&patched, base_view, page(vec![patch_response.clone()])))
+        .mount(&server)
+        .await;
     Mock::given(method("PATCH"))
         .and(path("/api/v1/saved_views/21"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&patch_response))
+        .respond_with(raises(&patched, 200, patch_response.clone()))
         .expect(1)
         .mount(&server)
         .await;

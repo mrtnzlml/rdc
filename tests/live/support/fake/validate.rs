@@ -10,11 +10,6 @@
 //! `on_write` below, rather than left to be discovered by a stage-2 author
 //! the hard way:
 //!
-//! - A schema DELETE is never refused for being referenced by a queue. The
-//!   real API answers `409 conflict_referenced`
-//!   (`tests/live/support/teardown.rs:36-44`, and the `assert_before`
-//!   rationale at `tests/live/scenarios/ordering.rs:311-315`) while a queue
-//!   still points at the schema; the fake has no such check.
 //! - An `engine_fields` DELETE is never refused for being referenced by a
 //!   schema either — the sibling this list lost when the engine-delete
 //!   refusal above was modelled (`on_delete`'s `kind == "engines"` branch)
@@ -81,6 +76,21 @@ use super::state::{ApiError, OrgState};
 
 /// Refuse a delete the real API refuses.
 pub fn on_delete(st: &OrgState, kind: &'static str, id: u64) -> Result<(), ApiError> {
+    // A queue's unique-typed default template goes only with the queue
+    // (observed live 2026-09-24; the wording is the real API's).
+    if kind == "email_templates"
+        && let Some(ty) = st.get(kind, id).and_then(|t| t.get("type").and_then(Value::as_str).map(str::to_string))
+        && UNIQUE_TEMPLATE_TYPES.contains(&ty.as_str())
+    {
+        return Err(ApiError::bad_request(format!("Cannot delete template with unique type: {ty}")));
+    }
+    // A schema is refused while a queue uses it — a draining queue included,
+    // although its GET already shows `schema: null` (observed live 2026-09-24).
+    if kind == "schemas" && st.schema_in_use(&st.url("schemas", id)) {
+        return Err(ApiError::conflict_referenced(
+            "Cannot delete schema because it is referenced from a queue.",
+        ));
+    }
     if kind == "engines" {
         let engine_url = st.url("engines", id);
         // Two distinct refusals, told apart by whether the bound queue has

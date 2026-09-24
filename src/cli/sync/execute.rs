@@ -3434,14 +3434,41 @@ fn find_engine_field_engine_slug(paths: &crate::paths::Paths, field_slug: &str) 
 pub async fn run(
     ctx: &mut PullCtx<'_>,
     catalog: &RemoteCatalog,
-    classified: &[ClassifiedItem],
+    all_classified: &[ClassifiedItem],
     no_push: bool,
     no_pull: bool,
     allow_deletes: bool,
     interactive: bool,
     conflict_strategy: Option<ConflictStrategy>,
+    settle: bool,
     progress: &Arc<Log>,
 ) -> Result<crate::cli::sync::CycleOutcome> {
+    // A settle pass (see `sync::run_cycle`) only takes in what the server
+    // moved under objects whose local side is settled. Anything still
+    // unsettled locally — an unpushed edit, an open conflict — was handled or
+    // reported by the cycle's main pass, and acting on it again would repeat
+    // that pass's prompts. `all_classified` is still what the post-pass
+    // protects, so a shadow the main pass parked is never swept here.
+    let settled_only: Vec<ClassifiedItem>;
+    let classified: &[ClassifiedItem] = if settle {
+        settled_only = all_classified
+            .iter()
+            .filter(|it| {
+                matches!(
+                    it.class,
+                    SyncClass::Clean
+                        | SyncClass::RemoteEdit
+                        | SyncClass::RemoteCreate
+                        | SyncClass::RemoteDelete
+                        | SyncClass::BothDeleted
+                )
+            })
+            .cloned()
+            .collect();
+        &settled_only
+    } else {
+        all_classified
+    };
     // Tally cycle counters up front by inspecting the static classification.
     // The dispatch branches below may early-return on user abort or
     // upstream errors; counting here keeps the watch summary aligned with
@@ -3936,7 +3963,9 @@ pub async fn run(
         // 4. Orphan prune: previously-synced datasets whose collection was
         //    deleted remotely. Kept gated on a NON-EMPTY listing so a
         //    transient empty/404 can never mass-delete every local dataset.
-        if catalog.mdh.available {
+        // Not in a settle pass: MDH already reads the env back after its own
+        // pushes (stage 3), and no other kind's write moves a dataset.
+        if catalog.mdh.available && !settle {
             let mut slug_to_collection: BTreeMap<String, &crate::model::Collection> =
                 BTreeMap::new();
             for (slug, c) in catalog.mdh.datasets() {
@@ -4223,110 +4252,6 @@ pub async fn run(
             }
         }
 
-        // Same-pass back-ref refresh (idempotency). Creating, deleting, or
-        // re-queueing an object makes the server update the *other* side of
-        // the link, and rdc strips those server-derived collections from every
-        // outbound body and never authors them:
-        //
-        //   child (rule/hook/inbox) created  -> queue.rules / .hooks / .webhooks
-        //   inbox created                    -> queue.inbox
-        //   queue created                    -> workspace.queues, schema.queues
-        //
-        // The Phase-1 catalog the pull phase consumed predates the push, so
-        // without this step every one of those stays stale on disk until the
-        // NEXT sync — a single `sync` that creates anything is not idempotent.
-        // On a fresh-env deploy that is the common case, not an edge case, and
-        // it matters most where nobody is watching: the CI deploy job runs
-        // `rdc sync --allow-deletes --yes` unattended and would otherwise
-        // leave the repo dirty every time.
-        //
-        // ELIGIBILITY. An object is refreshable when its on-disk state is
-        // known to equal its recorded base, so the three-way decision below
-        // can only come out `Write` (a server-only back-ref change) or
-        // `NoChange`. By this point that holds for every object this cycle
-        // settled in ONE direction: `Clean`; `LocalCreate` / `LocalEdit`,
-        // whose push wrote the file, the base cache and the lockfile hash from
-        // one set of bytes; and `RemoteCreate` / `RemoteEdit`, which the pull
-        // phase above just wrote. Each narrower set left a common case
-        // needing a second sync: `Clean` alone missed the just-created queue
-        // that needed its `inbox` back-ref, and `Clean | LocalCreate` missed a
-        // queue edited on either side in the same cycle that a rule or hook
-        // was added to it. Conflict classes are left alone, and the
-        // `decide_pull_action` guard inside each refresh is a second line of
-        // defence rather than the only one.
-        let settled = |it: &crate::cli::sync::classify::ClassifiedItem| {
-            matches!(
-                it.class,
-                SyncClass::Clean
-                    | SyncClass::LocalCreate
-                    | SyncClass::LocalEdit
-                    | SyncClass::RemoteCreate
-                    | SyncClass::RemoteEdit
-            )
-        };
-        let child_membership_pushed = !no_push
-            && classified.iter().any(|it| {
-                matches!(it.kind.as_str(), "rules" | "hooks" | "inboxes")
-                    && matches!(
-                        it.class,
-                        SyncClass::LocalCreate
-                            | SyncClass::LocalEdit
-                            | SyncClass::LocalDelete
-                            | SyncClass::BothDiverged
-                            | SyncClass::LocalEditRemoteDelete
-                            | SyncClass::LocalDeleteRemoteEdit
-                    )
-            });
-        // A created or deleted QUEUE moves `workspace.queues` and
-        // `schema.queues`; it also gains its own `inbox` back-ref once the
-        // inbox lands, which the child trigger above already covers.
-        let queue_membership_pushed = !no_push
-            && classified.iter().any(|it| {
-                it.kind == "queues"
-                    && matches!(it.class, SyncClass::LocalCreate | SyncClass::LocalDelete)
-            });
-
-        if child_membership_pushed || queue_membership_pushed {
-            let eligible_queues: BTreeSet<String> = classified
-                .iter()
-                .filter(|it| it.kind == "queues" && settled(it))
-                .map(|it| it.slug.clone())
-                .collect();
-            // Schemas are keyed by their queue's slug. Only bother when a
-            // queue actually moved: a rule or hook does not touch
-            // `schema.queues`, and each schema costs a GET.
-            let eligible_schemas: BTreeSet<String> = if queue_membership_pushed {
-                classified
-                    .iter()
-                    .filter(|it| it.kind == "schemas" && settled(it))
-                    .map(|it| it.slug.clone())
-                    .collect()
-            } else {
-                BTreeSet::new()
-            };
-            outcome.items_pulled += crate::cli::pull::queues::refresh_backrefs(
-                ctx,
-                &eligible_queues,
-                &eligible_schemas,
-                progress,
-            )
-            .await?;
-
-            if queue_membership_pushed {
-                let eligible_workspaces: BTreeSet<String> = classified
-                    .iter()
-                    .filter(|it| it.kind == "workspaces" && settled(it))
-                    .map(|it| it.slug.clone())
-                    .collect();
-                outcome.items_pulled += crate::cli::pull::workspaces::refresh_backrefs(
-                    ctx,
-                    &eligible_workspaces,
-                    progress,
-                )
-                .await?;
-            }
-        }
-
         // Post-pass: rewrite portable-kind URLs in every snapshotted file to
         // `rdc://<kind>/<slug>` form and re-record the lockfile `content_hash`
         // so the next `sync` sees the object as Clean (no phantom drift).
@@ -4336,7 +4261,7 @@ pub async fn run(
         // stale and is pruned by the pass so it can portabilize. Shadows are
         // only ever written for conflict-class items, so the conflict-class set
         // is exactly the set to protect.
-        let active_conflicts: std::collections::BTreeSet<(String, String)> = classified
+        let active_conflicts: std::collections::BTreeSet<(String, String)> = all_classified
             .iter()
             .filter(|it| {
                 matches!(

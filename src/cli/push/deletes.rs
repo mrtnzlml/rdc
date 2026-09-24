@@ -217,6 +217,7 @@ pub async fn run_deletes(
     progress: &Arc<Log>,
 ) -> Result<DeleteCounts> {
     let mut counts = DeleteCounts::default();
+    let mut refused: Vec<(&'static str, String, anyhow::Error)> = Vec::new();
 
     for (kind, map) in reverse_dep_order_iter(tombstones) {
         // Collect into a Vec so we can mutate the lockfile mid-iteration
@@ -225,17 +226,59 @@ pub async fn run_deletes(
         for (slug, id) in entries {
             match delete_one(client, kind, &slug, id, lockfile, interactive, progress).await {
                 Ok(outcome) => apply_outcome(&mut counts, kind, outcome),
-                Err(e) => {
-                    // Skip-and-continue: the remote refused this DELETE.
-                    // Warn, tally, leave the lockfile entry for retry, and
-                    // keep going so siblings + parents still get deleted.
-                    counts.failed += 1;
-                    progress.event(
-                        Action::Warn,
-                        &format!("{kind}/{slug} delete failed (skipped): {e:#}"),
-                    );
-                }
+                // Skip-and-continue: the remote refused this DELETE. Keep
+                // going so siblings + parents still get deleted; whether it
+                // is a failure is decided below, once the queues are done.
+                Err(e) => refused.push((kind, slug, e)),
             }
+        }
+    }
+
+    // A queue's own objects that Rossum refuses to delete apart from it. The
+    // queue is deleted after its children, so this can only be told once the
+    // whole batch has run. Both leave the env's listing with the queue, so
+    // keeping their lockfile entries would only make the NEXT sync drop them.
+    //
+    // - An email template of a unique type (`rejection_default`, …): Rossum
+    //   removes it with the queue.
+    // - The schema: refused (409) while the queue is pending deletion, and
+    //   left behind as an orphan afterwards. rdc never lists a schema no live
+    //   queue uses, so it stops tracking it and says so.
+    let deleted_queues: std::collections::BTreeSet<&str> = tombstones
+        .queues
+        .keys()
+        .filter(|q| !lockfile.objects.get("queues").is_some_and(|m| m.contains_key(q.as_str())))
+        .map(String::as_str)
+        .collect();
+    for (kind, slug, e) in refused {
+        let owner = match kind {
+            "email_templates" => slug.split('/').nth(1),
+            "schemas" => Some(slug.as_str()),
+            _ => None,
+        };
+        let Some(queue) = owner.filter(|q| deleted_queues.contains(q)) else {
+            // Leave the lockfile entry for retry.
+            counts.failed += 1;
+            progress.event(Action::Warn, &format!("{kind}/{slug} delete failed (skipped): {e:#}"));
+            continue;
+        };
+        if let Some(m) = lockfile.objects.get_mut(kind) {
+            m.remove(&slug);
+        }
+        apply_outcome(&mut counts, kind, DeleteOutcome::Deleted);
+        if kind == "schemas" {
+            progress.event(
+                Action::Warn,
+                &format!(
+                    "{kind}/{slug} stays on the env as an orphan: Rossum refuses to delete a \
+                     schema while its queue '{queue}' is pending deletion. rdc no longer tracks it."
+                ),
+            );
+        } else {
+            progress.event(
+                Action::Delete,
+                &format!("{kind}/{slug} (Rossum removes it with queue '{queue}')"),
+            );
         }
     }
 

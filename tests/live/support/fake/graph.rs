@@ -30,6 +30,30 @@ fn ref_urls<'a>(obj: &'a Value, edge: &kinds::Edge) -> Vec<&'a str> {
 }
 
 impl OrgState {
+    /// Drop a deleted object's url from the forward refs OTHER objects hold
+    /// to it, as the real API does at DELETE time (observed live 2026-09-24:
+    /// the sync after each delete pulled every such object back changed).
+    /// A deleted hook leaves every hook's `run_after`; a deleted queue leaves
+    /// every hook's and rule's `queues` and every saved view's
+    /// `queues_filter`. The holders' `modified_at` is left alone, like
+    /// [`Self::add_ref`]'s.
+    pub(super) fn drop_refs_to(&mut self, kind: &str, id: u64) {
+        let holders: &[(&str, &str)] = match kind {
+            "hooks" => &[("hooks", "run_after")],
+            "queues" => &[("hooks", "queues"), ("rules", "queues"), ("saved_views", "queues_filter")],
+            _ => return,
+        };
+        let url = self.url(kind, id);
+        for (owner, field) in holders {
+            let Some(objects) = self.objects.get_mut(owner) else { continue };
+            for obj in objects.values_mut() {
+                if let Some(refs) = obj.get_mut(*field).and_then(Value::as_array_mut) {
+                    refs.retain(|r| r.as_str() != Some(url.as_str()));
+                }
+            }
+        }
+    }
+
     /// Remove a queue and everything the server removes with it: its
     /// auto-created email templates and its inbox. The SCHEMA survives —
     /// teardown deletes it explicitly, and needs a retry precisely because it
@@ -166,7 +190,7 @@ impl OrgState {
     }
 
     /// Grow every back-reference this object's own refs imply. The real API
-    /// maintains these server-side; `pull::queues::refresh_backrefs` exists
+    /// maintains these server-side; `sync::settle_pass` exists
     /// because they change under rdc's feet. Walks `kinds::edges_for(kind)`
     /// — only OWNER-scoped edges, never the universal ones, because a
     /// back-reference is owner-specific (a queue's `workspace`/`schema` push
@@ -238,7 +262,7 @@ mod tests {
         assert_eq!(
             s.get("schemas", sc).unwrap()["queues"],
             json!([q_url]),
-            "schema.queues gains the queue on create (pull/queues.rs refresh_backrefs)"
+            "schema.queues gains the queue on create (read back by sync::settle_pass)"
         );
     }
 

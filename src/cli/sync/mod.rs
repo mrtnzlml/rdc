@@ -703,6 +703,7 @@ pub(crate) async fn run_cycle(
     // `cli::push::deletes::confirm_or_refuse`, which prints the full
     // tombstone list and either prompts (TTY) or refuses (non-TTY without
     // the flag).
+    let writes_before = crate::api::core_writes();
     let exec_result = {
         let mut ctx = crate::cli::pull::common::PullCtx {
             paths: &paths,
@@ -720,11 +721,38 @@ pub(crate) async fn run_cycle(
             allow_deletes,
             interactive,
             conflict_strategy,
+            false,
             &progress,
         )
         .await
         // `ctx`'s `&mut lockfile` borrow ends here, freeing `lockfile` for the
         // save-on-abort below.
+    };
+    // Phase 6: settle, when the cycle wrote anything to the env. See
+    // [`settle_pass`].
+    let exec_result = match exec_result {
+        Ok(main) if !no_pull && crate::api::core_writes() != writes_before => {
+            settle_pass(
+                &paths,
+                &client,
+                &mut lockfile,
+                env_cfg,
+                env,
+                &token,
+                interactive,
+                allow_deletes,
+                &progress,
+            )
+            .await
+            .map(|settled| CycleOutcome {
+                items_pushed: main.items_pushed + settled.items_pushed,
+                items_pulled: main.items_pulled + settled.items_pulled,
+                conflicts: main.conflicts + settled.conflicts,
+                remote_deletes_resolved: main.remote_deletes_resolved
+                    + settled.remote_deletes_resolved,
+            })
+        }
+        other => other,
     };
     let outcome = match exec_result {
         Ok(outcome) => outcome,
@@ -780,6 +808,59 @@ pub(crate) async fn run_cycle(
         progress.event(Action::Idle, "envs match remote");
     }
     Ok(outcome)
+}
+
+/// Read the env back after a cycle that wrote to it, and pull what those
+/// writes changed.
+///
+/// The main pass pulls from the catalog it listed BEFORE pushing, so it cannot
+/// see the server's side effects of its own writes: a rule create or delete
+/// moves `queue.rules`, a queue create provisions email templates, a queue
+/// delete takes its schema and templates out of the listing. Each of those
+/// used to surface only on the next sync, so one run was not idempotent. This
+/// pass lists the env again, re-classifies, and hands the executor only the
+/// objects whose local side is settled (see `execute::run`'s `settle`): it
+/// never pushes and never prompts for a conflict.
+///
+/// A pass that only pulls writes nothing remote, so one settle pass is enough.
+#[allow(clippy::too_many_arguments)]
+async fn settle_pass(
+    paths: &Paths,
+    client: &RossumClient,
+    lockfile: &mut Lockfile,
+    env_cfg: &crate::config::EnvConfig,
+    env: &str,
+    token: &str,
+    interactive: bool,
+    allow_deletes: bool,
+    progress: &Arc<Log>,
+) -> Result<CycleOutcome> {
+    progress.event(Action::Info, "re-reading the env after the push");
+    let mut ctx = crate::cli::pull::common::PullCtx {
+        paths,
+        client,
+        lockfile,
+        queue_locations: std::collections::BTreeMap::new(),
+        interactive,
+    };
+    let catalog =
+        crate::cli::pull::common::list_remote(&mut ctx, env_cfg, env, token, false, progress)
+            .await?;
+    let (_scanned, changes, tombstones) = crate::cli::push::scan::scan(paths, ctx.lockfile)?;
+    let classified = from_catalog_scan_lockfile(&catalog, &changes, &tombstones, ctx.lockfile)?;
+    execute::run(
+        &mut ctx,
+        &catalog,
+        &classified,
+        true,
+        false,
+        allow_deletes,
+        interactive,
+        None,
+        true,
+        progress,
+    )
+    .await
 }
 
 /// Fold the three sources (remote catalog, push scan, lockfile) into the

@@ -28,13 +28,14 @@ async fn live_backref_refresh() {
 }
 
 /// A rule create or delete moves the server-derived `queue.rules` back-ref.
-/// rdc never authors that array, so the sync that pushes the rule must
-/// re-read the queue afterwards — otherwise the queue stays stale on disk and
-/// only the NEXT sync writes it: one run is not idempotent.
+/// rdc never authors that array, so the sync that pushes the rule must read
+/// the queue back afterwards (`sync::settle_pass`) — otherwise the queue stays
+/// stale on disk and only the NEXT sync writes it: one run is not idempotent.
 ///
-/// The refresh used to cover only queues that were `Clean` (or just created)
-/// this cycle. A queue the same cycle also touched for another reason was
-/// skipped, and each of these three cases took two syncs to settle:
+/// Each of these cases once took two syncs, because the queue was touched for
+/// another reason in the same cycle. (c) was also a push bug: the rule DELETE
+/// runs first and moves `queue.rules`, and the pre-PATCH drift check skipped
+/// the queue edit as "remote changed".
 ///
 ///  (a) the queue is edited locally and a new rule targets it;
 ///  (b) the queue is edited remotely and a new rule targets it;
