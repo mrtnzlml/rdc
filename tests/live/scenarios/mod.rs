@@ -1,3 +1,4 @@
+pub mod backref_refresh;
 pub mod cli_surface;
 pub mod collisions;
 pub mod conflicts_deletes;

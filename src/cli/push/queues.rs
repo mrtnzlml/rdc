@@ -281,7 +281,9 @@ async fn push_update_batch(
                 });
             };
             let remote_art = remote_artifact(remote_queue)?;
-            if combined_hash(&remote_art.json, &remote_art.sidecars, lf) != base {
+            if combined_hash(&remote_art.json, &remote_art.sidecars, lf) != base
+                && !drift_is_server_derived_only(paths, queue_path, &remote_art.json, base, lf)
+            {
                 // Drift. NOT patched here — the sequential stage owns the prompt.
                 return Ok(Prepared::NeedsPrompt {
                     slug: q_slug.clone(),
@@ -403,6 +405,43 @@ async fn push_update_batch(
 /// wrong. One expression, called from both, so they cannot drift apart.
 fn drift_base(entry: &ObjectEntry) -> Option<&str> {
     entry.content_hash.as_deref()
+}
+
+/// Whether the remote moved away from the recorded base ONLY in fields the
+/// server derives and a PATCH never sends (`rules`, `hooks`, `webhooks`,
+/// `inbox`, …; see `is_server_stripped`). Such drift cannot be clobbered by
+/// this push, so it must not block it.
+///
+/// The common cause is this very sync: it deletes a rule or hook before it
+/// patches the queues, and the server drops the child from `queue.rules` /
+/// `queue.hooks`. Without this check a queue edited in the same cycle was
+/// skipped as "remote changed", and the edit only reached the server on the
+/// next sync.
+///
+/// Needs the base bytes, so it reads the base cache — and trusts it only when
+/// it hashes to the lockfile's `base`. Without a trustworthy base it answers
+/// `false` and the caller treats the drift as real.
+fn drift_is_server_derived_only(
+    paths: &Paths,
+    queue_path: &std::path::Path,
+    remote_json: &[u8],
+    base: &str,
+    lf: &Lockfile,
+) -> bool {
+    let Ok(Some(base_bytes)) = crate::state::base_cache::read(paths, queue_path) else {
+        return false;
+    };
+    if combined_hash(&base_bytes, &[], lf) != base {
+        return false;
+    }
+    let authored = |bytes: &[u8]| -> Option<serde_json::Value> {
+        let canonical = crate::snapshot::noise::canonicalize_for_hash(bytes, lf);
+        let mut v: serde_json::Value = serde_json::from_slice(&canonical).ok()?;
+        v.as_object_mut()?
+            .retain(|k, _| !crate::snapshot::create::is_server_stripped("queues", k));
+        Some(v)
+    };
+    matches!((authored(&base_bytes), authored(remote_json)), (Some(a), Some(b)) if a == b)
 }
 
 /// The canonical on-disk artifact for a remote queue, as the drift check and

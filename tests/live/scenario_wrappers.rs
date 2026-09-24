@@ -53,7 +53,7 @@ use std::path::{Path, PathBuf};
 /// README. Bump this only alongside a real change to that count (a scenario
 /// added or removed), and re-verify with that same command — never by
 /// guessing.
-const EXPECTED_IGNORED_LIVE_TESTS: usize = 24;
+const EXPECTED_IGNORED_LIVE_TESTS: usize = 25;
 
 /// `tests/live/scenarios/*.rs`, direct children only — matches how
 /// `tests/live.rs` wires scenario modules in one by one.

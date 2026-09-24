@@ -4243,17 +4243,26 @@ pub async fn run(
         // ELIGIBILITY. An object is refreshable when its on-disk state is
         // known to equal its recorded base, so the three-way decision below
         // can only come out `Write` (a server-only back-ref change) or
-        // `NoChange`. That is true of `Clean` objects AND of objects this very
-        // cycle CREATED: the create path writes the file, the base cache and
-        // the lockfile hash from one set of bytes. (Restricting this to
-        // `Clean` was the original bug — a just-created queue is `LocalCreate`,
-        // so the queue that most needed its `inbox` back-ref was the one
-        // object excluded from the refresh.) Anything else — a real local
-        // edit, an unresolved conflict — is left alone, and the
+        // `NoChange`. By this point that holds for every object this cycle
+        // settled in ONE direction: `Clean`; `LocalCreate` / `LocalEdit`,
+        // whose push wrote the file, the base cache and the lockfile hash from
+        // one set of bytes; and `RemoteCreate` / `RemoteEdit`, which the pull
+        // phase above just wrote. Each narrower set left a common case
+        // needing a second sync: `Clean` alone missed the just-created queue
+        // that needed its `inbox` back-ref, and `Clean | LocalCreate` missed a
+        // queue edited on either side in the same cycle that a rule or hook
+        // was added to it. Conflict classes are left alone, and the
         // `decide_pull_action` guard inside each refresh is a second line of
         // defence rather than the only one.
         let settled = |it: &crate::cli::sync::classify::ClassifiedItem| {
-            matches!(it.class, SyncClass::Clean | SyncClass::LocalCreate)
+            matches!(
+                it.class,
+                SyncClass::Clean
+                    | SyncClass::LocalCreate
+                    | SyncClass::LocalEdit
+                    | SyncClass::RemoteCreate
+                    | SyncClass::RemoteEdit
+            )
         };
         let child_membership_pushed = !no_push
             && classified.iter().any(|it| {
