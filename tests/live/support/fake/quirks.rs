@@ -39,7 +39,6 @@
 //!   claim the choice is proven, which it isn't by definition. A row MAY
 //!   additionally carry `corroborated_by`, a list of LIVE citations that
 //!   make the guess less arbitrary without proving it — see
-//!   `an_engine_or_engine_field_carries_no_modified_at` below and
 //!   [`Provenance::ChosenUnverified`]'s own doc comment. Checked by
 //!   `every_corroborating_citation_names_a_real_test` for the same weak
 //!   thing the LIVE check above verifies (the file and function are real),
@@ -550,7 +549,7 @@ pub(super) fn normalize_organization_settings(value: &mut Value) {
 /// whether a cited test that exists actually supports the claim it's cited
 /// for — only which field held it, and whether the referenced file and
 /// function are real. That last gap is not hypothetical: the first version
-/// of `an_engine_or_engine_field_carries_no_modified_at`'s `corroborated_by`
+/// of the former `an_engine_or_engine_field_carries_no_modified_at` row's `corroborated_by`
 /// cited a real file at a real line that was simply the wrong block, and
 /// separately asserted "no corroboration exists" for `engine_fields` when a
 /// stronger one already did — both caught only by a human reviewer reading
@@ -1023,100 +1022,20 @@ pub const QUIRKS: &[Quirk] = &[
         },
     },
     Quirk {
-        name: "an_engine_or_engine_field_carries_no_modified_at",
-        // `kinds::MODELLED`'s `has_modified_at: false` for `"engines"` and
-        // `"engine_fields"` (`kinds.rs`) was ORIGINALLY justified purely as
-        // an internal-consistency argument with rdc's OWN drift-check code,
-        // not as an observed server fact — see that field's doc comment,
-        // corrected alongside this row. On its own, that argument says
-        // nothing about the real server: `push::deletes::fetch_remote_modified_at`
-        // (`src/cli/push/deletes.rs:481` / `:487`) unconditionally discards
-        // whatever these two kinds' bodies carry (`.map(|_| None)`) when it
-        // reads them back for the DELETE-time drift check, regardless of
-        // what a real response would say.
-        //
-        // For ENGINES and ENGINE_FIELDS both, that is no longer the whole
-        // story — the same asymmetry corroborates a real-server fact for
-        // each, though at different strengths, because the PULL side is not
-        // special-cased the way the delete-time read is. `pull::engines` and
-        // `pull::engine_fields` both record whatever `.modified_at()` the
-        // real `GET /engines` / `GET /engine_fields` LIST response reports,
-        // `Some` or `None`, straight into the lockfile via `record_object`
-        // (`src/cli/pull/engines.rs:96`, `src/cli/pull/engine_fields.rs:142`).
-        // The LIST response, not the create response: `push::engines`
-        // (`src/cli/push/engines.rs:111`) and `push::engine_fields`
-        // (`src/cli/push/engine_fields.rs:100`) do write the CREATE
-        // response's value into the lockfile first, but every `rdc sync`
-        // pulls after it pushes, so the pull pass of that very same sync
-        // overwrites the entry — and both scenarios below then run
-        // `assert_converged` (one more full sync) between the create and the
-        // delete. Whatever the delete-time comparison reads is therefore
-        // pull-derived. Either way it is a real server response, which is
-        // why the conclusion is unchanged; naming the create response was
-        // simply the wrong link in the chain.
-        //
-        // So `delete_one`'s drift comparison — remote forced to `None` by
-        // the discard above, against whatever the LIST response last put in
-        // the lockfile — only agrees (both `None`, `drifted == false`, so
-        // `delete_one` falls through to actually issuing the `DELETE`) if
-        // the real listing carried no `modified_at` to begin with. A drifted
-        // comparison would not fail the delete outright; non-interactively
-        // (`resolve_delete_drift`, `src/cli/push/deletes.rs:370-381`) it
-        // SKIPS the delete and warns, leaving the object very much alive.
-        //
-        // For ENGINES: `ordering.rs::live_push_create_ordering` asserts that
-        // stderr contains the exact warning `"engines/{slug} delete failed
-        // (skipped)"` — `push::deletes::run_deletes`'s `Err(e)` arm, whose
-        // overwhelmingly likely cause is a server-REFUSED `DELETE`, which by
-        // the chain above requires exactly that. Not its ONLY cause, though:
-        // that arm catches every `Err` out of `delete_one`, including a
-        // failure of the listing `fetch_remote_modified_at` performs before
-        // the drift check, and the `bail!` on an interactive
-        // `DeleteDriftChoice::Abort`. Neither is plausible in this scenario —
-        // it runs non-interactively, and a listing failure would take the
-        // rest of the sync down with it — so the inference holds; the word
-        // "only" would not. A green run is an OBSERVATION that a real
-        // engine's listing carries no `modified_at` — CORROBORATION, not
-        // proof: nothing in that scenario reads a raw response body
-        // directly.
-        //
-        // For ENGINE_FIELDS, the corroboration is DIFFERENT and stronger:
-        // `engines.rs::live_engines_round_trip` creates a fresh, unbound
-        // engine field, confirms it listed remotely (`engines.rs:169`),
-        // deletes it through a tombstone (`sync --allow-deletes`), and
-        // confirms it is NOT listed afterward (`engines.rs:180`) — a
-        // directly OBSERVED successful `DELETE /engine_fields/{id}`, not an
-        // inferred one. By the same drift-comparison chain above, that
-        // delete could only have reached the server (rather than being
-        // silently skipped on drift, which would have left the field
-        // listed) if the real `GET /engine_fields` listing that
-        // `assert_converged`'s sync last recorded for that field carried no
-        // `modified_at`. Still CORROBORATION, not proof, for the
-        // same reason as the engines half — but a directly observed delete
-        // is stronger evidence than an inferred one from a refusal warning.
-        //
-        // An earlier version of this comment cited `ordering.rs:279` for an
-        // "engine_fields has NO corroboration" claim. Both halves of that
-        // were wrong: `ordering.rs:279` is an unrelated pre-flight
-        // tombstone-widening check that skips `engine_fields` for a
-        // slug/path-shape reason (its lockfile slug is compound,
-        // `<engine>/<field>`, and doesn't appear verbatim in its on-disk
-        // path); the "Everything that could go, went." sweep it was
-        // confused with is at `ordering.rs:356` and doesn't mention
-        // `engine_fields` at all, by inclusion or exclusion. And
-        // `engine_fields` was never uncorroborated — `live_engines_round_trip`
-        // corroborates it more directly than `ordering.rs` corroborates
-        // `engines`. Caught in review, not by any guard: a citation naming
-        // a real file at a real line is not the same as that line
-        // supporting the claim, which is exactly why `corroborated_by`
-        // below is checked only for existence, never for whether it proves
-        // anything — that half stays a human's job.
-        provenance: Provenance::ChosenUnverified {
-            weighed_against: "src/cli/push/deletes.rs:481",
-            corroborated_by: &[
-                "ordering.rs::live_push_create_ordering",
-                "engines.rs::live_engines_round_trip",
-            ],
+        name: "an_engine_or_engine_field_carries_modified_at",
+        // Observed live on 2026-09-24: `POST`, `GET` and the list of both
+        // `/engines` and `/engine_fields` return a `modified_at`, the same
+        // value in all three. This row used to claim the opposite
+        // (`an_engine_or_engine_field_carries_no_modified_at`, chosen to
+        // match `push::deletes::fetch_remote_modified_at`, which discarded
+        // the value for these two kinds). Once the real API returned one,
+        // that discard read as drift against the lockfile's recorded value,
+        // and every non-interactive engine and engine-field delete was
+        // skipped, on every run. The cited test deletes an engine field
+        // through a tombstone and checks it is gone remotely, which only
+        // passes when the delete-time comparison sees matching timestamps.
+        provenance: Provenance::Modelled {
+            proven_by: "engines.rs::live_engines_round_trip",
         },
     },
     Quirk {
@@ -1572,7 +1491,7 @@ mod tests {
     /// and is exactly as limited: it cannot tell whether the cited test
     /// actually corroborates the claim, only that it exists. That limit is
     /// not theoretical here. This guard was ADDED after
-    /// `an_engine_or_engine_field_carries_no_modified_at`'s first version
+    /// the former `an_engine_or_engine_field_carries_no_modified_at` row's first version
     /// cited `ordering.rs::live_push_create_ordering` correctly (this guard
     /// would have passed) while ALSO claiming, in prose, that `engine_fields`
     /// had no corroboration at all — a claim this guard cannot check,
@@ -1598,14 +1517,10 @@ mod tests {
                 assert_live_citation_resolves(q.name, "corroborated_by", citation, &root);
             }
         }
-        // Today exactly one row populates `corroborated_by` (with two
-        // entries), so a naive "iterate and maybe assert" version of this
-        // guard could still pass with zero real checks if that row's field
-        // were ever emptied by accident — this pins that it isn't.
-        assert!(
-            checked > 0,
-            "no quirk has a corroborated_by entry — this guard would be checking nothing"
-        );
+        // No row carries a corroboration today: the only one that did was
+        // proven live and became `Modelled`. `checked` stays so the loop
+        // reads as the count it is.
+        let _ = checked;
     }
 
     /// The other citation shape: a SOURCE citation (`<file>:<line>`, no

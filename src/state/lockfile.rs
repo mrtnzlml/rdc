@@ -28,6 +28,16 @@ pub struct Lockfile {
     pub api_base: String,
     /// Per object-type, a map of slug -> entry.
     pub objects: BTreeMap<String, BTreeMap<String, ObjectEntry>>,
+    /// Objects this run deleted, kind -> slug -> id. Never saved.
+    ///
+    /// The server can keep referencing a deleted object for a while: a queue
+    /// pending deletion stays in hooks' and rules' `queues`. Without its
+    /// entry the URL no longer portabilizes, so each such reference would
+    /// read as a remote change for the rest of the run, and a push of the
+    /// referencing object would be skipped as drift. [`Lockfile::lookup_url`]
+    /// falls back to this map; see [`Lockfile::depart`].
+    #[serde(skip)]
+    pub departed: BTreeMap<String, BTreeMap<String, u64>>,
 }
 
 /// One row in the lockfile.
@@ -75,6 +85,7 @@ impl Default for Lockfile {
             version: LOCKFILE_VERSION,
             api_base: String::new(),
             objects: BTreeMap::new(),
+            departed: BTreeMap::new(),
         }
     }
 }
@@ -238,9 +249,26 @@ impl Lockfile {
         // `self.objects` so the returned `&str` outlives this call.
         let (endpoint, id) = split_endpoint_id(url)?;
         let kind = kind_for_endpoint(endpoint);
-        let (k, _entries) = self.objects.get_key_value(kind)?;
-        let slug = self.slug_for_id(kind, id)?;
-        Some((k.as_str(), slug))
+        if let Some((k, _entries)) = self.objects.get_key_value(kind)
+            && let Some(slug) = self.slug_for_id(kind, id)
+        {
+            return Some((k.as_str(), slug));
+        }
+        let (k, departed) = self.departed.get_key_value(kind)?;
+        let (slug, _) = departed.iter().find(|(_, d)| **d == id)?;
+        Some((k.as_str(), slug.as_str()))
+    }
+
+    /// Remove `(kind, slug)` because this run deleted it on the env, keeping
+    /// its id in [`Lockfile::departed`] so its URL still portabilizes until
+    /// the run ends. Returns the removed entry.
+    pub fn depart(&mut self, kind: &str, slug: &str) -> Option<ObjectEntry> {
+        let entry = self.objects.get_mut(kind)?.remove(slug)?;
+        self.departed
+            .entry(kind.to_string())
+            .or_default()
+            .insert(slug.to_string(), entry.id);
+        Some(entry)
     }
 
     /// Derive the live URL for a given `(kind, slug)` from its `id` and the

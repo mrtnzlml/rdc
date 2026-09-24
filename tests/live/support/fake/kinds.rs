@@ -22,40 +22,11 @@ pub struct KindSpec {
     pub detail_get: bool,
     /// Keys stripped from LIST responses only.
     pub list_omits: &'static [&'static str],
-    /// Whether the fake should stamp `modified_at` when it creates or
-    /// patches an object of this kind. `false` only for `engines` and
-    /// `engine_fields` — ORIGINALLY chosen not because this fake had
-    /// observed that the real API omits the field on those two, but because
-    /// `push::deletes::fetch_remote_modified_at` (`src/cli/push/deletes.rs`)
-    /// deliberately DISCARDS whatever these two kinds' bodies carry: its
-    /// `"engines"`/`"engine_fields"` arms end `.map(|_| None)` (lines
-    /// 486/492), throwing the value away, where every other arm — e.g.
-    /// `"labels"`/`"saved_views"` at lines 458/464 — keeps it via
-    /// `.map(|x| x.modified_at()...)`. So rdc's own drift signal for these
-    /// two kinds is existence-only BY CONSTRUCTION, regardless of what the
-    /// wire actually sends. A fake that stamped a timestamp anyway would
-    /// make `push::deletes::delete_one`'s comparison see `(None, Some(_))`
-    /// — "one side has a timestamp the other doesn't" — and skip a delete
-    /// this scenario expects to reach the server and be refused there
-    /// instead. `has_modified_at: false` matches rdc's comparison contract,
-    /// not, on its own, a claim about the real response body.
-    ///
-    /// It IS also a `quirks::QUIRKS` entry now — name
-    /// `"an_engine_or_engine_field_carries_no_modified_at"`, a
-    /// `Provenance::ChosenUnverified` row (`quirks.rs`). An earlier version
-    /// of this comment argued the opposite — "deliberately NOT a
-    /// `quirks::QUIRKS` entry: that registry is for behaviors of the real
-    /// API, each backed by real, checkable evidence; this flag encodes an
-    /// internal-consistency requirement... not an observed server fact" —
-    /// but that rationale did not survive its own registry: the sibling row
-    /// `modified_at_does_not_move_when_a_back_reference_grows` is EQUALLY an
-    /// unobserved, chosen-not-proven fact (its own comment says the real
-    /// behavior is unknown), and it was in `QUIRKS` from the start. Same
-    /// category — "the fake had to pick an answer and the real API's
-    /// behaviour is unknown" — deserves the same treatment, which is exactly
-    /// what `Provenance::ChosenUnverified` is for. See that row's own doc
-    /// comment for the evidence — not restated here, so this comment can't
-    /// drift out of sync with it again.
+    /// Whether the fake stamps `modified_at` when it creates or patches an
+    /// object of this kind. The real API returns one for every kind modelled
+    /// here, engines and engine fields included — see the quirk
+    /// `an_engine_or_engine_field_carries_modified_at` (`quirks.rs`) for why
+    /// those two were once `false`.
     pub has_modified_at: bool,
     /// Fill in server-assigned and required-but-absent fields.
     pub defaults: fn(&mut Map<String, Value>, &OrgCtx),
@@ -160,8 +131,8 @@ pub const MODELLED: &[KindSpec] = &[
     KindSpec { path: "rules", creatable: true, detail_get: true, list_omits: &[], has_modified_at: true, defaults: queues_owned },
     KindSpec { path: "labels", creatable: true, detail_get: false, list_omits: &[], has_modified_at: true, defaults: org_owned },
     KindSpec { path: "email_templates", creatable: true, detail_get: true, list_omits: &[], has_modified_at: true, defaults: no_defaults },
-    KindSpec { path: "engines", creatable: true, detail_get: true, list_omits: &[], has_modified_at: false, defaults: no_defaults },
-    KindSpec { path: "engine_fields", creatable: true, detail_get: true, list_omits: &[], has_modified_at: false, defaults: no_defaults },
+    KindSpec { path: "engines", creatable: true, detail_get: true, list_omits: &[], has_modified_at: true, defaults: no_defaults },
+    KindSpec { path: "engine_fields", creatable: true, detail_get: true, list_omits: &[], has_modified_at: true, defaults: no_defaults },
     KindSpec { path: "saved_views", creatable: true, detail_get: true, list_omits: &[], has_modified_at: true, defaults: no_defaults },
     KindSpec { path: "workflows", creatable: false, detail_get: true, list_omits: &[], has_modified_at: true, defaults: no_defaults },
     KindSpec { path: "workflow_steps", creatable: false, detail_get: true, list_omits: &[], has_modified_at: true, defaults: no_defaults },

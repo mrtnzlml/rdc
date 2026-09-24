@@ -29,10 +29,9 @@
 //!   `schemas` TENTH, so `sync test --allow-deletes` issues
 //!   `DELETE /engine_fields/{id}` while the schema naming the field is still
 //!   very much alive — exactly the 409 case. `push::deletes::delete_one`'s
-//!   drift gate waves it through rather than skipping it, because
-//!   `KindSpec::has_modified_at` is `false` for this kind and
-//!   `fetch_remote_modified_at` discards the remote value anyway, leaving
-//!   both sides of the comparison `None`. The fake answers `204`.
+//!   drift gate waves it through rather than skipping it, because the
+//!   remote `modified_at` it reads matches the one the lockfile recorded.
+//!   The fake answers `204`.
 //!   The scenario's own `Teardown` sweep of `engine_field` by name prefix
 //!   (`tests/live/support/teardown.rs:68-78`) is NOT the source: by the time
 //!   it runs, rdc has already deleted the field, so the prefix lookup comes

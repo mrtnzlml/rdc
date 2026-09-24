@@ -275,7 +275,7 @@ rdc sync test
 
 A write can change objects rdc did not touch: a new rule appears in its queue's `rules`, and a new queue gets five email templates. So a sync that wrote anything reads the env back before it finishes. The next `rdc sync` has nothing left to do.
 
-Deleting a queue also removes its email templates and inbox. Rossum refuses to delete the queue's schema while the queue is pending deletion (24 hours), and keeps it afterwards with no queue. rdc stops tracking the schema in the same run and warns that it stays on the env.
+Deleting a queue also removes its email templates and inbox. Rossum refuses to delete the queue's schema while the queue is pending deletion (24 hours), and keeps it afterwards with no queue. rdc stops tracking the schema in the same run and warns that it stays on the env. Rossum also keeps the draining queue in hooks' and rules' `queues` and in saved views' `queues_filter`, so rdc removes it from those files and pushes them in the same run.
 
 ### Edit a file
 

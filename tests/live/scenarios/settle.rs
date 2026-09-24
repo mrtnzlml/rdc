@@ -36,8 +36,9 @@ async fn live_settle_after_push() {
 ///      provisions five, which land on disk in the same run;
 ///  (b) a hook deleted while another hook runs after it — the server drops it
 ///      from the survivor's `run_after`;
-///  (c) a queue deleted while a rule still targets it — the server drops it
-///      from the rule's `queues`, and the queue's schema and unique-typed
+///  (c) a queue deleted while a rule still targets it — the server keeps a
+///      draining queue in the rule's `queues` for up to 24 hours, so rdc
+///      detaches it in the same run, and the queue's schema and unique-typed
 ///      templates, which the server refuses to delete apart from the queue,
 ///      leave the lockfile in the same run.
 ///
@@ -167,8 +168,8 @@ async fn settle_after_push(cfg: &LiveConfig) {
     assert_eq!(
         rule["queues"],
         serde_json::json!([]),
-        "(c) the sync that deleted the queue must also pull the server dropping it \
-         from the rule's queues"
+        "(c) the sync that deleted the queue must also detach it from the rule, \
+         which still names it"
     );
     let lf = load_lockfile(project.path(), "test").expect("lockfile");
     let leftovers: Vec<String> = ["queues", "schemas", "inboxes"]

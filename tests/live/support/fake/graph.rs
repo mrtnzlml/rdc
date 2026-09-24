@@ -30,17 +30,20 @@ fn ref_urls<'a>(obj: &'a Value, edge: &kinds::Edge) -> Vec<&'a str> {
 }
 
 impl OrgState {
-    /// Drop a deleted object's url from the forward refs OTHER objects hold
-    /// to it, as the real API does at DELETE time (observed live 2026-09-24:
-    /// the sync after each delete pulled every such object back changed).
-    /// A deleted hook leaves every hook's `run_after`; a deleted queue leaves
-    /// every hook's and rule's `queues` and every saved view's
-    /// `queues_filter`. The holders' `modified_at` is left alone, like
-    /// [`Self::add_ref`]'s.
+    /// Drop a deleted hook's url from every hook's `run_after`, as the real
+    /// API does at the DELETE (observed live 2026-09-24). The holders'
+    /// `modified_at` is left alone, like [`Self::add_ref`]'s.
+    ///
+    /// A deleted queue is deliberately NOT dropped from hooks' and rules'
+    /// `queues` or saved views' `queues_filter`. The real API keeps those
+    /// refs while the queue drains, for up to 24 hours (observed the same
+    /// day), and this fake purges a queue after one more request, so dropping
+    /// them at the purge would hand rdc, within a single run, a cleanup the
+    /// real server only does a day later. What the real purge does to them
+    /// is unobserved.
     pub(super) fn drop_refs_to(&mut self, kind: &str, id: u64) {
         let holders: &[(&str, &str)] = match kind {
             "hooks" => &[("hooks", "run_after")],
-            "queues" => &[("hooks", "queues"), ("rules", "queues"), ("saved_views", "queues_filter")],
             _ => return,
         };
         let url = self.url(kind, id);

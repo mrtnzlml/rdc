@@ -64,11 +64,7 @@ mod tests {
             );
         }
         objects.insert(kind.to_string(), inner);
-        Lockfile {
-            version: 3,
-            api_base: String::new(),
-            objects,
-        }
+        Lockfile { version: 3, objects, ..Lockfile::default() }
     }
 
     #[test]

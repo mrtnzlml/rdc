@@ -3730,6 +3730,36 @@ pub async fn run(
                 _ => {}
             }
         }
+        // Objects that still name a queue deleted above. They are pushed
+        // with it removed, so the env drops the reference now rather than at
+        // the queue's purge.
+        let in_conflict: BTreeSet<(String, String)> = classified
+            .iter()
+            .filter(|it| {
+                matches!(
+                    it.class,
+                    SyncClass::BothDiverged
+                        | SyncClass::LocalEditRemoteDelete
+                        | SyncClass::LocalDeleteRemoteEdit
+                )
+            })
+            .map(|it| (it.kind.clone(), it.slug.clone()))
+            .collect();
+        for (kind, slug, path) in crate::cli::push::deletes::detach_departed_queues(
+            ctx.paths,
+            ctx.lockfile,
+            &in_conflict,
+            progress,
+        )? {
+            let list = match kind {
+                "hooks" => &mut change_list.hooks,
+                "rules" => &mut change_list.rules,
+                _ => &mut change_list.saved_views,
+            };
+            if list.insert(slug, path).is_none() {
+                outcome.items_pushed += 1;
+            }
+        }
         // Always run the push pipeline — `hooks::push` may have
         // secrets-only work even when no hook JSON/code changed. The
         // per-kind drivers inside `push_classified` are individually

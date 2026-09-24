@@ -262,9 +262,7 @@ pub async fn run_deletes(
             progress.event(Action::Warn, &format!("{kind}/{slug} delete failed (skipped): {e:#}"));
             continue;
         };
-        if let Some(m) = lockfile.objects.get_mut(kind) {
-            m.remove(&slug);
-        }
+        lockfile.depart(kind, &slug);
         apply_outcome(&mut counts, kind, DeleteOutcome::Deleted);
         if kind == "schemas" {
             progress.event(
@@ -296,6 +294,73 @@ pub async fn run_deletes(
     Ok(counts)
 }
 
+/// Drop every queue this run deleted from the local hooks', rules' and saved
+/// views' queue refs, so the push that follows detaches them on the env too.
+///
+/// Rossum keeps a deleted queue in hooks' and rules' `queues` and in saved
+/// views' `queues_filter` while it is pending deletion (up to 24 hours), and
+/// only drops it at the purge. Left alone, the pull would write the draining
+/// queue's raw URL into those files, since it has left the lockfile, and the
+/// purge would change them again on a later sync. Detaching now leaves them
+/// portable and settled in this run.
+///
+/// `skip` holds `(kind, slug)` pairs to leave untouched: objects with an open
+/// conflict, which must not be pushed over. Returns `(kind, slug, path)` for
+/// every file it rewrote, for the caller to push.
+pub fn detach_departed_queues(
+    paths: &crate::paths::Paths,
+    lockfile: &Lockfile,
+    skip: &std::collections::BTreeSet<(String, String)>,
+    progress: &Arc<Log>,
+) -> Result<Vec<(&'static str, String, std::path::PathBuf)>> {
+    let Some(departed) = lockfile.departed.get("queues").filter(|m| !m.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let gone: Vec<String> = departed.keys().map(|q| format!("rdc://queues/{q}")).collect();
+    let holders: [(&'static str, std::path::PathBuf, &str); 3] = [
+        ("hooks", paths.hooks_dir(), "queues"),
+        ("rules", paths.rules_dir(), "queues"),
+        ("saved_views", paths.saved_views_dir(), "queues_filter"),
+    ];
+    let mut rewritten = Vec::new();
+    for (kind, dir, field) in holders {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let mut files: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+            .collect();
+        files.sort();
+        for path in files {
+            let Some(slug) = path.file_stem().and_then(|s| s.to_str()).map(str::to_string) else {
+                continue;
+            };
+            if skip.contains(&(kind.to_string(), slug.clone())) {
+                continue;
+            }
+            let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+            let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                continue;
+            };
+            let Some(refs) = value.get_mut(field).and_then(|v| v.as_array_mut()) else {
+                continue;
+            };
+            let before = refs.len();
+            refs.retain(|r| !r.as_str().is_some_and(|r| gone.iter().any(|g| g == r)));
+            if refs.len() == before {
+                continue;
+            }
+            let mut out = serde_json::to_vec_pretty(&value).context("serializing a detached object")?;
+            out.push(b'\n');
+            crate::snapshot::writer::write_atomic(&path, &out)
+                .with_context(|| format!("writing {}", path.display()))?;
+            progress.event(Action::Info, &format!("{kind}/{slug}: detached from the deleted queue"));
+            rewritten.push((kind, slug, path));
+        }
+    }
+    Ok(rewritten)
+}
+
 #[derive(Debug)]
 enum DeleteOutcome {
     Deleted,
@@ -322,9 +387,7 @@ async fn delete_one(
     let remote = fetch_remote_modified_at(client, kind, id).await?;
     if remote.is_none() {
         // Already gone on the remote; just clean up our lockfile.
-        if let Some(m) = lockfile.objects.get_mut(kind) {
-            m.remove(slug);
-        }
+        lockfile.depart(kind, slug);
         progress.event(
             Action::Skip,
             &format!("{kind}/{slug} (remote id {id} missing)"),
@@ -376,9 +439,7 @@ async fn delete_one(
         .delete_path(&format!("/{kind}/{id}"), None)
         .await
         .with_context(|| format!("DELETE /{kind}/{id}"))?;
-    if let Some(m) = lockfile.objects.get_mut(kind) {
-        m.remove(slug);
-    }
+    lockfile.depart(kind, slug);
     progress.event(Action::Delete, &format!("{kind}/{slug}"));
     Ok(DeleteOutcome::Deleted)
 }
@@ -540,22 +601,22 @@ async fn fetch_remote_modified_at(
             .into_iter()
             .find(|x| x.id == id)
             .map(|x| x.modified_at().map(|s| s.to_string())),
-        // Engines / engine_fields don't expose modified_at on their
-        // model today; existence is the best signal we have. Treat
-        // "exists" as "not drifted" so the user isn't prompted for
-        // every one of them.
+        // Both carry `modified_at`, and the lockfile records it. Answering
+        // "no timestamp" here instead read as drift against the recorded
+        // one, so every engine delete was skipped non-interactively, on
+        // every run.
         "engines" => client
             .list_engines(None)
             .await?
             .into_iter()
             .find(|x| x.id == id)
-            .map(|_| None),
+            .map(|x| x.modified_at().map(|s| s.to_string())),
         "engine_fields" => client
             .list_engine_fields(None)
             .await?
             .into_iter()
             .find(|x| x.id == id)
-            .map(|_| None),
+            .map(|x| x.modified_at().map(|s| s.to_string())),
         "email_templates" => client
             .list_email_templates(None)
             .await?
