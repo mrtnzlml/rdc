@@ -68,6 +68,9 @@ fn write(path: &std::path::Path, body: &serde_json::Value) {
     std::fs::write(path, serde_json::to_vec_pretty(body).unwrap()).unwrap();
 }
 
+/// The commented `.rdc/mapping.toml` that `rdc init` scaffolds.
+const MAPPING_STUB: &str = include_str!("../templates/mapping.toml");
+
 fn read_json(path: &std::path::Path) -> serde_json::Value {
     serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
 }
@@ -318,9 +321,10 @@ fn migrate_dry_run_does_not_convert_or_delete_legacy_mapping_file() {
         map_after, map_body,
         "dry-run must leave the legacy mapping file byte-identical"
     );
-    assert!(
-        !root.join(".rdc/mapping.toml").exists(),
-        "dry-run must not write the generic mapping file"
+    assert_eq!(
+        std::fs::read_to_string(root.join(".rdc/mapping.toml")).unwrap(),
+        MAPPING_STUB,
+        "dry-run must leave the scaffolded mapping stub untouched"
     );
 }
 
@@ -2196,7 +2200,13 @@ fn migrate_warns_about_leftover_legacy_files_beside_generic_mapping() {
     let project = init_two_env_project();
     let root = project.path();
     std::fs::create_dir_all(root.join(".rdc")).unwrap();
-    std::fs::write(root.join(".rdc/mapping.toml"), "version = 2\n").unwrap();
+    // A row makes it authoritative; a file with none is a stub that legacy
+    // files are still converted into.
+    std::fs::write(
+        root.join(".rdc/mapping.toml"),
+        "version = 2\n\n[[hooks]]\ntest = \"a\"\nprod = \"b\"\n",
+    )
+    .unwrap();
     let map_dir = root.join(".rdc/map");
     std::fs::create_dir_all(&map_dir).unwrap();
     std::fs::write(
@@ -2333,9 +2343,10 @@ fn migrate_aborts_with_file_attribution_on_inconsistent_legacy_files() {
         map_dir.join("dev-to-prod.toml").exists(),
         "legacy files must be preserved when conversion aborts"
     );
-    assert!(
-        !root.join(".rdc/mapping.toml").exists(),
-        "no .rdc/mapping.toml may be written when conversion aborts"
+    assert_eq!(
+        std::fs::read_to_string(root.join(".rdc/mapping.toml")).unwrap(),
+        MAPPING_STUB,
+        "nothing may be written to .rdc/mapping.toml when conversion aborts"
     );
 }
 
@@ -3013,6 +3024,148 @@ fn allow_recreate_lets_the_prune_through() {
             .exists(),
         "and the new one written"
     );
+}
+
+/// A legacy file written beside the scaffolded stub is converted INTO it: the
+/// stub's comments stay and the rows are appended.
+#[test]
+fn migrate_converts_legacy_files_into_the_scaffolded_stub() {
+    let project = init_two_env_project();
+    let root = project.path();
+    let map_dir = root.join(".rdc/map");
+    std::fs::create_dir_all(&map_dir).unwrap();
+    std::fs::write(
+        map_dir.join("test-to-prod.toml"),
+        "version = 1\n\n[hooks]\n\"ghost\" = \"ghost-prod\"\n",
+    )
+    .unwrap();
+
+    let _guard = cwd_lock();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root).unwrap();
+    let result = rdc::cli::migrate::run("test", "prod", MirrorMode::Additive, false, vec![], Carry::NONE);
+    std::env::set_current_dir(&prev).unwrap();
+    result.expect("migrate should convert the legacy file");
+
+    let body = std::fs::read_to_string(root.join(".rdc/mapping.toml")).unwrap();
+    assert!(body.starts_with(MAPPING_STUB), "the stub's comments must stay:\n{body}");
+    assert!(
+        body.ends_with("[[hooks]]\nprod = \"ghost-prod\"\ntest = \"ghost\"\n"),
+        "{body}"
+    );
+    assert!(!map_dir.join("test-to-prod.toml").exists(), "the legacy file is consumed");
+}
+
+/// Record in `env`'s lockfile that `(kind, slug)` was migrated from `src`'s
+/// object `id` — what an earlier `rdc migrate` would have written.
+fn write_origins(root: &std::path::Path, env: &str, src: &str, entries: &[(&str, &str, u64)]) {
+    let path = root.join(format!(".rdc/state/{env}.lock.json"));
+    let mut lf = read_json(&path);
+    for (kind, slug, id) in entries {
+        lf["origins"][*kind][*slug] = serde_json::json!({ "env": src, "id": id });
+    }
+    write(&path, &lf);
+}
+
+/// The source env's own lockfile: `vendor-invoices` is the object prod's
+/// `invoices` came from (ids 100/101) when `same_ids`, or new objects
+/// (ids 200/201) when not.
+fn renamed_queue_project_with_origins(same_ids: bool) -> TempDir {
+    let project = renamed_queue_project();
+    let root = project.path();
+    write_origins(
+        root,
+        "prod",
+        "test",
+        &[("queues", "invoices", 100), ("schemas", "invoices", 101)],
+    );
+    let (q, sch) = if same_ids { (100, 101) } else { (200, 201) };
+    write_lockfile(
+        root,
+        "test",
+        &[
+            ("workspaces", "main", 9),
+            ("queues", "vendor-invoices", q),
+            ("schemas", "vendor-invoices", sch),
+        ],
+    );
+    project
+}
+
+/// The origin proves the rename, so the refusal names it as one and gives the
+/// exact steps — and no longer offers `--allow-recreate`.
+#[test]
+fn a_rename_proved_by_the_origin_prints_the_steps() {
+    let project = renamed_queue_project_with_origins(true);
+    let root = project.path();
+
+    let err = run_migrate(root, MirrorMode::Mirror { allow_recreate: false }, false)
+        .expect_err("a proved rename must still refuse");
+    let msg = format!("{err:#}");
+    for want in [
+        "invoices was renamed to vendor-invoices in test, but prod still uses the old name.",
+        "queue  invoices → vendor-invoices   (same test queue, id 100)",
+        "prod deletes queue invoices (id 502) and all its documents",
+        "[[queues]]\n     test = \"vendor-invoices\"\n     prod = \"invoices\"",
+        "[[schemas]]\n     test = \"vendor-invoices\"\n     prod = \"invoices\"",
+        "rdc migrate test prod --mirror",
+    ] {
+        assert!(msg.contains(want), "refusal must say {want:?}:\n{msg}");
+    }
+    assert!(!msg.contains("--allow-recreate"), "{msg}");
+    assert!(
+        root.join("envs/prod/workspaces/main/queues/invoices/queue.json").exists(),
+        "refused before touching the target"
+    );
+}
+
+/// The case the coarse guard got wrong: the source deleted one queue and
+/// created an unrelated one. The origin shows the deleted queue's id is gone
+/// from the source, so the prune goes through without `--allow-recreate`.
+#[test]
+fn a_queue_deleted_in_the_source_is_not_mistaken_for_a_rename() {
+    let project = renamed_queue_project_with_origins(false);
+    let root = project.path();
+
+    run_migrate(root, MirrorMode::Mirror { allow_recreate: false }, false)
+        .expect("a deletion plus an unrelated create is not a rename");
+    assert!(!root.join("envs/prod/workspaces/main/queues/invoices/queue.json").exists());
+    assert!(root.join("envs/prod/workspaces/main/queues/vendor-invoices/queue.json").exists());
+}
+
+/// Every migrate records, in the target lockfile, the source id each target
+/// object came from — the evidence the next `--mirror` reads. Objects the
+/// source never pushed get none, and a pruned object's origin goes with it.
+#[test]
+fn migrate_records_where_each_target_object_came_from() {
+    let project = renamed_queue_project_with_origins(false);
+    let root = project.path();
+
+    run_migrate(root, MirrorMode::Mirror { allow_recreate: false }, false).unwrap();
+    let lf = read_json(&root.join(".rdc/state/prod.lock.json"));
+    assert_eq!(
+        lf["origins"],
+        serde_json::json!({
+            "workspaces": { "main": { "env": "test", "id": 9 } },
+            "queues": { "vendor-invoices": { "env": "test", "id": 200 } },
+            "schemas": { "vendor-invoices": { "env": "test", "id": 201 } },
+        }),
+        "{lf:#}"
+    );
+    // The object entries themselves are sync's, and untouched.
+    assert_eq!(lf["objects"]["queues"]["invoices"]["id"], 502);
+}
+
+/// A dry run writes nothing, the lockfile included.
+#[test]
+fn a_dry_run_records_no_origins() {
+    let project = renamed_queue_project_with_origins(false);
+    let root = project.path();
+    let path = root.join(".rdc/state/prod.lock.json");
+    let before = std::fs::read(&path).unwrap();
+
+    run_migrate(root, MirrorMode::Mirror { allow_recreate: false }, true).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), before);
 }
 
 /// The payoff: with the row `rdc doctor` records, the same promotion keeps the

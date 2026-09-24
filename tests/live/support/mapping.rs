@@ -68,6 +68,7 @@ mod tests {
             version: 3,
             api_base: String::new(),
             objects,
+            origins: Default::default(),
         }
     }
 

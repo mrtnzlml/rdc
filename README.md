@@ -394,7 +394,11 @@ Re-running on an already-migrated snapshot is a no-op (matched objects keep the 
 
 Without `--mirror`, migrate is additive — objects that exist only in the target are left intact and nothing is ever removed. That is the deliberate alternative for a target that legitimately holds work the source lacks. `--mirror` instead deletes target snapshot files with no source counterpart; those are local file removals, so they reach the tenant only when the following `rdc sync <tgt>` is given `--allow-deletes` (or you confirm its prompt). Review with `git diff` before syncing.
 
-`--mirror` refuses one shape outright: pruning a target object the target's lockfile still holds a live id for, while creating another of the same kind. That is what an unrecorded rename looks like, and pushing it deletes the target object — for a queue, its documents — and creates a replacement. The refusal names the mapping row that turns it back into a rename. Objects that really are unrelated pass with `--allow-recreate`.
+`--mirror` refuses to prune a live target object that was renamed in the source. Pushing that prune deletes the target object — for a queue, its documents — and creates a replacement. Every migrate records in the target lockfile (`origins`) which source object each target object came from. So `--mirror` can tell the cases apart:
+
+- The source object still exists under a new slug. That is a rename, and the refusal prints the `.rdc/mapping.toml` rows to add and the command to re-run.
+- The source object is gone. That is a real deletion, and it goes through, even when the same run creates an unrelated object of the same kind.
+- There is no origin, because the target was last migrated by an older rdc or from another env. Then rdc cannot tell. It refuses any live prune paired with a create of the same kind, and `--allow-recreate` lets objects that really are unrelated through.
 
 ### Selective migrate
 

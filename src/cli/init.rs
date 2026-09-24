@@ -133,6 +133,7 @@ pub async fn run(env_specs: Vec<String>, force: bool) -> Result<()> {
     for env in cfg.envs.keys() {
         scaffold.extend(write_env_scaffolds(&cwd, env)?);
     }
+    scaffold.push(write_mapping_scaffold(&cwd)?);
 
     // The per-file summary is the whole output of a regenerate-only run, and
     // the receipt a `--force` user needs elsewhere ("did it touch my README?").
@@ -748,6 +749,25 @@ pub(crate) fn write_env_scaffolds(
     ])
 }
 
+/// Write `.rdc/mapping.toml` as a commented stub if it is absent, so the file
+/// that turns a cross-env slug difference into a rename is there to be found.
+/// Create-if-absent with no `--force` path, like the overlay: its rows are the
+/// user's own.
+///
+/// Skipped while legacy `.rdc/map/*.toml` files exist. `rdc migrate` converts
+/// those only when `.rdc/mapping.toml` is absent, so a stub would make it
+/// ignore them instead.
+pub(crate) fn write_mapping_scaffold(root: &Path) -> Result<(String, Scaffolded)> {
+    let name = ".rdc/mapping.toml".to_string();
+    let paths = Paths::for_env(root, "");
+    let path = paths.mapping_file();
+    if path.exists() || !paths.legacy_mapping_files().is_empty() {
+        return Ok((name, Scaffolded::Unchanged));
+    }
+    write_atomic(&path, MAPPING_TEMPLATE.as_bytes())?;
+    Ok((name, Scaffolded::Created))
+}
+
 /// `write_template_file`'s force semantics against bytes already in hand.
 fn write_template_file_bytes(
     path: &Path,
@@ -957,6 +977,7 @@ pub fn write_scaffold_files(
     tolerate(".gitlab-ci.yml", write_gitlab_ci(cwd, &cfg, false));
     write_testkit(cwd, false)?;
     write_env_scaffolds(cwd, env_name)?;
+    write_mapping_scaffold(cwd)?;
     Ok(())
 }
 
@@ -971,6 +992,10 @@ pub(crate) const GITLAB_CI_TEMPLATE: &str = include_str!("../../templates/gitlab
 /// decoration: `Overlay::version` has no serde default, so a comments-only
 /// file would fail to parse and take `rdc migrate` down with it.
 pub(crate) const OVERLAY_TEMPLATE: &str = include_str!("../../templates/overlay.toml");
+
+/// The commented `.rdc/mapping.toml` (see [`write_mapping_scaffold`]). Every
+/// row in it is commented out, so it parses as a mapping with no rows.
+pub(crate) const MAPPING_TEMPLATE: &str = include_str!("../../templates/mapping.toml");
 
 /// The Python test harness `rdc init` scaffolds, embedded from `templates/`
 /// like the pipeline is, so the shipped copy and the repo copy cannot drift.
@@ -1435,6 +1460,37 @@ mod tests {
                 && ov.organization.is_empty(),
             "every example must still be commented out: {ov:?}"
         );
+    }
+
+    /// Every example row stays commented: a live one would map slugs no env
+    /// has, and `rdc migrate` validates the file on every run.
+    #[test]
+    fn embedded_mapping_template_loads_as_an_empty_mapping() {
+        let g: crate::mapping::GenericMapping = toml::from_str(MAPPING_TEMPLATE).unwrap();
+        assert!(g.is_empty(), "every example must still be commented out: {g:?}");
+        assert_eq!(g.version, crate::mapping::GenericMapping::default().version);
+    }
+
+    /// Created once, never rewritten — and never while legacy per-pair files
+    /// still wait for `rdc migrate` to convert them.
+    #[test]
+    fn write_mapping_scaffold_creates_once_and_defers_to_legacy_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let legacy = dir.path().join(".rdc/map/dev-to-prod.toml");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "version = 1\n").unwrap();
+        let (_, o) = write_mapping_scaffold(dir.path()).unwrap();
+        assert_eq!(o, Scaffolded::Unchanged);
+        let mapping = dir.path().join(".rdc/mapping.toml");
+        assert!(!mapping.exists(), "legacy files must be converted, not shadowed");
+
+        std::fs::remove_file(&legacy).unwrap();
+        let (_, o) = write_mapping_scaffold(dir.path()).unwrap();
+        assert_eq!(o, Scaffolded::Created);
+        std::fs::write(&mapping, "version = 2\n\n[[hooks]]\ndev = \"a\"\nprod = \"b\"\n").unwrap();
+        let (_, o) = write_mapping_scaffold(dir.path()).unwrap();
+        assert_eq!(o, Scaffolded::Unchanged);
+        assert!(std::fs::read_to_string(&mapping).unwrap().contains("[[hooks]]"));
     }
 
     /// Once written, both files hold the user's own data — hand-written

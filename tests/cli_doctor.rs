@@ -349,6 +349,8 @@ fn doctor_dry_run_records_no_mapping_row() {
         .unwrap();
     }
 
+    // `rdc init` scaffolded the commented stub; a dry run must leave it as is.
+    let before = std::fs::read(root.join(".rdc/mapping.toml")).unwrap();
     Command::cargo_bin("rdc")
         .unwrap()
         .current_dir(root)
@@ -356,8 +358,9 @@ fn doctor_dry_run_records_no_mapping_row() {
         .assert()
         .success();
 
-    assert!(
-        !root.join(".rdc/mapping.toml").exists(),
+    assert_eq!(
+        std::fs::read(root.join(".rdc/mapping.toml")).unwrap(),
+        before,
         "a dry run must write nothing"
     );
     assert!(

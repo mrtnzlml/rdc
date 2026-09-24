@@ -1,0 +1,38 @@
+# Slugs that differ between envs, read by `rdc migrate`.
+#
+# A slug is an object's file or directory name under envs/<env>/. Migrate
+# matches objects by slug: `invoices` in one env updates `invoices` in the
+# other. When the same object has a different slug in two envs, it needs a
+# row here. Without one, `rdc migrate --mirror` deletes the target's object
+# and creates a new one, and deleting a queue deletes its documents.
+#
+# List only the slugs that differ. An object with the same slug in every env
+# needs no row. `rdc doctor <env>` adds rows itself when it renames a slug,
+# and `rdc migrate` prints the rows to add when it finds a rename it cannot
+# match.
+#
+# Shape: one `[[<kind>]]` table per object, one line per env:
+#
+# [[queues]]
+# dev = "ap-invoices"
+# prod = "invoices"
+#
+# A queue's schema and inbox use the queue's slug, and its email templates use
+# "<workspace>/<queue>/<template>". So a renamed queue needs a row for each:
+#
+# [[schemas]]
+# dev = "ap-invoices"
+# prod = "invoices"
+#
+# [[inboxes]]
+# dev = "ap-invoices"
+# prod = "invoices"
+#
+# [[email_templates]]
+# dev = "main/ap-invoices/welcome"
+# prod = "main/invoices/welcome"
+#
+# Kinds: workspaces, hooks, rules, labels, queues, schemas, inboxes,
+# email_templates, engines, engine_fields ("<engine>/<field>"), saved_views.
+
+version = 2

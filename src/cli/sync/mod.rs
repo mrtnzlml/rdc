@@ -248,6 +248,7 @@ pub(crate) async fn run_cycle(
     // adds an env. Skipped under `--dry-run`, which promises to write nothing.
     if !dry_run {
         crate::cli::init::write_env_scaffolds(&cwd, env)?;
+        crate::cli::init::write_mapping_scaffold(&cwd)?;
     }
 
     // Phase 0: offline pre-flight. Scanning the local tree needs nothing

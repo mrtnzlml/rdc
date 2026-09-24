@@ -53,7 +53,19 @@ fn load_or_migrate_mapping(
     log: &crate::log::Log,
 ) -> Result<GenericMapping> {
     let generic_path = src_paths.mapping_file();
-    if generic_path.exists() {
+    // A file with no rows — the stub `rdc init` scaffolds — records nothing, so
+    // legacy files beside it are still converted, into it.
+    let stub = if generic_path.exists() {
+        let generic = GenericMapping::load(&generic_path)?;
+        if generic.is_empty() && !src_paths.legacy_mapping_files().is_empty() {
+            Some(std::fs::read_to_string(&generic_path)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if generic_path.exists() && stub.is_none() {
         let generic = GenericMapping::load(&generic_path)?;
         // Validate the existing, hand-authored file every time it's loaded —
         // this is the ONLY place the happy path (no legacy conversion) runs
@@ -162,7 +174,16 @@ fn load_or_migrate_mapping(
     );
 
     if !dry_run {
-        if !generic.is_empty() {
+        if let Some(stub) = &stub {
+            // Append onto the stub, keeping its comments.
+            let mut text = stub.clone();
+            for kind in GenericMapping::KINDS {
+                for row in generic.kind_rows(kind).into_iter().flatten() {
+                    text = crate::mapping::append_row(&text, kind, row);
+                }
+            }
+            crate::snapshot::writer::write_atomic(&generic_path, text.as_bytes())?;
+        } else if !generic.is_empty() {
             generic.save(&generic_path)?;
         }
         for path in &converted {
@@ -2545,11 +2566,68 @@ fn produced_paths(
     mapping: &Mapping,
     skip: &std::collections::BTreeSet<PathBuf>,
 ) -> Result<std::collections::BTreeSet<PathBuf>> {
+    Ok(produced_pairs(src_root, src_env, mapping, skip)?
+        .into_iter()
+        .map(|(_, tgt)| tgt)
+        .collect())
+}
+
+/// [`produced_paths`], keeping each target path's source path beside it:
+/// `(source-relative, target-relative)`.
+fn produced_pairs(
+    src_root: &Path,
+    src_env: &str,
+    mapping: &Mapping,
+    skip: &std::collections::BTreeSet<PathBuf>,
+) -> Result<Vec<(PathBuf, PathBuf)>> {
     Ok(enumerate_files(src_root, src_env)?
         .into_iter()
         .filter(|rel| !skip.contains(rel))
-        .map(|rel| remap_relative(&rel, mapping))
+        .map(|rel| {
+            let tgt = remap_relative(&rel, mapping);
+            (rel, tgt)
+        })
         .collect())
+}
+
+/// Every `(kind, target slug) -> (kind, source slug)` pair a run produces, at
+/// object granularity (sidecars and code files fold into their object).
+fn produced_objects(
+    pairs: &[(PathBuf, PathBuf)],
+) -> std::collections::BTreeMap<(&'static str, String), String> {
+    pairs
+        .iter()
+        .filter_map(|(src, tgt)| {
+            let (kind, tgt_slug) = classify(tgt)?;
+            let (_, src_slug) = classify(src)?;
+            Some(((kind, tgt_slug), src_slug))
+        })
+        .collect()
+}
+
+/// A pruned target object whose source object still exists under a new slug.
+/// Slugs are pinned to ids in every lockfile, so the same source id under a
+/// different slug is the same object, renamed.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Rename {
+    pub kind: &'static str,
+    /// The target's slug, which the prune would delete.
+    pub old: String,
+    /// The target's id for it.
+    pub tgt_id: u64,
+    /// The source's slug for the same object now.
+    pub src_slug: String,
+    /// The source's id for it — the evidence.
+    pub src_id: u64,
+}
+
+/// What the `--mirror` guard found. `renames` are decided from the target
+/// lockfile's `origins`; `groups` is the coarse fallback for every live prune
+/// that has no usable origin.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct RecreatePlan {
+    pub renames: Vec<Rename>,
+    pub groups: Vec<RecreateGroup>,
 }
 
 /// Detect the delete-and-recreate shape, per kind.
@@ -2561,41 +2639,60 @@ fn produced_paths(
 /// within the target (a queue changing workspace), written at its new path in
 /// the same run.
 ///
-/// The pairing is deliberately coarse: one live prune plus one create in the
-/// same kind. It is not trying to identify WHICH object was renamed — after a
-/// create has had its `id` stripped there is nothing left to match on — only to
-/// stop a shape that is almost never deliberate, and to stay rare enough that
-/// `--allow-recreate` never becomes a permanent fixture of a pipeline.
-fn recreate_groups(
+/// Each remaining prune is then judged by the origin an earlier migrate from
+/// this same source recorded for it (`Lockfile::origins`):
+///
+/// - the source id is gone from the source lockfile: the source deleted the
+///   object, so the prune is what the user asked for. Not reported.
+/// - the source id now sits under a slug this run CREATES in the target: a
+///   rename, reported as a [`Rename`] with the mapping row that fixes it.
+/// - anything else, including no origin at all (an env migrated before origins
+///   existed, or last migrated from another env): the coarse pairing below.
+///
+/// The coarse pairing is deliberately blunt: one live prune plus one create in
+/// the same kind. With no origin there is nothing left to match on — migrate
+/// strips `id` from a create — so it only stops a shape that is almost never
+/// deliberate, and stays rare enough that `--allow-recreate` never becomes a
+/// permanent fixture of a pipeline.
+fn plan_recreate(
     prune: &[PathBuf],
-    produced: &std::collections::BTreeSet<PathBuf>,
+    pairs: &[(PathBuf, PathBuf)],
     tgt_root: &Path,
     tgt_env: &str,
     tgt_lockfile: &crate::state::Lockfile,
-) -> Result<Vec<RecreateGroup>> {
+    src_env: &str,
+    src_lockfile: &crate::state::Lockfile,
+) -> Result<RecreatePlan> {
     use std::collections::{BTreeMap, BTreeSet};
 
-    let produced_objs: BTreeSet<(&'static str, String)> =
-        produced.iter().filter_map(|rel| classify(rel)).collect();
+    let produced = produced_objects(pairs);
     let existing_objs: BTreeSet<(&'static str, String)> = enumerate_files(tgt_root, tgt_env)?
         .iter()
         .filter_map(|rel| classify(rel))
         .collect();
+    let src_to_tgt: BTreeMap<(&'static str, &str), &str> = produced
+        .iter()
+        .map(|((kind, tgt), src)| ((*kind, src.as_str()), tgt.as_str()))
+        .collect();
 
     let mut created: BTreeMap<&'static str, BTreeSet<String>> = BTreeMap::new();
-    for (kind, slug) in produced_objs.difference(&existing_objs) {
-        created.entry(kind).or_default().insert(slug.clone());
+    for (kind, slug) in produced.keys() {
+        if !existing_objs.contains(&(kind, slug.clone())) {
+            created.entry(kind).or_default().insert(slug.clone());
+        }
     }
 
-    let mut deleted: BTreeMap<&'static str, BTreeMap<String, u64>> = BTreeMap::new();
+    let mut renames: Vec<Rename> = Vec::new();
+    let mut unknown: BTreeMap<&'static str, BTreeMap<String, u64>> = BTreeMap::new();
+    let mut seen: BTreeSet<(&'static str, String)> = BTreeSet::new();
     for rel in prune {
         let Some((kind, slug)) = classify(rel) else {
             continue;
         };
-        if produced_objs.contains(&(kind, slug.clone())) {
-            continue; // moved, not deleted
+        if produced.contains_key(&(kind, slug.clone())) || !seen.insert((kind, slug.clone())) {
+            continue; // moved, not deleted — or a second file of the same object
         }
-        let Some(id) = tgt_lockfile
+        let Some(tgt_id) = tgt_lockfile
             .objects
             .get(kind)
             .and_then(|by_slug| by_slug.get(&slug))
@@ -2604,10 +2701,40 @@ fn recreate_groups(
         else {
             continue; // never pushed: no remote object to lose
         };
-        deleted.entry(kind).or_default().insert(slug, id);
+        let origin = tgt_lockfile
+            .origins
+            .get(kind)
+            .and_then(|by_slug| by_slug.get(&slug))
+            .filter(|o| o.env == src_env && o.id != 0);
+        if let Some(origin) = origin {
+            let now = src_lockfile
+                .objects
+                .get(kind)
+                .and_then(|by_slug| by_slug.iter().find(|(_, e)| e.id == origin.id))
+                .map(|(s, _)| s.as_str());
+            match now {
+                None => continue, // deleted in the source: a real deletion
+                Some(src_slug) => {
+                    let lands = src_to_tgt.get(&(kind, src_slug)).copied();
+                    if let Some(new) = lands
+                        && created.get(kind).is_some_and(|c| c.contains(new))
+                    {
+                        renames.push(Rename {
+                            kind,
+                            old: slug,
+                            tgt_id,
+                            src_slug: src_slug.to_string(),
+                            src_id: origin.id,
+                        });
+                        continue;
+                    }
+                }
+            }
+        }
+        unknown.entry(kind).or_default().insert(slug, tgt_id);
     }
 
-    Ok(deleted
+    let groups = unknown
         .into_iter()
         .filter_map(|(kind, dels)| {
             let created = created.get(kind)?;
@@ -2617,7 +2744,272 @@ fn recreate_groups(
                 created: created.iter().cloned().collect(),
             })
         })
-        .collect())
+        .collect();
+    Ok(RecreatePlan { renames, groups })
+}
+
+/// Record, in the target lockfile, which source object each target object was
+/// produced from — the evidence [`plan_recreate`] reads on the next `--mirror`.
+/// Only objects present in the target tree after the run get an origin, and
+/// only when the source has pushed them (a source id of `0` identifies
+/// nothing). Origins for objects the target no longer has are dropped. Written
+/// only when something changed, so an idle migrate leaves the lockfile alone.
+fn record_origins(
+    tgt_paths: &crate::paths::Paths,
+    tgt_root: &Path,
+    tgt_env: &str,
+    pairs: &[(PathBuf, PathBuf)],
+    src_env: &str,
+    src_lockfile: &crate::state::Lockfile,
+) -> Result<()> {
+    use std::collections::BTreeSet;
+
+    let path = tgt_paths.lockfile();
+    if !path.exists() {
+        // A target that has never synced has no remote objects to protect,
+        // and its first sync writes the lockfile from scratch.
+        return Ok(());
+    }
+    let mut lf = crate::state::Lockfile::load(&path)?;
+    let before = lf.origins.clone();
+
+    let present: BTreeSet<(&'static str, String)> = enumerate_files(tgt_root, tgt_env)?
+        .iter()
+        .filter_map(|rel| classify(rel))
+        .collect();
+    for (kind, by_slug) in lf.origins.iter_mut() {
+        by_slug.retain(|slug, _| {
+            present.iter().any(|(k, s)| k == kind && s == slug)
+        });
+    }
+    for ((kind, tgt_slug), src_slug) in produced_objects(pairs) {
+        // The org singleton is never pruned, so it never needs an origin.
+        if kind == "organization" || !present.contains(&(kind, tgt_slug.clone())) {
+            continue;
+        }
+        let Some(id) = src_lockfile
+            .objects
+            .get(kind)
+            .and_then(|by_slug| by_slug.get(&src_slug))
+            .map(|e| e.id)
+            .filter(|id| *id != 0)
+        else {
+            continue;
+        };
+        lf.origins.entry(kind.to_string()).or_default().insert(
+            tgt_slug,
+            crate::state::Origin { env: src_env.to_string(), id },
+        );
+    }
+    lf.origins.retain(|_, by_slug| !by_slug.is_empty());
+
+    if lf.origins != before {
+        lf.save(&path)?;
+    }
+    Ok(())
+}
+
+/// The singular noun a refusal uses for a kind.
+fn kind_noun(kind: &str) -> &str {
+    match kind {
+        "workspaces" => "workspace",
+        "queues" => "queue",
+        "schemas" => "schema",
+        "inboxes" => "inbox",
+        "email_templates" => "email template",
+        "hooks" => "hook",
+        "rules" => "rule",
+        "labels" => "label",
+        "engines" => "engine",
+        "engine_fields" => "engine field",
+        "saved_views" => "saved view",
+        other => other,
+    }
+}
+
+/// Whether a rename only follows from another one in the list: a queue's
+/// schema and inbox share its slug, and an email template's key embeds its
+/// workspace and queue. The refusal still prints their mapping rows, but not a
+/// line of their own — the reader renamed one queue, not four objects.
+fn rename_is_derived(r: &Rename, all: &[Rename]) -> bool {
+    let renamed = |kind: &str, old: &str, new: &str| {
+        all.iter().any(|o| o.kind == kind && o.old == old && o.src_slug == new)
+    };
+    match r.kind {
+        "schemas" | "inboxes" => renamed("queues", &r.old, &r.src_slug),
+        "email_templates" => {
+            let old: Vec<&str> = r.old.splitn(3, '/').collect();
+            let new: Vec<&str> = r.src_slug.splitn(3, '/').collect();
+            let [ow, oq, ot] = old[..] else { return false };
+            let [nw, nq, nt] = new[..] else { return false };
+            ot == nt
+                && (ow == nw || renamed("workspaces", ow, nw))
+                && (oq == nq || renamed("queues", oq, nq))
+        }
+        _ => false,
+    }
+}
+
+/// The refusal for renames rdc has PROVED from the origins: what was renamed,
+/// what continuing would destroy, and the exact steps that keep it.
+fn format_rename_error(
+    renames: &[Rename],
+    src: &str,
+    tgt: &str,
+    mapping: &GenericMapping,
+    rerun: &str,
+) -> String {
+    use std::fmt::Write as _;
+
+    let shown: Vec<&Rename> = renames
+        .iter()
+        .filter(|r| !rename_is_derived(r, renames))
+        .collect();
+    let mut out = String::new();
+
+    match shown.as_slice() {
+        [one] => {
+            let _ = writeln!(
+                out,
+                "{} was renamed to {} in {src}, but {tgt} still uses the old name.",
+                one.old, one.src_slug
+            );
+        }
+        many => {
+            let _ = writeln!(
+                out,
+                "{} objects were renamed in {src}, but {tgt} still uses the old names.",
+                many.len()
+            );
+        }
+    }
+    out.push('\n');
+    let noun_w = shown.iter().map(|r| kind_noun(r.kind).len()).max().unwrap_or(0);
+    let old_w = shown.iter().map(|r| r.old.len()).max().unwrap_or(0);
+    let new_w = shown.iter().map(|r| r.src_slug.len()).max().unwrap_or(0);
+    for r in &shown {
+        let noun = kind_noun(r.kind);
+        let _ = writeln!(
+            out,
+            "  {noun:<noun_w$}  {:<old_w$} → {:<new_w$}   (same {src} {noun}, id {})",
+            r.old, r.src_slug, r.src_id
+        );
+    }
+    out.push('\n');
+
+    let any_queue = shown.iter().any(|r| r.kind == "queues");
+    match shown.as_slice() {
+        [one] if one.kind == "queues" => {
+            let _ = writeln!(
+                out,
+                "If you continue, {tgt} deletes queue {} (id {}) and all its documents,\n\
+                 then creates a new, empty queue.",
+                one.old, one.tgt_id
+            );
+        }
+        [one] => {
+            let noun = kind_noun(one.kind);
+            let _ = writeln!(
+                out,
+                "If you continue, {tgt} deletes {noun} {} (id {}), then creates a new one.",
+                one.old, one.tgt_id
+            );
+        }
+        _ => {
+            let _ = writeln!(
+                out,
+                "If you continue, {tgt} deletes these objects and creates new ones in their place."
+            );
+            if any_queue {
+                let _ = writeln!(out, "Deleting a queue deletes all its documents.");
+            }
+        }
+    }
+    out.push('\n');
+
+    let keep = match shown.as_slice() {
+        [one] => format!("the {}", kind_noun(one.kind)),
+        _ => "them".to_string(),
+    };
+    let _ = writeln!(out, "To keep {keep} in {tgt}:");
+
+    // A row that already names one side gets the other column; everything
+    // else is a new row. Appending a second row for an (env, slug) some row
+    // already claims is exactly what `validate` rejects.
+    let mut add = String::new();
+    let mut edit: Vec<String> = Vec::new();
+    for r in renames {
+        let rows = mapping.kind_rows(r.kind);
+        let names = |env: &str, slug: &str| {
+            rows.is_some_and(|rows| rows.iter().any(|row| row.get(env).map(String::as_str) == Some(slug)))
+        };
+        if names(src, &r.src_slug) {
+            edit.push(format!(
+                "In the [[{}]] row where {src} = \"{}\", set {tgt} = \"{}\".",
+                r.kind, r.src_slug, r.old
+            ));
+        } else if names(tgt, &r.old) {
+            edit.push(format!(
+                "In the [[{}]] row where {tgt} = \"{}\", set {src} = \"{}\".",
+                r.kind, r.old, r.src_slug
+            ));
+        } else {
+            if !add.is_empty() {
+                add.push('\n');
+            }
+            let _ = write!(
+                add,
+                "     [[{}]]\n     {src} = \"{}\"\n     {tgt} = \"{}\"\n",
+                r.kind, r.src_slug, r.old
+            );
+        }
+    }
+    let mut step = 0;
+    if !add.is_empty() {
+        step += 1;
+        let _ = write!(out, "\n  {step}. Add these lines to .rdc/mapping.toml:\n\n{add}");
+    }
+    if !edit.is_empty() {
+        step += 1;
+        let _ = writeln!(out, "\n  {step}. Change these rows in .rdc/mapping.toml:\n");
+        for e in &edit {
+            let _ = writeln!(out, "     {e}");
+        }
+    }
+    step += 1;
+    let _ = write!(out, "\n  {step}. Run the command again:\n\n     {rerun}");
+    out
+}
+
+/// The command line that repeats this run, for the refusal's last step. Built
+/// from the parsed arguments rather than `argv`, so it also names the envs a
+/// picker chose.
+fn rerun_command(
+    src: &str,
+    tgt: &str,
+    dry_run: bool,
+    only: &[String],
+    carry: Carry,
+) -> String {
+    let mut cmd = format!("rdc migrate {src} {tgt} --mirror");
+    if dry_run {
+        cmd.push_str(" --dry-run");
+    }
+    for sel in only {
+        cmd.push_str(&format!(" --only '{sel}'"));
+    }
+    let groups: Vec<&str> = [
+        (carry.score_thresholds, "score-thresholds"),
+        (carry.email_prefixes, "email-prefixes"),
+        (carry.automation, "automation"),
+    ]
+    .into_iter()
+    .filter_map(|(on, name)| on.then_some(name))
+    .collect();
+    if !groups.is_empty() {
+        cmd.push_str(&format!(" --carry {}", groups.join(",")));
+    }
+    cmd
 }
 
 /// The refusal. Names every object at risk, and the exact row that turns the
@@ -3131,11 +3523,23 @@ pub fn run_at(
     } else {
         Vec::new()
     };
+    let produced_src_tgt = produced_pairs(&src_root, src, &mapping, &unique_tpl_skips)?;
     if mirror && !mirror_mode.allows_recreate() {
-        let produced = produced_paths(&src_root, src, &mapping, &unique_tpl_skips)?;
-        let groups = recreate_groups(&prune_plan, &produced, &tgt_root, tgt, &tgt_lockfile)?;
-        if !groups.is_empty() {
-            anyhow::bail!(format_recreate_error(&groups, src, tgt));
+        let plan = plan_recreate(
+            &prune_plan,
+            &produced_src_tgt,
+            &tgt_root,
+            tgt,
+            &tgt_lockfile,
+            src,
+            &src_lockfile,
+        )?;
+        if !plan.renames.is_empty() {
+            let rerun = rerun_command(src, tgt, dry_run, &only, carry);
+            anyhow::bail!(format_rename_error(&plan.renames, src, tgt, &generic, &rerun));
+        }
+        if !plan.groups.is_empty() {
+            anyhow::bail!(format_recreate_error(&plan.groups, src, tgt));
         }
     }
 
@@ -3488,6 +3892,7 @@ pub fn run_at(
         );
     }
     if !dry_run {
+        record_origins(&tgt_paths, &tgt_root, tgt, &produced_src_tgt, src, &src_lockfile)?;
         log.event(
             crate::log::Action::Info,
             &format!("review `git diff`, then `rdc sync {tgt}` to push"),
@@ -6652,49 +7057,191 @@ mod tests {
         assert!(msg.contains("[[queues]]\n  dev = \"vendor-invoices\"\n  prod = \"invoices\""), "{msg}");
     }
 
-    /// The guard reads the target's lockfile, so an object the target tracks
-    /// with no remote id (or none at all) is not something a prune destroys.
-    #[test]
-    fn recreate_groups_ignores_a_prune_with_no_remote_identity() {
-        use std::collections::BTreeSet;
+    fn origin(env: &str, id: u64) -> crate::state::Origin {
+        crate::state::Origin { env: env.into(), id }
+    }
+
+    /// prod holds `invoices` (id 502); this run produces `vendor-invoices`.
+    fn rename_fixture() -> (tempfile::TempDir, PathBuf, Vec<PathBuf>, Vec<(PathBuf, PathBuf)>) {
         let tmp = tempfile::TempDir::new().unwrap();
         let tgt_root = tmp.path().join("envs/prod");
         let old = PathBuf::from("workspaces/main/queues/invoices/queue.json");
         let new = PathBuf::from("workspaces/main/queues/vendor-invoices/queue.json");
         std::fs::create_dir_all(tgt_root.join(old.parent().unwrap())).unwrap();
         std::fs::write(tgt_root.join(&old), b"{}").unwrap();
+        (tmp, tgt_root, vec![old], vec![(new.clone(), new)])
+    }
 
-        let produced: BTreeSet<PathBuf> = BTreeSet::from([new]);
-        // Empty lockfile: prod has never pushed this queue.
-        let groups =
-            recreate_groups(
-                std::slice::from_ref(&old),
-                &produced,
-                &tgt_root,
-                "prod",
-                &Default::default(),
-            )
-            .unwrap();
-        assert!(groups.is_empty(), "nothing live to lose: {groups:?}");
+    /// The guard reads the target's lockfile, so an object the target tracks
+    /// with no remote id (or none at all) is not something a prune destroys.
+    #[test]
+    fn plan_recreate_ignores_a_prune_with_no_remote_identity() {
+        let (_tmp, tgt_root, prune, pairs) = rename_fixture();
+        let empty = crate::state::Lockfile::default();
+        let plan = plan_recreate(&prune, &pairs, &tgt_root, "prod", &empty, "dev", &empty).unwrap();
+        assert_eq!(plan, RecreatePlan::default(), "nothing live to lose");
 
-        // Same run, now with an id recorded for it.
+        // Same run, now with an id recorded for it but no origin: the coarse
+        // fallback pairs it with the create.
         let mut lf = crate::state::Lockfile::default();
-        lf.upsert(
-            "queues",
-            "invoices",
-            crate::state::ObjectEntry {
-                id: 502,
-                modified_at: None,
-                modified_by: None,
-                content_hash: None,
-                secrets_hash: None,
-            },
+        lf.upsert("queues", "invoices", entry(502));
+        let plan = plan_recreate(&prune, &pairs, &tgt_root, "prod", &lf, "dev", &empty).unwrap();
+        assert!(plan.renames.is_empty(), "{plan:?}");
+        assert_eq!(plan.groups.len(), 1, "{plan:?}");
+        assert_eq!(plan.groups[0].kind, "queues");
+        assert_eq!(plan.groups[0].deleted, vec![("invoices".to_string(), 502)]);
+        assert_eq!(plan.groups[0].created, vec!["vendor-invoices".to_string()]);
+    }
+
+    /// The source still has the object prod's `invoices` came from, under the
+    /// slug this run creates: a rename, proved rather than guessed.
+    #[test]
+    fn plan_recreate_proves_a_rename_from_the_origin() {
+        let (_tmp, tgt_root, prune, pairs) = rename_fixture();
+        let mut tgt = crate::state::Lockfile::default();
+        tgt.upsert("queues", "invoices", entry(502));
+        tgt.origins.entry("queues".into()).or_default().insert("invoices".into(), origin("dev", 100));
+        let mut src = crate::state::Lockfile::default();
+        src.upsert("queues", "vendor-invoices", entry(100));
+
+        let plan = plan_recreate(&prune, &pairs, &tgt_root, "prod", &tgt, "dev", &src).unwrap();
+        assert!(plan.groups.is_empty(), "{plan:?}");
+        assert_eq!(
+            plan.renames,
+            vec![Rename {
+                kind: "queues",
+                old: "invoices".into(),
+                tgt_id: 502,
+                src_slug: "vendor-invoices".into(),
+                src_id: 100,
+            }]
         );
-        let groups =
-            recreate_groups(std::slice::from_ref(&old), &produced, &tgt_root, "prod", &lf).unwrap();
-        assert_eq!(groups.len(), 1, "{groups:?}");
-        assert_eq!(groups[0].kind, "queues");
-        assert_eq!(groups[0].deleted, vec![("invoices".to_string(), 502)]);
-        assert_eq!(groups[0].created, vec!["vendor-invoices".to_string()]);
+    }
+
+    /// The source deleted the object prod's `invoices` came from, and created
+    /// an unrelated one. Both halves are what the user asked for — the case
+    /// the coarse pairing used to refuse.
+    #[test]
+    fn plan_recreate_lets_a_deletion_in_the_source_through() {
+        let (_tmp, tgt_root, prune, pairs) = rename_fixture();
+        let mut tgt = crate::state::Lockfile::default();
+        tgt.upsert("queues", "invoices", entry(502));
+        tgt.origins.entry("queues".into()).or_default().insert("invoices".into(), origin("dev", 100));
+        let mut src = crate::state::Lockfile::default();
+        src.upsert("queues", "vendor-invoices", entry(200));
+
+        let plan = plan_recreate(&prune, &pairs, &tgt_root, "prod", &tgt, "dev", &src).unwrap();
+        assert_eq!(plan, RecreatePlan::default());
+    }
+
+    /// An origin from another source env says nothing about this one's
+    /// lockfile, so the coarse fallback decides.
+    #[test]
+    fn plan_recreate_ignores_an_origin_from_another_env() {
+        let (_tmp, tgt_root, prune, pairs) = rename_fixture();
+        let mut tgt = crate::state::Lockfile::default();
+        tgt.upsert("queues", "invoices", entry(502));
+        tgt.origins.entry("queues".into()).or_default().insert("invoices".into(), origin("test", 100));
+        let src = crate::state::Lockfile::default();
+
+        let plan = plan_recreate(&prune, &pairs, &tgt_root, "prod", &tgt, "dev", &src).unwrap();
+        assert!(plan.renames.is_empty());
+        assert_eq!(plan.groups.len(), 1, "{plan:?}");
+    }
+
+    fn rename(kind: &'static str, old: &str, new: &str, src_id: u64, tgt_id: u64) -> Rename {
+        Rename { kind, old: old.into(), tgt_id, src_slug: new.into(), src_id }
+    }
+
+    /// The message agreed for one renamed queue, pinned whole: one line for
+    /// the queue, four rows for the queue-keyed kinds, the command to re-run.
+    #[test]
+    fn format_rename_error_for_one_queue() {
+        let renames = vec![
+            rename("queues", "invoices", "ap-invoices", 100, 501),
+            rename("schemas", "invoices", "ap-invoices", 101, 502),
+            rename("inboxes", "invoices", "ap-invoices", 102, 503),
+            rename("email_templates", "ws1/invoices/welcome", "ws1/ap-invoices/welcome", 103, 504),
+        ];
+        let msg = format_rename_error(
+            &renames,
+            "dev",
+            "prod",
+            &GenericMapping::default(),
+            "rdc migrate dev prod --mirror",
+        );
+        assert_eq!(
+            msg,
+            "invoices was renamed to ap-invoices in dev, but prod still uses the old name.
+
+  queue  invoices → ap-invoices   (same dev queue, id 100)
+
+If you continue, prod deletes queue invoices (id 501) and all its documents,
+then creates a new, empty queue.
+
+To keep the queue in prod:
+
+  1. Add these lines to .rdc/mapping.toml:
+
+     [[queues]]
+     dev = \"ap-invoices\"
+     prod = \"invoices\"
+
+     [[schemas]]
+     dev = \"ap-invoices\"
+     prod = \"invoices\"
+
+     [[inboxes]]
+     dev = \"ap-invoices\"
+     prod = \"invoices\"
+
+     [[email_templates]]
+     dev = \"ws1/ap-invoices/welcome\"
+     prod = \"ws1/invoices/welcome\"
+
+  2. Run the command again:
+
+     rdc migrate dev prod --mirror"
+        );
+    }
+
+    /// Two unrelated renames: a count headline, aligned lines, the documents
+    /// warning because one is a queue, and a row that already names one side
+    /// is edited rather than duplicated.
+    #[test]
+    fn format_rename_error_for_several_objects() {
+        let renames = vec![
+            rename("hooks", "export", "erp-export", 7, 70),
+            rename("queues", "orders", "sales-orders", 8, 80),
+        ];
+        let mapping: GenericMapping =
+            toml::from_str("[[hooks]]\ntest = \"export\"\nprod = \"export\"\n").unwrap();
+        let msg = format_rename_error(&renames, "dev", "prod", &mapping, "rdc migrate dev prod --mirror");
+        assert!(
+            msg.starts_with("2 objects were renamed in dev, but prod still uses the old names.\n"),
+            "{msg}"
+        );
+        assert!(msg.contains("  hook   export → erp-export     (same dev hook, id 7)\n"), "{msg}");
+        assert!(msg.contains("  queue  orders → sales-orders   (same dev queue, id 8)\n"), "{msg}");
+        assert!(msg.contains("Deleting a queue deletes all its documents."), "{msg}");
+        assert!(msg.contains("To keep them in prod:"), "{msg}");
+        assert!(msg.contains("  1. Add these lines"), "{msg}");
+        assert!(msg.contains(
+            "  2. Change these rows in .rdc/mapping.toml:\n\n     \
+             In the [[hooks]] row where prod = \"export\", set dev = \"erp-export\"."
+        ), "{msg}");
+        assert!(msg.contains("  3. Run the command again:"), "{msg}");
+        assert_eq!(msg.matches("[[queues]]").count(), 1, "{msg}");
+    }
+
+    #[test]
+    fn rerun_command_repeats_the_selection_and_carry() {
+        let carry = Carry { score_thresholds: true, email_prefixes: false, automation: true };
+        assert_eq!(
+            rerun_command("dev", "prod", true, &["queues/x".into()], carry),
+            "rdc migrate dev prod --mirror --dry-run --only 'queues/x' \
+             --carry score-thresholds,automation"
+        );
+        assert_eq!(rerun_command("dev", "prod", false, &[], Carry::NONE), "rdc migrate dev prod --mirror");
     }
 }
