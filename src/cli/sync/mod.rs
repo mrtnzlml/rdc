@@ -747,6 +747,12 @@ pub(crate) async fn run_cycle(
                 &progress,
             )
             .await
+            .with_context(|| {
+                format!(
+                    "reading env '{env}' back after the push (the push itself completed; \
+                     run `rdc sync {env}` again to finish)"
+                )
+            })
             .map(|settled| CycleOutcome {
                 items_pushed: main.items_pushed + settled.items_pushed,
                 items_pulled: main.items_pulled + settled.items_pulled,
