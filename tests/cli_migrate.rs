@@ -3156,6 +3156,27 @@ fn migrate_records_where_each_target_object_came_from() {
     assert_eq!(lf["objects"]["queues"]["invoices"]["id"], 502);
 }
 
+/// A target that has never synced has no lockfile. Migrate creates one that
+/// holds only the origins, so a rename in the source before the target's next
+/// migrate is still recognised. With nothing to record, no file appears.
+#[test]
+fn migrate_creates_the_lockfile_of_a_target_that_never_synced() {
+    let project = init_two_env_project();
+    let root = project.path();
+    write_queue_at(root, "test", "main", "invoices", "Invoices");
+    let lock = root.join(".rdc/state/prod.lock.json");
+
+    run_migrate(root, MirrorMode::Additive, false).unwrap();
+    assert!(!lock.exists(), "the source never pushed: nothing to record");
+
+    write_lockfile(root, "test", &[("queues", "invoices", 100), ("schemas", "invoices", 101)]);
+    run_migrate(root, MirrorMode::Additive, false).unwrap();
+    let lf = read_json(&lock);
+    assert_eq!(lf["objects"], serde_json::json!({}), "{lf:#}");
+    assert_eq!(lf["origins"]["queues"]["invoices"], serde_json::json!({ "env": "test", "id": 100 }));
+    assert!(!lf["api_base"].as_str().unwrap().is_empty(), "{lf:#}");
+}
+
 /// A dry run writes nothing, the lockfile included.
 #[test]
 fn a_dry_run_records_no_origins() {

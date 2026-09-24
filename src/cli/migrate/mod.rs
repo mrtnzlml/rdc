@@ -2753,11 +2753,14 @@ fn plan_recreate(
 /// Only objects present in the target tree after the run get an origin, and
 /// only when the source has pushed them (a source id of `0` identifies
 /// nothing). Origins for objects the target no longer has are dropped. Written
-/// only when something changed, so an idle migrate leaves the lockfile alone.
+/// only when something changed, so an idle migrate leaves the lockfile alone —
+/// and a target with no lockfile gets one only when there is an origin to put
+/// in it.
 fn record_origins(
     tgt_paths: &crate::paths::Paths,
     tgt_root: &Path,
     tgt_env: &str,
+    tgt_api_base: &str,
     pairs: &[(PathBuf, PathBuf)],
     src_env: &str,
     src_lockfile: &crate::state::Lockfile,
@@ -2765,12 +2768,14 @@ fn record_origins(
     use std::collections::BTreeSet;
 
     let path = tgt_paths.lockfile();
-    if !path.exists() {
-        // A target that has never synced has no remote objects to protect,
-        // and its first sync writes the lockfile from scratch.
-        return Ok(());
-    }
+    // A target that has never synced has no lockfile yet. Create one holding
+    // only the origins: `sync` reads it exactly like a missing one, and
+    // without it an object renamed in the source before the target's second
+    // migrate would find no origin.
     let mut lf = crate::state::Lockfile::load(&path)?;
+    if !path.exists() {
+        lf.api_base = tgt_api_base.to_string();
+    }
     let before = lf.origins.clone();
 
     let present: BTreeSet<(&'static str, String)> = enumerate_files(tgt_root, tgt_env)?
@@ -2803,7 +2808,7 @@ fn record_origins(
     }
     lf.origins.retain(|_, by_slug| !by_slug.is_empty());
 
-    if lf.origins != before {
+    if lf.origins != before && (path.exists() || !lf.origins.is_empty()) {
         lf.save(&path)?;
     }
     Ok(())
@@ -3892,7 +3897,16 @@ pub fn run_at(
         );
     }
     if !dry_run {
-        record_origins(&tgt_paths, &tgt_root, tgt, &produced_src_tgt, src, &src_lockfile)?;
+        let tgt_api_base = project_cfg.envs.get(tgt).map(|c| c.api_base.as_str()).unwrap_or("");
+        record_origins(
+            &tgt_paths,
+            &tgt_root,
+            tgt,
+            tgt_api_base,
+            &produced_src_tgt,
+            src,
+            &src_lockfile,
+        )?;
         log.event(
             crate::log::Action::Info,
             &format!("review `git diff`, then `rdc sync {tgt}` to push"),
