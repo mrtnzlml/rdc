@@ -40,7 +40,10 @@ async fn live_settle_after_push() {
 ///      draining queue in the rule's `queues` for up to 24 hours, so rdc
 ///      detaches it in the same run, and the queue's schema and unique-typed
 ///      templates, which the server refuses to delete apart from the queue,
-///      leave the lockfile in the same run.
+///      leave the lockfile in the same run;
+///  (d) a label deleted while a rule action adds it — the server keeps the
+///      dead ref for good and then refuses every PATCH of the rule, so rdc
+///      detaches it in the same run.
 ///
 /// Each case is one sync followed by `assert_converged`.
 async fn settle_after_push(cfg: &LiveConfig) {
@@ -80,6 +83,10 @@ async fn settle_after_push(cfg: &LiveConfig) {
             .to_string()
     };
     let (validator, post_validator) = (hook_slug("hook-validator"), hook_slug("hook-post-validator"));
+    let label = lf
+        .slug_for_id("labels", index.id("label-priority").expect("seeded label id"))
+        .expect("seeded label in the lockfile")
+        .to_string();
 
     let strip_server_fields = |v: &mut serde_json::Value| {
         let o = v.as_object_mut().unwrap();
@@ -126,6 +133,13 @@ async fn settle_after_push(cfg: &LiveConfig) {
     rule["name"] = run_id.prefix("On fresh").into();
     rule["url"] = format!("rdc://rules/{fresh_rule}").into();
     rule["queues"] = serde_json::json!([format!("rdc://queues/{fresh}")]);
+    rule["actions"] = serde_json::json!([{
+        "id": run_id.prefix("add-label"),
+        "enabled": true,
+        "type": "add_label",
+        "event": "validation",
+        "payload": { "labels": [format!("rdc://labels/{label}")] }
+    }]);
     project.write_json(&format!("envs/test/rules/{fresh_rule}.json"), &rule);
     if let Some(code) = project.read_to_string(&format!("envs/test/rules/{seeded_rule}.py")) {
         std::fs::write(project.path().join(format!("envs/test/rules/{fresh_rule}.py")), code)
@@ -194,6 +208,18 @@ async fn settle_after_push(cfg: &LiveConfig) {
         "(c) a queue's own leftovers are not failed deletes:\n{out_text}"
     );
     assert_converged(&project, "test", &prefix, "(c) queue deleted under a rule");
+
+    // (d) Delete the label the rule's action adds; the rule stays.
+    std::fs::remove_file(project.path().join(format!("envs/test/labels/{label}.json"))).unwrap();
+    let out = project.run_rdc(&["sync", "test", "--allow-deletes"]);
+    assert!(out.status.success(), "(d) sync failed: {}", combined(&out));
+    let rule = project.read_json(&format!("envs/test/rules/{fresh_rule}.json"));
+    assert_eq!(
+        rule["actions"][0]["payload"]["labels"],
+        serde_json::json!([]),
+        "(d) the sync that deleted the label must also detach it from the rule's action"
+    );
+    assert_converged(&project, "test", &prefix, "(d) label deleted under a rule action");
 
     drop(teardown);
 }

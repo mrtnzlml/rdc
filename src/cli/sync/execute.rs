@@ -3730,9 +3730,10 @@ pub async fn run(
                 _ => {}
             }
         }
-        // Objects that still name a queue deleted above. They are pushed
-        // with it removed, so the env drops the reference now rather than at
-        // the queue's purge.
+        // Objects that still name something deleted above. They are pushed
+        // with the ref removed, so the env drops it now: Rossum keeps a
+        // draining queue's refs until its purge, and a deleted label's for
+        // good (see `detach_departed`).
         let in_conflict: BTreeSet<(String, String)> = classified
             .iter()
             .filter(|it| {
@@ -3745,7 +3746,7 @@ pub async fn run(
             })
             .map(|it| (it.kind.clone(), it.slug.clone()))
             .collect();
-        for (kind, slug, path) in crate::cli::push::deletes::detach_departed_queues(
+        for (kind, slug, path) in crate::cli::push::deletes::detach_departed(
             ctx.paths,
             ctx.lockfile,
             &in_conflict,

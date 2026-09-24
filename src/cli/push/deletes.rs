@@ -294,36 +294,64 @@ pub async fn run_deletes(
     Ok(counts)
 }
 
-/// Drop every queue this run deleted from the local hooks', rules' and saved
-/// views' queue refs, so the push that follows detaches them on the env too.
+/// Drop every object this run deleted from the refs the local hooks, rules
+/// and saved views hold to it, so the push that follows detaches them on the
+/// env too.
 ///
-/// Rossum keeps a deleted queue in hooks' and rules' `queues` and in saved
-/// views' `queues_filter` while it is pending deletion (up to 24 hours), and
-/// only drops it at the purge. Left alone, the pull would write the draining
-/// queue's raw URL into those files, since it has left the lockfile, and the
-/// purge would change them again on a later sync. Detaching now leaves them
-/// portable and settled in this run.
+/// Rossum does not always do this itself (observed live 2026-09-24):
+///
+/// - a queue pending deletion (up to 24 hours) stays in hooks' and rules'
+///   `queues` and in saved views' `queues_filter` until its purge;
+/// - a deleted label stays in rule actions' `payload.labels` for good, and
+///   every later PATCH of that rule is refused ("Invalid hyperlink - Object
+///   does not exist").
+///
+/// Left alone, the pull writes the deleted object's raw URL into those files,
+/// since it has left the lockfile. Every array element that is exactly the
+/// deleted object's `rdc://` ref is removed, wherever it sits in the file;
+/// single-valued refs are left alone.
 ///
 /// `skip` holds `(kind, slug)` pairs to leave untouched: objects with an open
 /// conflict, which must not be pushed over. Returns `(kind, slug, path)` for
 /// every file it rewrote, for the caller to push.
-pub fn detach_departed_queues(
+pub fn detach_departed(
     paths: &crate::paths::Paths,
     lockfile: &Lockfile,
     skip: &std::collections::BTreeSet<(String, String)>,
     progress: &Arc<Log>,
 ) -> Result<Vec<(&'static str, String, std::path::PathBuf)>> {
-    let Some(departed) = lockfile.departed.get("queues").filter(|m| !m.is_empty()) else {
+    let gone: std::collections::BTreeSet<String> = lockfile
+        .departed
+        .iter()
+        .flat_map(|(kind, slugs)| slugs.keys().map(move |slug| format!("rdc://{kind}/{slug}")))
+        .collect();
+    if gone.is_empty() {
         return Ok(Vec::new());
-    };
-    let gone: Vec<String> = departed.keys().map(|q| format!("rdc://queues/{q}")).collect();
-    let holders: [(&'static str, std::path::PathBuf, &str); 3] = [
-        ("hooks", paths.hooks_dir(), "queues"),
-        ("rules", paths.rules_dir(), "queues"),
-        ("saved_views", paths.saved_views_dir(), "queues_filter"),
+    }
+    fn strip(value: &mut serde_json::Value, gone: &std::collections::BTreeSet<String>) -> bool {
+        match value {
+            serde_json::Value::Array(items) => {
+                let before = items.len();
+                items.retain(|v| !v.as_str().is_some_and(|s| gone.contains(s)));
+                let mut changed = items.len() != before;
+                for v in items {
+                    changed |= strip(v, gone);
+                }
+                changed
+            }
+            serde_json::Value::Object(map) => {
+                map.values_mut().fold(false, |changed, v| strip(v, gone) | changed)
+            }
+            _ => false,
+        }
+    }
+    let holders: [(&'static str, std::path::PathBuf); 3] = [
+        ("hooks", paths.hooks_dir()),
+        ("rules", paths.rules_dir()),
+        ("saved_views", paths.saved_views_dir()),
     ];
     let mut rewritten = Vec::new();
-    for (kind, dir, field) in holders {
+    for (kind, dir) in holders {
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         let mut files: Vec<std::path::PathBuf> = entries
             .flatten()
@@ -342,19 +370,14 @@ pub fn detach_departed_queues(
             let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
                 continue;
             };
-            let Some(refs) = value.get_mut(field).and_then(|v| v.as_array_mut()) else {
-                continue;
-            };
-            let before = refs.len();
-            refs.retain(|r| !r.as_str().is_some_and(|r| gone.iter().any(|g| g == r)));
-            if refs.len() == before {
+            if !strip(&mut value, &gone) {
                 continue;
             }
             let mut out = serde_json::to_vec_pretty(&value).context("serializing a detached object")?;
             out.push(b'\n');
             crate::snapshot::writer::write_atomic(&path, &out)
                 .with_context(|| format!("writing {}", path.display()))?;
-            progress.event(Action::Info, &format!("{kind}/{slug}: detached from the deleted queue"));
+            progress.event(Action::Info, &format!("{kind}/{slug}: detached from what this sync deleted"));
             rewritten.push((kind, slug, path));
         }
     }
