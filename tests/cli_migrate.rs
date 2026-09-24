@@ -2956,23 +2956,35 @@ fn mirror_refuses_to_delete_a_live_target_object_while_creating_one() {
 
     let err = run_migrate(root, MirrorMode::Mirror { allow_recreate: false }, false)
         .expect_err("the prune would destroy a live queue");
-    let msg = format!("{err:#}");
-    for want in [
-        "queues",
-        "invoices (id 502)",
-        "vendor-invoices",
-        "schemas",
-        "(id 503)",
-        ".rdc/mapping.toml",
-        "--allow-recreate",
-        "rdc doctor test",
-    ] {
-        assert!(msg.contains(want), "refusal must mention {want}:\n{msg}");
-    }
-    // A copyable row for the pair it found.
-    assert!(msg.contains("[[queues]]"), "{msg}");
-    assert!(msg.contains("test = \"vendor-invoices\""), "{msg}");
-    assert!(msg.contains("prod = \"invoices\""), "{msg}");
+    assert_eq!(
+        format!("{err:#}"),
+        "prod would lose objects it already has.
+
+--mirror deletes these from prod and creates new ones in their place:
+
+  queue   invoices (id 502)  \u{2192}  vendor-invoices
+  schema  invoices (id 503)  \u{2192}  vendor-invoices
+
+Deleting a queue also deletes all its documents.
+
+If these were renamed in test, keep them in prod:
+
+  1. Add these lines to .rdc/mapping.toml:
+
+     [[queues]]
+     test = \"vendor-invoices\"
+     prod = \"invoices\"
+
+     [[schemas]]
+     test = \"vendor-invoices\"
+     prod = \"invoices\"
+
+  2. Run the command again:
+
+     rdc migrate test prod --mirror
+
+If they are unrelated, run it again with --allow-recreate."
+    );
 
     // And it refused BEFORE touching the target tree.
     assert!(

@@ -2641,44 +2641,106 @@ fn recreate_groups(
         .collect())
 }
 
-/// The refusal. Names every object at risk, and the exact row that turns the
-/// pair back into a rename.
-fn format_recreate_error(groups: &[RecreateGroup], src: &str, tgt: &str) -> String {
-    let mut body = String::new();
-    for g in groups {
-        let dels: Vec<String> = g
-            .deleted
-            .iter()
-            .map(|(slug, id)| format!("{slug} (id {id})"))
-            .collect();
-        body.push_str(&format!(
-            "  {}: delete {} | create {}\n",
-            g.kind,
-            dels.join(", "),
-            g.created.join(", "),
-        ));
+/// The singular noun the refusal uses for a kind.
+fn kind_noun(kind: &str) -> &str {
+    match kind {
+        "workspaces" => "workspace",
+        "queues" => "queue",
+        "schemas" => "schema",
+        "inboxes" => "inbox",
+        "email_templates" => "email template",
+        "hooks" => "hook",
+        "rules" => "rule",
+        "labels" => "label",
+        "engines" => "engine",
+        "engine_fields" => "engine field",
+        "saved_views" => "saved view",
+        other => other,
     }
-    // One worked example, from the first pair — enough to copy, short enough
-    // to read.
-    let sample = groups
-        .first()
-        .and_then(|g| Some((g.kind, g.deleted.first()?.0.clone(), g.created.first()?.clone())))
-        .map(|(kind, old, new)| {
-            format!("\n  [[{kind}]]\n  {src} = \"{new}\"\n  {tgt} = \"{old}\"\n")
-        })
-        .unwrap_or_default();
+}
+
+/// The command line that repeats this run, for the refusal's last step. Built
+/// from the parsed arguments rather than `argv`, so it also names the envs a
+/// picker chose.
+fn rerun_command(src: &str, tgt: &str, dry_run: bool, only: &[String], carry: Carry) -> String {
+    let mut cmd = format!("rdc migrate {src} {tgt} --mirror");
+    if dry_run {
+        cmd.push_str(" --dry-run");
+    }
+    for sel in only {
+        cmd.push_str(&format!(" --only '{sel}'"));
+    }
+    let groups: Vec<&str> = [
+        (carry.score_thresholds, "score-thresholds"),
+        (carry.email_prefixes, "email-prefixes"),
+        (carry.automation, "automation"),
+    ]
+    .into_iter()
+    .filter_map(|(on, name)| on.then_some(name))
+    .collect();
+    if !groups.is_empty() {
+        cmd.push_str(&format!(" --carry {}", groups.join(",")));
+    }
+    cmd
+}
+
+/// The refusal. Names every object at risk and the steps that keep them.
+///
+/// A kind with exactly one delete and one create is shown as a pair, with the
+/// mapping row that turns it back into a rename. That pairing is a guess, which
+/// is why the steps start with "if". A kind with several of either cannot be
+/// paired, so it gets a row to fill in instead.
+fn format_recreate_error(groups: &[RecreateGroup], src: &str, tgt: &str, rerun: &str) -> String {
+    use std::fmt::Write as _;
+
+    let width = groups.iter().map(|g| kind_noun(g.kind).len()).max().unwrap_or(0);
+    let with_id = |(slug, id): &(String, u64)| format!("{slug} (id {id})");
+    let mut table = String::new();
+    let mut rows = String::new();
+    for g in groups {
+        let noun = kind_noun(g.kind);
+        if let ([del], [new]) = (&g.deleted[..], &g.created[..]) {
+            let _ = writeln!(table, "  {noun:<width$}  {}  \u{2192}  {new}", with_id(del));
+            let _ = write!(rows, "\n     [[{}]]\n     {src} = \"{new}\"\n     {tgt} = \"{}\"\n", g.kind, del.0);
+        } else {
+            let dels: Vec<String> = g.deleted.iter().map(with_id).collect();
+            let _ = writeln!(table, "  {noun:<width$}  delete  {}", dels.join(", "));
+            let _ = writeln!(table, "  {:<width$}  create  {}", "", g.created.join(", "));
+            let _ = write!(
+                rows,
+                "\n     [[{}]]\n     {src} = \"<name in {src}>\"\n     {tgt} = \"<name in {tgt}>\"\n",
+                g.kind
+            );
+        }
+    }
+    let paired = groups.iter().all(|g| g.deleted.len() == 1 && g.created.len() == 1);
+    let add = if paired {
+        "Add these lines to .rdc/mapping.toml:"
+    } else {
+        "Add one entry to .rdc/mapping.toml for each renamed object:"
+    };
+    let documents = if groups.iter().any(|g| g.kind == "queues") {
+        "\nDeleting a queue also deletes all its documents.\n"
+    } else {
+        ""
+    };
     format!(
-        "--mirror would DELETE live '{tgt}' objects while creating others of the same kind:\n\
-         {body}\n\
-         That is what a slug rename looks like when nothing recorded it: migrate strips \
-         `id`/`url` from an object it creates, so no file under envs/{tgt}/ ties the new slug \
-         to the object '{tgt}' already has. Deleting a queue takes its documents with it.\n\
+        "{tgt} would lose objects it already has.\n\
          \n\
-         If these are the SAME objects under a new name, record each one in \
-         .rdc/mapping.toml:\n\
-         {sample}\n\
-         `rdc doctor {src}` writes those rows itself when it renames a slug. If the objects \
-         really are unrelated, re-run with --allow-recreate."
+         --mirror deletes these from {tgt} and creates new ones in their place:\n\
+         \n\
+         {table}{documents}\
+         \n\
+         If these were renamed in {src}, keep them in {tgt}:\n\
+         \n  \
+         1. {add}\n\
+         {rows}\
+         \n  \
+         2. Run the command again:\n\
+         \n     \
+         {rerun}\n\
+         \n\
+         If they are unrelated, run it again with --allow-recreate."
     )
 }
 
@@ -3156,7 +3218,8 @@ pub fn run_at(
         let produced = produced_paths(&src_root, src, &mapping, &unique_tpl_skips)?;
         let groups = recreate_groups(&prune_plan, &produced, &tgt_root, tgt, &tgt_lockfile)?;
         if !groups.is_empty() {
-            anyhow::bail!(format_recreate_error(&groups, src, tgt));
+            let rerun = rerun_command(src, tgt, dry_run, &only, carry);
+            anyhow::bail!(format_recreate_error(&groups, src, tgt, &rerun));
         }
     }
 
@@ -6638,11 +6701,11 @@ mod tests {
         }
     }
 
-    /// Every object at risk is named, across kinds and however many there are
-    /// per kind — a refusal that lists one of three deletions would send the
-    /// reader to look for the other two themselves.
+    /// A kind with several deletes or creates cannot be paired: it is listed
+    /// as delete/create and gets a row to fill in, while a one-to-one kind
+    /// beside it still gets its arrow and its real row.
     #[test]
-    fn format_recreate_error_names_every_object_and_one_copyable_row() {
+    fn format_recreate_error_pairs_only_one_to_one_kinds() {
         let groups = vec![
             RecreateGroup {
                 kind: "queues",
@@ -6650,27 +6713,52 @@ mod tests {
                 created: vec!["vendor-invoices".into(), "sales-orders".into()],
             },
             RecreateGroup {
-                kind: "schemas",
-                deleted: vec![("invoices".into(), 503)],
-                created: vec!["vendor-invoices".into()],
+                kind: "email_templates",
+                deleted: vec![("main/invoices/welcome".into(), 505)],
+                created: vec!["main/vendor-invoices/welcome".into()],
             },
         ];
-        let msg = format_recreate_error(&groups, "dev", "prod");
-        for want in [
-            "invoices (id 502)",
-            "orders (id 504)",
-            "vendor-invoices",
-            "sales-orders",
-            "schemas",
-            "invoices (id 503)",
-            "--allow-recreate",
-            "rdc doctor dev",
-        ] {
-            assert!(msg.contains(want), "must mention {want}:\n{msg}");
-        }
-        // Exactly one worked example, from the first pair.
-        assert_eq!(msg.matches("[[").count(), 1, "one sample row only:\n{msg}");
-        assert!(msg.contains("[[queues]]\n  dev = \"vendor-invoices\"\n  prod = \"invoices\""), "{msg}");
+        let msg = format_recreate_error(&groups, "dev", "prod", "rdc migrate dev prod --mirror");
+        assert_eq!(
+            msg,
+            "prod would lose objects it already has.
+
+--mirror deletes these from prod and creates new ones in their place:
+
+  queue           delete  invoices (id 502), orders (id 504)
+                  create  vendor-invoices, sales-orders
+  email template  main/invoices/welcome (id 505)  \u{2192}  main/vendor-invoices/welcome
+
+Deleting a queue also deletes all its documents.
+
+If these were renamed in dev, keep them in prod:
+
+  1. Add one entry to .rdc/mapping.toml for each renamed object:
+
+     [[queues]]
+     dev = \"<name in dev>\"
+     prod = \"<name in prod>\"
+
+     [[email_templates]]
+     dev = \"main/vendor-invoices/welcome\"
+     prod = \"main/invoices/welcome\"
+
+  2. Run the command again:
+
+     rdc migrate dev prod --mirror
+
+If they are unrelated, run it again with --allow-recreate."
+        );
+    }
+
+    #[test]
+    fn rerun_command_repeats_the_selection_and_carry() {
+        let carry = Carry { score_thresholds: true, email_prefixes: false, automation: true };
+        assert_eq!(
+            rerun_command("dev", "prod", true, &["queues/x".into()], carry),
+            "rdc migrate dev prod --mirror --dry-run --only 'queues/x' --carry score-thresholds,automation"
+        );
+        assert_eq!(rerun_command("dev", "prod", false, &[], Carry::NONE), "rdc migrate dev prod --mirror");
     }
 
     /// The guard reads the target's lockfile, so an object the target tracks
