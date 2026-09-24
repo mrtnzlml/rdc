@@ -298,6 +298,13 @@ async fn push_update_batch(
                 .update_queue(id, &payload_to_send, Some(progress.clone()))
                 .await
                 .with_context(|| format!("PATCH /queues/{id}"))?;
+            crate::cli::push::warn_ignored(
+                progress,
+                &format!("queue/{q_slug}"),
+                &payload_to_send,
+                remote_queue,
+                &updated,
+            );
             Ok(Prepared::Patched {
                 slug: q_slug.clone(),
                 updated: QueuePatched { updated, deferred },
@@ -575,6 +582,13 @@ async fn push_one_drifted(
         .with_context(|| format!("PATCH /queues/{id}"));
     let updated = patch_result?;
 
+    crate::cli::push::warn_ignored(
+        progress,
+        &format!("queue/{q_slug}"),
+        &payload_to_send,
+        &remote_queue,
+        &updated,
+    );
     write_back(
         paths,
         lockfile,

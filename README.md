@@ -300,7 +300,15 @@ Lists every change that would be sent — POSTs, PATCHes, DELETEs — without wr
 RDC_TRACE_HTTP=/tmp/rdc-trace.csv rdc sync test
 ```
 
-The value is the **path of the file** to append to, so `RDC_TRACE_HTTP=1` writes a file named `1`. Each HTTP attempt adds one line, `epoch_ms,limiter_wait_ms,duration_ms,status,desc`, where `desc` is the method and URL. Request and response bodies are not recorded.
+The value is the **path of the file** to append to, so `RDC_TRACE_HTTP=1` writes a file named `1`. Each HTTP attempt adds one line, `epoch_ms,limiter_wait_ms,duration_ms,status,desc`, where `desc` is the method and URL.
+
+To see what rdc sent, set `RDC_TRACE_HTTP_BODIES` to a second path. Each request that carries a body adds one JSON line with `epoch_ms`, `status`, `desc` and `request`. Every `secrets`, `password` and `token` value is replaced with `"<redacted>"`; everything else is written as sent, including Data Storage documents. Response bodies are not recorded.
+
+```sh
+RDC_TRACE_HTTP_BODIES=/tmp/rdc-bodies.jsonl rdc sync test
+```
+
+When a PATCH answers 2xx but the server keeps the old value of a field rdc asked to change, sync prints `warn <kind>/<slug>: the server accepted the PATCH but kept its old value for <fields>`. The next pull would otherwise overwrite your edit with that old value without a word.
 
 ### Watch an environment
 

@@ -269,6 +269,13 @@ pub async fn push(
                     .with_context(|| {
                         format!("PATCH /email_templates/{id} (adopting existing)")
                     })?;
+                crate::cli::push::warn_ignored(
+                    progress,
+                    &format!("email_template/{lockfile_key}"),
+                    &to_send,
+                    &remote,
+                    &updated,
+                );
                 let codec = crate::snapshot::codec::codec("email_templates").unwrap();
                 let updated_art = codec
                     .disk_bytes(
@@ -529,6 +536,13 @@ async fn push_update_batch(
                     .update_email_template(id, &payload_to_send, Some(progress.clone()))
                     .await
                     .with_context(|| format!("PATCH /email_templates/{id}"))?;
+                crate::cli::push::warn_ignored(
+                    progress,
+                    &format!("email_template/{lockfile_key}"),
+                    &payload_to_send,
+                    remote_template,
+                    &updated,
+                );
                 Ok(Prepared::Patched {
                     slug: lockfile_key.clone(),
                     updated,
@@ -799,6 +813,13 @@ async fn push_one_drifted(
         .with_context(|| format!("PATCH /email_templates/{id}"));
     let updated = patch_result?;
 
+    crate::cli::push::warn_ignored(
+        progress,
+        &format!("email_template/{lockfile_key}"),
+        &payload_to_send,
+        &remote_template,
+        &updated,
+    );
     write_back(paths, lockfile, lockfile_key, template_path, &updated)?;
     progress.event(Action::Patch, &format!("email_template/{lockfile_key}"));
     Ok((1, 0))

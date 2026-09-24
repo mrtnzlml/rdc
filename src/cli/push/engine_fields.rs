@@ -297,6 +297,13 @@ async fn push_update_batch(
                 }
                 Err(e) => return Err(e),
             };
+            crate::cli::push::warn_ignored(
+                progress,
+                &format!("engine_field/{slug}"),
+                &payload_to_send,
+                remote_field,
+                &updated,
+            );
             Ok(Prepared::Patched {
                 slug: slug.clone(),
                 updated: FieldPatched::Updated(updated),
@@ -601,6 +608,13 @@ async fn push_one_drifted(
         }
     };
 
+    crate::cli::push::warn_ignored(
+        progress,
+        &format!("engine_field/{slug}"),
+        &payload_to_send,
+        remote_field,
+        &updated,
+    );
     write_back(paths, lockfile, slug, path, &updated)?;
     progress.event(Action::Patch, &format!("engine_field/{slug}"));
     Ok((1, 0, false))

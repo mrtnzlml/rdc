@@ -244,6 +244,13 @@ async fn push_update_batch(
                 .update_label(id, &payload_to_send, Some(progress.clone()))
                 .await
                 .with_context(|| format!("PATCH /labels/{id}"))?;
+            crate::cli::push::warn_ignored(
+                progress,
+                &format!("label/{slug}"),
+                &payload_to_send,
+                remote_label,
+                &updated,
+            );
             Ok(Prepared::Patched {
                 slug: slug.clone(),
                 updated,
@@ -504,6 +511,13 @@ async fn push_one_drifted(
         .with_context(|| format!("PATCH /labels/{id}"));
     let updated = result?;
 
+    crate::cli::push::warn_ignored(
+        progress,
+        &format!("label/{slug}"),
+        &payload_to_send,
+        remote_label,
+        &updated,
+    );
     write_back(paths, lockfile, slug, path, &updated)?;
     progress.event(Action::Patch, &format!("label/{slug}"));
     Ok((1, 0))

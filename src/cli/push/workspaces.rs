@@ -241,6 +241,13 @@ async fn push_update_batch(
                 .update_workspace(id, &payload_to_send, Some(progress.clone()))
                 .await
                 .with_context(|| format!("PATCH /workspaces/{id}"))?;
+            crate::cli::push::warn_ignored(
+                progress,
+                &format!("workspace/{ws_slug}"),
+                &payload_to_send,
+                &remote_workspace,
+                &updated,
+            );
             Ok(Prepared::Patched {
                 slug: ws_slug.clone(),
                 updated,
@@ -498,6 +505,13 @@ async fn push_one_drifted(
         .with_context(|| format!("PATCH /workspaces/{id}"));
     let updated = patch_result?;
 
+    crate::cli::push::warn_ignored(
+        progress,
+        &format!("workspace/{ws_slug}"),
+        &payload_to_send,
+        remote_workspace,
+        &updated,
+    );
     write_back(paths, lockfile, ws_slug, ws_path, &updated)?;
     progress.event(Action::Patch, &format!("workspace/{ws_slug}"));
     Ok((1, 0))

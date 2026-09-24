@@ -46,10 +46,60 @@ pub(crate) fn ignored_fields(
         .filter(|(k, _)| !matches!(k.as_str(), "id" | "url"))
         .filter(|(k, v)| {
             let old = before.get(k.as_str());
-            old != Some(*v) && after.get(k.as_str()) == old
+            !old.is_some_and(|o| loosely_equal(o, v)) && after.get(k.as_str()) == old
         })
         .map(|(k, _)| k.clone())
         .collect()
+}
+
+/// Equality up to what the server normalizes on write: trailing whitespace in
+/// strings, and `140` vs `140.0`. A field that differs from the remote only
+/// that way is not a change the user asked for, so it must not be reported as
+/// ignored.
+fn loosely_equal(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match (a, b) {
+        (Value::String(x), Value::String(y)) => x.trim_end() == y.trim_end(),
+        (Value::Number(x), Value::Number(y)) => x.as_f64() == y.as_f64(),
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(x, y)| loosely_equal(x, y))
+        }
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len()
+                && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| loosely_equal(v, w)))
+        }
+        _ => a == b,
+    }
+}
+
+/// Warn when a PATCH answered 2xx but `after` still shows the old value for a
+/// field `sent` changed (see [`ignored_fields`]). `what` names the object in
+/// the log line, e.g. `inbox/<slug>`. Diagnostics only: a body that fails to
+/// serialize is skipped, never an error.
+pub(crate) fn warn_ignored(
+    progress: &crate::log::Log,
+    what: &str,
+    sent: &impl serde::Serialize,
+    before: &impl serde::Serialize,
+    after: &impl serde::Serialize,
+) {
+    let (Ok(sent), Ok(before), Ok(after)) = (
+        serde_json::to_value(sent),
+        serde_json::to_value(before),
+        serde_json::to_value(after),
+    ) else {
+        return;
+    };
+    let ignored = ignored_fields(&sent, &before, &after);
+    if !ignored.is_empty() {
+        progress.event(
+            crate::log::Action::Warn,
+            &format!(
+                "{what}: the server accepted the PATCH but kept its old value for {}",
+                ignored.join(", ")
+            ),
+        );
+    }
 }
 
 /// Push phase: run each kind's push driver in dependency order. Called
@@ -199,4 +249,44 @@ pub(crate) async fn push_classified(
         );
     }
     Ok((pushed, skipped))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn ignored_fields_skips_self_identity() {
+        let before = json!({ "id": 5, "url": "https://x/labels/5", "name": "A" });
+        let sent = json!({ "id": 0, "url": "rdc://labels/a", "name": "A" });
+        assert!(ignored_fields(&sent, &before, &before).is_empty());
+    }
+
+    /// A hook whose code differs from the remote only by a trailing newline
+    /// (clean under rdc's EOF-insensitive hashing) is not an edit, so the
+    /// server trimming it back must not be reported.
+    #[test]
+    fn ignored_fields_tolerates_server_normalization() {
+        let before = json!({ "name": "A", "config": { "code": "x = 1", "width": 140.0 } });
+        let sent = json!({ "name": "B", "config": { "code": "x = 1\n", "width": 140 } });
+        let after = json!({ "name": "B", "config": { "code": "x = 1", "width": 140.0 } });
+        assert!(ignored_fields(&sent, &before, &after).is_empty());
+    }
+
+    #[test]
+    fn ignored_fields_reports_a_nested_edit_the_server_dropped() {
+        let before = json!({ "config": { "code": "x = 1" } });
+        let sent = json!({ "config": { "code": "x = 2" } });
+        assert_eq!(ignored_fields(&sent, &before, &before), vec!["config".to_string()]);
+    }
+
+    /// A key the remote never had, sent and not echoed back, is reported: the
+    /// server does not know the field.
+    #[test]
+    fn ignored_fields_reports_an_unknown_key() {
+        let before = json!({ "name": "A" });
+        let sent = json!({ "name": "A", "colour": "red" });
+        assert_eq!(ignored_fields(&sent, &before, &before), vec!["colour".to_string()]);
+    }
 }

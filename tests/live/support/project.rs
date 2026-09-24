@@ -62,12 +62,14 @@ impl ProjectFixture {
 
     #[allow(dead_code)]
     pub fn run_rdc(&self, args: &[&str]) -> Output {
-        assert_cmd::Command::cargo_bin("rdc")
+        let out = assert_cmd::Command::cargo_bin("rdc")
             .unwrap()
             .current_dir(self.dir.path())
             .args(args)
             .output()
-            .expect("spawning rdc")
+            .expect("spawning rdc");
+        assert_no_ignored_patch(args, &out);
+        out
     }
 
     /// `run_rdc`, with `RDC_TRACE_HTTP` pointed at a fresh file so the caller
@@ -91,6 +93,7 @@ impl ProjectFixture {
             .args(args)
             .output()
             .expect("spawning rdc");
+        assert_no_ignored_patch(args, &out);
         (out, Trace::read(&trace_path))
     }
 
@@ -125,6 +128,18 @@ impl ProjectFixture {
     pub fn exists(&self, rel: &str) -> bool {
         self.dir.path().join(rel).exists()
     }
+}
+
+/// Every scenario pushes real edits, so a PATCH the server answered 2xx but
+/// did not apply (rdc's "kept its old value" warning) is either a real API
+/// quirk rdc must handle or a false positive in the warning itself. Both
+/// deserve a failed run rather than a line nobody reads.
+fn assert_no_ignored_patch(args: &[&str], out: &Output) {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("kept its old value"),
+        "rdc {args:?} reported a PATCH the server did not apply:\n{stderr}"
+    );
 }
 
 #[cfg(test)]

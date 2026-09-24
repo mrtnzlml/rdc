@@ -91,6 +91,87 @@ mod trace {
     }
 }
 
+/// Opt-in request-body trace. Set `RDC_TRACE_HTTP_BODIES=<path>` to append one
+/// JSON line per HTTP **attempt** that carries a body:
+///
+/// ```text
+/// {"epoch_ms":…,"status":"200","desc":"PATCH https://…/inboxes/5","request":{…}}
+/// ```
+///
+/// A separate file from [`trace`] so that CSV keeps its shape for the tools
+/// that parse it. The value of every `secrets`, `password` and `token` key is
+/// replaced with `"<redacted>"` at any depth, so neither hook secrets nor the
+/// login password reach the file. Everything else is written as sent,
+/// including Data Storage documents. `request` is the parsed JSON body, or the
+/// raw text when the body is not JSON.
+mod body_trace {
+    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+
+    fn sink() -> Option<&'static Mutex<std::fs::File>> {
+        static SINK: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+        SINK.get_or_init(|| {
+            let path = std::env::var("RDC_TRACE_HTTP_BODIES").ok()?;
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()?;
+            Some(Mutex::new(file))
+        })
+        .as_ref()
+    }
+
+    pub fn enabled() -> bool {
+        sink().is_some()
+    }
+
+    pub fn redact(v: &mut serde_json::Value) {
+        match v {
+            serde_json::Value::Object(map) => {
+                for (k, child) in map.iter_mut() {
+                    if matches!(k.as_str(), "secrets" | "password" | "token") {
+                        *child = serde_json::Value::String("<redacted>".into());
+                    } else {
+                        redact(child);
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(redact),
+            _ => {}
+        }
+    }
+
+    pub fn line(epoch_ms: f64, status: &str, desc: &str, body: &[u8]) -> String {
+        let request = match serde_json::from_slice::<serde_json::Value>(body) {
+            Ok(mut v) => {
+                redact(&mut v);
+                v
+            }
+            Err(_) => serde_json::Value::String(String::from_utf8_lossy(body).into_owned()),
+        };
+        serde_json::json!({
+            "epoch_ms": (epoch_ms * 10.0).round() / 10.0,
+            "status": status,
+            "desc": desc,
+            "request": request,
+        })
+        .to_string()
+    }
+
+    pub fn record(status: &str, desc: &str, body: &[u8]) {
+        let Some(sink) = sink() else { return };
+        let epoch_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
+        // Diagnostics, not state: a failed write never fails the request.
+        if let Ok(mut file) = sink.lock() {
+            let _ = writeln!(file, "{}", line(epoch_ms, status, desc, body));
+        }
+    }
+}
+
 const MAX_ATTEMPTS: u32 = 5;
 const MAX_SLEEP_SECS: u64 = 60;
 
@@ -158,10 +239,34 @@ async fn send_once(
     }
     let limiter_wait_ms = gate.elapsed().as_secs_f64() * 1000.0;
     let sent = std::time::Instant::now();
-    let out = build()
-        .send()
-        .await
-        .with_context(|| format!("{desc} (attempt {attempt})"));
+    let out = if body_trace::enabled() {
+        // Build the request first so its body can be read; sending it through
+        // the builder's own client keeps every other behaviour identical.
+        let (client, req) = build().build_split();
+        match req {
+            Ok(req) => {
+                let body = req.body().and_then(|b| b.as_bytes()).map(<[u8]>::to_vec);
+                let out = client
+                    .execute(req)
+                    .await
+                    .with_context(|| format!("{desc} (attempt {attempt})"));
+                if let Some(body) = body {
+                    let status = match &out {
+                        Ok(r) => r.status().as_str().to_string(),
+                        Err(_) => "ERR".to_string(),
+                    };
+                    body_trace::record(&status, desc, &body);
+                }
+                out
+            }
+            Err(e) => Err(anyhow::Error::from(e).context(format!("{desc} (attempt {attempt})"))),
+        }
+    } else {
+        build()
+            .send()
+            .await
+            .with_context(|| format!("{desc} (attempt {attempt})"))
+    };
     if trace::enabled() {
         let status = match &out {
             Ok(r) => r.status().as_str().to_string(),
@@ -229,6 +334,35 @@ fn backoff(attempt: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn body_trace_redacts_secrets_at_any_depth_and_keeps_the_rest() {
+        let body = br#"{"name":"h","secrets":{"api_key":"s3cret"},"config":{"auth":{"password":"pw","token":"t"}},"items":[{"token":"t2"}]}"#;
+        let line: serde_json::Value =
+            serde_json::from_str(&body_trace::line(1.25, "200", "PATCH x", body)).unwrap();
+        assert_eq!(
+            line,
+            serde_json::json!({
+                "epoch_ms": 1.3,
+                "status": "200",
+                "desc": "PATCH x",
+                "request": {
+                    "name": "h",
+                    "secrets": "<redacted>",
+                    "config": { "auth": { "password": "<redacted>", "token": "<redacted>" } },
+                    "items": [{ "token": "<redacted>" }]
+                }
+            })
+        );
+        assert!(!line.to_string().contains("s3cret"));
+    }
+
+    #[test]
+    fn body_trace_keeps_a_non_json_body_as_text() {
+        let line: serde_json::Value =
+            serde_json::from_str(&body_trace::line(0.0, "200", "POST x", b"a=b")).unwrap();
+        assert_eq!(line["request"], serde_json::json!("a=b"));
+    }
 
     #[test]
     fn backoff_doubles_with_cap() {

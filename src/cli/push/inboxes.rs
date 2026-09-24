@@ -395,20 +395,13 @@ async fn send_patch(
         .get_inbox(id, Some(progress.clone()))
         .await
         .with_context(|| format!("GET /inboxes/{id} to re-baseline after push"))?;
-    let ignored = crate::cli::push::ignored_fields(
-        &serde_json::to_value(payload_to_send)?,
-        &serde_json::to_value(remote_before)?,
-        &serde_json::to_value(&refetched)?,
+    crate::cli::push::warn_ignored(
+        progress,
+        &format!("inbox/{q_slug}"),
+        payload_to_send,
+        remote_before,
+        &refetched,
     );
-    if !ignored.is_empty() {
-        progress.event(
-            Action::Warn,
-            &format!(
-                "inbox/{q_slug}: the server accepted the PATCH but kept its old value for {}",
-                ignored.join(", ")
-            ),
-        );
-    }
     Ok(refetched)
 }
 

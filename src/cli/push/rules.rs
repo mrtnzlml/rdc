@@ -259,6 +259,13 @@ async fn push_update_batch(
                 .update_rule(id, &payload_to_send, Some(progress.clone()))
                 .await
                 .with_context(|| format!("PATCH /rules/{id}"))?;
+            crate::cli::push::warn_ignored(
+                progress,
+                &format!("rule/{slug}"),
+                &payload_to_send,
+                remote_rule,
+                &updated,
+            );
             Ok(Prepared::Patched {
                 slug: slug.clone(),
                 updated,
@@ -533,6 +540,13 @@ async fn push_one_drifted(
         .with_context(|| format!("PATCH /rules/{id}"));
     let updated = patch_result?;
 
+    crate::cli::push::warn_ignored(
+        progress,
+        &format!("rule/{slug}"),
+        &payload_to_send,
+        remote_rule,
+        &updated,
+    );
     write_back(paths, rules_dir, lockfile, slug, local_json_path, &updated)?;
     progress.event(Action::Patch, &format!("rule/{slug}"));
     Ok((1, 0))

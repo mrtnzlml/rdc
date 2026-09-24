@@ -315,6 +315,13 @@ async fn push_update_batch(
                 .update_schema(id, &payload_to_send, Some(progress.clone()))
                 .await
                 .with_context(|| format!("PATCH /schemas/{id}"))?;
+            crate::cli::push::warn_ignored(
+                progress,
+                &format!("schema/{q_slug}"),
+                &payload_to_send,
+                remote_schema,
+                &updated,
+            );
             Ok(Prepared::Patched {
                 slug: q_slug.clone(),
                 updated,
@@ -561,6 +568,13 @@ async fn push_one_drifted(
         .with_context(|| format!("PATCH /schemas/{id}"));
     let updated = patch_result?;
 
+    crate::cli::push::warn_ignored(
+        progress,
+        &format!("schema/{q_slug}"),
+        &payload_to_send,
+        remote_schema,
+        &updated,
+    );
     write_back(paths, lockfile, q_slug, schema_path, &updated)?;
     progress.event(Action::Patch, &format!("schema/{q_slug}"));
     Ok((1, 0))

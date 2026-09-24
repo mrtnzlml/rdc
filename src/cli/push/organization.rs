@@ -155,6 +155,17 @@ pub async fn push(
         .update_organization(id, &body, Some(progress.clone()))
         .await
         .with_context(|| format!("patching organization settings for env '{env}'"))?;
+    // No remote read precedes this PATCH; the base is the last value the
+    // server returned, which is what "kept its old value" compares against.
+    if let Some(base) = &base_settings {
+        crate::cli::push::warn_ignored(
+            progress,
+            "organization",
+            &body,
+            &serde_json::json!({ "settings": base }),
+            &updated,
+        );
+    }
 
     // Write back ONLY `settings`, merged into the body already on disk.
     //

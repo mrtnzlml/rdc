@@ -548,6 +548,7 @@ async fn push_update_batch(
                 &payload_to_send,
                 &deferred,
                 secrets_ref,
+                remote_hook,
                 progress,
             )
             .await?;
@@ -707,6 +708,7 @@ async fn send_patch(
     payload_to_send: &crate::model::Hook,
     deferred: &[(String, Value)],
     hook_secrets: &HookSecrets,
+    remote_before: &crate::model::Hook,
     progress: &Arc<Log>,
 ) -> Result<(crate::model::Hook, String)> {
     // Build a Value form of the typed payload so secrets (which
@@ -734,6 +736,13 @@ async fn send_patch(
         .update_hook_value(id, &body, Some(progress.clone()))
         .await
         .with_context(|| format!("PATCH /hooks/{id}"))?;
+    // `secrets` is write-only: the server never echoes it, so it would always
+    // look ignored.
+    let mut sent = body;
+    if let Some(obj) = sent.as_object_mut() {
+        obj.remove("secrets");
+    }
+    crate::cli::push::warn_ignored(progress, &format!("hook/{slug}"), &sent, remote_before, &updated);
     Ok((updated, secrets_hash))
 }
 
@@ -966,6 +975,7 @@ async fn push_one_drifted(
         &payload_to_send,
         &deferred,
         hook_secrets,
+        remote_hook,
         progress,
     )
     .await?;
