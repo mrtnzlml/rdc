@@ -378,13 +378,15 @@ pub(crate) async fn run_cycle(
             crate::cli::pull::mdh::plan_mdh_index_edits(&catalog.mdh, &lockfile, &paths, &progress)
                 .await?,
         );
+        // A direction the flags switch off is previewed as empty, because the
+        // real run would not take it.
         let mdh_pull: Vec<&crate::cli::pull::mdh::MdhPlanItem> = mdh_plan
             .iter()
-            .filter(|i| i.dir == crate::cli::pull::mdh::MdhPlanDir::Pull)
+            .filter(|i| !no_pull && i.dir == crate::cli::pull::mdh::MdhPlanDir::Pull)
             .collect();
         let mdh_push: Vec<&crate::cli::pull::mdh::MdhPlanItem> = mdh_plan
             .iter()
-            .filter(|i| i.dir == crate::cli::pull::mdh::MdhPlanDir::Push)
+            .filter(|i| !no_push && i.dir == crate::cli::pull::mdh::MdhPlanDir::Push)
             .collect();
 
         // Pull-side items (would write local). A clean `RemoteDelete`
@@ -393,10 +395,11 @@ pub(crate) async fn run_cycle(
         let pull_items: Vec<&crate::cli::sync::classify::ClassifiedItem> = classified
             .iter()
             .filter(|c| {
-                matches!(
-                    c.class,
-                    SyncClass::RemoteEdit | SyncClass::RemoteCreate | SyncClass::RemoteDelete
-                )
+                !no_pull
+                    && matches!(
+                        c.class,
+                        SyncClass::RemoteEdit | SyncClass::RemoteCreate | SyncClass::RemoteDelete
+                    )
             })
             .collect();
         let pull_count = pull_items.len() + mdh_pull.len();
@@ -405,10 +408,11 @@ pub(crate) async fn run_cycle(
         let push_items: Vec<&crate::cli::sync::classify::ClassifiedItem> = classified
             .iter()
             .filter(|c| {
-                matches!(
-                    c.class,
-                    SyncClass::LocalEdit | SyncClass::LocalCreate | SyncClass::LocalDelete
-                )
+                !no_push
+                    && matches!(
+                        c.class,
+                        SyncClass::LocalEdit | SyncClass::LocalCreate | SyncClass::LocalDelete
+                    )
             })
             .collect();
 
@@ -431,7 +435,7 @@ pub(crate) async fn run_cycle(
             crate::cli::push::plan_secret_pushes(&hook_secrets, &lockfile);
         let secret_only: Vec<&String> = secret_push_all
             .iter()
-            .filter(|s| !pushed_hooks.contains(s.as_str()))
+            .filter(|s| !no_push && !pushed_hooks.contains(s.as_str()))
             .collect();
         let secret_dangling: Vec<&String> = secret_dangling_all
             .iter()
