@@ -1586,11 +1586,7 @@ pub fn from_catalog_scan_lockfile(
     // Dedup globally, pre-seeded with already-pinned slugs (kept stable by
     // slug_for_id), so two same-named queues in different workspaces never
     // collapse onto one bare slug.
-    let mut used_q_slugs: std::collections::HashSet<String> = lockfile
-        .objects
-        .get("queues")
-        .map(|m| m.keys().cloned().collect())
-        .unwrap_or_default();
+    let mut used_q_slugs: std::collections::HashSet<String> = lockfile.claimed_slugs("queues");
     // Build per-queue (ws_slug, q_slug, q.id, q.url) tuples so the
     // email_templates block can look up its compound key without
     // re-deriving slugs.

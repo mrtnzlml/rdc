@@ -232,6 +232,17 @@ impl Lockfile {
         None
     }
 
+    /// Every slug of `kind` that a newly-seen object must not take: the
+    /// tracked ones and the ones departed this run. Counting the departed
+    /// keeps slug derivation stable across a run — the classifier derives
+    /// before the remote-delete phase departs anything, the pull drivers
+    /// after, and both must hand a newcomer the same slug.
+    pub fn claimed_slugs(&self, kind: &str) -> std::collections::HashSet<String> {
+        let tracked = self.objects.get(kind).into_iter().flat_map(|m| m.keys());
+        let departed = self.departed.get(kind).into_iter().flat_map(|m| m.keys());
+        tracked.chain(departed).cloned().collect()
+    }
+
     /// Multi-kind reverse lookup: given a URL, find which `(kind, slug)`
     /// owns it. Drives [`crate::snapshot::refs::url_to_rdc`], i.e. the pull
     /// side's portabilization of a live cross-reference into

@@ -73,12 +73,7 @@ pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<Log>) -> Result<Vec<Queue>> 
 /// after [`process`]. Slug derivation is pure (reads only the lockfile), so
 /// it never issues a request and matches the on-disk layout exactly.
 pub fn locate_queues(ctx: &mut PullCtx<'_>, queues: &[Queue]) {
-    let mut used_q_slugs: HashSet<String> = ctx
-        .lockfile
-        .objects
-        .get(KIND_QUEUES)
-        .map(|m| m.keys().cloned().collect())
-        .unwrap_or_default();
+    let mut used_q_slugs: HashSet<String> = ctx.lockfile.claimed_slugs(KIND_QUEUES);
     for q in queues {
         let Some(ws_url) = q.workspace.as_ref() else {
             continue;
@@ -144,12 +139,7 @@ pub async fn process(
     // identity (silent cross-attribution). Dedup globally, pre-seeded with the
     // slugs already pinned in the lockfile (kept stable by `slug_for_id`) so a
     // newly-seen queue never steals an existing slug regardless of list order.
-    let mut used_q_slugs: HashSet<String> = ctx
-        .lockfile
-        .objects
-        .get(KIND_QUEUES)
-        .map(|m| m.keys().cloned().collect())
-        .unwrap_or_default();
+    let mut used_q_slugs: HashSet<String> = ctx.lockfile.claimed_slugs(KIND_QUEUES);
     let mut counts = QueueCounts {
         queues: 0,
         schemas: 0,

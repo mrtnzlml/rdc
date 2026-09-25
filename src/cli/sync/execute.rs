@@ -288,12 +288,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
     {
         // Global, id-pinned queue slugs (mirror pull::queues::process): dedup
         // globally, pre-seeded with the already-pinned slugs.
-        let mut used_q: HashSet<String> = ctx
-            .lockfile
-            .objects
-            .get("queues")
-            .map(|m| m.keys().cloned().collect())
-            .unwrap_or_default();
+        let mut used_q: HashSet<String> = ctx.lockfile.claimed_slugs("queues");
         for q in &catalog.queues {
             let Some(ws_url) = q.workspace.as_ref() else {
                 continue;
@@ -1501,7 +1496,9 @@ fn resolve_one_conflict<R: BufRead>(
     // object ([k] force-pushes all local halves, [r] adopts all remote ones).
     // Without this line a JSON diff consisting solely of server-stamped
     // `modified_by` churn reads as "nothing really changed" — while the code
-    // sidecar the user is about to discard never appears on screen.
+    // sidecar the user is about to discard never appears on screen. Once an
+    // "apply to all" choice or `--conflict` has decided, no prompt follows and
+    // the line is only noise.
     let divergent_parts = divergent_shadow_parts(
         hash_strategy,
         json_canonicalize_equal,
@@ -1513,10 +1510,11 @@ fn resolve_one_conflict<R: BufRead>(
         &local_formulas,
         &remote_formulas,
     );
-    if divergent_parts.len() > 1 {
+    if divergent_parts.len() > 1 && sticky_now.is_none() {
+        let env_root = ctx.paths.env_root();
         let list = divergent_parts
             .iter()
-            .map(|(p, _)| p.display().to_string())
+            .map(|(p, _)| p.strip_prefix(&env_root).unwrap_or(p).display().to_string())
             .collect::<Vec<_>>()
             .join(", ");
         progress.event(
@@ -2058,6 +2056,19 @@ fn delete_local_object(
         }
     }
     let _ = std::fs::remove_file(deleted_marker_path(ctx.paths, local_path));
+    // Remove the dirs this left empty (a deleted queue's `email-templates/`,
+    // then the queue dir). Git never tracks them, and an empty queue dir
+    // shadows a namesake queue in another workspace (`locate_queue_dir`).
+    // `remove_dir` refuses a non-empty dir, which ends the walk.
+    let env_root = ctx.paths.env_root();
+    let mut dir = local_path.parent();
+    while let Some(d) = dir
+        && d.starts_with(&env_root)
+        && d != env_root
+        && std::fs::remove_dir(d).is_ok()
+    {
+        dir = d.parent();
+    }
     // Departed, not just dropped: another object may still name it, and the
     // push phase detaches those refs (see `detach_departed`).
     ctx.lockfile.depart(&it.kind, &it.slug);
@@ -2581,12 +2592,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
     {
         // Global, id-pinned queue slugs (mirror pull::queues::process): dedup
         // globally, pre-seeded with the already-pinned slugs.
-        let mut used_q: HashSet<String> = ctx
-            .lockfile
-            .objects
-            .get("queues")
-            .map(|m| m.keys().cloned().collect())
-            .unwrap_or_default();
+        let mut used_q: HashSet<String> = ctx.lockfile.claimed_slugs("queues");
         for q in &catalog.queues {
             let Some(ws_url) = q.workspace.as_ref() else {
                 continue;
