@@ -169,6 +169,13 @@ fn an_unambiguous_prefix_resolves_to_its_verb() {
     }
 }
 
+/// `edit` needs a subcommand, so its prefix is checked with a full command
+/// line rather than alone.
+#[test]
+fn the_edit_prefix_resolves_to_edit() {
+    assert_eq!(resolve(&["rdc", "e", "env", "rename", "dev", "sandbox"]), "edit");
+}
+
 /// Inference matches prefixes, not fuzzy spellings: a string that prefixes no
 /// verb is still an error rather than a guess at what was meant.
 #[test]

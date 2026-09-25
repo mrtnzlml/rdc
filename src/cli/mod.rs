@@ -505,6 +505,11 @@ pub enum Command {
         #[arg(long = "dry-run")]
         dry_run: bool,
     },
+    /// Maintain the local project: rename an environment. Offline.
+    Edit {
+        #[command(subcommand)]
+        command: crate::cli::edit::EditCommand,
+    },
     /// Replace the running rdc binary with a release build.
     #[command(long_about = UPGRADE_LONG_ABOUT)]
     Upgrade {
@@ -622,6 +627,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             // doctor is fully offline — no `with_401_retry` wrapper needed.
             crate::cli::doctor::run(&env, dry_run).await
         }
+        Some(Command::Edit { command }) => crate::cli::edit::run(command),
         Some(Command::Upgrade { version, check }) => {
             let target = match version {
                 Some(v) => Some(crate::upgrade::Version::parse(&v)?),

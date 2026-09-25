@@ -579,6 +579,26 @@ Because slug alignment is direction-free (`.rdc/mapping.toml`), promoting the
 same objects back up later (`rdc migrate dev prod`) patches the originals
 rather than duplicating them.
 
+## `rdc edit`
+
+Local project maintenance. Nothing under `rdc edit` contacts Rossum.
+
+### Rename an environment
+
+```sh
+rdc edit env rename dev sandbox --dry-run   # show the plan
+rdc edit env rename dev sandbox
+```
+
+It moves `envs/dev/`, both secrets files and the env's state under `.rdc/`. It
+renames the env in `rdc.toml` and `.rdc/mapping.toml`, and refreshes the rdc
+regions of `README.md`, `CLAUDE.md` and `.gitlab-ci.yml`. A finished deploy job
+keeps its settings under the new name. It refuses while a sync runs on the env,
+and undoes everything if a step fails.
+
+Rename the GitLab CI variables named after the env (`RDC_TOKEN_DEV` →
+`RDC_TOKEN_SANDBOX`) yourself; the command lists them.
+
 ## Commands
 
 | Command | What it does |
@@ -588,6 +608,7 @@ rather than duplicating them.
 | `rdc sync <env>` | Reconcile snapshot ↔ remote in one pass. |
 | `rdc migrate <src> <tgt>` | Copy one env's snapshot into another's, locally (slug remap, ref rewrite, overlay) — then push with `rdc sync <tgt>`. |
 | `rdc doctor <env>` | Offline check of the local snapshot — report unpushed local changes, realign stale slugs (cascade-aware) and record them in `.rdc/mapping.toml`, prune orphan base-cache entries. |
+| `rdc edit env rename <old> <new>` | Rename an env everywhere in the project, offline: files, state, `rdc.toml`, mapping, generated doc and pipeline regions. |
 | `rdc upgrade` | Self-update the binary. |
 
 Every command that writes to the remote takes `--dry-run`. Use `rdc <command> --help` for the full flag list.

@@ -177,10 +177,14 @@ fn rewrite_value(line: &str, old: &str, new: &str) -> Option<(String, String)> {
     Some((format!("{indent}{dash}{key}: {gap}{replaced}{tail}"), key.to_string()))
 }
 
-/// Whether `word` appears in `line` as a whole env name (not inside
-/// `dev-us` or `RDC_TOKEN_DEV`).
+/// Whether `word` appears in `line` as a whole env name: not in a comment
+/// line, and not inside `dev-us`, `RDC_TOKEN_DEV` or a path like
+/// `/dev/null`.
 fn names_word(line: &str, word: &str) -> bool {
-    let is_name = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    if line.trim_start().starts_with('#') {
+        return false;
+    }
+    let is_name = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/' | '.');
     line.match_indices(word).any(|(i, _)| {
         let before = line[..i].chars().next_back();
         let after = line[i + word.len()..].chars().next();
@@ -292,6 +296,16 @@ notify:
         assert!(text.ends_with("notify:\n  script: echo dev done\n"));
         assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
         assert!(r.warnings[0].contains("still names \"dev\" outside the rdc regions"));
+    }
+
+    #[test]
+    fn comments_and_paths_outside_the_regions_do_not_warn() {
+        let text = PIPELINE.replace(
+            "notify:\n  script: echo dev done\n",
+            "# Keep hand-authored source envs (dev) out of the deploy jobs.\nnotify:\n  script: find . 2>/dev/null\n",
+        );
+        let r = rename_in_pipeline(&text, "dev", "sandbox", &envs(&["dev-us", "prod", "sandbox"])).unwrap();
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
     }
 
     #[test]

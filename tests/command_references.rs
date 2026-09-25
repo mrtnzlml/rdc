@@ -64,13 +64,15 @@ fn reachable(token: &str) -> bool {
         Ok(m) => m.subcommand_name().is_some(),
         // The token resolved and clap stopped for an unrelated reason: it
         // printed help or the version (`rdc --help` is a fine thing to point
-        // a reader at), or the line is a fragment missing an argument that
-        // the prose goes on to supply.
+        // a reader at), or the line is a fragment missing an argument -- or,
+        // for a group verb like `rdc edit`, the action -- that the prose goes
+        // on to supply.
         Err(e) => matches!(
             e.kind(),
             ErrorKind::DisplayHelp
                 | ErrorKind::DisplayVersion
                 | ErrorKind::MissingRequiredArgument
+                | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
         ),
     }
 }
@@ -80,7 +82,7 @@ fn reachable(token: &str) -> bool {
 /// reject a line that works.
 #[test]
 fn an_abbreviated_command_counts_as_documented() {
-    for token in ["i", "in", "s", "d", "do", "u", "sync", "migrate"] {
+    for token in ["i", "in", "s", "d", "do", "u", "e", "sync", "migrate", "edit"] {
         assert!(reachable(token), "`rdc {token}` runs today; the guard must accept it");
     }
 }

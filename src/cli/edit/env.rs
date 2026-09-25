@@ -119,9 +119,15 @@ fn plan_and_apply(
     if mapping_path.exists() {
         let original = read(&mapping_path)?;
         let mut mapping = GenericMapping::load(&mapping_path)?;
+        let before = toml::to_string_pretty(&mapping).context("serializing mapping")?;
         mapping.rename_env(old, new);
         let text = toml::to_string_pretty(&mapping).context("serializing mapping")?;
-        push_rewrite(&mut rewrites, mapping_path, original, text);
+        // Re-serializing drops the file's comments, so only a file with a
+        // row naming the env is rewritten; the commented stub `rdc init`
+        // scaffolds keeps its bytes.
+        if text != before {
+            push_rewrite(&mut rewrites, mapping_path, original, text);
+        }
     }
     let doc_regions = crate::cli::scaffold_docs::render_doc_regions(&new_cfg.envs);
     for doc in ["README.md", "CLAUDE.md"] {
@@ -434,6 +440,17 @@ mod tests {
         assert!(r.dry_run);
         assert_eq!(r.moved.len(), 6);
         assert_eq!(r.rewritten.len(), 2);
+    }
+
+    #[test]
+    fn a_mapping_with_no_row_for_the_env_keeps_its_bytes() {
+        let dir = project(&["dev", "prod"]);
+        let root = dir.path();
+        let stub = "# Slugs that differ between envs.\n#\n# [[queues]]\n# dev = \"ap\"\n";
+        write(root, ".rdc/mapping.toml", stub);
+        let r = rename_env(root, "dev", "sandbox", false).unwrap();
+        assert_eq!(std::fs::read_to_string(root.join(".rdc/mapping.toml")).unwrap(), stub);
+        assert!(!r.rewritten.contains(&PathBuf::from(".rdc/mapping.toml")));
     }
 
     #[test]
