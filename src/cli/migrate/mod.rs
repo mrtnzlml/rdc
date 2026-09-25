@@ -3037,6 +3037,11 @@ pub fn run_at(
         );
     }
 
+    // Both names first: a typo is "not defined", not a missing snapshot.
+    let project_cfg = crate::config::ProjectConfig::load(&cwd.join("rdc.toml"))?;
+    project_cfg.env_or_err(src)?;
+    project_cfg.env_or_err(tgt)?;
+
     let src_paths = crate::paths::Paths::for_env(cwd, src);
     let tgt_paths = crate::paths::Paths::for_env(cwd, tgt);
     let src_root = src_paths.env_root();
@@ -3051,7 +3056,6 @@ pub fn run_at(
 
     let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode());
 
-    let project_cfg = crate::config::ProjectConfig::load(&cwd.join("rdc.toml"))?;
     let known_envs: std::collections::BTreeSet<String> =
         project_cfg.envs.keys().cloned().collect();
 

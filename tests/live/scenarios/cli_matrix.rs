@@ -662,6 +662,9 @@ const ARGS: &[(In, &[&str], Ends)] = &[
     (Project, &["sync", "test", "--watch", "--poll-interval", "abc"], Fails("invalid duration")),
     (Project, &["sync", "test", "--watch", "--poll-interval", "5x"], Fails("invalid duration unit")),
     (Project, &["sync", "test", "--watch", "--poll-interval", "-5"], Usage("unexpected argument '-5'")),
+    (Project, &["sync", "test", "--watch", "--poll-interval", "0"], Fails("at least 1s")),
+    (Project, &["sync", "test", "--watch", "--poll-interval", "0s"], Fails("at least 1s")),
+    (Project, &["sync", "test", "--watch", "--poll-interval", "0m"], Fails("at least 1s")),
     // ---- sync: flags that belong to another command
     (Project, &["sync", "test", "--only", "labels/x"], Usage("unexpected argument '--only'")),
     (Project, &["sync", "test", "--mirror"], Usage("unexpected argument '--mirror'")),
@@ -673,6 +676,8 @@ const ARGS: &[(In, &[&str], Ends)] = &[
     (Project, &["migrate", "test"], Fails(NO_TTY_ENV)),
     (Project, &["migrate", "test", "test"], Fails("are the same")),
     (Project, &["migrate", "test", "nope"], Fails(UNDEFINED)),
+    (Project, &["migrate", "nope", "prod"], Fails(UNDEFINED)),
+    (Project, &["migrate", "nope", "prod", "--dry-run"], Fails(UNDEFINED)),
     (Project, &["migrate", "test", "prod", "--allow-recreate"], Usage("--mirror")),
     (Project, &["migrate", "test", "prod", "--mirror", "--allow-recreate", "--dry-run"], Succeeds),
     (Project, &["migrate", "test", "prod", "--only", "labels/*", "--dry-run"], Succeeds),

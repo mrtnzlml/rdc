@@ -681,12 +681,18 @@ fn parse_duration(s: &str) -> anyhow::Result<std::time::Duration> {
     let n: u64 = num.parse().map_err(|_| {
         anyhow::anyhow!("invalid duration '{s}'; expected forms like '30s', '2m', '5m'")
     })?;
-    match unit {
-        "s" | "" => Ok(std::time::Duration::from_secs(n)),
-        "m" => Ok(std::time::Duration::from_secs(n * 60)),
-        "h" => Ok(std::time::Duration::from_secs(n * 3600)),
+    let d = match unit {
+        "s" | "" => std::time::Duration::from_secs(n),
+        "m" => std::time::Duration::from_secs(n * 60),
+        "h" => std::time::Duration::from_secs(n * 3600),
         _ => anyhow::bail!("invalid duration unit '{unit}'; use s / m / h"),
+    };
+    // The poll ticker counts whole seconds, so zero would poll every second
+    // while claiming "every 0s". `--no-poll` is how to turn polling off.
+    if d.is_zero() {
+        anyhow::bail!("invalid duration '{s}': the poll interval must be at least 1s (use --no-poll to stop polling)");
     }
+    Ok(d)
 }
 
 pub mod auth;
