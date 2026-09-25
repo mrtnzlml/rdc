@@ -16,3 +16,5 @@ pub mod mdh;
 pub mod trace;
 pub mod snapshot;
 pub mod fake;
+#[cfg(unix)]
+pub mod pty;

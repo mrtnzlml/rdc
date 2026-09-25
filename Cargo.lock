@@ -1615,6 +1615,7 @@ dependencies = [
  "http",
  "indexmap",
  "inquire",
+ "libc",
  "notify",
  "predicates",
  "pretty_assertions",

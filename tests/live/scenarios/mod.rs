@@ -1,4 +1,7 @@
 pub mod backref_refresh;
+pub mod cli_matrix;
+#[cfg(unix)]
+pub mod cli_prompts;
 pub mod cli_surface;
 pub mod collisions;
 pub mod conflicts_deletes;
