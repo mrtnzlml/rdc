@@ -36,7 +36,8 @@
 use crate::cli::pull::common::{PullCtx, RemoteCatalog};
 use crate::cli::resolve::{
     BulkChoice, BulkPrompt, ConflictStrategy, PullAborted, Resolution, detect_color_mode,
-    ObjectRef, prompt_remote_delete, prompt_remote_delete_with_color,
+    ObjectRef, prompt_local_delete_remote_edit_with_color, prompt_remote_delete,
+    prompt_remote_delete_with_color,
     prompt_resolve_with_bytes_and_color,
 };
 use crate::cli::stdin_coord::CoordinatorStdin;
@@ -1990,6 +1991,11 @@ fn deleted_marker_path(paths: &crate::paths::Paths, local_path: &Path) -> PathBu
     PathBuf::from(s)
 }
 
+/// Which side's deletion a `-deleted` marker defers, for its warning.
+fn deleting_side(class: &SyncClass) -> &'static str {
+    if *class == SyncClass::LocalDeleteRemoteEdit { "local" } else { "env" }
+}
+
 /// Event detail for a clean `RemoteDelete`.
 ///
 /// For most kinds the remote object really is gone. A saved view usually is
@@ -3229,8 +3235,9 @@ async fn resolve_remote_deletes_projected<R: BufRead>(
                         progress.event(
                             Action::Warn,
                             &format!(
-                                "{}: env deletion deferred (non-tty); marker at {}",
+                                "{}: {} deletion deferred (non-tty); marker at {}",
                                 local_path.display(),
+                                deleting_side(&it.class),
                                 marker.display(),
                             ),
                         );
@@ -3275,8 +3282,13 @@ async fn resolve_remote_deletes_projected<R: BufRead>(
                     let prompt_res: std::cell::RefCell<Option<Resolution>> =
                         std::cell::RefCell::new(None);
                     let local_for_prompt = local_path.clone();
+                    let prompt = if it.class == SyncClass::LocalDeleteRemoteEdit {
+                        prompt_local_delete_remote_edit_with_color::<_, _>
+                    } else {
+                        prompt_remote_delete_with_color::<_, _>
+                    };
                     progress.with_prompt(|| -> anyhow::Result<()> {
-                        let r = prompt_remote_delete_with_color(
+                        let r = prompt(
                             &mut input,
                             progress.writer(),
                             content_total + processed_lerd + processed_ldre + 1,
@@ -3411,8 +3423,9 @@ async fn resolve_remote_deletes_projected<R: BufRead>(
                         progress.event(
                             Action::Warn,
                             &format!(
-                                "{}: env deletion deferred; marker at {}",
+                                "{}: {} deletion deferred; marker at {}",
                                 local_path.display(),
+                                deleting_side(&it.class),
                                 marker.display(),
                             ),
                         );

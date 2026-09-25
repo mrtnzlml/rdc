@@ -495,6 +495,47 @@ pub fn prompt_remote_delete<R: BufRead, W: Write>(
 /// Color-aware variant. Tests pin the mode; production goes through
 /// `prompt_remote_delete`.
 pub fn prompt_remote_delete_with_color<R: BufRead, W: Write>(
+    input: R,
+    output: W,
+    index: usize,
+    total: usize,
+    obj: ObjectRef<'_>,
+    local_path: &Path,
+    env: &str,
+    mode: ColorMode,
+    bulk: Option<&BulkPrompt>,
+) -> Result<Resolution> {
+    prompt_one_sided_delete(input, output, index, total, obj, local_path, env, mode, bulk, DeletedOn::Env)
+}
+
+/// The prompt for an object deleted locally and edited on the env: the mirror
+/// image of [`prompt_remote_delete_with_color`], with the same keys and the
+/// same [`Resolution`]s. `[k]` keeps the local deletion, so the env's copy is
+/// to go; `[r]` takes the env's copy back. `local_path` holds the env's bytes,
+/// which the caller restored there for review.
+pub fn prompt_local_delete_remote_edit_with_color<R: BufRead, W: Write>(
+    input: R,
+    output: W,
+    index: usize,
+    total: usize,
+    obj: ObjectRef<'_>,
+    local_path: &Path,
+    env: &str,
+    mode: ColorMode,
+    bulk: Option<&BulkPrompt>,
+) -> Result<Resolution> {
+    prompt_one_sided_delete(input, output, index, total, obj, local_path, env, mode, bulk, DeletedOn::Local)
+}
+
+/// Which side of a delete-vs-edit conflict deleted the object.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeletedOn {
+    Env,
+    Local,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prompt_one_sided_delete<R: BufRead, W: Write>(
     mut input: R,
     mut output: W,
     index: usize,
@@ -504,6 +545,7 @@ pub fn prompt_remote_delete_with_color<R: BufRead, W: Write>(
     env: &str,
     mode: ColorMode,
     bulk: Option<&BulkPrompt>,
+    deleted_on: DeletedOn,
 ) -> Result<Resolution> {
     let local_bytes = read_local(local_path)?;
     let preview = prettify_json_for_diff(&local_bytes);
@@ -520,16 +562,29 @@ pub fn prompt_remote_delete_with_color<R: BufRead, W: Write>(
         s.to_string()
     };
 
-    // Row, connector, body — the same three parts a conflict uses. The local
-    // file is the `-` side and the env, which no longer has it, is the empty
-    // `+` side, so this reads as the one-sided deletion it is.
+    // Row, connector, body — the same three parts a conflict uses. The side
+    // that still has the object shows its bytes and the side that deleted it
+    // is empty: local is `-` and the env `+`, so an env deletion reads as all
+    // removals and a local one as all additions.
+    let (header, left, right, before, after) = match deleted_on {
+        DeletedOn::Env => (
+            format!("deleted on {env}"),
+            "local".to_string(),
+            format!("{env} (deleted)"),
+            shown.as_str(),
+            "",
+        ),
+        DeletedOn::Local => (
+            format!("changed on {env}, deleted locally"),
+            "local (deleted)".to_string(),
+            env.to_string(),
+            "",
+            shown.as_str(),
+        ),
+    };
     writeln!(output)?;
-    writeln!(
-        output,
-        "{}",
-        render_prompt_header(index, total, &format!("deleted on {env}"), mode)
-    )?;
-    let (added, removed) = count_changes(&shown, "");
+    writeln!(output, "{}", render_prompt_header(index, total, &header, mode))?;
+    let (added, removed) = count_changes(before, after);
     let row = ChangeRow {
         verb: None,
         kind: obj.kind,
@@ -546,12 +601,12 @@ pub fn prompt_remote_delete_with_color<R: BufRead, W: Write>(
     writeln!(
         output,
         "{}",
-        render_connector(local_path, "local", &format!("{env} (deleted)"), mode)
+        render_connector(local_path, &left, &right, mode)
     )?;
     write!(
         output,
         "{}",
-        render_diff_body(&shown, "", is_json_path(local_path), mode)
+        render_diff_body(before, after, is_json_path(local_path), mode)
     )?;
     if elided > 0 {
         writeln!(
@@ -568,8 +623,12 @@ pub fn prompt_remote_delete_with_color<R: BufRead, W: Write>(
             keys.push(PromptKey::new('K', "keep ALL local"));
             keys.push(PromptKey::new('R', &format!("use {env} for ALL")));
         }
-        keys.push(PromptKey::new('k', &format!("keep local (restore it on {env})")));
-        keys.push(PromptKey::new('r', &format!("use {env} (delete local)")));
+        let (keep, take) = match deleted_on {
+            DeletedOn::Env => (format!("keep local (restore it on {env})"), format!("use {env} (delete local)")),
+            DeletedOn::Local => (format!("keep local (delete it on {env})"), format!("use {env} (restore local)")),
+        };
+        keys.push(PromptKey::new('k', &keep));
+        keys.push(PromptKey::new('r', &take));
         keys.push(PromptKey::new('s', "decide later"));
         keys.push(PromptKey::new('a', "abort the sync"));
         crate::cli::stdin_coord::announce(Prompt {
@@ -3179,6 +3238,32 @@ mod tests {
 
         let actual = redact_tempdir(&t.text(), dir.path());
         pin("remote_delete", &actual);
+    }
+
+    #[test]
+    fn local_delete_remote_edit_prompt_bytes_are_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("labels/audit-hold.json");
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        // The env's copy, restored for review before the prompt.
+        std::fs::write(&local, b"{\"name\":\"Audit hold EU\"}").unwrap();
+
+        let t = Transcript::new();
+        let _ = prompt_local_delete_remote_edit_with_color(
+            t.input("s\n"),
+            t.output(),
+            1,
+            1,
+            ObjectRef { kind: "labels", slug: "audit-hold" },
+            &local,
+            "dev",
+            ColorMode::Plain,
+            None,
+        )
+        .unwrap();
+
+        let actual = redact_tempdir(&t.text(), dir.path());
+        pin("local_delete_remote_edit", &actual);
     }
 
     // --- prompt pins --------------------------------------------------------
