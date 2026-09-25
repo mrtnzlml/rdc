@@ -921,6 +921,93 @@ async fn settle_pass(
     .await
 }
 
+/// `lockfile` plus an entry for every catalog object it does not track yet,
+/// under the slug the pull drivers will give it. Portabilizing the env's bytes
+/// against it turns a ref to an object created on the env since the last sync
+/// into its `rdc://` form, as the pull will write it, instead of a raw URL.
+///
+/// The slugs agree with the pull drivers because both seed their dedup set
+/// with [`crate::state::Lockfile::claimed_slugs`]. A queue's schema and inbox
+/// take the queue's slug, as everywhere else.
+pub(crate) fn project_catalog(
+    lockfile: &crate::state::Lockfile,
+    catalog: &crate::cli::pull::common::RemoteCatalog,
+) -> crate::state::Lockfile {
+    let mut lf = lockfile.clone();
+    let entry = |id| crate::state::ObjectEntry {
+        id,
+        modified_at: None,
+        modified_by: None,
+        content_hash: None,
+        secrets_hash: None,
+    };
+    let add = |lf: &mut crate::state::Lockfile, kind: &str, id: u64, name: &str| {
+        if lf.slug_for_id(kind, id).is_none() {
+            // Allocate a UNIQUE slug (against slugs already in this kind)
+            // so a same-name sibling never clobbers an existing entry.
+            // Plain `slugify` + `upsert` would overwrite the tracked
+            // object's id + base hash and collapse both objects onto one
+            // slug — dropping one and making the survivor false-classify
+            // as RemoteCreate every sync (perpetual non-idempotency).
+            let slug = crate::slug::slugify_unique(name, &lf.claimed_slugs(kind));
+            lf.upsert(kind, &slug, entry(id));
+        }
+    };
+    for x in &catalog.labels {
+        add(&mut lf, "labels", x.id, &x.name);
+    }
+    for x in &catalog.hooks {
+        add(&mut lf, "hooks", x.id, &x.name);
+    }
+    for x in &catalog.rules {
+        add(&mut lf, "rules", x.id, &x.name);
+    }
+    for x in &catalog.engines {
+        add(&mut lf, "engines", x.id, &x.name);
+    }
+    for x in &catalog.workspaces {
+        add(&mut lf, "workspaces", x.id, &x.name);
+    }
+    for q in &catalog.queues {
+        // Only seed queues rdc actually TRACKS — those that belong to a
+        // workspace. A workspace-less queue (orphan / `deletion_requested`,
+        // still returned by GET /queues) is excluded by the pull driver and
+        // the classify queue-loop alike, so it never enters the lockfile.
+        // Seeding it here would let `portabilize_proposed` rewrite a hook's
+        // (or another object's) raw URL ref to that queue into `rdc://`
+        // form during classify, while the pull-recorded base — computed
+        // against the real lockfile that never tracked the queue — left the
+        // ref a raw URL. The two hashes then diverge on EVERY sync, so the
+        // referencing object re-pulls forever (RemoteEdit). Mirroring the
+        // pull driver's `workspace.is_some()` gate keeps both paths leaving
+        // an unresolvable ref raw, so they hash identically.
+        if q.workspace.is_none() {
+            continue;
+        }
+        add(&mut lf, "queues", q.id, &q.name);
+        let Some(q_slug) = lf.slug_for_id("queues", q.id).map(str::to_string) else {
+            continue;
+        };
+        let nested = [
+            ("schemas", catalog.schemas_by_queue_id.get(&q.id).map(|s| s.id)),
+            ("inboxes", catalog.inboxes_by_queue_id.get(&q.id).map(|i| i.id)),
+        ];
+        for (kind, id) in nested {
+            if let Some(id) = id
+                && lf.slug_for_id(kind, id).is_none()
+                && !lf.claimed_slugs(kind).contains(&q_slug)
+            {
+                lf.upsert(kind, &q_slug, entry(id));
+            }
+        }
+    }
+    for x in &catalog.workflows {
+        add(&mut lf, "workflows", x.id, &x.name);
+    }
+    lf
+}
+
+
 /// Fold the three sources (remote catalog, push scan, lockfile) into the
 /// `(kind, slug) -> hash` maps the classifier consumes.
 ///
@@ -958,79 +1045,7 @@ pub fn from_catalog_scan_lockfile(
     // canonicalize differently and an unchanged object false-conflicts on the
     // post-rebuild sync. This is a NO-OP whenever the lockfile already tracks
     // the object (the normal path), so it can't affect a populated env.
-    let augmented = {
-        let mut lf = lockfile.clone();
-        let mut add = |kind: &str, id: u64, name: &str| {
-            if lf.slug_for_id(kind, id).is_none() {
-                // Allocate a UNIQUE slug (against slugs already in this kind)
-                // so a same-name sibling never clobbers an existing entry.
-                // Plain `slugify` + `upsert` would overwrite the tracked
-                // object's id + base hash and collapse both objects onto one
-                // slug — dropping one and making the survivor false-classify
-                // as RemoteCreate every sync (perpetual non-idempotency).
-                // Mirrors the per-kind `slugify_unique` the classify loops use.
-                let used: std::collections::HashSet<String> = lf
-                    .objects
-                    .get(kind)
-                    .map(|m| m.keys().cloned().collect())
-                    .unwrap_or_default();
-                let slug = crate::slug::slugify_unique(name, &used);
-                lf.upsert(
-                    kind,
-                    &slug,
-                    crate::state::ObjectEntry {
-                        id,
-                        modified_at: None,
-                        modified_by: None,
-                        content_hash: None,
-                        secrets_hash: None,
-                    },
-                );
-            }
-        };
-        for x in &catalog.labels {
-            add("labels", x.id, &x.name);
-        }
-        for x in &catalog.hooks {
-            add("hooks", x.id, &x.name);
-        }
-        for x in &catalog.rules {
-            add("rules", x.id, &x.name);
-        }
-        for x in &catalog.engines {
-            add("engines", x.id, &x.name);
-        }
-        for x in &catalog.workspaces {
-            add("workspaces", x.id, &x.name);
-        }
-        for x in &catalog.queues {
-            // Only seed queues rdc actually TRACKS — those that belong to a
-            // workspace. A workspace-less queue (orphan / `deletion_requested`,
-            // still returned by GET /queues) is excluded by the pull driver and
-            // the classify queue-loop alike, so it never enters the lockfile.
-            // Seeding it here would let `portabilize_proposed` rewrite a hook's
-            // (or another object's) raw URL ref to that queue into `rdc://`
-            // form during classify, while the pull-recorded base — computed
-            // against the real lockfile that never tracked the queue — left the
-            // ref a raw URL. The two hashes then diverge on EVERY sync, so the
-            // referencing object re-pulls forever (RemoteEdit). Mirroring the
-            // pull driver's `workspace.is_some()` gate keeps both paths leaving
-            // an unresolvable ref raw, so they hash identically.
-            if x.workspace.is_some() {
-                add("queues", x.id, &x.name);
-            }
-        }
-        for x in catalog.schemas_by_queue_id.values() {
-            add("schemas", x.id, &x.name);
-        }
-        for x in catalog.inboxes_by_queue_id.values() {
-            add("inboxes", x.id, &x.name);
-        }
-        for x in &catalog.workflows {
-            add("workflows", x.id, &x.name);
-        }
-        lf
-    };
+    let augmented = project_catalog(lockfile, catalog);
     let lockfile = &augmented;
 
     // --- labels --------------------------------------------------------
@@ -1039,7 +1054,7 @@ pub fn from_catalog_scan_lockfile(
     // This prevents phantom drift when fields like `modified_at` differ
     // between what the API returns and what the codec writes to disk.
     let labels_codec = crate::snapshot::codec::codec("labels").expect("labels codec must exist");
-    let mut used_label_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut used_label_slugs: std::collections::HashSet<String> = lockfile.claimed_slugs("labels");
     for l in &catalog.labels {
         let slug = match lockfile.slug_for_id("labels", l.id) {
             Some(existing) => existing.to_string(),
@@ -1091,7 +1106,7 @@ pub fn from_catalog_scan_lockfile(
     let saved_views_codec =
         crate::snapshot::codec::codec("saved_views").expect("saved_views codec must exist");
     let mut used_saved_view_slugs: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+        lockfile.claimed_slugs("saved_views");
     for v in &catalog.saved_views {
         let slug = match lockfile.slug_for_id("saved_views", v.id) {
             Some(existing) => existing.to_string(),
@@ -1182,7 +1197,7 @@ pub fn from_catalog_scan_lockfile(
     let workflows_codec =
         crate::snapshot::codec::codec("workflows").expect("workflows codec must exist");
     let mut used_workflow_slugs: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+        lockfile.claimed_slugs("workflows");
     let mut workflow_url_to_slug: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     for w in &catalog.workflows {
@@ -1287,7 +1302,7 @@ pub fn from_catalog_scan_lockfile(
     let workspaces_codec =
         crate::snapshot::codec::codec("workspaces").expect("workspaces codec must exist");
     let mut used_workspace_slugs: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+        lockfile.claimed_slugs("workspaces");
     let mut ws_url_to_slug: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     for w in &catalog.workspaces {
@@ -1341,7 +1356,7 @@ pub fn from_catalog_scan_lockfile(
     // on a fresh lockfile where `slug_for_url` would otherwise return
     // `None`.
     let engines_codec = crate::snapshot::codec::codec("engines").expect("engines codec must exist");
-    let mut used_engine_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut used_engine_slugs: std::collections::HashSet<String> = lockfile.claimed_slugs("engines");
     let mut engine_url_to_slug: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     for e in &catalog.engines {
@@ -1462,7 +1477,7 @@ pub fn from_catalog_scan_lockfile(
     // and `combined_hash` folds it in, matching the combined hash the pull
     // driver records.
     let hooks_codec = crate::snapshot::codec::codec("hooks").expect("hooks codec must exist");
-    let mut used_hook_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut used_hook_slugs: std::collections::HashSet<String> = lockfile.claimed_slugs("hooks");
     for h in &catalog.hooks {
         let slug = match lockfile.slug_for_id("hooks", h.id) {
             Some(existing) => existing.to_string(),
@@ -1526,7 +1541,7 @@ pub fn from_catalog_scan_lockfile(
     // code lives in `trigger_condition`. Route through the KindCodec for
     // hash parity with the pull baseline.
     let rules_codec = crate::snapshot::codec::codec("rules").expect("rules codec must exist");
-    let mut used_rule_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut used_rule_slugs: std::collections::HashSet<String> = lockfile.claimed_slugs("rules");
     for r in &catalog.rules {
         let slug = match lockfile.slug_for_id("rules", r.id) {
             Some(existing) => existing.to_string(),

@@ -32,7 +32,7 @@ pub async fn process(
     subset: &BTreeSet<(String, String)>,
     progress: &Arc<Log>,
 ) -> Result<(usize, usize)> {
-    let mut used: HashSet<String> = HashSet::new();
+    let mut used: HashSet<String> = ctx.lockfile.claimed_slugs(KIND);
     let mut conflicts = 0usize;
     let mut written = 0usize;
     for w in &workflows {

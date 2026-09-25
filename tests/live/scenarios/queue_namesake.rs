@@ -37,6 +37,10 @@ async fn live_queue_namesake() {
 /// skipped. Nothing referencing it could portabilize, and it took three syncs
 /// to settle: the second pulled the queue, the third fixed its own `url`
 /// (the deleted queue's emptied directory shadowed the new one).
+///
+/// A hook that points at the newcomer and conflicts locally is adopted from
+/// the env through the conflict resolver, which must write the newcomer's
+/// `rdc://` ref under the slug the pull records — not its URL.
 async fn queue_namesake(cfg: &LiveConfig) {
     let run_id = RunId::new();
     let client = LiveClient::connect(cfg).expect("connect");
@@ -91,8 +95,21 @@ async fn queue_namesake(cfg: &LiveConfig) {
         .patch_fields("hook", hook_id, serde_json::json!({ "queues": [main_url, new_url] }))
         .await
         .expect("point the hook at the namesake");
+    // Edit the hook's `queues` locally too — the same field, so no auto-merge
+    // — and the env's side is adopted through the conflict resolver. That
+    // writes the namesake's ref under the slug the projection predicts, which
+    // must be the slug the pull then records.
+    let hook_slug = load_lockfile(project.path(), "test")
+        .expect("lockfile")
+        .slug_for_id("hooks", hook_id)
+        .expect("seeded hook")
+        .to_string();
+    let hook_rel = format!("envs/test/hooks/{hook_slug}.json");
+    let mut local_hook = project.read_json(&hook_rel);
+    local_hook["queues"] = serde_json::json!([]);
+    project.write_json(&hook_rel, &local_hook);
 
-    let out = project.run_rdc(&["sync", "test", "--no-push"]);
+    let out = project.run_rdc(&["sync", "test", "--no-push", "--conflict", "use-remote"]);
     assert!(out.status.success(), "sync failed: {}", combined(&out));
 
     let lf = load_lockfile(project.path(), "test").expect("lockfile");
@@ -105,8 +122,7 @@ async fn queue_namesake(cfg: &LiveConfig) {
     let queue: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&queue_json).unwrap()).unwrap();
     assert_eq!(queue["url"], format!("rdc://queues/{slug}"), "{}", queue_json.display());
-    let hook_slug = lf.slug_for_id("hooks", hook_id).expect("seeded hook").to_string();
-    let hook = project.read_json(&format!("envs/test/hooks/{hook_slug}.json"));
+    let hook = project.read_json(&hook_rel);
     assert!(
         hook["queues"].as_array().unwrap().contains(&format!("rdc://queues/{slug}").into()),
         "the hook's ref to the namesake must be portable: {}",

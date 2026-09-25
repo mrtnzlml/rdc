@@ -140,7 +140,38 @@ pub(crate) fn build_bulk_prompt(
 /// `resolve_one_conflict`'s `sticky_now` seeding. `None` preserves the
 /// existing behavior (interactive prompt on a TTY, shadow-file skip
 /// otherwise).
+#[cfg(test)]
 pub(crate) async fn resolve_conflicts<R: BufRead>(
+    ctx: &mut PullCtx<'_>,
+    catalog: &RemoteCatalog,
+    classified: &[ClassifiedItem],
+    input: R,
+    interactive: bool,
+    conflict_strategy: Option<ConflictStrategy>,
+    progress: &Arc<Log>,
+    bulk_sticky: &mut Option<BulkChoice>,
+) -> Result<ConflictOutcome> {
+    let projection = crate::cli::sync::project_catalog(ctx.lockfile, catalog);
+    resolve_conflicts_projected(
+        ctx,
+        catalog,
+        classified,
+        input,
+        interactive,
+        conflict_strategy,
+        progress,
+        bulk_sticky,
+        &projection,
+    )
+    .await
+}
+
+/// `resolve_conflicts`, portabilizing the env's side against `projection`
+/// (see [`crate::cli::sync::project_catalog`]) so a ref to an object created
+/// on the env since the last sync reads as the `rdc://` ref the pull will
+/// write. A `--no-pull` run passes the plain lockfile: nothing is pulled, so
+/// such an object stays untracked and its ref must stay a URL.
+async fn resolve_conflicts_projected<R: BufRead>(
     ctx: &mut PullCtx<'_>,
     catalog: &RemoteCatalog,
     classified: &[ClassifiedItem],
@@ -149,6 +180,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
     conflict_strategy: Option<ConflictStrategy>,
     progress: &Arc<Log>,
     bulk_sticky: &mut Option<BulkChoice>,
+    projection: &crate::state::Lockfile,
 ) -> Result<ConflictOutcome> {
     let mut outcome = ConflictOutcome::default();
 
@@ -158,7 +190,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
     // the slug the classifier emitted.
     let mut label_by_slug: BTreeMap<String, &crate::model::Label> = BTreeMap::new();
     {
-        let mut used: HashSet<String> = HashSet::new();
+        let mut used: HashSet<String> = ctx.lockfile.claimed_slugs("labels");
         for l in &catalog.labels {
             let slug = match ctx.lockfile.slug_for_id("labels", l.id) {
                 Some(existing) => existing.to_string(),
@@ -173,7 +205,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
     // listing, slugged the same way `pull::saved_views::process` does.
     let mut saved_view_by_slug: BTreeMap<String, &crate::model::SavedView> = BTreeMap::new();
     {
-        let mut used: HashSet<String> = HashSet::new();
+        let mut used: HashSet<String> = ctx.lockfile.claimed_slugs("saved_views");
         for v in &catalog.saved_views {
             let slug = match ctx.lockfile.slug_for_id("saved_views", v.id) {
                 Some(existing) => existing.to_string(),
@@ -200,7 +232,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
     // its inbox even though the freshly-pulled catalog has them all.
     let mut ws_url_to_slug: BTreeMap<String, String> = BTreeMap::new();
     {
-        let mut used: HashSet<String> = HashSet::new();
+        let mut used: HashSet<String> = ctx.lockfile.claimed_slugs("workspaces");
         for w in &catalog.workspaces {
             let slug = match ctx.lockfile.slug_for_id("workspaces", w.id) {
                 Some(existing) => existing.to_string(),
@@ -213,7 +245,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
     }
     let mut engine_by_slug: BTreeMap<String, &crate::model::Engine> = BTreeMap::new();
     {
-        let mut used: HashSet<String> = HashSet::new();
+        let mut used: HashSet<String> = ctx.lockfile.claimed_slugs("engines");
         for e in &catalog.engines {
             let slug = match ctx.lockfile.slug_for_id("engines", e.id) {
                 Some(existing) => existing.to_string(),
@@ -255,7 +287,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
     }
     let mut hook_by_slug: BTreeMap<String, &crate::model::Hook> = BTreeMap::new();
     {
-        let mut used: HashSet<String> = HashSet::new();
+        let mut used: HashSet<String> = ctx.lockfile.claimed_slugs("hooks");
         for h in &catalog.hooks {
             let slug = match ctx.lockfile.slug_for_id("hooks", h.id) {
                 Some(existing) => existing.to_string(),
@@ -267,7 +299,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
     }
     let mut rule_by_slug: BTreeMap<String, &crate::model::Rule> = BTreeMap::new();
     {
-        let mut used: HashSet<String> = HashSet::new();
+        let mut used: HashSet<String> = ctx.lockfile.claimed_slugs("rules");
         for r in &catalog.rules {
             let slug = match ctx.lockfile.slug_for_id("rules", r.id) {
                 Some(existing) => existing.to_string(),
@@ -681,7 +713,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
         // portabilizes regardless, and is idempotent on already-portable bytes).
         let mut refs = refs;
         refs.remote_bytes =
-            crate::cli::pull::common::portabilize_proposed(&refs.remote_bytes, ctx.lockfile);
+            crate::cli::pull::common::portabilize_proposed(&refs.remote_bytes, projection);
 
         let content_remaining = total - idx;
         let bulk = build_bulk_prompt(&env, content_remaining, lerd_total, ldre_total);
@@ -2255,7 +2287,7 @@ fn remove_mdh_dataset(ctx: &mut PullCtx<'_>, slug: &str, indexes_path: &Path) {
 /// - `[a]` abort: propagate [`PullAborted`].
 ///
 /// `interactive == false` (CI / `--yes`) falls back to `[s]` for every
-/// orphan, mirroring [`resolve_remote_deletes`], so a non-tty run never
+/// orphan, mirroring `resolve_remote_deletes`, so a non-tty run never
 /// silently destroys local files. A lockfile entry whose on-disk
 /// `indexes.json` is already gone is a both-sides-agree deletion: the
 /// entry + base cache are dropped silently, no prompt.
@@ -2440,7 +2472,33 @@ async fn prune_mdh_orphans<R: BufRead>(
 /// Only the `labels` kind is wired today (Task 17 scope); other kinds
 /// are emitted as warnings and skipped. Subsequent tasks plumb in
 /// hashing for the remaining kinds.
+#[cfg(test)]
 pub(crate) async fn resolve_remote_deletes<R: BufRead>(
+    ctx: &mut PullCtx<'_>,
+    catalog: &RemoteCatalog,
+    classified: &[ClassifiedItem],
+    input: R,
+    interactive: bool,
+    progress: &Arc<Log>,
+    bulk_sticky: &mut Option<BulkChoice>,
+) -> Result<ConflictOutcome> {
+    let projection = crate::cli::sync::project_catalog(ctx.lockfile, catalog);
+    resolve_remote_deletes_projected(
+        ctx,
+        catalog,
+        classified,
+        input,
+        interactive,
+        progress,
+        bulk_sticky,
+        &projection,
+    )
+    .await
+}
+
+/// `resolve_remote_deletes`, restoring the env's side portabilized against
+/// `projection` — see [`resolve_conflicts_projected`].
+async fn resolve_remote_deletes_projected<R: BufRead>(
     ctx: &mut PullCtx<'_>,
     catalog: &RemoteCatalog,
     classified: &[ClassifiedItem],
@@ -2448,6 +2506,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
     interactive: bool,
     progress: &Arc<Log>,
     bulk_sticky: &mut Option<BulkChoice>,
+    projection: &crate::state::Lockfile,
 ) -> Result<ConflictOutcome> {
     let mut outcome = ConflictOutcome::default();
 
@@ -2476,7 +2535,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
     // drivers (and `resolve_conflicts`).
     let mut label_by_slug: BTreeMap<String, &crate::model::Label> = BTreeMap::new();
     {
-        let mut used: HashSet<String> = HashSet::new();
+        let mut used: HashSet<String> = ctx.lockfile.claimed_slugs("labels");
         for l in &catalog.labels {
             let slug = match ctx.lockfile.slug_for_id("labels", l.id) {
                 Some(existing) => existing.to_string(),
@@ -2488,7 +2547,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
     }
     let mut saved_view_by_slug: BTreeMap<String, &crate::model::SavedView> = BTreeMap::new();
     {
-        let mut used: HashSet<String> = HashSet::new();
+        let mut used: HashSet<String> = ctx.lockfile.claimed_slugs("saved_views");
         for v in &catalog.saved_views {
             let slug = match ctx.lockfile.slug_for_id("saved_views", v.id) {
                 Some(existing) => existing.to_string(),
@@ -2504,7 +2563,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
     // lockfile is empty (fresh checkout or partial-deploy resume).
     let mut ws_url_to_slug: BTreeMap<String, String> = BTreeMap::new();
     {
-        let mut used: HashSet<String> = HashSet::new();
+        let mut used: HashSet<String> = ctx.lockfile.claimed_slugs("workspaces");
         for w in &catalog.workspaces {
             let slug = match ctx.lockfile.slug_for_id("workspaces", w.id) {
                 Some(existing) => existing.to_string(),
@@ -2517,7 +2576,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
     }
     let mut engine_by_slug: BTreeMap<String, &crate::model::Engine> = BTreeMap::new();
     {
-        let mut used: HashSet<String> = HashSet::new();
+        let mut used: HashSet<String> = ctx.lockfile.claimed_slugs("engines");
         for e in &catalog.engines {
             let slug = match ctx.lockfile.slug_for_id("engines", e.id) {
                 Some(existing) => existing.to_string(),
@@ -2559,7 +2618,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
     }
     let mut hook_by_slug: BTreeMap<String, &crate::model::Hook> = BTreeMap::new();
     {
-        let mut used: HashSet<String> = HashSet::new();
+        let mut used: HashSet<String> = ctx.lockfile.claimed_slugs("hooks");
         for h in &catalog.hooks {
             let slug = match ctx.lockfile.slug_for_id("hooks", h.id) {
                 Some(existing) => existing.to_string(),
@@ -2571,7 +2630,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
     }
     let mut rule_by_slug: BTreeMap<String, &crate::model::Rule> = BTreeMap::new();
     {
-        let mut used: HashSet<String> = HashSet::new();
+        let mut used: HashSet<String> = ctx.lockfile.claimed_slugs("rules");
         for r in &catalog.rules {
             let slug = match ctx.lockfile.slug_for_id("rules", r.id) {
                 Some(existing) => existing.to_string(),
@@ -3058,7 +3117,12 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                         None
                     }
                 };
-                let Some(refs) = refs_opt else { continue };
+                let Some(mut refs) = refs_opt else { continue };
+                // The env's body is serialized from the live API; write it
+                // back in the snapshot's `rdc://` form, like every pull.
+                refs.restore_bytes = refs
+                    .restore_bytes
+                    .map(|b| crate::cli::pull::common::portabilize_proposed(&b, projection));
                 let local_path = refs.local_path.clone();
 
                 // For LocalDeleteRemoteEdit the local file is tombstoned
@@ -3522,7 +3586,12 @@ pub async fn run(
     // "apply to all" choice in the content phase carries into the delete
     // phase. (Delete phase is wired in the next task.)
     let mut bulk_sticky: Option<BulkChoice> = None;
-    let conflict_outcome = resolve_conflicts(
+    let projection = if no_pull {
+        ctx.lockfile.clone()
+    } else {
+        crate::cli::sync::project_catalog(ctx.lockfile, catalog)
+    };
+    let conflict_outcome = resolve_conflicts_projected(
         ctx,
         catalog,
         classified,
@@ -3531,6 +3600,7 @@ pub async fn run(
         conflict_strategy,
         progress,
         &mut bulk_sticky,
+        &projection,
     )
     .await?;
 
@@ -3538,7 +3608,7 @@ pub async fn run(
     // stdin source as Phase A; `BothDiverged` items have already been
     // resolved above so the dispatcher only sees the destructive-direction
     // classes here.
-    let remote_delete_outcome = resolve_remote_deletes(
+    let remote_delete_outcome = resolve_remote_deletes_projected(
         ctx,
         catalog,
         classified,
@@ -3546,6 +3616,7 @@ pub async fn run(
         interactive,
         progress,
         &mut bulk_sticky,
+        &projection,
     )
     .await?;
 
@@ -6582,13 +6653,17 @@ mod tests {
 
         assert!(outcome.promoted_to_push.is_empty());
 
-        // The dispatcher restored the local file from env-side bytes so
-        // the user can review it on the next sync run.
+        // The dispatcher restored the local file from env-side bytes, in
+        // the snapshot's `rdc://` form, so the user can review it on the
+        // next sync run.
         assert!(
             local_path.exists(),
             "local file must be restored from env-side bytes for review"
         );
-        assert_eq!(std::fs::read(&local_path).unwrap(), remote_bytes);
+        assert_eq!(
+            std::fs::read(&local_path).unwrap(),
+            crate::cli::pull::common::portabilize_proposed(&remote_bytes, &lockfile)
+        );
 
         // Marker written too.
         let marker = deleted_marker_path(&paths, &local_path);
@@ -7246,6 +7321,99 @@ mod tests {
         assert!(
             !after.contains("queues/100") && !after.contains("x.invalid"),
             "keep-remote must NOT write raw API URLs; got:\n{after}"
+        );
+    }
+
+    /// The same, for a ref to a queue created on the env since the last sync:
+    /// the lockfile does not track it yet, but the catalog lists it, so the
+    /// env's side must show — and `[r]` write — the `rdc://` ref the pull
+    /// will give it, never its URL.
+    #[tokio::test]
+    async fn resolve_conflicts_shows_a_new_env_queue_as_a_portable_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_env(tmp.path(), "test");
+        std::fs::create_dir_all(paths.hooks_dir()).unwrap();
+        let local_path = paths.hooks_dir().join("wh.json");
+        std::fs::write(
+            &local_path,
+            b"{\n  \"id\": 42,\n  \"url\": \"rdc://hooks/wh\",\n  \"name\": \"Webhook (local)\",\n  \"type\": \"webhook\",\n  \"queues\": [],\n  \"events\": [],\n  \"config\": {}\n}\n",
+        )
+        .unwrap();
+        let remote_hook: crate::model::Hook = serde_json::from_value(serde_json::json!({
+            "id": 42,
+            "url": "https://x.invalid/api/v1/hooks/42",
+            "name": "Webhook (remote)",
+            "type": "webhook",
+            "queues": ["https://x.invalid/api/v1/queues/101"],
+            "events": [],
+            "config": {}
+        }))
+        .unwrap();
+        let fresh: crate::model::Queue = serde_json::from_value(serde_json::json!({
+            "id": 101,
+            "url": "https://x.invalid/api/v1/queues/101",
+            "name": "Fresh",
+            "workspace": "https://x.invalid/api/v1/workspaces/7",
+        }))
+        .unwrap();
+
+        let mut lockfile = Lockfile {
+            api_base: "https://x.invalid/api/v1".to_string(),
+            ..Lockfile::default()
+        };
+        lockfile.upsert(
+            "hooks",
+            "wh",
+            ObjectEntry {
+                id: 42,
+                modified_at: None,
+                modified_by: None,
+                content_hash: Some("base".to_string()),
+                secrets_hash: None,
+            },
+        );
+        let mut catalog = catalog_with_hooks(vec![remote_hook]);
+        catalog.queues.push(fresh);
+        let classified = vec![ClassifiedItem {
+            kind: "hooks".to_string(),
+            slug: "wh".to_string(),
+            class: SyncClass::BothDiverged,
+            local_hash: Some("L".to_string()),
+            remote_hash: Some("R".to_string()),
+            base_hash: Some("B".to_string()),
+        }];
+        let client =
+            RossumClient::new("https://unused.invalid/api/v1".to_string(), "TEST".to_string())
+                .unwrap();
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
+        {
+            let mut ctx = PullCtx {
+                paths: &paths,
+                client: &client,
+                lockfile: &mut lockfile,
+                queue_locations: BTreeMap::new(),
+                interactive: true,
+            };
+            resolve_conflicts(
+                &mut ctx,
+                &catalog,
+                &classified,
+                Cursor::new(b"r\n"),
+                true,
+                None,
+                &progress,
+                &mut None,
+            )
+            .await
+            .expect("resolver should succeed on [r]");
+        }
+
+        let after = String::from_utf8(std::fs::read(&local_path).unwrap()).unwrap();
+        assert!(after.contains("rdc://queues/fresh"), "got:\n{after}");
+        assert!(!after.contains("x.invalid"), "got:\n{after}");
+        assert!(
+            lockfile.slug_for_id("queues", 101).is_none(),
+            "the projection must not leak into the real lockfile"
         );
     }
 
@@ -8227,10 +8395,9 @@ mod tests {
         );
 
         // The lockfile hash must be combined_hash(canonical json, framed sidecars)
-        // so the next sync sees Clean.
-        let expected_hash = codec
-            .base_hash(&schema_value, &Lockfile::default())
-            .unwrap();
+        // so the next sync sees Clean. The restore is written in `rdc://`
+        // form, so hash the env's body portabilized the same way.
+        let expected_hash = codec.base_hash(&schema_value, &lockfile).unwrap();
         let recorded = lockfile
             .objects
             .get("schemas")
