@@ -3566,7 +3566,9 @@ pub async fn run(
                 outcome.conflicts += 1;
             }
             SyncClass::RemoteDelete => {
-                outcome.remote_deletes_resolved += 1;
+                if !no_pull {
+                    outcome.remote_deletes_resolved += 1;
+                }
             }
             SyncClass::Clean | SyncClass::BothDeleted => {}
         }
@@ -3608,10 +3610,25 @@ pub async fn run(
     // stdin source as Phase A; `BothDiverged` items have already been
     // resolved above so the dispatcher only sees the destructive-direction
     // classes here.
+    //
+    // A clean `RemoteDelete` is a pull: mirroring it removes the local file.
+    // `--no-pull` leaves it, and its lockfile entry, for the next sync that
+    // pulls.
+    let remote_delete_items: Vec<ClassifiedItem>;
+    let remote_delete_input: &[ClassifiedItem] = if no_pull {
+        remote_delete_items = classified
+            .iter()
+            .filter(|it| it.class != SyncClass::RemoteDelete)
+            .cloned()
+            .collect();
+        &remote_delete_items
+    } else {
+        classified
+    };
     let remote_delete_outcome = resolve_remote_deletes_projected(
         ctx,
         catalog,
-        classified,
+        remote_delete_input,
         CoordinatorStdin::new(),
         interactive,
         progress,
