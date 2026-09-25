@@ -787,6 +787,9 @@ async fn sync_no_push_skips_local_edit() {
     let edited_color = "#ff00ff";
     let mut v: serde_json::Value = serde_json::from_str(&raw).unwrap();
     v["color"] = serde_json::Value::String(edited_color.to_string());
+    // An unsorted URL array: the post-pull portabilize pass sorts these, and
+    // it must not rewrite (or re-hash) an edit that was not pushed.
+    v["extra_refs"] = serde_json::json!(["https://x/api/v1/queues/2", "https://x/api/v1/queues/1"]);
     let edited_body = format!("{}\n", serde_json::to_string_pretty(&v).unwrap());
     std::fs::write(&label_path, &edited_body).unwrap();
 

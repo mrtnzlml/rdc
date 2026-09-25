@@ -4548,10 +4548,28 @@ pub async fn run(
             })
             .map(|it| (it.kind.clone(), it.slug.clone()))
             .collect();
+        // A local edit that did not reach the env (`--no-push`, or a push that
+        // skipped it) still has its old base. Re-hashing its file would record
+        // the edit as synced, so it would never push.
+        let unpushed: std::collections::BTreeSet<(String, String)> = all_classified
+            .iter()
+            .filter(|it| {
+                it.class == SyncClass::LocalEdit
+                    && ctx
+                        .lockfile
+                        .objects
+                        .get(&it.kind)
+                        .and_then(|m| m.get(&it.slug))
+                        .and_then(|e| e.content_hash.as_ref())
+                        == it.base_hash.as_ref()
+            })
+            .map(|it| (it.kind.clone(), it.slug.clone()))
+            .collect();
         crate::cli::pull::portabilize::portabilize_refs(
             ctx.paths,
             ctx.lockfile,
             &active_conflicts,
+            &unpushed,
         )
         .context("portabilizing snapshot references")?;
     }

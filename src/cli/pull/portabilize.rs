@@ -28,10 +28,14 @@ use crate::state::Lockfile;
 /// shadow (the conflict was resolved, or the object now syncs cleanly, but the
 /// shadow from an earlier non-TTY `[s]kip` was never swept) — that shadow is
 /// pruned here so the object portabilizes and stops re-syncing forever.
+///
+/// `unpushed` objects are skipped outright: their file carries a local edit
+/// the env has not seen, and re-hashing it would record that edit as synced.
 pub fn portabilize_refs(
     paths: &Paths,
     lockfile: &mut Lockfile,
     active_conflicts: &std::collections::BTreeSet<(String, String)>,
+    unpushed: &std::collections::BTreeSet<(String, String)>,
 ) -> Result<()> {
     // Snapshot the (kind, slug) list to avoid borrow conflicts while we
     // mutate the lockfile entries below.
@@ -42,6 +46,9 @@ pub fn portabilize_refs(
         .collect();
 
     for (kind, slug) in entries {
+        if unpushed.contains(&(kind.clone(), slug.clone())) {
+            continue;
+        }
         // Locate the on-disk JSON path.
         let path = match locate_json_path(paths, &kind, &slug) {
             Some(p) => p,
@@ -319,7 +326,7 @@ mod tests {
         assert!(shadow.exists());
 
         // Empty active-conflict set → the shadow is stale.
-        portabilize_refs(&paths, &mut lockfile, &std::collections::BTreeSet::new())
+        portabilize_refs(&paths, &mut lockfile, &Default::default(), &Default::default())
             .expect("portabilize_refs must succeed");
 
         // The stale shadow is gone, and the label portabilized despite it.
@@ -360,7 +367,7 @@ mod tests {
         // The label IS actively conflicted this run → protect it.
         let mut active = std::collections::BTreeSet::new();
         active.insert(("labels".to_string(), LABEL_SLUG.to_string()));
-        portabilize_refs(&paths, &mut lockfile, &active).expect("portabilize_refs must succeed");
+        portabilize_refs(&paths, &mut lockfile, &active, &Default::default()).expect("portabilize_refs must succeed");
 
         // Shadow preserved, local file untouched (still raw URL) for resolution.
         assert!(shadow.exists(), "active-conflict shadow must be preserved");
@@ -419,7 +426,7 @@ mod tests {
             .content_hash = Some(pre_hash.clone());
 
         // Run the portabilize pass.
-        portabilize_refs(&paths, &mut lockfile, &std::collections::BTreeSet::new())
+        portabilize_refs(&paths, &mut lockfile, &Default::default(), &Default::default())
             .expect("portabilize_refs must succeed");
 
         // (a) The label file now contains `rdc://workspaces/<slug>` and
@@ -510,7 +517,7 @@ mod tests {
             .unwrap()
             .content_hash = Some(stable_hash.clone());
 
-        portabilize_refs(&paths, &mut lockfile, &std::collections::BTreeSet::new())
+        portabilize_refs(&paths, &mut lockfile, &Default::default(), &Default::default())
             .expect("portabilize_refs must succeed");
 
         // The lockfile hash must be unchanged (skip-if-unchanged).
@@ -570,7 +577,7 @@ mod tests {
             .unwrap()
             .content_hash = Some(pre.clone());
 
-        portabilize_refs(&paths, &mut lockfile, &std::collections::BTreeSet::new())
+        portabilize_refs(&paths, &mut lockfile, &Default::default(), &Default::default())
             .expect("portabilize_refs must succeed");
 
         let after_bytes = fs::read(&path).unwrap();
@@ -628,7 +635,7 @@ mod tests {
             .unwrap()
             .content_hash = Some(pre.clone());
 
-        portabilize_refs(&paths, &mut lockfile, &std::collections::BTreeSet::new())
+        portabilize_refs(&paths, &mut lockfile, &Default::default(), &Default::default())
             .expect("portabilize_refs must succeed");
 
         // The on-disk BYTES must change: the file is rewritten with run_after
@@ -704,7 +711,7 @@ mod tests {
             .unwrap()
             .content_hash = Some(pre.clone());
 
-        portabilize_refs(&paths, &mut lockfile, &std::collections::BTreeSet::new())
+        portabilize_refs(&paths, &mut lockfile, &Default::default(), &Default::default())
             .expect("portabilize_refs must succeed");
 
         let after_bytes = fs::read(&path).unwrap();
@@ -726,7 +733,7 @@ mod tests {
         seed_entry(&mut lockfile, "labels", "ghost-label", 777);
 
         // Must not panic or error.
-        portabilize_refs(&paths, &mut lockfile, &std::collections::BTreeSet::new())
+        portabilize_refs(&paths, &mut lockfile, &Default::default(), &Default::default())
             .expect("portabilize_refs must succeed even with missing files");
     }
 }
