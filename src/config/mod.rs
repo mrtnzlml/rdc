@@ -15,6 +15,16 @@ pub struct EnvConfig {
     pub org_id: u64,
 }
 
+/// An env name may only contain ASCII letters, digits, `-` and `_`. The name
+/// is interpolated into file paths (`envs/<env>/`, `secrets/<env>.*`), so
+/// checking it is what keeps `..` or a path separator out of them.
+pub fn valid_env_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// The error for a name that fails [`valid_env_name`].
+pub const INVALID_ENV_NAME_MSG: &str = "Environment name may only contain letters, digits, - and _.";
+
 impl EnvConfig {
     /// Derive the Data Storage (MDH) service base URL from `api_base`.
     ///

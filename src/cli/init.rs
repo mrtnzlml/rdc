@@ -440,10 +440,7 @@ fn prompt_env_name(taken: &[String]) -> std::result::Result<String, PromptOutcom
             if trimmed.is_empty() {
                 return Ok(Validation::Invalid("env name cannot be empty".into()));
             }
-            if !trimmed
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-            {
+            if !crate::config::valid_env_name(trimmed) {
                 return Ok(Validation::Invalid(
                     "only letters, digits, '-', and '_' are allowed".into(),
                 ));
