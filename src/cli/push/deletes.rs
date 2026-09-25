@@ -226,6 +226,9 @@ pub async fn run_deletes(
         for (slug, id) in entries {
             match delete_one(client, kind, &slug, id, lockfile, interactive, progress).await {
                 Ok(outcome) => apply_outcome(&mut counts, kind, outcome),
+                // `[a]` at the drift prompt ends the sync, like every other
+                // prompt's abort; it is not a refused DELETE.
+                Err(e) if e.is::<crate::cli::resolve::PullAborted>() => return Err(e),
                 // Skip-and-continue: the remote refused this DELETE. Keep
                 // going so siblings + parents still get deleted; whether it
                 // is a failure is decided below, once the queues are done.
@@ -456,7 +459,7 @@ async fn delete_one(
                 return Ok(DeleteOutcome::Skipped);
             }
             DeleteDriftChoice::Abort => {
-                bail!("push aborted at delete drift resolver");
+                return Err(anyhow::Error::new(crate::cli::resolve::PullAborted));
             }
         }
     }
