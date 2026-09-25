@@ -9,17 +9,18 @@
 //!   without recursing further.
 //! * **Objects.** Recurse per key, using the union of base / local /
 //!   remote keys. A missing key on a side is treated as `Value::Null`
-//!   so add-vs-edit and delete-vs-edit are observed correctly. If a
-//!   key auto-resolves to `Value::Null` AND was absent on all
-//!   resolved sides, it is dropped from the output (so a deletion
-//!   doesn't leak back as an explicit null).
+//!   so add-vs-edit and delete-vs-edit are observed correctly. A key
+//!   that resolves to `Value::Null` is dropped when its presence,
+//!   merged the same way, says it was deleted (so a deletion doesn't
+//!   leak back as an explicit null).
 //! * **Arrays of `id`-keyed objects.** When every element of every
 //!   side is an object with an `id` field (string or number), the
 //!   array is merged as a *map keyed by id*: element identity follows
-//!   the id, element body is merge3'd recursively. The output order
-//!   is base order first (preserving the user's existing layout),
-//!   then any added ids in (local-first, remote-second) discovery
-//!   order. This is the schema.content / schema.children case.
+//!   the id, element body is merge3'd recursively. If only one side
+//!   changed the id sequence, its order wins. If both did, the output
+//!   is base order, then local additions, then remote additions (each
+//!   sorted by id); a side that reordered base ids is a conflict. This
+//!   is the schema.content / schema.children case.
 //! * **Arrays of strings.** Treated as sets. The result is
 //!   `(base ∪ local-adds ∪ remote-adds) \ (local-removes ∪
 //!   remote-removes)`, ordered alphabetically for determinism. This
@@ -29,11 +30,6 @@
 //!   element kinds, objects without `id`), returns
 //!   `MergeOutcome::Conflict` with a dotted path of where the
 //!   disagreement lives.
-//!
-//! The merge is **hash-invariant safe**: the canonical form used by
-//! `content_hash` (alphabetical key sort + noise strip) produces the
-//! same hash whether the merge keeps base ordering or any other
-//! ordering, so a re-pull after auto-merge won't appear as drift.
 
 use super::MergeOutcome;
 use serde_json::{Map, Value};
@@ -149,13 +145,12 @@ fn merge_objects(
             conflicts,
         );
 
-        // If the merge resolved to Null AND the key was absent from
-        // BOTH local and remote, treat as "deleted on both sides" —
-        // drop the key. Otherwise keep it (an explicit null is a
-        // legitimate value).
-        let key_absent_local = !local.contains_key(&k);
-        let key_absent_remote = !remote.contains_key(&k);
-        if merged.is_null() && key_absent_local && key_absent_remote {
+        // A missing key merges as `Null`, so merge its PRESENCE the same
+        // way: a key one side deleted and the other left alone is gone,
+        // while an explicit `null` a side set is a legitimate value.
+        let (in_b, in_l, in_r) = (base.contains_key(&k), local.contains_key(&k), remote.contains_key(&k));
+        let present = if in_l == in_b { in_r } else { in_l };
+        if merged.is_null() && !present {
             continue;
         }
         out.insert(k, merged);
@@ -185,7 +180,7 @@ fn merge_arrays(
     ) {
         return merge_id_keyed_arrays(
             path,
-            base,
+            [base, local, remote],
             &b_map,
             &l_map,
             &r_map,
@@ -269,7 +264,7 @@ fn merge_string_arrays(
 
 fn merge_id_keyed_arrays(
     path: &str,
-    base_order: &[Value],
+    [base_arr, local_arr, remote_arr]: [&[Value]; 3],
     base: &std::collections::BTreeMap<String, Value>,
     local: &std::collections::BTreeMap<String, Value>,
     remote: &std::collections::BTreeMap<String, Value>,
@@ -278,69 +273,68 @@ fn merge_id_keyed_arrays(
     conflicts: &mut Vec<String>,
 ) -> Value {
     use std::collections::BTreeSet;
-    // Union of all ids, but emit in: base order first, then local-only
-    // (sorted), then remote-only (sorted). Preserves user's existing
-    // schema layout while giving deterministic placement for additions.
-    let mut out = Vec::new();
-    let mut emitted: BTreeSet<String> = BTreeSet::new();
-
-    let id_of = |v: &Value| -> Option<String> {
-        v.as_object()
-            .and_then(|o| o.get("id"))
-            .and_then(|i| match i {
+    let ids = |arr: &[Value]| -> Vec<String> {
+        arr.iter()
+            .filter_map(|v| match v.get("id")? {
                 Value::String(s) => Some(s.clone()),
                 Value::Number(n) => Some(n.to_string()),
                 _ => None,
             })
+            .collect()
+    };
+    let (b_ids, l_ids, r_ids) = (ids(base_arr), ids(local_arr), ids(remote_arr));
+
+    // Element order is positional (a schema's field order is its layout). When
+    // only one side changed the id sequence, that side's order wins, additions
+    // included. When both did, keep base order and append additions — but a
+    // side that REORDERED base ids cannot be reconciled with the other's edits.
+    let order: Vec<String> = if l_ids == b_ids {
+        r_ids
+    } else if r_ids == b_ids {
+        l_ids
+    } else {
+        if reorders(&b_ids, &l_ids) || reorders(&b_ids, &r_ids) {
+            conflicts.push(if path.is_empty() { "<root>".to_string() } else { path.to_string() });
+        }
+        let mut order = b_ids;
+        let mut added_l: Vec<String> = l_ids.into_iter().filter(|k| !base.contains_key(k)).collect();
+        let mut added_r: Vec<String> = r_ids
+            .into_iter()
+            .filter(|k| !base.contains_key(k) && !local.contains_key(k))
+            .collect();
+        added_l.sort();
+        added_r.sort();
+        order.extend(added_l);
+        order.extend(added_r);
+        order
     };
 
-    // Pass 1: base order.
-    for b_el in base_order {
-        let Some(id) = id_of(b_el) else { continue };
+    // Every id is merged, including ones the chosen order lacks: a base id
+    // removed on one side may still be a delete-vs-edit conflict.
+    let mut out = Vec::new();
+    let mut emitted: BTreeSet<String> = BTreeSet::new();
+    let rest: Vec<String> = base.keys().chain(local.keys()).chain(remote.keys()).cloned().collect();
+    for id in order.into_iter().chain(rest) {
         if !emitted.insert(id.clone()) {
             continue;
         }
-        let merged = merge_single_id(
+        if let Some(m) = merge_single_id(
             path, &id, base, local, remote, local_paths, remote_paths, conflicts,
-        );
-        if let Some(m) = merged {
+        ) {
             out.push(m);
         }
     }
-    // Pass 2: local-only.
-    let mut local_only: Vec<String> = local
-        .keys()
-        .filter(|k| !base.contains_key(k.as_str()))
-        .cloned()
-        .collect();
-    local_only.sort();
-    for id in local_only {
-        if !emitted.insert(id.clone()) { continue; }
-        let merged = merge_single_id(
-            path, &id, base, local, remote, local_paths, remote_paths, conflicts,
-        );
-        if let Some(m) = merged {
-            out.push(m);
-        }
-    }
-    // Pass 3: remote-only.
-    let mut remote_only: Vec<String> = remote
-        .keys()
-        .filter(|k| !base.contains_key(k.as_str()) && !local.contains_key(k.as_str()))
-        .cloned()
-        .collect();
-    remote_only.sort();
-    for id in remote_only {
-        if !emitted.insert(id.clone()) { continue; }
-        let merged = merge_single_id(
-            path, &id, base, local, remote, local_paths, remote_paths, conflicts,
-        );
-        if let Some(m) = merged {
-            out.push(m);
-        }
-    }
-
     Value::Array(out)
+}
+
+/// Whether `side` puts the ids it shares with `base` in a different relative
+/// order than `base` does.
+fn reorders(base: &[String], side: &[String]) -> bool {
+    use std::collections::BTreeSet;
+    let shared: BTreeSet<&String> = base.iter().filter(|k| side.contains(k)).collect();
+    let b: Vec<&String> = base.iter().filter(|k| shared.contains(k)).collect();
+    let s: Vec<&String> = side.iter().filter(|k| shared.contains(k)).collect();
+    b != s
 }
 
 fn merge_single_id(
@@ -532,6 +526,52 @@ mod tests {
         let remote = json!({"a": 1, "x": "edited"}); // edited x
         let out = merge3_json(&base, &local, &remote);
         assert_eq!(conflict_paths(out), vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn key_deleted_on_one_side_does_not_come_back_as_null() {
+        let base = json!({"x": 1, "y": 1});
+        let local = json!({"y": 1});
+        let remote = json!({"x": 1, "y": 2});
+        assert_eq!(merged_value(merge3_json(&base, &local, &remote)), json!({"y": 2}));
+    }
+
+    #[test]
+    fn explicit_null_added_on_one_side_is_kept() {
+        let base = json!({"y": 1});
+        let local = json!({"x": null, "y": 1});
+        let remote = json!({"y": 2});
+        assert_eq!(merged_value(merge3_json(&base, &local, &remote)), json!({"x": null, "y": 2}));
+    }
+
+    #[test]
+    fn id_keyed_array_keeps_a_local_reorder_while_remote_edits() {
+        let base = json!([{"id": "a", "v": 1}, {"id": "b", "v": 1}]);
+        let local = json!([{"id": "b", "v": 1}, {"id": "a", "v": 1}]);
+        let remote = json!([{"id": "a", "v": 2}, {"id": "b", "v": 1}]);
+        assert_eq!(
+            merged_value(merge3_json(&base, &local, &remote)),
+            json!([{"id": "b", "v": 1}, {"id": "a", "v": 2}]),
+        );
+    }
+
+    #[test]
+    fn id_keyed_array_keeps_a_local_insertion_in_place() {
+        let base = json!([{"id": "a", "v": 1}, {"id": "c", "v": 1}]);
+        let local = json!([{"id": "a", "v": 1}, {"id": "b", "v": 1}, {"id": "c", "v": 1}]);
+        let remote = json!([{"id": "a", "v": 2}, {"id": "c", "v": 1}]);
+        assert_eq!(
+            merged_value(merge3_json(&base, &local, &remote)),
+            json!([{"id": "a", "v": 2}, {"id": "b", "v": 1}, {"id": "c", "v": 1}]),
+        );
+    }
+
+    #[test]
+    fn id_keyed_array_reorder_against_an_addition_is_conflict() {
+        let base = json!([{"id": "a"}, {"id": "b"}]);
+        let local = json!([{"id": "b"}, {"id": "a"}]);
+        let remote = json!([{"id": "a"}, {"id": "b"}, {"id": "c"}]);
+        assert!(!conflict_paths(merge3_json(&base, &local, &remote)).is_empty());
     }
 
     #[test]
