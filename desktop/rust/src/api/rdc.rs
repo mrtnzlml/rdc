@@ -355,6 +355,7 @@ pub fn remove_env(folder: String, env: String) -> Result<Option<ProjectSummary>>
     let paths = rdc::paths::Paths::for_env(&folder, &env);
     let _ = std::fs::remove_dir_all(paths.env_root());
     let _ = std::fs::remove_file(paths.secrets_file());
+    let _ = std::fs::remove_file(rdc::secrets::hook_secrets_path(&folder, &env));
     let _ = std::fs::remove_file(paths.lockfile());
     let _ = std::fs::remove_file(paths.env_lock());
     let _ = std::fs::remove_dir_all(paths.base_cache_root());
@@ -1043,8 +1044,11 @@ mod tests {
         let conflicts_dir = folder.join(".rdc/conflicts/prod");
         std::fs::create_dir_all(&conflicts_dir).unwrap();
         std::fs::write(conflicts_dir.join("stray.json"), "{}").unwrap();
+        let hook_secrets = rdc::secrets::hook_secrets_path(&folder, "prod");
+        std::fs::write(&hook_secrets, "{}").unwrap();
 
         let p = remove_env(folder.display().to_string(), "prod".into()).unwrap().unwrap();
+        assert!(!hook_secrets.exists(), "hook secrets should be removed");
         assert_eq!(p.envs.iter().map(|e| e.name.clone()).collect::<Vec<_>>(), vec!["main"]);
         assert!(!folder.join("secrets/prod.secrets.json").exists());
         assert!(!paths.env_root().exists(), "envs/prod should be removed");
