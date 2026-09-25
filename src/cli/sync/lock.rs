@@ -28,18 +28,7 @@ impl EnvLock {
     /// 200 ms while blocked. Creates the lock file (and the parent
     /// directory) if needed.
     pub fn acquire(lock_path: &Path, timeout: Duration) -> Result<Self> {
-        if let Some(parent) = lock_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating lock parent dir {}", parent.display()))?;
-        }
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(lock_path)
-            .with_context(|| format!("opening lock file {}", lock_path.display()))?;
-
+        let file = open_lock_file(lock_path)?;
         let deadline = std::time::Instant::now() + timeout;
         loop {
             match <File as FileExt>::try_lock(&file) {
@@ -75,6 +64,34 @@ impl EnvLock {
             }
         }
     }
+
+    /// Take the lock only if it is free right now. `Ok(None)` means another
+    /// process holds it; the caller words the refusal for its own context.
+    pub fn try_acquire(lock_path: &Path) -> Result<Option<Self>> {
+        let file = open_lock_file(lock_path)?;
+        match <File as FileExt>::try_lock(&file) {
+            Ok(()) => Ok(Some(EnvLock { file })),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(e)) => {
+                Err(e).with_context(|| format!("acquiring exclusive lock on {}", lock_path.display()))
+            }
+        }
+    }
+}
+
+/// Open the lock file, creating it and its parent directory if needed.
+fn open_lock_file(lock_path: &Path) -> Result<File> {
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating lock parent dir {}", parent.display()))?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)
+        .with_context(|| format!("opening lock file {}", lock_path.display()))
 }
 
 impl Drop for EnvLock {

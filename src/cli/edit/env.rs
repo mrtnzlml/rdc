@@ -13,12 +13,11 @@ use crate::cli::edit::ci::{self, CiChange};
 use crate::cli::sync::lock::EnvLock;
 use crate::config::{valid_env_name, ProjectConfig, INVALID_ENV_NAME_MSG};
 use crate::mapping::GenericMapping;
-use crate::paths::Paths;
+use crate::paths::{is_shadow_artifact, Paths};
 use crate::secrets::{env_var_for, hook_secrets_path};
 use crate::snapshot::writer::write_atomic;
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 /// What a rename did, or would do under `--dry-run`.
 #[derive(Debug, Default)]
@@ -71,8 +70,9 @@ pub fn rename_env(root: &Path, old: &str, new: &str, dry_run: bool) -> Result<Re
         .find(|e| env_var_for(e, "TOKEN") == var)
     {
         bail!(
-            "\"{new}\" would share the credential variable {var} with env \"{clash}\" (rdc maps \
-             every character except letters and digits to '_'). Pick a distinct name."
+            "\"{new}\" would share the credential variable {var} with env \"{clash}\" (rdc \
+             upper-cases the name and maps every character except letters and digits to '_'). \
+             Pick a distinct name."
         );
     }
     let pairs = move_pairs(root, &cfg, old, new);
@@ -84,20 +84,89 @@ pub fn rename_env(root: &Path, old: &str, new: &str, dry_run: bool) -> Result<Re
             );
         }
     }
-    let moves: Vec<(PathBuf, PathBuf)> =
+    let mut moves: Vec<(PathBuf, PathBuf)> =
         pairs.into_iter().filter(|(from, _)| from.symlink_metadata().is_ok()).collect();
+    // These run after `envs/<old>/` itself has moved, which is the first move.
+    moves.extend(shadow_moves(root, old, new)?);
 
     let lock_path = Paths::for_env(root, old).env_lock();
     let lock_existed = lock_path.exists();
-    let lock = if dry_run { None } else { Some(EnvLock::acquire(&lock_path, Duration::ZERO)?) };
-    let result = plan_and_apply(root, &cfg, old, new, dry_run, &moves);
-    drop(lock);
+    // Taking the lock creates `.rdc/state/` (and `.rdc/`) in a project that
+    // never synced; neither should outlive the run.
+    let rdc_dir = root.join(".rdc");
+    let created_dirs: Vec<PathBuf> =
+        [rdc_dir.join("state"), rdc_dir].into_iter().filter(|d| !d.exists()).collect();
+    let result = if dry_run {
+        plan_and_apply(root, &cfg, old, new, dry_run, &moves)
+    } else {
+        match EnvLock::try_acquire(&lock_path)? {
+            None => Err(anyhow!(
+                "A sync is running on \"{old}\": another rdc process holds its lock. Let it \
+                 finish, or stop it, then retry the rename."
+            )),
+            Some(lock) => {
+                let result = plan_and_apply(root, &cfg, old, new, dry_run, &moves);
+                drop(lock);
+                result
+            }
+        }
+    };
     // The old env's lock file has no env left to guard after a rename, and
     // one this run created should not outlive a failed run either.
     if !dry_run && (result.is_ok() || !lock_existed) {
         let _ = std::fs::remove_file(&lock_path);
+        for dir in &created_dirs {
+            // Succeeds only while the directory is empty.
+            let _ = std::fs::remove_dir(dir);
+        }
     }
     result
+}
+
+/// Old-style conflict shadows (`<file>.<old>`, `<file>.<old>-deleted`) inside
+/// `envs/<old>/` carry the env name in their file name, and snapshot walkers
+/// skip them only while it matches (`paths::is_shadow_artifact`). Returned as
+/// `(from, to)` pairs under `envs/<new>/`, to run after the env tree moved.
+fn shadow_moves(root: &Path, old: &str, new: &str) -> Result<Vec<(PathBuf, PathBuf)>> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+        let Ok(entries) = std::fs::read_dir(dir) else { return Ok(()) };
+        for entry in entries {
+            let path = entry.with_context(|| format!("reading {}", dir.display()))?.path();
+            if path.is_dir() {
+                walk(&path, out)?;
+            } else {
+                out.push(path);
+            }
+        }
+        Ok(())
+    }
+    let old_root = Paths::for_env(root, old).env_root();
+    let new_root = Paths::for_env(root, new).env_root();
+    let mut files = Vec::new();
+    walk(&old_root, &mut files)?;
+    let mut moves = Vec::new();
+    for path in files {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        if !is_shadow_artifact(name, old) {
+            continue;
+        }
+        let renamed = match name.strip_suffix(&format!(".{old}-deleted")) {
+            Some(base) => format!("{base}.{new}-deleted"),
+            None => format!("{}.{new}", &name[..name.len() - old.len() - 1]),
+        };
+        let collision = path.with_file_name(&renamed);
+        if collision.exists() {
+            bail!(
+                "{} already exists. Move or delete it, then retry the rename.",
+                rel(root, &collision).display()
+            );
+        }
+        let from = new_root.join(path.strip_prefix(&old_root).unwrap_or(&path));
+        let to = from.with_file_name(renamed);
+        moves.push((from, to));
+    }
+    moves.sort();
+    Ok(moves)
 }
 
 fn plan_and_apply(
@@ -275,6 +344,7 @@ fn rel(root: &Path, path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     fn project(envs: &[&str]) -> TempDir {
@@ -366,6 +436,8 @@ mod tests {
         assert_eq!(r.rewritten, vec![PathBuf::from("rdc.toml")]);
         let cfg = ProjectConfig::load(&dir.path().join("rdc.toml")).unwrap();
         assert!(cfg.envs.contains_key("sandbox") && !cfg.envs.contains_key("dev"));
+        // Taking the lock must not leave an empty `.rdc/` behind.
+        assert!(!dir.path().join(".rdc").exists());
     }
 
     #[test]
@@ -379,6 +451,7 @@ mod tests {
             ("dev", "dev", "", "already called"),
             ("dev", "Dev", "", "differ only in letter case"),
             ("dev", "dev_us", "", "would share the credential variable RDC_TOKEN_DEV_US"),
+            ("dev", "PROD", "", "upper-cases"),
             ("dev", "sandbox", "envs/sandbox/stray.json", "envs/sandbox already exists"),
             ("dev", "sandbox", "secrets/sandbox.secrets.json", "secrets/sandbox.secrets.json already exists"),
             ("dev", "sandbox", "secrets/sandbox.hook-secrets.json", "secrets/sandbox.hook-secrets.json already exists"),
@@ -408,7 +481,8 @@ mod tests {
         let _held = EnvLock::acquire(&Paths::for_env(root, "dev").env_lock(), Duration::from_secs(1)).unwrap();
         let before = tree(root);
         let err = rename_env(root, "dev", "sandbox", false).unwrap_err();
-        assert!(format!("{err:#}").contains("holding the lock on env 'dev'"), "{err:#}");
+        assert!(format!("{err:#}").contains("A sync is running on \"dev\""), "{err:#}");
+        assert!(!format!("{err:#}").contains("timed out"), "{err:#}");
         assert_eq!(tree(root), before);
     }
 
@@ -426,6 +500,51 @@ mod tests {
         assert!(format!("{err:#}").contains("every change was undone"), "{err:#}");
         assert_eq!(tree(root), before);
         assert!(!root.join("envs/sandbox").exists());
+    }
+
+    #[test]
+    fn a_failed_rdc_toml_write_undoes_every_move_and_write() {
+        let dir = project(&["dev", "prod"]);
+        let root = dir.path();
+        seed_dev(root);
+        // `rdc.toml` is written last; a directory at its temp path fails it
+        // after every move and the mapping write.
+        std::fs::create_dir_all(root.join("rdc.toml.tmp")).unwrap();
+        let before = tree(root);
+        let err = rename_env(root, "dev", "sandbox", false).unwrap_err();
+        assert!(format!("{err:#}").contains("every change was undone"), "{err:#}");
+        assert_eq!(tree(root), before);
+    }
+
+    #[test]
+    fn renames_legacy_sibling_shadows_inside_the_env_tree() {
+        let dir = project(&["dev", "prod"]);
+        let root = dir.path();
+        seed_dev(root);
+        write(root, "envs/dev/queues/invoices.json.dev", "{}");
+        write(root, "envs/dev/queues/invoices.json.dev-deleted", "");
+        let r = rename_env(root, "dev", "sandbox", false).unwrap();
+        assert!(root.join("envs/sandbox/queues/invoices.json.sandbox").exists());
+        assert!(root.join("envs/sandbox/queues/invoices.json.sandbox-deleted").exists());
+        assert!(!root.join("envs/sandbox/queues/invoices.json.dev").exists());
+        assert!(!root.join("envs/sandbox/queues/invoices.json.dev-deleted").exists());
+        assert!(r.moved.contains(&(
+            PathBuf::from("envs/sandbox/queues/invoices.json.dev"),
+            PathBuf::from("envs/sandbox/queues/invoices.json.sandbox"),
+        )));
+    }
+
+    #[test]
+    fn a_shadow_that_would_collide_refuses_before_writing() {
+        let dir = project(&["dev", "prod"]);
+        let root = dir.path();
+        seed_dev(root);
+        write(root, "envs/dev/queues/invoices.json.dev", "{}");
+        write(root, "envs/dev/queues/invoices.json.sandbox", "{}");
+        let before = tree(root);
+        let err = rename_env(root, "dev", "sandbox", false).unwrap_err();
+        assert!(format!("{err:#}").contains("invoices.json.sandbox already exists"), "{err:#}");
+        assert_eq!(tree(root), before);
     }
 
     #[test]

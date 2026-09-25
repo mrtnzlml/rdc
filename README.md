@@ -593,8 +593,9 @@ rdc edit env rename dev sandbox
 It moves `envs/dev/`, both secrets files and the env's state under `.rdc/`. It
 renames the env in `rdc.toml` and `.rdc/mapping.toml`, and refreshes the rdc
 regions of `README.md`, `CLAUDE.md` and `.gitlab-ci.yml`. A finished deploy job
-keeps its settings under the new name. It refuses while a sync runs on the env,
-and undoes everything if a step fails.
+keeps its settings under the new name, and `needs:` references to it follow. It
+refuses while a sync runs on the env or when a `deploy:<new>` job already
+exists, and undoes everything if a step fails.
 
 Rename the GitLab CI variables named after the env (`RDC_TOKEN_DEV` →
 `RDC_TOKEN_SANDBOX`) yourself; the command lists them.

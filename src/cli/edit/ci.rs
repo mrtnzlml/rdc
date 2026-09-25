@@ -396,6 +396,35 @@ notify:
         assert!(!text.contains("'deploy:dev':"), "{text}");
     }
 
+    /// Lines outside the rdc regions, markers included.
+    fn outside_regions(text: &str) -> Vec<&str> {
+        let mut inside = false;
+        let mut out = Vec::new();
+        for line in text.lines() {
+            if regions::marker_name(line, ">>>", YAML).is_some() {
+                inside = true;
+                out.push(line);
+            } else if regions::marker_name(line, "<<<", YAML).is_some() {
+                inside = false;
+                out.push(line);
+            } else if !inside {
+                out.push(line);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_archive_equals_the_renderer_and_nothing_outside_the_markers_moves() {
+        let n = envs(&["dev-us", "prod", "sandbox"]);
+        let text = rename_in_pipeline(PIPELINE, "dev", "sandbox", &n).unwrap().text.unwrap();
+        assert_eq!(
+            regions::region_body(&text, REGION_ARCHIVE_ENVS, YAML).unwrap(),
+            crate::cli::gitlab_ci::render_regions(&n)[REGION_ARCHIVE_ENVS]
+        );
+        assert_eq!(outside_regions(&text), outside_regions(PIPELINE));
+    }
+
     #[test]
     fn a_file_without_markers_is_left_alone() {
         let r = rename_in_pipeline("deploy:\n  script: echo dev\n", "dev", "sandbox", &envs(&["sandbox"])).unwrap();

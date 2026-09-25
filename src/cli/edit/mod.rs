@@ -36,7 +36,7 @@ pub enum EnvCommand {
 
 const RENAME_LONG_ABOUT: &str = r#"Rename an environment everywhere in the project. Rossum is not contacted: the org, its objects and the token stay as they are.
 
-Moves envs/<old>/, secrets/<old>.secrets.json, secrets/<old>.hook-secrets.json and the env's state under .rdc/. Renames the env in rdc.toml and .rdc/mapping.toml. Refreshes the rdc regions of README.md, CLAUDE.md and .gitlab-ci.yml. In the pipeline's deploy jobs it changes only values equal to <old> and the deploy:<old> job key.
+Moves envs/<old>/, secrets/<old>.secrets.json, secrets/<old>.hook-secrets.json and the env's state under .rdc/. Renames the env in rdc.toml and .rdc/mapping.toml. Refreshes the rdc regions of README.md, CLAUDE.md and .gitlab-ci.yml. In the pipeline's deploy jobs it changes only values equal to <old>, the deploy:<old> job key, and references to that job such as `needs:`. It refuses if a deploy:<new> job already exists.
 
 It refuses before writing anything when <new> is taken, when a target path already exists, or when another rdc process holds <old>'s lock. If a step fails partway, it undoes every change.
 
