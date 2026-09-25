@@ -384,7 +384,8 @@ pub fn remove_env(folder: String, env: String) -> Result<Option<ProjectSummary>>
 /// path, rewrite `.rdc/mapping.toml`, and rename the `[envs.<old>]` section.
 ///
 /// Not fully transactional: the state/conflicts moves below stay best-effort
-/// (as before), but once the substantive moves (`env_root`, `secrets`) have
+/// (as before), but once the substantive moves (`env_root`, `secrets`,
+/// `hook-secrets`) have
 /// happened, a later failure (mapping.toml rewrite, final `rdc.toml` save)
 /// triggers a best-effort rollback of exactly those substantive moves before
 /// the error is returned, so the registry and filesystem don't end up
@@ -418,9 +419,13 @@ pub fn rename_env(folder: String, old: String, new: String) -> Result<ProjectSum
     }
     let op = rdc::paths::Paths::for_env(&folder, &old);
     let np = rdc::paths::Paths::for_env(&folder, &new);
-    // 1. filesystem moves — env_root + secrets are the substantive ones; state/conflicts best-effort.
+    let old_hook_secrets = rdc::secrets::hook_secrets_path(&folder, &old);
+    let new_hook_secrets = rdc::secrets::hook_secrets_path(&folder, &new);
+    // 1. filesystem moves — env_root + both secrets files are the substantive
+    // ones; state/conflicts best-effort.
     let mut moved_env_root = false;
     let mut moved_secrets = false;
+    let mut moved_hook_secrets = false;
     // Best-effort undo of every per-env path this function may have moved —
     // used by every fallible step below that runs AFTER the moves. Covers
     // both the two substantive moves (env_root/secrets, gated on the tracked
@@ -430,7 +435,7 @@ pub fn rename_env(folder: String, old: String, new: String) -> Result<ProjectSum
     // unconditionally further down, before this closure is ever invoked —
     // reversing those is unconditional too; each `np...exists()` check
     // makes a given rename a no-op if that particular cache never existed.
-    let rollback = |moved_env_root: bool, moved_secrets: bool| {
+    let rollback = |moved_env_root: bool, moved_secrets: bool, moved_hook_secrets: bool| {
         for (n, o) in [
             (np.lockfile(), op.lockfile()),
             (np.env_lock(), op.env_lock()),
@@ -444,6 +449,9 @@ pub fn rename_env(folder: String, old: String, new: String) -> Result<ProjectSum
         let old_conflicts = op.conflict_shadow_path(&op.env_root());
         if new_conflicts.exists() {
             let _ = std::fs::rename(&new_conflicts, &old_conflicts);
+        }
+        if moved_hook_secrets && new_hook_secrets.exists() {
+            let _ = std::fs::rename(&new_hook_secrets, &old_hook_secrets);
         }
         if moved_secrets && np.secrets_file().exists() {
             let _ = std::fs::rename(np.secrets_file(), op.secrets_file());
@@ -460,10 +468,17 @@ pub fn rename_env(folder: String, old: String, new: String) -> Result<ProjectSum
     if op.secrets_file().exists() {
         if let Some(parent) = np.secrets_file().parent() { let _ = std::fs::create_dir_all(parent); }
         if let Err(e) = std::fs::rename(op.secrets_file(), np.secrets_file()) {
-            rollback(moved_env_root, moved_secrets);
+            rollback(moved_env_root, moved_secrets, moved_hook_secrets);
             return Err(anyhow!("moving secrets: {e}"));
         }
         moved_secrets = true;
+    }
+    if old_hook_secrets.exists() {
+        if let Err(e) = std::fs::rename(&old_hook_secrets, &new_hook_secrets) {
+            rollback(moved_env_root, moved_secrets, moved_hook_secrets);
+            return Err(anyhow!("moving hook secrets: {e}"));
+        }
+        moved_hook_secrets = true;
     }
     for (o, n) in [
         (op.lockfile(), np.lockfile()),
@@ -481,20 +496,20 @@ pub fn rename_env(folder: String, old: String, new: String) -> Result<ProjectSum
         let mut g = match rdc::mapping::GenericMapping::load(&mapping_path) {
             Ok(g) => g,
             Err(e) => {
-                rollback(moved_env_root, moved_secrets);
+                rollback(moved_env_root, moved_secrets, moved_hook_secrets);
                 return Err(anyhow!("{e:#}"));
             }
         };
         g.rename_env(&old, &new);
         if let Err(e) = g.save(&mapping_path) {
-            rollback(moved_env_root, moved_secrets);
+            rollback(moved_env_root, moved_secrets, moved_hook_secrets);
             return Err(anyhow!("{e:#}"));
         }
     }
     // 3. rename the rdc.toml section last (authoritative record)
     if let Some(env_cfg) = cfg.envs.remove(&old) { cfg.envs.insert(new.clone(), env_cfg); }
     if let Err(e) = cfg.save(&toml_path) {
-        rollback(moved_env_root, moved_secrets);
+        rollback(moved_env_root, moved_secrets, moved_hook_secrets);
         return Err(anyhow!("{e:#}"));
     }
     discover::inspect(&folder).as_ref().map(ProjectSummary::from)
@@ -1201,6 +1216,7 @@ mod tests {
             "[envs.dev]\napi_base = \"https://d.test/api/v1\"\norg_id = 1\n\
              [envs.prod]\napi_base = \"https://p.test/api/v1\"\norg_id = 2\n").unwrap();
         rdc::secrets::write_secrets_file(&folder, "dev", "tok", None).unwrap();
+        std::fs::write(folder.join("secrets/dev.hook-secrets.json"), "{}").unwrap();
         std::fs::create_dir_all(folder.join(".rdc")).unwrap();
         std::fs::write(folder.join(".rdc/mapping.toml"),
             "version = 2\n[[queues]]\ndev = \"cost-dev\"\nprod = \"cost-prod\"\n").unwrap();
@@ -1212,6 +1228,8 @@ mod tests {
         assert!(folder.join("envs/sandbox/queues/x.json").exists());
         assert!(!folder.join("envs/dev").exists());
         assert!(folder.join("secrets/sandbox.secrets.json").exists());
+        assert!(folder.join("secrets/sandbox.hook-secrets.json").exists());
+        assert!(!folder.join("secrets/dev.hook-secrets.json").exists());
         let mapping = std::fs::read_to_string(folder.join(".rdc/mapping.toml")).unwrap();
         assert!(mapping.contains("sandbox = \"cost-dev\"") && !mapping.contains("dev = \"cost-dev\""));
     }
@@ -1233,6 +1251,7 @@ mod tests {
             "[envs.dev]\napi_base = \"https://d.test/api/v1\"\norg_id = 1\n\
              [envs.prod]\napi_base = \"https://p.test/api/v1\"\norg_id = 2\n").unwrap();
         rdc::secrets::write_secrets_file(&folder, "dev", "tok", None).unwrap();
+        std::fs::write(folder.join("secrets/dev.hook-secrets.json"), "{}").unwrap();
 
         let paths = rdc::paths::Paths::for_env(&folder, "dev");
         std::fs::create_dir_all(paths.lockfile().parent().unwrap()).unwrap();
@@ -1257,6 +1276,8 @@ mod tests {
         assert!(!folder.join("envs/sandbox").exists());
         assert!(folder.join("secrets/dev.secrets.json").exists());
         assert!(!folder.join("secrets/sandbox.secrets.json").exists());
+        assert!(folder.join("secrets/dev.hook-secrets.json").exists());
+        assert!(!folder.join("secrets/sandbox.hook-secrets.json").exists());
         assert!(paths.lockfile().exists(), "lockfile should be rolled back to dev");
         assert!(paths.env_lock().exists(), "env_lock should be rolled back to dev");
         assert!(paths.base_cache_root().join("organization.json").exists(),
