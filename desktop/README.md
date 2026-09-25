@@ -79,7 +79,7 @@ flutter build linux       # build/linux/x64/release/bundle/
 Only needed after changing the Rust API (`rust/src/api/`):
 
 ```sh
-cargo install flutter_rust_bridge_codegen --version 2.12.0   # once
+cargo install flutter_rust_bridge_codegen --version 2.13.0   # once
 cd desktop && flutter_rust_bridge_codegen generate
 ```
 

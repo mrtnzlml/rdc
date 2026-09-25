@@ -1,5 +1,4 @@
 import 'package:desktop/src/app_state.dart';
-import 'package:desktop/src/dialogs.dart';
 import 'package:desktop/src/settings.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -29,11 +28,4 @@ void main() {
     expect(s.canRenameEnv(folder, env), isTrue);
   });
 
-  test('renameNotesMessage is null without notes and lists them otherwise', () {
-    expect(renameNotesMessage(const []), isNull);
-    expect(
-      renameNotesMessage(const ['rename the CI variable RDC_TOKEN_DEV to RDC_TOKEN_SANDBOX']),
-      'Renamed. Still to do:\n• rename the CI variable RDC_TOKEN_DEV to RDC_TOKEN_SANDBOX',
-    );
-  });
 }

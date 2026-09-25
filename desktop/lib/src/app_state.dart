@@ -20,6 +20,43 @@ class ProjectItem {
 /// Single source of truth for the UI. Wraps the Rust bridge and derives the
 /// project list from disk (parent scan ∪ attached externals). Transient sync
 /// state is keyed per (folder, env) via [envKey].
+/// What a rename left for the user: rdc's warnings, and the GitLab work rdc
+/// cannot do (CI variables, environment history).
+class RenameNotes {
+  const RenameNotes({this.warnings = const [], this.followUps = const []});
+  final List<String> warnings;
+  final List<String> followUps;
+  bool get isEmpty => warnings.isEmpty && followUps.isEmpty;
+}
+
+/// The snackbar text after a rename, or null when there is nothing to say.
+String? renameNotesMessage(RenameNotes notes) {
+  if (notes.isEmpty) return null;
+  String list(List<String> items) => items.map((n) => '• $n').join('\n');
+  return [
+    'Renamed.',
+    if (notes.followUps.isNotEmpty) 'Still to do:\n${list(notes.followUps)}',
+    if (notes.warnings.isNotEmpty) 'Warnings:\n${list(notes.warnings)}',
+  ].join('\n');
+}
+
+/// A step after a completed rename failed. Carries the rename's notes so the
+/// follow-ups still reach the user; the rename itself is not undone.
+class RenamedButFailed implements Exception {
+  RenamedButFailed(this.cause, this.notes);
+  final Object cause;
+  final RenameNotes notes;
+
+  @override
+  String toString() {
+    final message = renameNotesMessage(notes);
+    final renamed = message == null
+        ? 'The environment was renamed.'
+        : 'The environment was renamed. ${message.replaceFirst('Renamed.\n', '')}';
+    return '${errorText(cause)}\n\n$renamed';
+  }
+}
+
 class AppState extends ChangeNotifier {
   AppState(this._settings);
 
@@ -219,22 +256,23 @@ class AppState extends ChangeNotifier {
   /// so the pre-existing state is still accurate on failure.
   ///
   /// Returns the rename's warnings and GitLab follow-ups, empty when nothing
-  /// was renamed.
-  Future<List<String>> editEnvEntry(
+  /// was renamed. If a step after a completed rename fails, the error is a
+  /// [RenamedButFailed] that still carries them.
+  Future<RenameNotes> editEnvEntry(
     ProjectItem item,
     EnvSummary env,
     EditConnectionInput input, {
     String? newEnvName,
   }) async {
     var targetEnv = env.name;
-    var notes = const <String>[];
+    var notes = const RenameNotes();
     final renamed = newEnvName != null && newEnvName != env.name;
     if (renamed) {
       if (!canRenameEnv(item.summary.folder, env.name)) {
         throw Exception("Can't rename while this environment is syncing.");
       }
       final r = await renameEnv(folder: item.summary.folder, old: env.name, new_: newEnvName);
-      notes = [...r.warnings, ...r.followUps];
+      notes = RenameNotes(warnings: r.warnings, followUps: r.followUps);
       targetEnv = newEnvName;
     }
     try {
@@ -250,8 +288,9 @@ class AppState extends ChangeNotifier {
       selectEnv(updated.folder, targetEnv);
       return notes;
     } catch (e) {
-      if (renamed) await reload();
-      rethrow;
+      if (!renamed) rethrow;
+      await reload();
+      throw RenamedButFailed(e, notes);
     }
   }
 

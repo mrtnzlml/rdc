@@ -420,10 +420,6 @@ class _AddEnvDialogState extends State<AddEnvDialog> {
 
 // ------------------------------------------------------------ edit
 
-/// The snackbar text after a rename, or null when there is nothing to say.
-String? renameNotesMessage(List<String> notes) =>
-    notes.isEmpty ? null : 'Renamed. Still to do:\n${notes.map((n) => '• $n').join('\n')}';
-
 class EditConnectionDialog extends StatefulWidget {
   const EditConnectionDialog({super.key, required this.state, required this.item, required this.env});
   final AppState state;
