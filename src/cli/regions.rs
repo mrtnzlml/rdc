@@ -40,7 +40,7 @@ pub fn regions_present(existing: &str, style: MarkerStyle) -> BTreeSet<String> {
 /// and it may be indented. The closing delimiter (if the style has one) is
 /// stripped before the name is read, so a suffix hugging the name with no
 /// separating space (`<!-- >>> rdc:envs-->`) still parses.
-fn marker_name(line: &str, kind: &str, style: MarkerStyle) -> Option<String> {
+pub(crate) fn marker_name(line: &str, kind: &str, style: MarkerStyle) -> Option<String> {
     let rest = line.trim_start().strip_prefix(&format!("{}{kind} rdc:", style.prefix))?;
     let closing = style.suffix.trim();
     let rest = if closing.is_empty() {

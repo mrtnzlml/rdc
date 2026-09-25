@@ -691,6 +691,7 @@ pub mod migrate;
 pub mod pull;
 pub mod push;
 pub mod doctor;
+pub mod edit;
 #[cfg(test)]
 pub(crate) mod prompt_pin;
 pub mod resolve;
