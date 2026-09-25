@@ -8,10 +8,10 @@
 //! first and the normal splice runs on the result: the renamed job counts as
 //! already offered, and no duplicate draft is appended.
 
-use crate::cli::gitlab_ci::{render_regions_for_existing, REGION_ARCHIVE_ENVS, REGION_DEPLOY_JOBS};
+use crate::cli::gitlab_ci::{has_deploy_job, render_regions_for_existing, REGION_ARCHIVE_ENVS, REGION_DEPLOY_JOBS};
 use crate::cli::regions::{self, YAML};
 use crate::config::EnvConfig;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use std::collections::BTreeMap;
 
 /// One value rewritten inside `rdc:deploy-jobs`.
@@ -53,6 +53,11 @@ pub fn rename_in_pipeline(
     new: &str,
     new_envs: &BTreeMap<String, EnvConfig>,
 ) -> Result<PipelineRename> {
+    // A job left behind for an env removed from rdc.toml (the deploy region
+    // never drops one) would become a duplicate YAML key.
+    if has_deploy_job(existing, new) {
+        bail!(".gitlab-ci.yml already has a deploy:{new} job. Delete or rename it, then retry the rename.");
+    }
     let (rewritten, changes, mut warnings) = rewrite_regions(existing, old, new);
     let regions = render_regions_for_existing(&rewritten, new_envs);
     let text = regions::splice(&rewritten, &regions, YAML)?;
@@ -111,6 +116,14 @@ fn rewrite_regions(existing: &str, old: &str, new: &str) -> (String, Vec<CiChang
             job = new_job.clone();
             continue;
         }
+        // `needs: ["deploy:<old>"]` and the like: GitLab rejects the whole
+        // pipeline when a needed job does not exist.
+        if in_deploy && let Some(line) = replace_token(body, &old_job, &new_job) {
+            out.push_str(&line);
+            out.push_str(eol);
+            changes.push(CiChange { job: job.clone(), key: line_key(body), from: old_job.clone(), to: new_job.clone() });
+            continue;
+        }
         match rewrite_value(body, old, new) {
             Some((line, key)) => {
                 out.push_str(&line);
@@ -133,8 +146,42 @@ fn job_key(line: &str) -> Option<&str> {
         return None;
     }
     let key = line.trim_end().strip_suffix(':')?;
-    let key = key.strip_prefix('"').and_then(|k| k.strip_suffix('"')).unwrap_or(key);
+    let key = ['"', '\'']
+        .iter()
+        .find_map(|q| key.strip_prefix(*q).and_then(|k| k.strip_suffix(*q)))
+        .unwrap_or(key);
     (!key.is_empty()).then_some(key)
+}
+
+/// `line` with every whole-token `token` replaced, or `None` if it has none.
+fn replace_token(line: &str, token: &str, with: &str) -> Option<String> {
+    let mut out = String::with_capacity(line.len());
+    let mut last = 0;
+    for (i, _) in line.match_indices(token) {
+        let before = line[..i].chars().next_back();
+        let after = line[i + token.len()..].chars().next();
+        if !before.is_some_and(is_name_char) && !after.is_some_and(is_name_char) {
+            out.push_str(&line[last..i]);
+            out.push_str(with);
+            last = i + token.len();
+        }
+    }
+    (last > 0).then(|| out + &line[last..])
+}
+
+/// The YAML key a line sets (`needs` for `  needs: [...]`, `job` for
+/// `  - job: x`), or `reference` when it has none.
+fn line_key(line: &str) -> String {
+    let t = line.trim_start();
+    let t = t.strip_prefix("- ").unwrap_or(t);
+    match t.split_once(':') {
+        Some((k, _)) if !k.is_empty() && !k.contains(char::is_whitespace) => k.to_string(),
+        _ => "reference".to_string(),
+    }
+}
+
+fn is_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/' | '.')
 }
 
 /// If `line` is `key: value` (optionally a `- ` list item) whose scalar value
@@ -184,11 +231,10 @@ fn names_word(line: &str, word: &str) -> bool {
     if line.trim_start().starts_with('#') {
         return false;
     }
-    let is_name = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/' | '.');
     line.match_indices(word).any(|(i, _)| {
         let before = line[..i].chars().next_back();
         let after = line[i + word.len()..].chars().next();
-        !before.is_some_and(is_name) && !after.is_some_and(is_name)
+        !before.is_some_and(is_name_char) && !after.is_some_and(is_name_char)
     })
 }
 
@@ -306,6 +352,48 @@ notify:
         );
         let r = rename_in_pipeline(&text, "dev", "sandbox", &envs(&["dev-us", "prod", "sandbox"])).unwrap();
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    }
+
+    #[test]
+    fn refuses_when_the_new_name_already_has_a_job() {
+        let leftover = PIPELINE.replace(
+            "# <<< rdc:deploy-jobs",
+            "\"deploy:sandbox\":\n  extends: .rdc-deploy\n# <<< rdc:deploy-jobs",
+        );
+        let err = rename_in_pipeline(&leftover, "dev", "sandbox", &envs(&["dev-us", "prod", "sandbox"]))
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("already has a deploy:sandbox job"), "{err:#}");
+    }
+
+    #[test]
+    fn rewrites_references_to_the_old_job() {
+        let chained = PIPELINE
+            .replace(
+                "    RDC_SRC: dev   # promote from dev\n",
+                "    RDC_SRC: dev   # promote from dev\n  needs: [\"pytest\", \"deploy:dev\"]\n",
+            )
+            .replace(
+                "    RDC_SRC: \"dev-us\"\n",
+                "    RDC_SRC: \"dev-us\"\n  needs:\n    - job: deploy:dev-us\n",
+            );
+        let r = rename_in_pipeline(&chained, "dev", "sandbox", &envs(&["dev-us", "prod", "sandbox"])).unwrap();
+        let text = r.text.unwrap();
+        assert!(text.contains("  needs: [\"pytest\", \"deploy:sandbox\"]\n"), "{text}");
+        assert!(text.contains("    - job: deploy:dev-us\n"), "{text}");
+        assert!(
+            r.changes.iter().any(|c| c.to_string() == "deploy:prod needs \"deploy:dev\" -> \"deploy:sandbox\""),
+            "{:?}",
+            r.changes
+        );
+    }
+
+    #[test]
+    fn single_quoted_job_keys_are_renamed() {
+        let single = PIPELINE.replace("\"deploy:dev\":", "'deploy:dev':");
+        let r = rename_in_pipeline(&single, "dev", "sandbox", &envs(&["dev-us", "prod", "sandbox"])).unwrap();
+        let text = r.text.unwrap();
+        assert!(text.contains("'deploy:sandbox':\n"), "{text}");
+        assert!(!text.contains("'deploy:dev':"), "{text}");
     }
 
     #[test]

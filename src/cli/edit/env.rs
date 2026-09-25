@@ -146,7 +146,7 @@ fn plan_and_apply(
     if ci_path.exists() {
         let original = read(&ci_path)?;
         let pipeline = ci::rename_in_pipeline(&original, old, new, &new_cfg.envs)
-            .context("reading the rdc regions of .gitlab-ci.yml")?;
+            .context("planning the .gitlab-ci.yml rename")?;
         report.ci_changes = pipeline.changes;
         report.warnings = pipeline.warnings;
         if let Some(text) = pipeline.text {
@@ -451,6 +451,22 @@ mod tests {
         let r = rename_env(root, "dev", "sandbox", false).unwrap();
         assert_eq!(std::fs::read_to_string(root.join(".rdc/mapping.toml")).unwrap(), stub);
         assert!(!r.rewritten.contains(&PathBuf::from(".rdc/mapping.toml")));
+    }
+
+    #[test]
+    fn a_leftover_job_for_the_new_name_refuses_before_writing() {
+        let dir = project(&["dev", "prod"]);
+        let root = dir.path();
+        seed_dev(root);
+        write(
+            root,
+            ".gitlab-ci.yml",
+            "# >>> rdc:deploy-jobs\n\"deploy:sandbox\":\n  extends: .rdc-deploy\n# <<< rdc:deploy-jobs\n",
+        );
+        let before = tree(root);
+        let err = rename_env(root, "dev", "sandbox", false).unwrap_err();
+        assert!(format!("{err:#}").contains("already has a deploy:sandbox job"), "{err:#}");
+        assert_eq!(tree(root), before);
     }
 
     #[test]

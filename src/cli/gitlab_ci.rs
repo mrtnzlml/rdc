@@ -195,7 +195,7 @@ fn archived_envs(existing: &str) -> std::collections::BTreeSet<String> {
 /// Whether the file already declares a `deploy:<env>` job, in any of the three
 /// spellings YAML allows for the key. Comment lines don't count: a reader who
 /// commented a job out has removed it.
-fn has_deploy_job(existing: &str, env: &str) -> bool {
+pub(crate) fn has_deploy_job(existing: &str, env: &str) -> bool {
     let job = format!("deploy:{env}");
     let forms = [
         format!("{}:", yaml_quote(&job)),
