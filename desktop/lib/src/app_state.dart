@@ -217,19 +217,24 @@ class AppState extends ChangeNotifier {
   /// "This project has no `<old>` environment" and masking that the rename
   /// took. Not needed on the non-rename path: nothing moved on disk there,
   /// so the pre-existing state is still accurate on failure.
-  Future<void> editEnvEntry(
+  ///
+  /// Returns the rename's warnings and GitLab follow-ups, empty when nothing
+  /// was renamed.
+  Future<List<String>> editEnvEntry(
     ProjectItem item,
     EnvSummary env,
     EditConnectionInput input, {
     String? newEnvName,
   }) async {
     var targetEnv = env.name;
+    var notes = const <String>[];
     final renamed = newEnvName != null && newEnvName != env.name;
     if (renamed) {
       if (!canRenameEnv(item.summary.folder, env.name)) {
         throw Exception("Can't rename while this environment is syncing.");
       }
-      await renameEnv(folder: item.summary.folder, old: env.name, new_: newEnvName);
+      final r = await renameEnv(folder: item.summary.folder, old: env.name, new_: newEnvName);
+      notes = [...r.warnings, ...r.followUps];
       targetEnv = newEnvName;
     }
     try {
@@ -243,6 +248,7 @@ class AppState extends ChangeNotifier {
       }
       await reload();
       selectEnv(updated.folder, targetEnv);
+      return notes;
     } catch (e) {
       if (renamed) await reload();
       rethrow;

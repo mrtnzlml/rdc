@@ -7,6 +7,7 @@
 
 use crate::discover::{self, AuthKindRaw, Project};
 use anyhow::{anyhow, Result};
+use rdc::config::{valid_env_name, INVALID_ENV_NAME_MSG};
 use crate::frb_generated::StreamSink;
 use std::collections::HashSet;
 use std::future::Future;
@@ -290,17 +291,6 @@ pub struct AddEnvInput {
     pub password: Option<String>,
 }
 
-/// An env name may only contain letters, digits, `-` and `_` — the same rule
-/// `rdc init`'s own prompt validator enforces (see `cli::init::prompt_env_name`).
-/// Rejecting anything else here (path separators, `..`, etc.) before an env
-/// name is ever interpolated into a filesystem path is what keeps `remove_env`
-/// from being tricked into deleting outside the project folder.
-fn valid_env_name(name: &str) -> bool {
-    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-}
-
-const INVALID_ENV_NAME_MSG: &str = "Environment name may only contain letters, digits, - and _.";
-
 /// Add a new environment to an existing project. Errors if the env already exists.
 pub fn add_env(folder: String, input: AddEnvInput) -> Result<ProjectSummary> {
     let folder = PathBuf::from(&folder);
@@ -380,140 +370,33 @@ pub fn remove_env(folder: String, env: String) -> Result<Option<ProjectSummary>>
         .ok_or_else(|| anyhow!("Project not found after remove_env"))
 }
 
-/// Rename an environment `old` → `new` entirely locally: move every per-env
-/// path, rewrite `.rdc/mapping.toml`, and rename the `[envs.<old>]` section.
-///
-/// Not fully transactional: the state/conflicts moves below stay best-effort
-/// (as before), but once the substantive moves (`env_root`, `secrets`,
-/// `hook-secrets`) have
-/// happened, a later failure (mapping.toml rewrite, final `rdc.toml` save)
-/// triggers a best-effort rollback of exactly those substantive moves before
-/// the error is returned, so the registry and filesystem don't end up
-/// disagreeing (`rdc.toml` still naming `old` while the files live under
-/// `new`, or vice versa).
-pub fn rename_env(folder: String, old: String, new: String) -> Result<ProjectSummary> {
+/// What the app shows after a rename.
+#[derive(Debug, Clone)]
+pub struct RenameEnvResult {
+    pub project: ProjectSummary,
+    /// GitLab work rdc cannot do (CI variables, environment history).
+    pub follow_ups: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Rename an environment `old` → `new`, offline. The work is
+/// `rdc edit env rename`'s (`rdc::cli::edit::env::rename_env`), so the app
+/// and the CLI rename the same paths, refuse the same cases and roll back
+/// the same way.
+pub fn rename_env(folder: String, old: String, new: String) -> Result<RenameEnvResult> {
     let folder = PathBuf::from(&folder);
-    // Defensive, mirroring `remove_env`: `old` comes from a hand-editable
-    // `rdc.toml` (via `validate_existing_project`, which adopts any env
-    // name), so it must be checked before it's ever interpolated into a
-    // filesystem path below — an env name with `..` or a path separator
-    // must never reach `std::fs::rename`.
-    if !valid_env_name(&old) {
-        return Err(anyhow!(INVALID_ENV_NAME_MSG));
-    }
-    let new = new.trim().to_string();
-    if !valid_env_name(&new) {
-        return Err(anyhow!("Environment name may only contain letters, digits, - and _."));
-    }
-    let toml_path = folder.join("rdc.toml");
-    let mut cfg = rdc::config::ProjectConfig::load(&toml_path).map_err(|e| anyhow!("{e:#}"))?;
-    if !cfg.envs.contains_key(&old) {
-        return Err(anyhow!("This project has no \"{old}\" environment."));
-    }
-    if new == old {
-        return discover::inspect(&folder).as_ref().map(ProjectSummary::from)
-            .ok_or_else(|| anyhow!("Project not found"));
-    }
-    if cfg.envs.contains_key(&new) {
-        return Err(anyhow!("An environment named \"{new}\" already exists in this project."));
-    }
-    let op = rdc::paths::Paths::for_env(&folder, &old);
-    let np = rdc::paths::Paths::for_env(&folder, &new);
-    let old_hook_secrets = rdc::secrets::hook_secrets_path(&folder, &old);
-    let new_hook_secrets = rdc::secrets::hook_secrets_path(&folder, &new);
-    // 1. filesystem moves — env_root + both secrets files are the substantive
-    // ones; state/conflicts best-effort.
-    let mut moved_env_root = false;
-    let mut moved_secrets = false;
-    let mut moved_hook_secrets = false;
-    // Best-effort undo of every per-env path this function may have moved —
-    // used by every fallible step below that runs AFTER the moves. Covers
-    // both the two substantive moves (env_root/secrets, gated on the tracked
-    // flags since a hard failure partway through the forward move may leave
-    // them untouched) AND the four best-effort cache/derived paths
-    // (lockfile, env_lock, base_cache_root, conflicts dir) that are moved
-    // unconditionally further down, before this closure is ever invoked —
-    // reversing those is unconditional too; each `np...exists()` check
-    // makes a given rename a no-op if that particular cache never existed.
-    let rollback = |moved_env_root: bool, moved_secrets: bool, moved_hook_secrets: bool| {
-        for (n, o) in [
-            (np.lockfile(), op.lockfile()),
-            (np.env_lock(), op.env_lock()),
-            (np.base_cache_root(), op.base_cache_root()),
-        ] {
-            if n.exists() {
-                let _ = std::fs::rename(&n, &o);
-            }
-        }
-        let new_conflicts = np.conflict_shadow_path(&np.env_root());
-        let old_conflicts = op.conflict_shadow_path(&op.env_root());
-        if new_conflicts.exists() {
-            let _ = std::fs::rename(&new_conflicts, &old_conflicts);
-        }
-        if moved_hook_secrets && new_hook_secrets.exists() {
-            let _ = std::fs::rename(&new_hook_secrets, &old_hook_secrets);
-        }
-        if moved_secrets && np.secrets_file().exists() {
-            let _ = std::fs::rename(np.secrets_file(), op.secrets_file());
-        }
-        if moved_env_root && np.env_root().exists() {
-            let _ = std::fs::rename(np.env_root(), op.env_root());
-        }
+    let summary = |f: &Path| {
+        discover::inspect(f)
+            .as_ref()
+            .map(ProjectSummary::from)
+            .ok_or_else(|| anyhow!("Project not found after rename_env"))
     };
-    if op.env_root().exists() {
-        std::fs::rename(op.env_root(), np.env_root())
-            .map_err(|e| anyhow!("moving envs/{old} → envs/{new}: {e}"))?;
-        moved_env_root = true;
+    // The edit dialog submits the env name even when it is unchanged.
+    if valid_env_name(&old) && new.trim() == old {
+        return Ok(RenameEnvResult { project: summary(&folder)?, follow_ups: vec![], warnings: vec![] });
     }
-    if op.secrets_file().exists() {
-        if let Some(parent) = np.secrets_file().parent() { let _ = std::fs::create_dir_all(parent); }
-        if let Err(e) = std::fs::rename(op.secrets_file(), np.secrets_file()) {
-            rollback(moved_env_root, moved_secrets, moved_hook_secrets);
-            return Err(anyhow!("moving secrets: {e}"));
-        }
-        moved_secrets = true;
-    }
-    if old_hook_secrets.exists() {
-        if let Err(e) = std::fs::rename(&old_hook_secrets, &new_hook_secrets) {
-            rollback(moved_env_root, moved_secrets, moved_hook_secrets);
-            return Err(anyhow!("moving hook secrets: {e}"));
-        }
-        moved_hook_secrets = true;
-    }
-    for (o, n) in [
-        (op.lockfile(), np.lockfile()),
-        (op.env_lock(), np.env_lock()),
-        (op.base_cache_root(), np.base_cache_root()),
-    ] {
-        if o.exists() { let _ = std::fs::rename(&o, &n); }
-    }
-    let old_conflicts = op.conflict_shadow_path(&op.env_root());
-    let new_conflicts = np.conflict_shadow_path(&np.env_root());
-    if old_conflicts.exists() { let _ = std::fs::rename(&old_conflicts, &new_conflicts); }
-    // 2. rewrite mapping.toml
-    let mapping_path = op.mapping_file();
-    if mapping_path.exists() {
-        let mut g = match rdc::mapping::GenericMapping::load(&mapping_path) {
-            Ok(g) => g,
-            Err(e) => {
-                rollback(moved_env_root, moved_secrets, moved_hook_secrets);
-                return Err(anyhow!("{e:#}"));
-            }
-        };
-        g.rename_env(&old, &new);
-        if let Err(e) = g.save(&mapping_path) {
-            rollback(moved_env_root, moved_secrets, moved_hook_secrets);
-            return Err(anyhow!("{e:#}"));
-        }
-    }
-    // 3. rename the rdc.toml section last (authoritative record)
-    if let Some(env_cfg) = cfg.envs.remove(&old) { cfg.envs.insert(new.clone(), env_cfg); }
-    if let Err(e) = cfg.save(&toml_path) {
-        rollback(moved_env_root, moved_secrets, moved_hook_secrets);
-        return Err(anyhow!("{e:#}"));
-    }
-    discover::inspect(&folder).as_ref().map(ProjectSummary::from)
-        .ok_or_else(|| anyhow!("Project not found after rename_env"))
+    let report = rdc::cli::edit::env::rename_env(&folder, &old, &new, false).map_err(|e| anyhow!("{e:#}"))?;
+    Ok(RenameEnvResult { project: summary(&folder)?, follow_ups: report.follow_ups, warnings: report.warnings })
 }
 
 // ---------------------------------------------------------------- sync
@@ -1221,7 +1104,7 @@ mod tests {
         std::fs::write(folder.join(".rdc/mapping.toml"),
             "version = 2\n[[queues]]\ndev = \"cost-dev\"\nprod = \"cost-prod\"\n").unwrap();
 
-        let p = rename_env(folder.display().to_string(), "dev".into(), "sandbox".into()).unwrap();
+        let p = rename_env(folder.display().to_string(), "dev".into(), "sandbox".into()).unwrap().project;
         let names: Vec<String> = p.envs.iter().map(|e| e.name.clone()).collect();
         assert!(names.contains(&"sandbox".to_string()) && names.contains(&"prod".to_string()));
         assert!(!names.contains(&"dev".to_string()));
@@ -1235,62 +1118,28 @@ mod tests {
     }
 
     #[test]
-    fn rename_env_rollback_is_symmetric_on_mapping_load_failure() {
-        // A corrupt `.rdc/mapping.toml` fails to parse, so `rename_env` errors
-        // out at the mapping-rewrite step — AFTER the env_root/secrets moves
-        // and the four best-effort cache moves (lockfile, env_lock,
-        // base_cache_root, conflicts dir) have already happened. The rollback
-        // must reverse ALL of them, not just env_root/secrets, or the tree is
-        // left half-renamed (derived caches under `sandbox` while `rdc.toml`
-        // still names `dev`).
+    fn rename_env_returns_the_gitlab_follow_ups() {
         let tmp = tempfile::tempdir().unwrap();
         let folder = tmp.path().join("acme");
-        std::fs::create_dir_all(folder.join("envs/dev")).unwrap();
-        std::fs::write(folder.join("envs/dev/organization.json"), "{}").unwrap();
+        std::fs::create_dir_all(&folder).unwrap();
         std::fs::write(folder.join("rdc.toml"),
             "[envs.dev]\napi_base = \"https://d.test/api/v1\"\norg_id = 1\n\
              [envs.prod]\napi_base = \"https://p.test/api/v1\"\norg_id = 2\n").unwrap();
-        rdc::secrets::write_secrets_file(&folder, "dev", "tok", None).unwrap();
-        std::fs::write(folder.join("secrets/dev.hook-secrets.json"), "{}").unwrap();
+        std::fs::write(folder.join(".gitlab-ci.yml"),
+            "# >>> rdc:archive-envs\n- RDC_ENV: \"dev\"\n  RDC_VAR_SUFFIX: \"DEV\"\n# <<< rdc:archive-envs\n\
+             # >>> rdc:deploy-jobs\n# <<< rdc:deploy-jobs\n").unwrap();
+        let r = rename_env(folder.display().to_string(), "dev".into(), "sandbox".into()).unwrap();
+        assert!(r.follow_ups[0].contains("RDC_TOKEN_SANDBOX"), "{:?}", r.follow_ups);
+        assert!(r.project.envs.iter().any(|e| e.name == "sandbox"));
+    }
 
-        let paths = rdc::paths::Paths::for_env(&folder, "dev");
-        std::fs::create_dir_all(paths.lockfile().parent().unwrap()).unwrap();
-        std::fs::write(paths.lockfile(), "{}").unwrap();
-        std::fs::write(paths.env_lock(), "").unwrap();
-        std::fs::create_dir_all(paths.base_cache_root()).unwrap();
-        std::fs::write(paths.base_cache_root().join("organization.json"), "{}").unwrap();
-        let conflicts_dir = folder.join(".rdc/conflicts/dev");
-        std::fs::create_dir_all(&conflicts_dir).unwrap();
-        std::fs::write(conflicts_dir.join("stray.json"), "{}").unwrap();
-
-        // Garbage (unparsable) mapping.toml forces `GenericMapping::load` to
-        // error inside `rename_env`, after the moves above already ran.
-        std::fs::write(folder.join(".rdc/mapping.toml"), "not [ valid toml").unwrap();
-
-        let err = rename_env(folder.display().to_string(), "dev".into(), "sandbox".into())
-            .unwrap_err();
-        assert!(format!("{err:#}").contains("parsing"), "unexpected error: {err:#}");
-
-        // Everything must be back under `dev` — no `sandbox` remnants.
-        assert!(folder.join("envs/dev/organization.json").exists());
-        assert!(!folder.join("envs/sandbox").exists());
-        assert!(folder.join("secrets/dev.secrets.json").exists());
-        assert!(!folder.join("secrets/sandbox.secrets.json").exists());
-        assert!(folder.join("secrets/dev.hook-secrets.json").exists());
-        assert!(!folder.join("secrets/sandbox.hook-secrets.json").exists());
-        assert!(paths.lockfile().exists(), "lockfile should be rolled back to dev");
-        assert!(paths.env_lock().exists(), "env_lock should be rolled back to dev");
-        assert!(paths.base_cache_root().join("organization.json").exists(),
-            "base cache should be rolled back to dev");
-        assert!(conflicts_dir.join("stray.json").exists(), "conflicts dir should be rolled back to dev");
-        let sandbox_paths = rdc::paths::Paths::for_env(&folder, "sandbox");
-        assert!(!sandbox_paths.lockfile().exists());
-        assert!(!sandbox_paths.env_lock().exists());
-        assert!(!sandbox_paths.base_cache_root().exists());
-        assert!(!folder.join(".rdc/conflicts/sandbox").exists());
-        // rdc.toml untouched (rename never got past the mapping step).
-        let cfg = rdc::config::ProjectConfig::load(&folder.join("rdc.toml")).unwrap();
-        assert!(cfg.envs.contains_key("dev") && !cfg.envs.contains_key("sandbox"));
+    #[test]
+    fn rename_env_to_the_same_name_is_a_no_op() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = seed_project(tmp.path(), "acme");
+        let r = rename_env(folder.display().to_string(), "main".into(), "main".into()).unwrap();
+        assert!(r.follow_ups.is_empty());
+        assert_eq!(r.project.envs[0].name, "main");
     }
 
     #[test]

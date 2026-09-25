@@ -4,11 +4,14 @@
 // ignore_for_file: unused_import, unused_element, unnecessary_import, duplicate_ignore, invalid_use_of_internal_member, annotate_overrides, non_constant_identifier_names, curly_braces_in_flow_control_structures, prefer_const_literals_to_create_immutables, unused_field
 
 import 'api/rdc.dart';
+
 import 'dart:async';
 import 'dart:convert';
+
 import 'frb_generated.dart';
 import 'frb_generated.io.dart'
     if (dart.library.js_interop) 'frb_generated.web.dart';
+
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
 /// Main entrypoint of the Rust API
@@ -115,7 +118,7 @@ abstract class RustLibApi extends BaseApi {
     required String env,
   });
 
-  Future<ProjectSummary> crateApiRdcRenameEnv({
+  Future<RenameEnvResult> crateApiRdcRenameEnv({
     required String folder,
     required String old,
     required String new_,
@@ -417,7 +420,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       const TaskConstMeta(debugName: "remove_env", argNames: ["folder", "env"]);
 
   @override
-  Future<ProjectSummary> crateApiRdcRenameEnv({
+  Future<RenameEnvResult> crateApiRdcRenameEnv({
     required String folder,
     required String old,
     required String new_,
@@ -437,7 +440,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           );
         },
         codec: SseCodec(
-          decodeSuccessData: sse_decode_project_summary,
+          decodeSuccessData: sse_decode_rename_env_result,
           decodeErrorData: sse_decode_AnyhowException,
         ),
         constMeta: kCrateApiRdcRenameEnvConstMeta,
@@ -801,6 +804,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  List<String> dco_decode_list_String(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return (raw as List<dynamic>).map(dco_decode_String).toList();
+  }
+
+  @protected
   List<EnvSummary> dco_decode_list_env_summary(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return (raw as List<dynamic>).map(dco_decode_env_summary).toList();
@@ -878,6 +887,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   PromptKindDto dco_decode_prompt_kind_dto(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return PromptKindDto.values[raw as int];
+  }
+
+  @protected
+  RenameEnvResult dco_decode_rename_env_result(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 3)
+      throw Exception('unexpected arr length: expect 3 but see ${arr.length}');
+    return RenameEnvResult(
+      project: dco_decode_project_summary(arr[0]),
+      followUps: dco_decode_list_String(arr[1]),
+      warnings: dco_decode_list_String(arr[2]),
+    );
   }
 
   @protected
@@ -1083,6 +1105,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  List<String> sse_decode_list_String(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var len_ = sse_decode_i_32(deserializer);
+    var ans_ = <String>[];
+    for (var idx_ = 0; idx_ < len_; ++idx_) {
+      ans_.add(sse_decode_String(deserializer));
+    }
+    return ans_;
+  }
+
+  @protected
   List<EnvSummary> sse_decode_list_env_summary(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
 
@@ -1203,6 +1237,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var inner = sse_decode_i_32(deserializer);
     return PromptKindDto.values[inner];
+  }
+
+  @protected
+  RenameEnvResult sse_decode_rename_env_result(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_project = sse_decode_project_summary(deserializer);
+    var var_followUps = sse_decode_list_String(deserializer);
+    var var_warnings = sse_decode_list_String(deserializer);
+    return RenameEnvResult(
+      project: var_project,
+      followUps: var_followUps,
+      warnings: var_warnings,
+    );
   }
 
   @protected
@@ -1409,6 +1456,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_list_String(List<String> self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    for (final item in self) {
+      sse_encode_String(item, serializer);
+    }
+  }
+
+  @protected
   void sse_encode_list_env_summary(
     List<EnvSummary> self,
     SseSerializer serializer,
@@ -1526,6 +1582,17 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_i_32(self.index, serializer);
+  }
+
+  @protected
+  void sse_encode_rename_env_result(
+    RenameEnvResult self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_project_summary(self.project, serializer);
+    sse_encode_list_String(self.followUps, serializer);
+    sse_encode_list_String(self.warnings, serializer);
   }
 
   @protected

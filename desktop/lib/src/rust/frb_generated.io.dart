@@ -4,10 +4,13 @@
 // ignore_for_file: unused_import, unused_element, unnecessary_import, duplicate_ignore, invalid_use_of_internal_member, annotate_overrides, non_constant_identifier_names, curly_braces_in_flow_control_structures, prefer_const_literals_to_create_immutables, unused_field
 
 import 'api/rdc.dart';
+
 import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi' as ffi;
+
 import 'frb_generated.dart';
+
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated_io.dart';
 
 abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
@@ -70,6 +73,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   PlatformInt64 dco_decode_i_64(dynamic raw);
 
   @protected
+  List<String> dco_decode_list_String(dynamic raw);
+
+  @protected
   List<EnvSummary> dco_decode_list_env_summary(dynamic raw);
 
   @protected
@@ -101,6 +107,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   PromptKindDto dco_decode_prompt_kind_dto(dynamic raw);
+
+  @protected
+  RenameEnvResult dco_decode_rename_env_result(dynamic raw);
 
   @protected
   SyncPhase dco_decode_sync_phase(dynamic raw);
@@ -173,6 +182,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   PlatformInt64 sse_decode_i_64(SseDeserializer deserializer);
 
   @protected
+  List<String> sse_decode_list_String(SseDeserializer deserializer);
+
+  @protected
   List<EnvSummary> sse_decode_list_env_summary(SseDeserializer deserializer);
 
   @protected
@@ -210,6 +222,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   PromptKindDto sse_decode_prompt_kind_dto(SseDeserializer deserializer);
+
+  @protected
+  RenameEnvResult sse_decode_rename_env_result(SseDeserializer deserializer);
 
   @protected
   SyncPhase sse_decode_sync_phase(SseDeserializer deserializer);
@@ -296,6 +311,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_i_64(PlatformInt64 self, SseSerializer serializer);
 
   @protected
+  void sse_encode_list_String(List<String> self, SseSerializer serializer);
+
+  @protected
   void sse_encode_list_env_summary(
     List<EnvSummary> self,
     SseSerializer serializer,
@@ -348,6 +366,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_prompt_kind_dto(PromptKindDto self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_rename_env_result(
+    RenameEnvResult self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_sync_phase(SyncPhase self, SseSerializer serializer);

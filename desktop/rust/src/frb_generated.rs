@@ -742,6 +742,18 @@ impl SseDecode for i64 {
     }
 }
 
+impl SseDecode for Vec<String> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut len_ = <i32>::sse_decode(deserializer);
+        let mut ans_ = Vec::with_capacity(len_ as usize);
+        for idx_ in 0..len_ {
+            ans_.push(<String>::sse_decode(deserializer));
+        }
+        return ans_;
+    }
+}
+
 impl SseDecode for Vec<crate::api::rdc::EnvSummary> {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -876,6 +888,20 @@ impl SseDecode for crate::api::rdc::PromptKindDto {
             6 => crate::api::rdc::PromptKindDto::MdhRowDelete,
             7 => crate::api::rdc::PromptKindDto::Unknown,
             _ => unreachable!("Invalid variant for PromptKindDto: {}", inner),
+        };
+    }
+}
+
+impl SseDecode for crate::api::rdc::RenameEnvResult {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_project = <crate::api::rdc::ProjectSummary>::sse_decode(deserializer);
+        let mut var_followUps = <Vec<String>>::sse_decode(deserializer);
+        let mut var_warnings = <Vec<String>>::sse_decode(deserializer);
+        return crate::api::rdc::RenameEnvResult {
+            project: var_project,
+            follow_ups: var_followUps,
+            warnings: var_warnings,
         };
     }
 }
@@ -1155,6 +1181,28 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::rdc::PromptKindDto>
     }
 }
 // Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::rdc::RenameEnvResult {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.project.into_into_dart().into_dart(),
+            self.follow_ups.into_into_dart().into_dart(),
+            self.warnings.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::api::rdc::RenameEnvResult
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::rdc::RenameEnvResult>
+    for crate::api::rdc::RenameEnvResult
+{
+    fn into_into_dart(self) -> crate::api::rdc::RenameEnvResult {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
 impl flutter_rust_bridge::IntoDart for crate::api::rdc::SyncPhase {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
         match self {
@@ -1299,6 +1347,16 @@ impl SseEncode for i64 {
     }
 }
 
+impl SseEncode for Vec<String> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(self.len() as _, serializer);
+        for item in self {
+            <String>::sse_encode(item, serializer);
+        }
+    }
+}
+
 impl SseEncode for Vec<crate::api::rdc::EnvSummary> {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
@@ -1416,6 +1474,15 @@ impl SseEncode for crate::api::rdc::PromptKindDto {
             },
             serializer,
         );
+    }
+}
+
+impl SseEncode for crate::api::rdc::RenameEnvResult {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <crate::api::rdc::ProjectSummary>::sse_encode(self.project, serializer);
+        <Vec<String>>::sse_encode(self.follow_ups, serializer);
+        <Vec<String>>::sse_encode(self.warnings, serializer);
     }
 }
 

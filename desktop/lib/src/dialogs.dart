@@ -420,6 +420,10 @@ class _AddEnvDialogState extends State<AddEnvDialog> {
 
 // ------------------------------------------------------------ edit
 
+/// The snackbar text after a rename, or null when there is nothing to say.
+String? renameNotesMessage(List<String> notes) =>
+    notes.isEmpty ? null : 'Renamed. Still to do:\n${notes.map((n) => '• $n').join('\n')}';
+
 class EditConnectionDialog extends StatefulWidget {
   const EditConnectionDialog({super.key, required this.state, required this.item, required this.env});
   final AppState state;
@@ -459,7 +463,7 @@ class _EditConnectionDialogState extends State<EditConnectionDialog> {
       _error = null;
     });
     try {
-      await widget.state.editEnvEntry(
+      final notes = await widget.state.editEnvEntry(
         widget.item,
         widget.env,
         EditConnectionInput(
@@ -473,7 +477,16 @@ class _EditConnectionDialogState extends State<EditConnectionDialog> {
         ),
         newEnvName: _envName.text.trim(),
       );
-      if (mounted) Navigator.of(context).pop(true);
+      if (!mounted) return;
+      final messenger = ScaffoldMessenger.of(context);
+      Navigator.of(context).pop(true);
+      final message = renameNotesMessage(notes);
+      if (message != null) {
+        messenger.showSnackBar(SnackBar(
+          content: SelectableText(message),
+          duration: const Duration(seconds: 12),
+        ));
+      }
     } catch (e) {
       setState(() {
         _busy = false;

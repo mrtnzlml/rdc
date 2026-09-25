@@ -247,7 +247,8 @@ void main() {
 
       final renamed =
           await renameEnv(folder: folder, old: 'prod', new_: 'staging');
-      expect(renamed.envs.map((e) => e.name).toList(), ['main', 'staging']);
+      expect(renamed.project.envs.map((e) => e.name).toList(), ['main', 'staging']);
+      expect(renamed.followUps, isEmpty); // no .gitlab-ci.yml in this project
 
       final list = await listProjects(parent: parent.path);
       expect(list.length, 1);

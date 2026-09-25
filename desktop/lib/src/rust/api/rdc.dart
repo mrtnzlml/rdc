@@ -4,13 +4,14 @@
 // ignore_for_file: invalid_use_of_internal_member, unused_import, unnecessary_import
 
 import '../frb_generated.dart';
+
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 import 'package:freezed_annotation/freezed_annotation.dart' hide protected;
 part 'rdc.freezed.dart';
 
-// These functions are ignored because they are not marked as `pub`: `block_on`, `discard`, `kind_to_dto`, `valid_env_name`, `write_credentials`
+// These functions are ignored because they are not marked as `pub`: `block_on`, `discard`, `kind_to_dto`, `write_credentials`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `LineBuffer`, `LineForwarder`, `SinkPromptRoute`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `ask`, `assert_fields_are_eq`, `assert_fields_are_eq`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `eq`, `eq`, `flush`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `from`, `from`, `from`, `write`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `ask`, `assert_fields_are_eq`, `assert_fields_are_eq`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `eq`, `eq`, `flush`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `from`, `from`, `from`, `write`
 // These functions are ignored (category: IgnoreBecauseNotAllowedOwner): `emit`
 // These functions are ignored (category: IgnoreBecauseOwnerTyShouldIgnore): `default`
 
@@ -65,17 +66,11 @@ Future<ProjectSummary?> removeEnv({
   required String env,
 }) => RustLib.instance.api.crateApiRdcRemoveEnv(folder: folder, env: env);
 
-/// Rename an environment `old` → `new` entirely locally: move every per-env
-/// path, rewrite `.rdc/mapping.toml`, and rename the `[envs.<old>]` section.
-///
-/// Not fully transactional: the state/conflicts moves below stay best-effort
-/// (as before), but once the substantive moves (`env_root`, `secrets`) have
-/// happened, a later failure (mapping.toml rewrite, final `rdc.toml` save)
-/// triggers a best-effort rollback of exactly those substantive moves before
-/// the error is returned, so the registry and filesystem don't end up
-/// disagreeing (`rdc.toml` still naming `old` while the files live under
-/// `new`, or vice versa).
-Future<ProjectSummary> renameEnv({
+/// Rename an environment `old` → `new`, offline. The work is
+/// `rdc edit env rename`'s (`rdc::cli::edit::env::rename_env`), so the app
+/// and the CLI rename the same paths, refuse the same cases and roll back
+/// the same way.
+Future<RenameEnvResult> renameEnv({
   required String folder,
   required String old,
   required String new_,
@@ -367,6 +362,33 @@ enum PromptKindDto {
   /// silently mislabelling the prompt as a conflict. Render it as an
   /// explicit "unrecognised prompt" state, not as a normal dialog.
   unknown,
+}
+
+/// What the app shows after a rename.
+class RenameEnvResult {
+  final ProjectSummary project;
+
+  /// GitLab work rdc cannot do (CI variables, environment history).
+  final List<String> followUps;
+  final List<String> warnings;
+
+  const RenameEnvResult({
+    required this.project,
+    required this.followUps,
+    required this.warnings,
+  });
+
+  @override
+  int get hashCode => project.hashCode ^ followUps.hashCode ^ warnings.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is RenameEnvResult &&
+          runtimeType == other.runtimeType &&
+          project == other.project &&
+          followUps == other.followUps &&
+          warnings == other.warnings;
 }
 
 @freezed
