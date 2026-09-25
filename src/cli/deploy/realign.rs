@@ -142,36 +142,30 @@ fn priority(p: &PendingRename) -> u8 {
 pub fn detect(paths: &Paths, lockfile: &Lockfile) -> Vec<PendingRename> {
     let mut out: Vec<PendingRename> = Vec::new();
 
-    if let Some(ws_map) = lockfile.objects.get("workspaces") {
-        for slug in ws_map.keys() {
-            if let Some(name) = read_name(&paths.workspace_dir(slug).join("workspace.json")) {
-                let proposed = slugify(&name);
-                if proposed != *slug && !ws_map.contains_key(&proposed) {
-                    out.push(PendingRename::Workspace {
-                        old: slug.clone(),
-                        new: proposed,
-                    });
-                }
-            }
-        }
-    }
-
-    if let Some(q_map) = lockfile.objects.get("queues") {
-        for slug in q_map.keys() {
-            if let Some((ws, q_path)) = locate_queue_dir(paths, lockfile, slug)
-                && let Some(name) = read_name(&q_path.join("queue.json"))
-            {
-                let proposed = slugify(&name);
-                if proposed != *slug && !q_map.contains_key(&proposed) {
-                    out.push(PendingRename::Queue {
-                        ws,
-                        old: slug.clone(),
-                        new: proposed,
-                    });
-                }
-            }
-        }
-    }
+    // Workspaces and queues own directories, and a queue's slug is unique
+    // across workspaces, so duplicate names need the same suffixing as the
+    // flat kinds: proposing one bare slug for two objects would make the
+    // second rename overwrite the first's lockfile entries.
+    detect_by_name(
+        lockfile,
+        "workspaces",
+        |slug| read_name(&paths.workspace_dir(slug).join("workspace.json")),
+        &mut out,
+        |o, n| PendingRename::Workspace { old: o, new: n },
+    );
+    detect_by_name(
+        lockfile,
+        "queues",
+        |slug| read_name(&locate_queue_dir(paths, lockfile, slug)?.1.join("queue.json")),
+        &mut out,
+        |o, n| PendingRename::Queue {
+            ws: locate_queue_dir(paths, lockfile, &o)
+                .expect("a queue with a readable name has a located dir")
+                .0,
+            old: o,
+            new: n,
+        },
+    );
 
     detect_flat_kind(lockfile, "hooks", paths.hooks_dir(), &mut out, |o, n| {
         PendingRename::Hook { old: o, new: n }
@@ -185,7 +179,13 @@ pub fn detect(paths: &Paths, lockfile: &Lockfile) -> Vec<PendingRename> {
     detect_flat_kind(lockfile, "saved_views", paths.saved_views_dir(), &mut out, |o, n| {
         PendingRename::SavedView { old: o, new: n }
     });
-    detect_engines(paths, lockfile, &mut out);
+    detect_by_name(
+        lockfile,
+        "engines",
+        |slug| read_name(&paths.engine_dir(slug).join("engine.json")),
+        &mut out,
+        |o, n| PendingRename::Engine { old: o, new: n },
+    );
     detect_engine_fields(paths, lockfile, &mut out);
     detect_workflows(paths, lockfile, &mut out);
     detect_workflow_steps(paths, lockfile, &mut out);
@@ -220,10 +220,23 @@ pub fn detect(paths: &Paths, lockfile: &Lockfile) -> Vec<PendingRename> {
     out
 }
 
+/// [`detect_by_name`] for a kind stored as `<dir>/<slug>.json`.
 fn detect_flat_kind(
     lockfile: &Lockfile,
     kind: &str,
     dir: std::path::PathBuf,
+    out: &mut Vec<PendingRename>,
+    make: impl Fn(String, String) -> PendingRename,
+) {
+    detect_by_name(lockfile, kind, |slug| read_name(&dir.join(format!("{slug}.json"))), out, make);
+}
+
+/// Propose a rename for every `kind` object whose name (read by `read_name`)
+/// no longer slugifies to its slug.
+fn detect_by_name(
+    lockfile: &Lockfile,
+    kind: &str,
+    read_name: impl Fn(&str) -> Option<String>,
     out: &mut Vec<PendingRename>,
     make: impl Fn(String, String) -> PendingRename,
 ) {
@@ -263,7 +276,7 @@ fn detect_flat_kind(
     // renamed away — that slug is about to be free, so a duplicate-name
     // collision with it should not earn a `-N` suffix. But it is not free
     // *yet*, and proposals are applied in `priority` order (see the `sort_by_key`
-    // in `detect_pending_renames`) with no dependency sort, while `move_file`
+    // in `detect`) with no dependency sort, while `move_file`
     // bails when the destination exists. So a proposal landing on a slug whose
     // occupant is itself moving is withheld and re-proposed on the next run,
     // once the occupant has actually moved — the same defer-until-next-run the
@@ -280,7 +293,7 @@ fn detect_flat_kind(
     let mut renaming_away: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for slug in by_slug.keys() {
-        let name = read_name(&dir.join(format!("{slug}.json")));
+        let name = read_name(slug);
         if let Some(name) = &name
             && is_stable_slug(slug, &slugify(name))
         {
@@ -346,29 +359,6 @@ fn read_name(path: &std::path::Path) -> Option<String> {
     v.get("name")
         .and_then(|n| n.as_str())
         .map(|s| s.to_string())
-}
-
-/// Detect stale engine slugs: read `engines/<slug>/engine.json` and
-/// propose a rename if the JSON's `name` slugifies to something
-/// different than `<slug>`. Engines own a directory on disk, so a
-/// rename moves the whole subtree (engine.json + fields/).
-fn detect_engines(paths: &Paths, lockfile: &Lockfile, out: &mut Vec<PendingRename>) {
-    let Some(by_slug) = lockfile.objects.get("engines") else {
-        return;
-    };
-    for slug in by_slug.keys() {
-        let file = paths.engine_dir(slug).join("engine.json");
-        let Some(name) = read_name(&file) else {
-            continue;
-        };
-        let proposed = slugify(&name);
-        if proposed != *slug && !by_slug.contains_key(&proposed) {
-            out.push(PendingRename::Engine {
-                old: slug.clone(),
-                new: proposed,
-            });
-        }
-    }
 }
 
 /// Detect stale engine-field slugs. Each field nests under exactly one
@@ -502,9 +492,8 @@ fn locate_workflow_step_file(paths: &Paths, key: &str) -> Option<std::path::Path
     None
 }
 
-/// Locate the queue dir for a given q_slug by reading the queue.json's
-/// `workspace` URL and looking up the parent ws_slug via the lockfile.
-/// Returns (ws_slug, queue_dir_path).
+/// Locate the queue dir for a given q_slug: the `workspaces/<ws>/queues/<q_slug>`
+/// directory whose `<ws>` the lockfile tracks. Returns (ws_slug, queue_dir_path).
 fn locate_queue_dir(
     paths: &Paths,
     lockfile: &Lockfile,
@@ -3360,6 +3349,39 @@ mod tests {
             ]
         );
         drop(tmp);
+    }
+
+    /// Queue slugs are unique across workspaces, so two queues in different
+    /// workspaces renamed to one name must not both be proposed the bare slug:
+    /// the second rename would overwrite the first's lockfile entries.
+    #[test]
+    fn duplicate_queue_names_across_workspaces_get_a_suffix() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = Paths::for_env(tmp.path(), "dev");
+        write_workspace(&paths, "ws-a", "ws-a");
+        write_workspace(&paths, "ws-b", "ws-b");
+        write_queue(&paths, "ws-a", "old-a", "Invoices");
+        write_queue(&paths, "ws-b", "old-b", "Invoices");
+        let mut lockfile = flat_lockfile("queues", &["old-a", "old-b"]);
+        for ws in ["ws-a", "ws-b"] {
+            lockfile.upsert("workspaces", ws, lockfile.objects["queues"]["old-a"].clone());
+        }
+
+        let mut pairs: Vec<(String, String, String)> = detect(&paths, &lockfile)
+            .into_iter()
+            .filter_map(|r| match r {
+                PendingRename::Queue { ws, old, new } => Some((ws, old, new)),
+                _ => None,
+            })
+            .collect();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                ("ws-a".into(), "old-a".into(), "invoices".into()),
+                ("ws-b".into(), "old-b".into(), "invoices-2".into()),
+            ]
+        );
     }
 
     /// The reservation accumulates, so a third duplicate gets `-3`.
