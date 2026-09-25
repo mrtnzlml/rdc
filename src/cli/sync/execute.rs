@@ -64,6 +64,10 @@ type PromptOutcome = (Resolution, bool, Vec<u8>, Vec<u8>, PathBuf);
 pub(crate) struct ConflictOutcome {
     /// `(kind, slug, on-disk path)` triples to feed into the push driver.
     pub(crate) promoted_to_push: Vec<(String, String, PathBuf)>,
+    /// `(kind, slug)` pairs to DELETE on the env: a local deletion the user
+    /// kept (`[k]` on `LocalDeleteRemoteEdit`). They join the run's own
+    /// tombstones, behind the same gate.
+    pub(crate) promoted_to_delete: Vec<(String, String)>,
 }
 
 /// Build the two confirmation summaries for the in-prompt "apply to all
@@ -106,9 +110,10 @@ pub(crate) fn build_bulk_prompt(
         ));
     }
     if recreate_local > 0 {
+        // The DELETEs join this run's delete phase, behind its own gate.
         keep.push_str(&format!(
-            "\n  {} need a follow-up `rdc sync {env} --allow-deletes`",
-            count_noun(recreate_local, "local deletion", "local deletions")
+            "\n  {} deleted on {env} too, once you confirm the deletes",
+            count_noun(recreate_local, "object", "objects")
         ));
         remote.push_str(&format!(
             "\n  {} recreated from {env}",
@@ -2495,6 +2500,8 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
         classified,
         input,
         interactive,
+        None,
+        false,
         progress,
         bulk_sticky,
         &projection,
@@ -2504,12 +2511,15 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
 
 /// `resolve_remote_deletes`, restoring the env's side portabilized against
 /// `projection` — see [`resolve_conflicts_projected`].
+#[allow(clippy::too_many_arguments)]
 async fn resolve_remote_deletes_projected<R: BufRead>(
     ctx: &mut PullCtx<'_>,
     catalog: &RemoteCatalog,
     classified: &[ClassifiedItem],
     mut input: R,
     interactive: bool,
+    conflict_strategy: Option<ConflictStrategy>,
+    no_pull: bool,
     progress: &Arc<Log>,
     bulk_sticky: &mut Option<BulkChoice>,
     projection: &crate::state::Lockfile,
@@ -3131,18 +3141,30 @@ async fn resolve_remote_deletes_projected<R: BufRead>(
                     .map(|b| crate::cli::pull::common::portabilize_proposed(&b, projection));
                 let local_path = refs.local_path.clone();
 
+                // `--conflict` answers the edit-vs-delete classes as their
+                // keys would, on a terminal or not.
+                let forced = conflict_strategy;
+                // Parked with no one to review it (no terminal, or `skip`).
+                let parks_unseen = forced == Some(ConflictStrategy::Skip)
+                    || (forced.is_none() && !interactive);
+
                 // For LocalDeleteRemoteEdit the local file is tombstoned
                 // — restore it from the env-side bytes so the user has
                 // something to review on the next sync. The prompt also
                 // reads `local_path`, so this restoration is required
-                // before the prompt can run.
-                if matches!(it.class, SyncClass::LocalDeleteRemoteEdit) {
+                // before the prompt can run. Under `--no-pull` nothing is
+                // restored that the answer does not ask for: `restored`
+                // lists what to take back.
+                let mut restored: Vec<PathBuf> = Vec::new();
+                let ldre_needs_restore = !(no_pull && parks_unseen);
+                if matches!(it.class, SyncClass::LocalDeleteRemoteEdit) && ldre_needs_restore {
                     match refs.restore_bytes.as_ref() {
                         Some(bytes) => {
                             if let Some(parent) = local_path.parent() {
                                 std::fs::create_dir_all(parent).ok();
                             }
                             write_atomic(&local_path, bytes)?;
+                            restored.push(local_path.clone());
                             // Restore the sidecar too for split-file
                             // kinds, so the local restore is byte-complete.
                             // For hooks, the sidecar extension is
@@ -3157,6 +3179,7 @@ async fn resolve_remote_deletes_projected<R: BufRead>(
                                         local_path.with_extension("py")
                                     };
                                 write_atomic(&restored_code_path, code.as_bytes())?;
+                                restored.push(restored_code_path);
                             }
                             // Restore formula sidecars for schemas (bug e fix).
                             if matches!(refs.hash_strategy, HashStrategy::Schema)
@@ -3166,7 +3189,9 @@ async fn resolve_remote_deletes_projected<R: BufRead>(
                                 let formulas_dir = queue_dir.join("formulas");
                                 std::fs::create_dir_all(&formulas_dir).ok();
                                 for (fid, fbytes) in &refs.restore_formulas {
-                                    write_atomic(&formulas_dir.join(format!("{fid}.py")), fbytes)?;
+                                    let path = formulas_dir.join(format!("{fid}.py"));
+                                    write_atomic(&path, fbytes)?;
+                                    restored.push(path);
                                 }
                             }
                         }
@@ -3223,13 +3248,14 @@ async fn resolve_remote_deletes_projected<R: BufRead>(
                     }
                 }
 
-                if !interactive {
+                if forced.is_none() && !interactive {
                     // CI / --yes fallback: write the deleted marker so
                     // the next interactive sync re-presents the choice.
                     // For RemoteDelete / LocalEditRemoteDelete the
                     // local file already has bytes; for
-                    // LocalDeleteRemoteEdit we just restored it above.
-                    if local_path.exists() {
+                    // LocalDeleteRemoteEdit it was restored above, unless
+                    // --no-pull kept it deleted.
+                    if local_path.exists() || it.class == SyncClass::LocalDeleteRemoteEdit {
                         let marker = deleted_marker_path(ctx.paths, &local_path);
                         write_atomic(&marker, b"")?;
                         progress.event(
@@ -3245,7 +3271,7 @@ async fn resolve_remote_deletes_projected<R: BufRead>(
                     continue;
                 }
 
-                if !local_path.exists() {
+                if forced.is_none() && !local_path.exists() {
                     // RemoteDelete / LocalEditRemoteDelete with no local
                     // file: the classifier saw a tombstone-flavored
                     // state but the file isn't there. Defensive — emit
@@ -3266,7 +3292,13 @@ async fn resolve_remote_deletes_projected<R: BufRead>(
                 );
                 let sticky_now = if bulk_eligible { *bulk_sticky } else { None };
 
-                let resolution = if let Some(b) = sticky_now {
+                let resolution = if let Some(strategy) = forced {
+                    match strategy {
+                        ConflictStrategy::KeepLocal => Resolution::KeepLocal,
+                        ConflictStrategy::UseRemote => Resolution::KeepRemote,
+                        ConflictStrategy::Skip => Resolution::Skip,
+                    }
+                } else if let Some(b) = sticky_now {
                     b.resolution()
                 } else {
                     let bulk = if bulk_eligible {
@@ -3337,27 +3369,24 @@ async fn resolve_remote_deletes_projected<R: BufRead>(
                 match resolution {
                     Resolution::KeepLocal => {
                         if is_local_delete_remote_edit {
-                            // Spec: `[k]` = commit the local tombstone by
-                            // DELETEing on env. Sync's executor doesn't
-                            // have a DELETE-via-classified path yet (the
-                            // push pipeline DELETEs via tombstones, not
-                            // ChangeList entries) — defer with a clear
-                            // user-facing instruction. The restored
-                            // local bytes are removed so re-running the
-                            // sync without explicit user intervention
-                            // doesn't accidentally re-create the file.
-                            std::fs::remove_file(&local_path)
-                                .with_context(|| format!("removing {}", local_path.display()))?;
-                            progress.event(
-                                Action::Info,
-                                &format!(
-                                    "{}: committing the local tombstone needs an \
-                                 explicit `rdc sync {} --allow-deletes` follow-up; \
-                                 the lockfile entry was retained so the deletion isn't lost",
-                                    local_path.display(),
-                                    env,
-                                ),
-                            );
+                            // Commit the local tombstone: take back what was
+                            // restored for review, and queue a DELETE for
+                            // this run's delete phase. The user has seen the
+                            // env's edit, so record its `modified_at` as the
+                            // base; otherwise that phase's drift check would
+                            // ask the same question a second time.
+                            for path in &restored {
+                                let _ = std::fs::remove_file(path);
+                            }
+                            if let Some(entry) = ctx
+                                .lockfile
+                                .objects
+                                .get_mut(it.kind.as_str())
+                                .and_then(|m| m.get_mut(it.slug.as_str()))
+                            {
+                                entry.modified_at = refs.modified_at.clone();
+                            }
+                            outcome.promoted_to_delete.push((it.kind.clone(), it.slug.clone()));
                         } else {
                             // Restore on env: drop the lockfile entry so
                             // the push pipeline's "missing lockfile
@@ -3418,6 +3447,11 @@ async fn resolve_remote_deletes_projected<R: BufRead>(
                         }
                     }
                     Resolution::Skip => {
+                        if no_pull {
+                            for path in &restored {
+                                let _ = std::fs::remove_file(path);
+                            }
+                        }
                         let marker = deleted_marker_path(ctx.paths, &local_path);
                         write_atomic(&marker, b"")?;
                         progress.event(
@@ -3644,6 +3678,8 @@ pub async fn run(
         remote_delete_input,
         CoordinatorStdin::new(),
         interactive,
+        conflict_strategy,
+        no_pull,
         progress,
         &mut bulk_sticky,
         &projection,
@@ -3659,24 +3695,31 @@ pub async fn run(
     // `run_deletes` which handles drift detection, cascade order
     // (children before parents), idempotency, and lockfile cleanup.
     //
-    // `LocalDeleteRemoteEdit` is intentionally NOT included — it already
-    // routed through the remote-delete resolver above. We only act on
-    // the clean-delete class here.
+    // `LocalDeleteRemoteEdit` went through the remote-delete resolver
+    // above; the ones answered `[k]` come back as `promoted_to_delete` and
+    // join the clean deletes here, behind the same gate.
     //
     // Gated by `no_push`: audit-mode (`--no-push`) suppresses all
     // outbound mutations, deletes included.
     let mut delete_counts = crate::cli::push::deletes::DeleteCounts::default();
     if !no_push {
         let mut tombstones = crate::cli::push::scan::Tombstones::default();
-        for it in classified {
-            if !matches!(it.class, SyncClass::LocalDelete) {
-                continue;
-            }
+        let targets = classified
+            .iter()
+            .filter(|it| matches!(it.class, SyncClass::LocalDelete))
+            .map(|it| (it.kind.as_str(), it.slug.as_str()))
+            .chain(
+                remote_delete_outcome
+                    .promoted_to_delete
+                    .iter()
+                    .map(|(k, s)| (k.as_str(), s.as_str())),
+            );
+        for (kind, slug) in targets {
             let id = ctx
                 .lockfile
                 .objects
-                .get(&it.kind)
-                .and_then(|m| m.get(&it.slug))
+                .get(kind)
+                .and_then(|m| m.get(slug))
                 .map(|e| e.id);
             let Some(id) = id else {
                 // Classifier emits LocalDelete only when the lockfile
@@ -3685,48 +3728,48 @@ pub async fn run(
                 // mid-sync.
                 progress.event(Action::Warn, &format!(
                     "{}/{} classified as LocalDelete but lockfile entry is missing; skipping delete",
-                    it.kind, it.slug
+                    kind, slug
                 ));
                 continue;
             };
-            match it.kind.as_str() {
+            match kind {
                 "workspaces" => {
-                    tombstones.workspaces.insert(it.slug.clone(), id);
+                    tombstones.workspaces.insert(slug.to_string(), id);
                 }
                 "hooks" => {
-                    tombstones.hooks.insert(it.slug.clone(), id);
+                    tombstones.hooks.insert(slug.to_string(), id);
                 }
                 "rules" => {
-                    tombstones.rules.insert(it.slug.clone(), id);
+                    tombstones.rules.insert(slug.to_string(), id);
                 }
                 "labels" => {
-                    tombstones.labels.insert(it.slug.clone(), id);
+                    tombstones.labels.insert(slug.to_string(), id);
                 }
                 "queues" => {
-                    tombstones.queues.insert(it.slug.clone(), id);
+                    tombstones.queues.insert(slug.to_string(), id);
                 }
                 "schemas" => {
-                    tombstones.schemas.insert(it.slug.clone(), id);
+                    tombstones.schemas.insert(slug.to_string(), id);
                 }
                 "inboxes" => {
-                    tombstones.inboxes.insert(it.slug.clone(), id);
+                    tombstones.inboxes.insert(slug.to_string(), id);
                 }
                 "email_templates" => {
-                    tombstones.email_templates.insert(it.slug.clone(), id);
+                    tombstones.email_templates.insert(slug.to_string(), id);
                 }
                 "engines" => {
-                    tombstones.engines.insert(it.slug.clone(), id);
+                    tombstones.engines.insert(slug.to_string(), id);
                 }
                 "engine_fields" => {
-                    tombstones.engine_fields.insert(it.slug.clone(), id);
+                    tombstones.engine_fields.insert(slug.to_string(), id);
                 }
                 "saved_views" => {
-                    tombstones.saved_views.insert(it.slug.clone(), id);
+                    tombstones.saved_views.insert(slug.to_string(), id);
                 }
                 other => {
                     progress.event(Action::Warn, &format!(
                         "{other}/{} classified as LocalDelete but kind is not deletable via rdc sync; skipping",
-                        it.slug
+                        slug
                     ));
                 }
             }
@@ -3773,7 +3816,7 @@ pub async fn run(
         .iter()
         .filter(|c| matches!(c.class, SyncClass::LocalDelete))
         .count();
-    if !no_push && local_delete_planned > 0 {
+    if !no_push && (local_delete_planned > 0 || !remote_delete_outcome.promoted_to_delete.is_empty()) {
         outcome.items_pushed = outcome.items_pushed.saturating_sub(local_delete_planned)
             + delete_counts.total_deleted();
     }
@@ -4653,13 +4696,12 @@ mod tests {
         assert!(b.use_remote_summary.contains("2 local files deleted"));
         assert!(b.use_remote_summary.contains("1 local file recreated from prod"));
         assert!(b.keep_local_summary.contains("39 local files kept and pushed to prod"));
-        assert!(b.keep_local_summary.contains("rdc sync prod --allow-deletes"));
-        // The follow-up has to name a subcommand that EXISTS. It once named
-        // a push subcommand, which rdc has never had — push is a phase of
-        // sync. `tests/command_references.rs` guards the whole tree for this.
+        assert!(b.keep_local_summary.contains("1 object deleted on prod too"));
+        // It once promised a follow-up `rdc sync --allow-deletes` that never
+        // deleted anything; the DELETE now happens in the same run.
         assert!(
-            !b.keep_local_summary.contains("rdc push"),
-            "the follow-up must name a real subcommand: {}",
+            !b.keep_local_summary.contains("follow-up"),
+            "keep-local deletes in this run: {}",
             b.keep_local_summary
         );
         assert!(

@@ -10,8 +10,7 @@
 //! path), and compares what happened against [`want`]. The interactive path
 //! is `cli_prompts`.
 //!
-//! [`want`] is the specification. A cell it leaves `None` is one whose right
-//! answer has not been decided; the comment there says which.
+//! [`want`] is the specification.
 //!
 //! Fake-only on purpose: none of this is about what the real API does, and
 //! 180 syncs against a live org would take the better part of an hour.
@@ -225,6 +224,7 @@ const FLAGS: &[&[&str]] = &[
     &["--allow-deletes"],
     &["--allow-deletes", "--no-push"],
     &["--allow-deletes", "--no-pull"],
+    &["--allow-deletes", "--conflict", "keep-local"],
     &["--conflict", "keep-local"],
     &["--conflict", "use-remote"],
     &["--conflict", "skip"],
@@ -275,6 +275,9 @@ struct Seen {
     local: Option<String>,
     shadow: bool,
     marker: bool,
+    /// Some label named like the first one exists on the env (a restore
+    /// re-creates it under a new id).
+    named_remote: bool,
     /// POST / PATCH / DELETE against the core API.
     writes: usize,
     lock_changed: bool,
@@ -292,6 +295,7 @@ struct Want {
     local: Option<Option<&'static str>>,
     shadow: Option<bool>,
     marker: Option<bool>,
+    named_remote: Option<bool>,
     writes: Option<usize>,
     lock_changed: Option<bool>,
     urgent_remote: Option<bool>,
@@ -358,15 +362,12 @@ fn want(state: State, f: &Flags) -> Want {
                 w.remote = Some(Some(if pushes { LOCAL } else { REMOTE }));
                 w.shadow = Some(false);
             }
+            // An explicit strategy wins over --no-pull.
             Some(Strategy::UseRemote) => {
                 w.remote = Some(Some(REMOTE));
+                w.local = Some(Some(REMOTE));
                 w.shadow = Some(false);
                 w.writes = Some(0);
-                // UNDECIDED: `--no-pull --conflict use-remote` overwrites the
-                // local file today. Either flag can be read as winning.
-                if pulls {
-                    w.local = Some(Some(REMOTE));
-                }
             }
         },
         State::LocalDelete => {
@@ -389,28 +390,61 @@ fn want(state: State, f: &Flags) -> Want {
             // which must not apply remote changes to the snapshot.
             w.local = Some(if pulls { None } else { Some(RED) });
         }
+        // `--conflict` resolves edit-vs-delete conflicts as its keys do.
         State::LocalEditRemoteDelete => {
             w.remote = Some(None);
-            // UNDECIDED: `--conflict` is ignored for edit-vs-delete conflicts
-            // today, though its help says it resolves "every object that
-            // changed on both sides".
-            if matches!(f.conflict, None | Some(Strategy::Skip)) {
-                w.local = Some(Some(LOCAL));
+            match f.conflict {
+                None | Some(Strategy::Skip) => {
+                    w.local = Some(Some(LOCAL));
+                    w.marker = Some(true);
+                    w.named_remote = Some(false);
+                    w.writes = Some(0);
+                }
+                // Restore on the env: re-created, under a new id.
+                Some(Strategy::KeepLocal) => {
+                    w.local = Some(Some(LOCAL));
+                    w.marker = Some(false);
+                    w.named_remote = Some(pushes);
+                }
+                Some(Strategy::UseRemote) => {
+                    w.local = Some(None);
+                    w.marker = Some(false);
+                    w.named_remote = Some(false);
+                    w.writes = Some(0);
+                }
+            }
+        }
+        State::LocalDeleteRemoteEdit => match f.conflict {
+            // Parked. The env's copy is restored for review — but not under
+            // --no-pull, which leaves the snapshot alone.
+            None | Some(Strategy::Skip) => {
+                w.remote = Some(Some(REMOTE));
+                w.local = Some(if pulls { Some(REMOTE) } else { None });
                 w.marker = Some(true);
                 w.writes = Some(0);
             }
-        }
-        State::LocalDeleteRemoteEdit => {
-            w.remote = Some(Some(REMOTE));
-            w.writes = Some(0);
-            // Without a terminal the env's copy is restored for review, and a
-            // marker defers the decision. UNDECIDED: whether --no-pull may
-            // restore it (it does today), and what `--conflict` means here.
-            if pulls && matches!(f.conflict, None | Some(Strategy::Skip)) {
+            Some(Strategy::UseRemote) => {
+                w.remote = Some(Some(REMOTE));
                 w.local = Some(Some(REMOTE));
-                w.marker = Some(true);
+                w.marker = Some(false);
+                w.writes = Some(0);
             }
-        }
+            // Keep the local deletion: DELETE on the env, behind the same
+            // gate as any delete, so no terminal means --allow-deletes.
+            Some(Strategy::KeepLocal) => {
+                w.local = Some(None);
+                w.marker = Some(false);
+                if !pushes {
+                    w.remote = Some(Some(REMOTE));
+                } else if f.allow_deletes {
+                    w.remote = Some(None);
+                } else {
+                    w.ok = Some(false);
+                    w.remote = Some(Some(REMOTE));
+                    w.writes = Some(0);
+                }
+            }
+        },
         State::RemoteCreate => {
             w.urgent_remote = Some(true);
             w.urgent_local = Some(pulls);
@@ -441,6 +475,7 @@ fn diff(w: &Want, s: &Seen) -> Vec<String> {
     check!(local, s.local.as_deref());
     check!(shadow, s.shadow);
     check!(marker, s.marker);
+    check!(named_remote, s.named_remote);
     check!(writes, s.writes);
     check!(lock_changed, s.lock_changed);
     check!(urgent_remote, s.urgent_remote);
@@ -468,6 +503,7 @@ async fn run_cell(state: State, flags: &[&str]) -> (Seen, String) {
         local: fx.local(),
         shadow: fx.project.exists(&fx.shadow),
         marker: fx.project.exists(&fx.marker),
+        named_remote: fx.remote_names().await.iter().any(|n| n == "Priority"),
         writes,
         lock_changed: fx.lockfile() != lock_before,
         urgent_remote: fx.remote_names().await.iter().any(|n| n == URGENT),

@@ -371,8 +371,12 @@ pub enum Command {
         /// `use-remote` overwrites the local file with the env's copy.
         /// `keep-local` keeps the local file and pushes it to the env. `skip`
         /// writes the env's copy to `.rdc/conflicts/<env>/` and leaves the
-        /// local file alone. Leave the flag out and a terminal prompts, while
-        /// everything else skips. Cannot be used with `--watch`.
+        /// local file alone. An object edited on one side and deleted on the
+        /// other follows the same rule: `keep-local` restores it on the env,
+        /// or deletes it there, behind the usual delete gate; `use-remote`
+        /// deletes or restores the local file. Leave the flag out and a
+        /// terminal prompts, while everything else skips. Cannot be used with
+        /// `--watch`.
         #[arg(long = "conflict", value_enum, conflicts_with = "watch")]
         conflict: Option<ConflictStrategy>,
         /// Watch local files and poll the env, reconciling on each event. On

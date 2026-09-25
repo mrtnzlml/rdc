@@ -189,6 +189,14 @@ async fn conflict_prompt_answers() {
             ..After::default()
         })
         .await,
+        // An explicit [r] wins over --no-pull.
+        check(State::Conflict, &["--no-pull"], &[(MENU_END, "r")], After {
+            ok: Some(true),
+            local: Some(Some(REMOTE)),
+            remote: Some(Some(REMOTE)),
+            ..After::default()
+        })
+        .await,
         // --no-push: the answer is taken, the push is not made.
         check(State::Conflict, &["--no-push"], &[(MENU_END, "k")], After {
             ok: Some(true),
@@ -298,6 +306,15 @@ async fn edit_vs_remote_delete_answers() {
             ..After::default()
         })
         .await,
+        // --conflict answers it without asking.
+        check(s, &["--conflict", "keep-local"], &[], After {
+            ok: Some(true),
+            local: Some(Some(LOCAL)),
+            says: &["post   label/priority"],
+            never_says: &[MENU_END],
+            ..After::default()
+        })
+        .await,
         // --no-push: nothing is re-created on the env this run.
         check(s, &["--no-push"], &[(MENU_END, "k")], After {
             ok: Some(true),
@@ -340,12 +357,45 @@ async fn local_delete_vs_remote_edit_answers() {
             ..wording()
         })
         .await,
-        // The tombstone stands; the env keeps its copy until a delete is
-        // authorised.
-        check(s, &[], &[(MENU_END, "k")], After {
+        // Keeping the deletion deletes on the env, behind the delete gate.
+        check(s, &[], &[(MENU_END, "k"), (GATE_END, "y")], After {
+            ok: Some(true),
+            local: Some(None),
+            remote: Some(None),
+            marker: Some(false),
+            never_says: &["follow-up"],
+            ..wording()
+        })
+        .await,
+        check(s, &[], &[(MENU_END, "k"), (GATE_END, "n")], After {
             ok: Some(true),
             local: Some(None),
             remote: Some(Some(REMOTE)),
+            ..wording()
+        })
+        .await,
+        check(s, &["--allow-deletes"], &[(MENU_END, "k")], After {
+            ok: Some(true),
+            local: Some(None),
+            remote: Some(None),
+            never_says: &[GATE_END],
+            ..wording()
+        })
+        .await,
+        // --no-pull: "decide later" leaves the local deletion as it was.
+        check(s, &["--no-pull"], &[(MENU_END, "s")], After {
+            ok: Some(true),
+            local: Some(None),
+            remote: Some(Some(REMOTE)),
+            marker: Some(true),
+            ..wording()
+        })
+        .await,
+        // ... while an explicit [r] still restores it.
+        check(s, &["--no-pull"], &[(MENU_END, "r")], After {
+            ok: Some(true),
+            local: Some(Some(REMOTE)),
+            marker: Some(false),
             ..wording()
         })
         .await,
