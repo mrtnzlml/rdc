@@ -171,7 +171,8 @@ One cycle, in order:
   1. Scan envs/<env>/ for problems rdc can find offline: invalid JSON, a
      field past the API's length limit, a field the API needs on create, a
      broken organization `settings` structure, a saved view that is not
-     shared, a queue bound to more than one engine. Any one stops the run
+     shared, a queue bound to more than one engine, a formula field with no
+     formula. Any one stops the run
      before the first remote write. (--dry-run lists them instead.
      --no-push skips the check.)
   2. List the env. Classify every object by comparing the local file, the
@@ -245,9 +246,10 @@ It reports these, and changes nothing:
     the tenant;
   * a field longer than the Rossum API's limit for that field;
   * a field the API needs on create that a new object does not have;
-  * a queue bound to more than one engine, which the API rejects.
+  * a queue bound to more than one engine, which the API rejects;
+  * a formula field with no formula, which the API rejects.
 
-`rdc sync <env>` refuses to push while any of the last three is there.
+`rdc sync <env>` refuses to push while any of the last four is there.
 Finding them here costs no network call. rdc cannot fix them: shortening
 text, or picking one engine, is your decision.
 

@@ -7913,9 +7913,15 @@ async fn sync_auto_merges_disjoint_label_edits_without_prompting() {
     // Second sync — the 3-way merge accepts both disjoint edits, then
     // (because a local-side field survived the merge) PATCHes the merged
     // result back so the remote receives the local color.
-    rdc::cli::sync::run("dev", false, false, false, false, false, None)
+    let outcome = rdc::cli::sync::run("dev", false, false, false, false, false, None)
         .await
         .expect("second sync auto-merges and pushes");
+    // The merged label went out as a push, so the run must report it: an
+    // auto-merged push once counted as a conflict only ("0 changed").
+    assert!(
+        outcome.items_pushed >= 1,
+        "an auto-merged push must count as pushed: {outcome:?}"
+    );
 
     let merged_raw = std::fs::read_to_string(&label_path).unwrap();
     let merged: serde_json::Value = serde_json::from_str(&merged_raw).unwrap();

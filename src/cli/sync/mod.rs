@@ -262,6 +262,14 @@ pub(crate) async fn run_cycle(
     // `push --dry-run` byte for byte. The scan result is also reused by
     // the classify phase below, so the tree is still walked and hashed
     // exactly once.
+    let (renamed, rename_warnings) =
+        crate::cli::deploy::realign::follow_hand_renames(&paths, &mut lockfile, dry_run)?;
+    for line in renamed {
+        progress.event(Action::Info, &format!("renamed by hand, followed as a rename: {line}"));
+    }
+    for w in rename_warnings {
+        progress.event(Action::Warn, w.trim());
+    }
     for (old, new) in crate::cli::push::scan::follow_moved_email_templates(&paths, &mut lockfile, dry_run) {
         progress.event(Action::Info, &format!("email_templates/{old} moved to {new}"));
     }
@@ -272,10 +280,11 @@ pub(crate) async fn run_cycle(
     let settings_problems = changes.organization_settings_problems();
     let unshared_views = changes.unshared_saved_views();
     let engine_conflicts = changes.queue_engine_conflicts();
+    let missing_formulas = changes.schemas_missing_formulas();
 
     // `--no-push` is an audit mode: there is nothing to half-apply, so it
     // proceeds and merely reports. `--dry-run` proceeds too — its job is
-    // to print the COMPLETE plan, and it already surfaces all six classes
+    // to print the COMPLETE plan, and it already surfaces all seven classes
     // in dedicated sections further down.
     if !no_push && !dry_run {
         refuse_on_offline_defects(
@@ -285,6 +294,7 @@ pub(crate) async fn run_cycle(
             &settings_problems,
             &unshared_views,
             &engine_conflicts,
+            &missing_formulas,
         )?;
     }
 
@@ -628,6 +638,22 @@ pub(crate) async fn run_cycle(
             progress.block(&body);
         }
 
+        if !missing_formulas.is_empty() {
+            progress.event(Action::Plan, "formula fields without a formula");
+            let mut body = String::new();
+            use std::fmt::Write as _;
+            for m in &missing_formulas {
+                let _ = writeln!(
+                    body,
+                    "- schemas/{} -- {}: {} (the API needs a formula for each)",
+                    m.slug,
+                    m.path.display(),
+                    m.fields.join(", "),
+                );
+            }
+            progress.block(&body);
+        }
+
         if !renderer_was_supplied {
             let parse_suffix = if parse_errors.is_empty() {
                 String::new()
@@ -683,9 +709,18 @@ pub(crate) async fn run_cycle(
                     if engine_conflicts.len() == 1 { "" } else { "s" }
                 )
             };
+            let formula_suffix = if missing_formulas.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", {} schema{} with a formula field and no formula",
+                    missing_formulas.len(),
+                    if missing_formulas.len() == 1 { "" } else { "s" }
+                )
+            };
             let parse_suffix = format!(
                 "{parse_suffix}{limit_suffix}{missing_suffix}{settings_suffix}\
-                 {unshared_suffix}{engine_suffix}"
+                 {unshared_suffix}{engine_suffix}{formula_suffix}"
             );
             progress.event(
                 Action::Done,
@@ -733,8 +768,22 @@ pub(crate) async fn run_cycle(
     };
     // Phase 6: settle, when the cycle wrote anything to the env. See
     // [`settle_pass`].
+    // The main pass may have pulled a queue into another workspace, carrying
+    // its email templates along; they follow now, and their own `url` is
+    // refreshed by the settle pass below.
+    let moved = if !no_pull && exec_result.is_ok() {
+        crate::cli::push::scan::follow_moved_email_templates(&paths, &mut lockfile, false)
+    } else {
+        Vec::new()
+    };
+    for (old, new) in &moved {
+        progress.event(Action::Info, &format!("email_templates/{old} moved to {new}"));
+    }
+    let templates_moved = !moved.is_empty();
     let exec_result = match exec_result {
-        Ok(main) if !no_pull && crate::api::core_writes() != writes_before => {
+        Ok(main)
+            if !no_pull && (templates_moved || crate::api::core_writes() != writes_before) =>
+        {
             settle_pass(
                 &paths,
                 &client,
@@ -1715,7 +1764,18 @@ pub fn from_catalog_scan_lockfile(
             None => crate::slug::slugify_unique(&t.name, used),
         };
         used.insert(template_slug.clone());
-        let compound = format!("{ws_slug}/{q_slug}/{template_slug}");
+        // A known template keeps its lockfile key while it stays on the same
+        // queue, whichever workspace the env lists that queue under. After a
+        // local move the key already names the new workspace
+        // (`follow_moved_email_templates`) while the env still lists the old
+        // one until the queue is pushed; deriving the key from the env would
+        // read every template of the moved queue as deleted on the env.
+        let compound = match lockfile.slug_for_id("email_templates", t.id) {
+            Some(existing) if existing.split('/').nth(1) == Some(q_slug.as_str()) => {
+                existing.to_string()
+            }
+            _ => format!("{ws_slug}/{q_slug}/{template_slug}"),
+        };
 
         let value = match serde_json::to_value(t) {
             Ok(v) => v,
@@ -1780,6 +1840,7 @@ fn refuse_on_offline_defects(
     settings_problems: &[(std::path::PathBuf, crate::snapshot::limits::SettingsProblem)],
     unshared_views: &[crate::snapshot::limits::UnsharedSavedView],
     engine_conflicts: &[crate::snapshot::limits::EngineSlotConflict],
+    missing_formulas: &[crate::snapshot::limits::FormulaFieldWithoutFormula],
 ) -> Result<()> {
     use std::fmt::Write as _;
 
@@ -1913,6 +1974,29 @@ fn refuse_on_offline_defects(
             msg,
             "\n  Keep the binding you want and set the others to null (a queue bound to a \
              custom `engine` has `generic_engine: null`), or re-run migrate."
+        );
+        anyhow::bail!("{msg}");
+    }
+
+    if !missing_formulas.is_empty() {
+        let mut msg = format!(
+            "{} local schema(s) have a formula field with no formula, which the Rossum API \
+             refuses; refusing to push before any remote write:",
+            missing_formulas.len()
+        );
+        for m in missing_formulas {
+            let _ = write!(
+                msg,
+                "\n  - schemas/{} -- {}: {}",
+                m.slug,
+                m.path.display(),
+                m.fields.join(", "),
+            );
+        }
+        let _ = write!(
+            msg,
+            "\n  Restore formulas/<field_id>.py next to the schema, or change the field's \
+             `ui_configuration.type`."
         );
         anyhow::bail!("{msg}");
     }
@@ -2497,7 +2581,7 @@ mod tests {
             field: "email_prefix",
             detail: None,
         }];
-        let err = refuse_on_offline_defects(&[], &[], &missing, &[], &[], &[])
+        let err = refuse_on_offline_defects(&[], &[], &missing, &[], &[], &[], &[])
             .expect_err("a doomed create must refuse the push");
         let msg = err.to_string();
         assert!(msg.contains("inboxes/invoices"), "{msg}");
@@ -2508,7 +2592,7 @@ mod tests {
     /// ...and must stay silent when there is nothing to refuse.
     #[test]
     fn refuse_on_offline_defects_passes_a_clean_change_list() {
-        refuse_on_offline_defects(&[], &[], &[], &[], &[], &[])
+        refuse_on_offline_defects(&[], &[], &[], &[], &[], &[], &[])
             .expect("a clean scan must not refuse");
     }
 
@@ -2521,7 +2605,7 @@ mod tests {
             slug: "mine".to_string(),
             path: std::path::PathBuf::from("envs/prod/saved-views/mine.json"),
         }];
-        let err = refuse_on_offline_defects(&[], &[], &[], &[], &unshared, &[])
+        let err = refuse_on_offline_defects(&[], &[], &[], &[], &unshared, &[], &[])
             .expect_err("an unshared saved view must refuse the push");
         let msg = err.to_string();
         assert!(msg.contains("saved-views/mine"), "{msg}");
@@ -2538,12 +2622,29 @@ mod tests {
             path: std::path::PathBuf::from("envs/prod/workspaces/main/queues/invoices/queue.json"),
             fields: vec!["engine", "generic_engine"],
         }];
-        let err = refuse_on_offline_defects(&[], &[], &[], &[], &[], &conflicts)
+        let err = refuse_on_offline_defects(&[], &[], &[], &[], &[], &conflicts, &[])
             .expect_err("two engine bindings must refuse the push");
         let msg = err.to_string();
         assert!(msg.contains("queues/invoices"), "{msg}");
         assert!(msg.contains("queue.json"), "{msg}");
         assert!(msg.contains("engine, generic_engine"), "{msg}");
         assert!(msg.contains("migrate"), "must point at the fix: {msg}");
+    }
+
+    /// A formula field whose `formulas/<id>.py` is gone makes the API refuse
+    /// the schema on every push, so it must refuse before any remote write.
+    #[test]
+    fn refuse_on_offline_defects_bails_on_a_formula_field_without_a_formula() {
+        let missing = vec![crate::snapshot::limits::FormulaFieldWithoutFormula {
+            slug: "invoices".to_string(),
+            path: std::path::PathBuf::from("envs/prod/workspaces/main/queues/invoices/schema.json"),
+            fields: vec!["amount_total".to_string()],
+        }];
+        let err = refuse_on_offline_defects(&[], &[], &[], &[], &[], &[], &missing)
+            .expect_err("a formula field without a formula must refuse the push");
+        let msg = err.to_string();
+        assert!(msg.contains("schemas/invoices"), "{msg}");
+        assert!(msg.contains("amount_total"), "{msg}");
+        assert!(msg.contains("formulas/<field_id>.py"), "must point at the fix: {msg}");
     }
 }

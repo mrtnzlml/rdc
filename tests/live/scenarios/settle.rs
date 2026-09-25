@@ -43,7 +43,11 @@ async fn live_settle_after_push() {
 ///      leave the lockfile in the same run;
 ///  (d) a label deleted while a rule action adds it — the server keeps the
 ///      dead ref for good and then refuses every PATCH of the rule, so rdc
-///      detaches it in the same run.
+///      detaches it in the same run;
+///  (e) the same label deleted on the env instead — rdc mirrors the delete and
+///      repairs the rule on the env in the same run;
+///  (f) a rule that already names a dead label rdc never saw — created, used
+///      and deleted on the env between two syncs — is repaired the same way.
 ///
 /// Each case is one sync followed by `assert_converged`.
 async fn settle_after_push(cfg: &LiveConfig) {
@@ -220,6 +224,88 @@ async fn settle_after_push(cfg: &LiveConfig) {
         "(d) the sync that deleted the label must also detach it from the rule's action"
     );
     assert_converged(&project, "test", &prefix, "(d) label deleted under a rule action");
+
+    // (e) A label that exists on the env, added to the rule locally, then
+    //     deleted on the env behind rdc's back.
+    let (label_id, _) = client
+        .create(
+            "label",
+            &serde_json::json!({
+                "name": run_id.prefix("Remote label"),
+                "color": "#123456",
+                "organization": client.org_url,
+            }),
+        )
+        .await
+        .expect("create a label remotely");
+    let out = project.run_rdc(&["sync", "test"]);
+    assert!(out.status.success(), "(e) pulling the label failed: {}", combined(&out));
+    let remote_label = load_lockfile(project.path(), "test")
+        .expect("lockfile")
+        .slug_for_id("labels", label_id)
+        .expect("the remote label pulled into the lockfile")
+        .to_string();
+    let mut rule = project.read_json(&format!("envs/test/rules/{fresh_rule}.json"));
+    rule["actions"][0]["payload"]["labels"] =
+        serde_json::json!([format!("rdc://labels/{remote_label}")]);
+    project.write_json(&format!("envs/test/rules/{fresh_rule}.json"), &rule);
+    let out = project.run_rdc(&["sync", "test"]);
+    assert!(out.status.success(), "(e) pushing the label action failed: {}", combined(&out));
+    client.delete("label", label_id).await.expect("delete the label remotely");
+    let out = project.run_rdc(&["sync", "test"]);
+    assert!(out.status.success(), "(e) sync failed: {}", combined(&out));
+    let rule = project.read_json(&format!("envs/test/rules/{fresh_rule}.json"));
+    assert_eq!(
+        rule["actions"][0]["payload"]["labels"],
+        serde_json::json!([]),
+        "(e) the sync that mirrored the label's delete must drop it from the rule"
+    );
+    let rule_id = load_lockfile(project.path(), "test")
+        .expect("lockfile")
+        .objects["rules"][&fresh_rule]
+        .id;
+    let remote_rule = client.get_value("rule", rule_id).await.expect("GET the rule");
+    assert_eq!(
+        remote_rule["actions"][0]["payload"]["labels"],
+        serde_json::json!([]),
+        "(e) the rule must be repaired on the env too, or it stays unpatchable"
+    );
+    assert_converged(&project, "test", &prefix, "(e) label deleted on the env under a rule action");
+
+    // (f) The whole life of a label happens on the env, between two syncs.
+    let (ghost_id, ghost_url) = client
+        .create(
+            "label",
+            &serde_json::json!({
+                "name": run_id.prefix("Ghost label"),
+                "color": "#654321",
+                "organization": client.org_url,
+            }),
+        )
+        .await
+        .expect("create a label remotely");
+    let mut actions = remote_rule["actions"].clone();
+    actions[0]["payload"]["labels"] = serde_json::json!([ghost_url]);
+    client
+        .patch_fields("rule", rule_id, serde_json::json!({ "actions": actions }))
+        .await
+        .expect("point the rule's action at the label");
+    client.delete("label", ghost_id).await.expect("delete the label remotely");
+    let out = project.run_rdc(&["sync", "test"]);
+    assert!(out.status.success(), "(f) sync failed: {}", combined(&out));
+    let rule = project.read_json(&format!("envs/test/rules/{fresh_rule}.json"));
+    assert_eq!(
+        rule["actions"][0]["payload"]["labels"],
+        serde_json::json!([]),
+        "(f) a dead label URL must not land in the snapshot"
+    );
+    let remote_rule = client.get_value("rule", rule_id).await.expect("GET the rule");
+    assert_eq!(
+        remote_rule["actions"][0]["payload"]["labels"],
+        serde_json::json!([]),
+        "(f) the rule must be repaired on the env"
+    );
+    assert_converged(&project, "test", &prefix, "(f) a dead label rdc never saw");
 
     drop(teardown);
 }

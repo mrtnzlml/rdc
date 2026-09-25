@@ -618,6 +618,27 @@ fn reconcile_moved_queue(
         .unwrap_or_else(|| "?".to_string());
 
     if is_stale_queue_dir_clean(ctx, q_slug, stale_dir)? {
+        // The queue's email templates move with it. Their lockfile keys still
+        // name the old workspace, and `follow_moved_email_templates` re-keys
+        // them (and their base cache) once they sit under the new one.
+        // Deleting them here instead left the next sync reading a tombstone
+        // for each, i.e. a DELETE of every template of the moved queue.
+        let from = stale_dir.join("email-templates");
+        if from.is_dir() {
+            let to = ctx.paths.queue_email_templates_dir(new_ws_slug, q_slug);
+            std::fs::create_dir_all(&to).with_context(|| format!("creating {}", to.display()))?;
+            for entry in std::fs::read_dir(&from)
+                .with_context(|| format!("listing {}", from.display()))?
+                .flatten()
+            {
+                let target = to.join(entry.file_name());
+                if !target.exists() {
+                    std::fs::rename(entry.path(), &target).with_context(|| {
+                        format!("moving {} -> {}", entry.path().display(), target.display())
+                    })?;
+                }
+            }
+        }
         std::fs::remove_dir_all(stale_dir)
             .with_context(|| format!("removing stale queue dir {}", stale_dir.display()))?;
         progress.event(

@@ -1005,6 +1005,9 @@ fn apply_one(paths: &Paths, lockfile: &mut Lockfile, p: &PendingRename) -> Resul
                 &paths.hooks_dir().join(format!("{new}.js")),
             )?;
             rename_lockfile_key(lockfile, "hooks", old, new);
+            // Hook secrets are keyed by slug and live outside the env tree;
+            // left behind, the renamed hook would push without them.
+            crate::secrets::rename_hook_secret(paths.root(), paths.env(), old, new)?;
             collect_orphans(paths, "hooks", old, &mut orphans);
         }
         PendingRename::Rule { old, new } => {
@@ -1109,6 +1112,263 @@ fn apply_one(paths: &Paths, lockfile: &mut Lockfile, p: &PendingRename) -> Resul
         }
     }
     Ok(orphans)
+}
+
+/// Follow objects the user renamed by hand: a file (or, for workspaces,
+/// queues and engines, a directory) moved to a new slug with its `id` left
+/// inside.
+///
+/// Without this, sync reads a hand rename as a delete plus a create: the
+/// object is DELETEd on the env and POSTed again with a new id, and a hook
+/// comes back without its secrets, which are keyed by slug. A missing lockfile
+/// entry whose `id` is carried by exactly one untracked file of the same kind
+/// is taken as renamed to that file's slug.
+///
+/// The files are moved back under the old slug and handed to [`apply`], so a
+/// hand rename is applied exactly as a `doctor` rename: files, base cache,
+/// lockfile, `rdc://` refs, overlay keys, hook secrets and a mapping row all
+/// follow. Structural kinds go first, so a leaf inside a renamed directory is
+/// found at its new path. With `dry_run` nothing on disk changes; only the
+/// in-memory lockfile is re-keyed, so the plan shows the rename's real effect.
+///
+/// Returns one line per rename followed, and any warnings [`apply`] raised.
+pub fn follow_hand_renames(
+    paths: &Paths,
+    lockfile: &mut Lockfile,
+    dry_run: bool,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let mut followed = Vec::new();
+    let mut warnings = Vec::new();
+    for round in [HandRenameRound::Structural, HandRenameRound::Leaves] {
+        let found = detect_hand_renames(paths, lockfile, round);
+        if found.is_empty() {
+            continue;
+        }
+        followed.extend(found.iter().map(|(p, _)| p.describe()));
+        if dry_run {
+            for (p, _) in &found {
+                let (kind, old, new) = lockfile_key_change(p);
+                rename_lockfile_key(lockfile, kind, &old, &new);
+            }
+            continue;
+        }
+        let mut pending = Vec::new();
+        for (p, moves) in found {
+            for (at_new, at_old) in &moves {
+                std::fs::rename(at_new, at_old).with_context(|| {
+                    format!("moving {} back to {}", at_new.display(), at_old.display())
+                })?;
+            }
+            pending.push(p);
+        }
+        pending.sort_by_key(priority);
+        let stats = apply(paths, lockfile, pending, false)?;
+        warnings.extend(stats.orphan_warnings);
+    }
+    Ok((followed, warnings))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HandRenameRound {
+    /// Workspaces, engines and queues: each owns a subtree on disk.
+    Structural,
+    /// Everything that sits inside one: hooks, rules, labels, saved views
+    /// and email templates.
+    Leaves,
+}
+
+/// The lockfile `(kind, old_key, new_key)` a rename re-keys, for the dry-run
+/// path that re-keys without touching disk.
+fn lockfile_key_change(p: &PendingRename) -> (&'static str, String, String) {
+    match p {
+        PendingRename::Workspace { old, new } => ("workspaces", old.clone(), new.clone()),
+        PendingRename::Queue { old, new, .. } => ("queues", old.clone(), new.clone()),
+        PendingRename::Engine { old, new } => ("engines", old.clone(), new.clone()),
+        PendingRename::Hook { old, new } => ("hooks", old.clone(), new.clone()),
+        PendingRename::Rule { old, new } => ("rules", old.clone(), new.clone()),
+        PendingRename::Label { old, new } => ("labels", old.clone(), new.clone()),
+        PendingRename::SavedView { old, new } => ("saved_views", old.clone(), new.clone()),
+        PendingRename::EmailTemplate { ws, q, old, new } => {
+            ("email_templates", format!("{ws}/{q}/{old}"), format!("{ws}/{q}/{new}"))
+        }
+        PendingRename::EngineField { old, new } => ("engine_fields", old.clone(), new.clone()),
+        PendingRename::Workflow { old, new } => ("workflows", old.clone(), new.clone()),
+        PendingRename::WorkflowStep { old, new } => ("workflow_steps", old.clone(), new.clone()),
+    }
+}
+
+/// The `id` a local JSON file carries, if any.
+fn file_id(path: &std::path::Path) -> Option<u64> {
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice::<serde_json::Value>(&bytes).ok()?.get("id")?.as_u64()
+}
+
+/// Pair each missing lockfile entry of `kind` with the one untracked
+/// candidate that carries its id. `candidates` are `(slug, json_path)`;
+/// `present(slug)` says whether a tracked slug's file is still on disk.
+fn pair_by_id(
+    lockfile: &Lockfile,
+    kind: &str,
+    candidates: &[(String, std::path::PathBuf)],
+    present: impl Fn(&str) -> bool,
+) -> Vec<(String, String)> {
+    let Some(entries) = lockfile.objects.get(kind) else {
+        return Vec::new();
+    };
+    let mut pairs = Vec::new();
+    for (old, entry) in entries {
+        if entry.id == 0 || present(old) {
+            continue;
+        }
+        let matches: Vec<&String> = candidates
+            .iter()
+            .filter(|(slug, path)| !entries.contains_key(slug) && file_id(path) == Some(entry.id))
+            .map(|(slug, _)| slug)
+            .collect();
+        if let [new] = matches[..] {
+            pairs.push((old.clone(), new.clone()));
+        }
+    }
+    pairs
+}
+
+/// Immediate subdirectories of `dir` that contain `file`, as `(name, path to file)`.
+fn subdirs_with(dir: &std::path::Path, file: &str) -> Vec<(String, std::path::PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, std::path::PathBuf)> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| (e.file_name().to_string_lossy().to_string(), e.path().join(file)))
+        .filter(|(_, p)| p.exists())
+        .collect();
+    out.sort();
+    out
+}
+
+/// `<stem>.json` files directly in `dir`, as `(stem, path)`.
+fn json_files_in(dir: &std::path::Path) -> Vec<(String, std::path::PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, std::path::PathBuf)> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+        .filter_map(|p| Some((p.file_stem()?.to_str()?.to_string(), p)))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Every hand rename of one round, with the `(path at new slug, path at old
+/// slug)` moves that put its files back where [`apply`] expects them.
+fn detect_hand_renames(
+    paths: &Paths,
+    lockfile: &Lockfile,
+    round: HandRenameRound,
+) -> Vec<(PendingRename, Vec<(std::path::PathBuf, std::path::PathBuf)>)> {
+    let mut out = Vec::new();
+    let workspaces = subdirs_with(&paths.workspaces_dir(), "workspace.json");
+    if round == HandRenameRound::Structural {
+        for (old, new) in pair_by_id(lockfile, "workspaces", &workspaces, |s| {
+            paths.workspace_dir(s).join("workspace.json").exists()
+        }) {
+            let moves = vec![(paths.workspace_dir(&new), paths.workspace_dir(&old))];
+            out.push((PendingRename::Workspace { old, new }, moves));
+        }
+        let engines = subdirs_with(&paths.engines_dir(), "engine.json");
+        for (old, new) in pair_by_id(lockfile, "engines", &engines, |s| {
+            paths.engine_dir(s).join("engine.json").exists()
+        }) {
+            let moves = vec![(paths.engine_dir(&new), paths.engine_dir(&old))];
+            out.push((PendingRename::Engine { old, new }, moves));
+        }
+        // A queue renamed inside its workspace. One renamed AND moved to
+        // another workspace is left alone: it has no single old location.
+        for (ws, _) in &workspaces {
+            let queues = subdirs_with(&paths.queues_dir(ws), "queue.json");
+            let queue_anywhere = |slug: &str| {
+                subdirs_with(&paths.workspaces_dir(), "workspace.json")
+                    .iter()
+                    .any(|(w, _)| paths.queue_dir(w, slug).join("queue.json").exists())
+            };
+            for (old, new) in pair_by_id(lockfile, "queues", &queues, queue_anywhere) {
+                let moves = vec![(paths.queue_dir(ws, &new), paths.queue_dir(ws, &old))];
+                out.push((PendingRename::Queue { ws: ws.clone(), old, new }, moves));
+            }
+        }
+        return out;
+    }
+
+    let flat: [(&str, std::path::PathBuf, &[&str]); 4] = [
+        ("hooks", paths.hooks_dir(), &["py", "js"]),
+        ("rules", paths.rules_dir(), &["py"]),
+        ("labels", paths.labels_dir(), &[]),
+        ("saved_views", paths.saved_views_dir(), &[]),
+    ];
+    for (kind, dir, sidecars) in flat {
+        let files = json_files_in(&dir);
+        for (old, new) in pair_by_id(lockfile, kind, &files, |s| dir.join(format!("{s}.json")).exists()) {
+            let mut moves = vec![(dir.join(format!("{new}.json")), dir.join(format!("{old}.json")))];
+            for ext in sidecars {
+                let at_new = dir.join(format!("{new}.{ext}"));
+                if at_new.exists() {
+                    moves.push((at_new, dir.join(format!("{old}.{ext}"))));
+                }
+            }
+            let p = match kind {
+                "hooks" => PendingRename::Hook { old, new },
+                "rules" => PendingRename::Rule { old, new },
+                "labels" => PendingRename::Label { old, new },
+                _ => PendingRename::SavedView { old, new },
+            };
+            out.push((p, moves));
+        }
+    }
+
+    // Email templates renamed inside their queue's directory. Keyed
+    // `<ws>/<q>/<t>`, so the lookup is per queue directory.
+    let Some(templates) = lockfile.objects.get("email_templates") else {
+        return out;
+    };
+    let mut dirs: BTreeSet<(String, String)> = BTreeSet::new();
+    for key in templates.keys() {
+        if let Some((ws, q, _)) = split_compound(key) {
+            dirs.insert((ws, q));
+        }
+    }
+    for (ws, q) in dirs {
+        let dir = paths.queue_email_templates_dir(&ws, &q);
+        let files: Vec<(String, std::path::PathBuf)> = json_files_in(&dir)
+            .into_iter()
+            .map(|(t, p)| (format!("{ws}/{q}/{t}"), p))
+            .collect();
+        let prefix = format!("{ws}/{q}/");
+        let scoped = Lockfile {
+            objects: std::iter::once((
+                "email_templates".to_string(),
+                templates
+                    .iter()
+                    .filter(|(k, _)| k.starts_with(&prefix))
+                    .map(|(k, e)| (k.clone(), e.clone()))
+                    .collect(),
+            ))
+            .collect(),
+            ..Lockfile::default()
+        };
+        for (old_key, new_key) in pair_by_id(&scoped, "email_templates", &files, |k| {
+            let t = k.rsplit('/').next().unwrap_or(k);
+            dir.join(format!("{t}.json")).exists()
+        }) {
+            let old = old_key.rsplit('/').next().unwrap_or_default().to_string();
+            let new = new_key.rsplit('/').next().unwrap_or_default().to_string();
+            let moves = vec![(dir.join(format!("{new}.json")), dir.join(format!("{old}.json")))];
+            out.push((PendingRename::EmailTemplate { ws: ws.clone(), q: q.clone(), old, new }, moves));
+        }
+    }
+    out
 }
 
 fn move_file(paths: &Paths, from: &std::path::Path, to: &std::path::Path) -> Result<()> {

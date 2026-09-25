@@ -84,6 +84,18 @@ pub(crate) fn manifest_bytes_merged(existing: Option<&[u8]>, name: &str) -> Resu
     Ok(bytes)
 }
 
+/// Whether `name` is a Data Storage collection Rossum keeps for itself.
+///
+/// Rossum prefixes its own collections with `__`: import temporaries
+/// (`__tmp_*`, created and dropped by the minute) and caches such as
+/// `__aggregate_cache`, whose search-index listing answers `404 Dataset ...
+/// not found` every time (observed live 2026-09-25). None of them is project
+/// configuration, and mirroring one would let `migrate` create it in another
+/// env, so rdc lists, pulls and creates none of them.
+pub(crate) fn is_internal_collection(name: &str) -> bool {
+    name.starts_with("__")
+}
+
 /// Read a dataset's collection name from its manifest. Returns `None` when
 /// the manifest is absent (a legacy dataset predating the manifest) or
 /// unparseable — never panics; the caller warns and skips.
@@ -115,6 +127,9 @@ pub(crate) fn local_only_dataset_slugs(
         };
         if remote_slugs.contains(&slug) {
             continue; // handled by the remote-driven path; never touched here
+        }
+        if read_collection_name(&entry.path()).is_some_and(|n| is_internal_collection(&n)) {
+            continue; // Rossum's own, left over from an older pull
         }
         if entry.path().join("indexes.json").is_file() {
             out.push(slug);
@@ -909,7 +924,10 @@ pub async fn list(
         .context("constructing Data Storage client")?;
 
     let (collections, available) = match client.list_collections(Some(progress.clone())).await {
-        Ok(c) => (c, true),
+        Ok(mut c) => {
+            c.retain(|c| !is_internal_collection(&c.name));
+            (c, true)
+        }
         Err(e) if anyhow_has_status(&e, 404) => {
             // MDH not enabled on this cluster — quietly skip. `available:
             // false` keeps the deploy from attempting collection creation
@@ -1319,6 +1337,19 @@ mod tests {
 
         let remote: BTreeSet<String> = ["b".to_string()].into_iter().collect();
         assert_eq!(local_only_dataset_slugs(mdh.path(), &remote), vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn local_only_dataset_slugs_skips_rossums_internal_collections() {
+        let mdh = tempfile::TempDir::new().unwrap();
+        for (slug, name) in [("aggregate-cache", "__aggregate_cache"), ("vendors", "vendors")] {
+            let dir = mdh.path().join(slug);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("indexes.json"), "{}").unwrap();
+            std::fs::write(dir.join(COLLECTION_MANIFEST), format!("{{\"name\": \"{name}\"}}")).unwrap();
+        }
+        let remote = BTreeSet::new();
+        assert_eq!(local_only_dataset_slugs(mdh.path(), &remote), vec!["vendors".to_string()]);
     }
 
     #[test]

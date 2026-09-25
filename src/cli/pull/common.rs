@@ -507,6 +507,16 @@ pub fn record_object(
     modified_by: Option<String>,
     content_hash: Option<String>,
 ) {
+    // Hook secrets are write-only: no response carries them, so a pull cannot
+    // know them and must keep what the last secrets push recorded. Dropping it
+    // made the next sync push the secrets again, and the settle pass that
+    // follows such a push pulls the hook, so it never stopped.
+    let secrets_hash = lockfile
+        .objects
+        .get(kind)
+        .and_then(|m| m.get(slug))
+        .filter(|e| e.id == id)
+        .and_then(|e| e.secrets_hash.clone());
     lockfile.upsert(
         kind,
         slug,
@@ -515,7 +525,7 @@ pub fn record_object(
             modified_at,
             modified_by,
             content_hash,
-            secrets_hash: None,
+            secrets_hash,
         },
     );
 }

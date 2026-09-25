@@ -2058,7 +2058,9 @@ fn delete_local_object(
         }
     }
     let _ = std::fs::remove_file(deleted_marker_path(ctx.paths, local_path));
-    drop_lockfile_entry(ctx, &it.kind, &it.slug);
+    // Departed, not just dropped: another object may still name it, and the
+    // push phase detaches those refs (see `detach_departed`).
+    ctx.lockfile.depart(&it.kind, &it.slug);
     Ok(())
 }
 
@@ -2641,7 +2643,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                 // branch below warned on every sync forever and left an
                 // unclearable lockfile entry.
                 if crate::kinds::DELETABLE.contains(&it.kind.as_str()) {
-                    drop_lockfile_entry(ctx, &it.kind, &it.slug);
+                    ctx.lockfile.depart(&it.kind, &it.slug);
                 } else {
                     progress.event(
                         Action::Warn,
@@ -3117,7 +3119,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
                     if !local_path.exists() {
                         // Vanished mid-run — both sides agree; converge by
                         // dropping the entry (same semantics as BothDeleted).
-                        drop_lockfile_entry(ctx, &it.kind, &it.slug);
+                        ctx.lockfile.depart(&it.kind, &it.slug);
                         continue;
                     }
                     // Resolve-time drift re-check (defense in depth,
@@ -3684,10 +3686,15 @@ pub async fn run(
         // because we dropped the lockfile entry).
         let mut change_list =
             crate::cli::push::scan::change_list_from_classified(ctx.paths, classified);
-        let promotions = conflict_outcome
+        let promotions: Vec<_> = conflict_outcome
             .promoted_to_push
             .into_iter()
-            .chain(remote_delete_outcome.promoted_to_push);
+            .chain(remote_delete_outcome.promoted_to_push)
+            .collect();
+        // A resolved conflict (auto-merged, kept local, or restored) goes out
+        // as an ordinary push; the pre-tally counted it as a conflict only,
+        // so without this a run that pushed it reported "0 changed".
+        outcome.items_pushed += promotions.len();
         for (kind, slug, path) in promotions {
             match kind.as_str() {
                 "labels" => {
@@ -3746,9 +3753,37 @@ pub async fn run(
             })
             .map(|it| (it.kind.clone(), it.slug.clone()))
             .collect();
+        // Rossum keeps a deleted label in rule actions for good and then
+        // refuses every PATCH of the rule. Labels are listed org-wide, so a
+        // label URL a listed rule names but the label listing lacks is dead,
+        // wherever it was deleted.
+        let live_labels: BTreeSet<u64> = catalog.labels.iter().map(|l| l.id).collect();
+        let dead_label_urls: BTreeSet<String> = catalog
+            .rules
+            .iter()
+            .filter_map(|r| serde_json::to_value(r).ok())
+            .flat_map(|r| {
+                r.get("actions")
+                    .and_then(|a| a.as_array())
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .flat_map(|a| {
+                a.pointer("/payload/labels")
+                    .and_then(|l| l.as_array())
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .filter_map(|u| u.as_str().map(str::to_string))
+            .filter(|u| {
+                crate::cli::pull::common::parse_id_from_url(u)
+                    .is_ok_and(|id| u.contains("/labels/") && !live_labels.contains(&id))
+            })
+            .collect();
         for (kind, slug, path) in crate::cli::push::deletes::detach_departed(
             ctx.paths,
             ctx.lockfile,
+            &dead_label_urls,
             &in_conflict,
             progress,
         )? {
@@ -3758,6 +3793,60 @@ pub async fn run(
                 _ => &mut change_list.saved_views,
             };
             if list.insert(slug, path).is_none() {
+                outcome.items_pushed += 1;
+            }
+        }
+        // A rule this run pushes from its local file is repaired by that push.
+        // Any other rule naming a dead label (one that arrived with a remote
+        // edit, say) is repaired on the env directly; the settle pass then
+        // pulls the repaired body.
+        if !dead_label_urls.is_empty() {
+            let pushed: BTreeSet<u64> = change_list
+                .rules
+                .keys()
+                .filter_map(|slug| ctx.lockfile.objects.get("rules")?.get(slug).map(|e| e.id))
+                .collect();
+            for rule in &catalog.rules {
+                if pushed.contains(&rule.id) {
+                    continue;
+                }
+                let Some(mut actions) = rule.extra.get("actions").cloned() else {
+                    continue;
+                };
+                let mut dropped = Vec::new();
+                for action in actions.as_array_mut().into_iter().flatten() {
+                    if let Some(labels) =
+                        action.pointer_mut("/payload/labels").and_then(|l| l.as_array_mut())
+                    {
+                        labels.retain(|l| {
+                            let dead = l.as_str().is_some_and(|u| dead_label_urls.contains(u));
+                            if dead {
+                                dropped.push(l.as_str().unwrap_or_default().to_string());
+                            }
+                            !dead
+                        });
+                    }
+                }
+                if dropped.is_empty() {
+                    continue;
+                }
+                ctx.client
+                    .patch_value(
+                        &format!("/rules/{}", rule.id),
+                        &serde_json::json!({ "actions": actions }),
+                        Some(progress.clone()),
+                    )
+                    .await
+                    .with_context(|| format!("PATCH /rules/{} (dropping deleted labels)", rule.id))?;
+                progress.event(
+                    Action::Patch,
+                    &format!(
+                        "rule/{}: dropped deleted label(s) {} (Rossum keeps them and then \
+                         refuses every edit of the rule)",
+                        ctx.lockfile.slug_for_id("rules", rule.id).unwrap_or(&rule.name),
+                        dropped.join(", ")
+                    ),
+                );
                 outcome.items_pushed += 1;
             }
         }
@@ -3784,9 +3873,8 @@ pub async fn run(
             // Reconcile the plan-time tally with what the drivers actually
             // wrote: a skipped item (refused create, drift skip, adopt-remote)
             // changed nothing on the remote, so it must not be reported as
-            // "changed". Promoted conflict items were never pre-counted, so a
-            // skip among them could over-subtract — `saturating_sub` bounds
-            // that interactive-only edge at zero.
+            // "changed". Promoted conflict items are counted above, so a skip
+            // among them is subtracted like any other.
             outcome.items_pushed = outcome.items_pushed.saturating_sub(push_skipped);
 
             if !relink_items.is_empty() {

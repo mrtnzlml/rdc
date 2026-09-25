@@ -366,6 +366,56 @@ pub fn check_queue_engine_slot(body: &serde_json::Value) -> Vec<&'static str> {
     if set.len() > 1 { set } else { Vec::new() }
 }
 
+/// A local schema whose formula fields have no formula.
+///
+/// The API refuses such a schema on create and on update: `400 Datapoints of
+/// type 'formula' need to have a formula defined.` (observed live
+/// 2026-09-24). On disk a formula lives in `formulas/<field_id>.py`, so
+/// deleting that file while the field keeps its formula type fails every
+/// sync mid-push, until someone restores the file or changes the field.
+#[derive(Debug, PartialEq, Eq)]
+pub struct FormulaFieldWithoutFormula {
+    pub slug: String,
+    pub path: std::path::PathBuf,
+    /// Ids of the formula datapoints with no formula, in document order.
+    pub fields: Vec<String>,
+}
+
+/// Ids of the datapoints in `schema` whose `ui_configuration.type` is
+/// `formula` but which have no formula: neither an inline `formula` string
+/// nor an entry for their id in `formulas` (the `formulas/*.py` sidecars,
+/// keyed by field id). An empty or blank formula passes: the API accepts
+/// both and refuses only a missing one (observed live 2026-09-25).
+pub fn check_schema_formulas(
+    schema: &serde_json::Value,
+    formulas: &[(String, Vec<u8>)],
+) -> Vec<String> {
+    fn walk(v: &serde_json::Value, formulas: &[(String, Vec<u8>)], out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::Array(items) => items.iter().for_each(|i| walk(i, formulas, out)),
+            serde_json::Value::Object(o) => {
+                let is_formula = o.get("category").and_then(|c| c.as_str()) == Some("datapoint")
+                    && o.get("ui_configuration").and_then(|u| u.get("type")).and_then(|t| t.as_str())
+                        == Some("formula");
+                if is_formula && let Some(id) = o.get("id").and_then(|i| i.as_str()) {
+                    let inline = o.get("formula").is_some_and(|f| f.is_string());
+                    let sidecar = formulas.iter().any(|(fid, _)| fid == id);
+                    if !inline && !sidecar {
+                        out.push(id.to_string());
+                    }
+                }
+                o.values().for_each(|c| walk(c, formulas, out));
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(content) = schema.get("content") {
+        walk(content, formulas, &mut out);
+    }
+    out
+}
+
 /// Declared `max_length` for each kind's top-level string fields.
 ///
 /// Kinds absent from this match (and fields absent from a kind's slice)
@@ -539,6 +589,36 @@ pub fn missing_required_for_create(kind: &str, body: &Value) -> Vec<&'static str
 
 #[cfg(test)]
 mod tests {
+    /// Every way a formula field can carry, or lack, its formula.
+    #[test]
+    fn check_schema_formulas_flags_only_formula_fields_without_a_formula() {
+        let formula = |id: &str| {
+            serde_json::json!({
+                "category": "datapoint", "id": id, "type": "string",
+                "ui_configuration": { "type": "formula", "edit": "disabled" }
+            })
+        };
+        let mut inline = formula("inline");
+        inline["formula"] = "field.a".into();
+        let schema = serde_json::json!({ "content": [{
+            "category": "section", "id": "s", "children": [
+                formula("has_file"),
+                formula("empty_file"),
+                formula("no_file"),
+                inline,
+                { "category": "datapoint", "id": "plain", "type": "string" },
+                { "category": "multivalue", "id": "lines", "children": {
+                    "category": "tuple", "id": "line", "children": [formula("nested")]
+                }}
+            ]
+        }]});
+        let formulas = vec![
+            ("has_file".to_string(), b"field.a".to_vec()),
+            ("empty_file".to_string(), b"".to_vec()),
+        ];
+        assert_eq!(check_schema_formulas(&schema, &formulas), ["no_file", "nested"]);
+    }
+
     use super::*;
     use serde_json::json;
 

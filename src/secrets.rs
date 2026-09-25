@@ -517,6 +517,46 @@ pub fn write_hook_secrets_stub(project_root: &Path, env: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// Move a hook's entry in `secrets/<env>.hook-secrets.json` from slug `old`
+/// to slug `new`, so a renamed hook keeps its secrets. Returns whether it
+/// moved one. Leaves the file alone when it has no entry for `old`, and
+/// refuses to overwrite an existing entry for `new`. Every other key in the
+/// file, `"//"` included, is kept as it was.
+pub fn rename_hook_secret(project_root: &Path, env: &str, old: &str, new: &str) -> Result<bool> {
+    let path = hook_secrets_path(project_root, env);
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Ok(false);
+    };
+    if raw.trim().is_empty() {
+        return Ok(false);
+    }
+    let mut file: serde_json::Value =
+        serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+    let Some(hooks) = file.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
+        return Ok(false);
+    };
+    if hooks.contains_key(new) {
+        anyhow::bail!(
+            "{} already holds secrets for hook '{new}'; move the ones for '{old}' by hand",
+            path.display()
+        );
+    }
+    let Some(entry) = hooks.remove(old) else {
+        return Ok(false);
+    };
+    hooks.insert(new.to_string(), entry);
+    let mut bytes = serde_json::to_vec_pretty(&file)?;
+    bytes.push(b'\n');
+    crate::snapshot::writer::write_atomic(&path, &bytes)
+        .with_context(|| format!("writing {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

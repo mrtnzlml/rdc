@@ -374,6 +374,38 @@ impl ChangeList {
         out
     }
 
+    /// Local schemas with a formula field that has no formula.
+    ///
+    /// See `snapshot::limits::check_schema_formulas`: the API refuses the
+    /// schema on every push, so it is refused offline instead of failing a
+    /// sync halfway through its writes.
+    pub fn schemas_missing_formulas(
+        &self,
+    ) -> Vec<crate::snapshot::limits::FormulaFieldWithoutFormula> {
+        let mut out = Vec::new();
+        for (slug, path) in &self.schemas {
+            let Ok(bytes) = std::fs::read(path) else {
+                continue; // unreadable — push surfaces I/O errors
+            };
+            let Ok(body) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                continue; // unparseable is already reported by json_parse_errors
+            };
+            let formulas = path
+                .parent()
+                .and_then(|q| crate::snapshot::schema::read_local_formulas(q).ok())
+                .unwrap_or_default();
+            let fields = crate::snapshot::limits::check_schema_formulas(&body, &formulas);
+            if !fields.is_empty() {
+                out.push(crate::snapshot::limits::FormulaFieldWithoutFormula {
+                    slug: slug.clone(),
+                    path: path.clone(),
+                    fields,
+                });
+            }
+        }
+        out
+    }
+
     /// Local queue files that bind more than one engine.
     ///
     /// See `snapshot::limits::check_queue_engine_slot`. Like an over-length

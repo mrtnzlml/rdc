@@ -308,8 +308,10 @@ pub async fn run_deletes(
 ///
 /// Left alone, the pull writes the deleted object's raw URL into those files,
 /// since it has left the lockfile. Every array element that is exactly the
-/// deleted object's `rdc://` ref is removed, wherever it sits in the file;
-/// single-valued refs are left alone.
+/// `rdc://` ref of an object in [`Lockfile::departed`] — deleted by this run,
+/// or on the env and mirrored by it — or one of the raw URLs in `dead_urls`
+/// is removed, wherever it sits in the file; single-valued refs are left
+/// alone.
 ///
 /// `skip` holds `(kind, slug)` pairs to leave untouched: objects with an open
 /// conflict, which must not be pushed over. Returns `(kind, slug, path)` for
@@ -317,6 +319,7 @@ pub async fn run_deletes(
 pub fn detach_departed(
     paths: &crate::paths::Paths,
     lockfile: &Lockfile,
+    dead_urls: &std::collections::BTreeSet<String>,
     skip: &std::collections::BTreeSet<(String, String)>,
     progress: &Arc<Log>,
 ) -> Result<Vec<(&'static str, String, std::path::PathBuf)>> {
@@ -324,6 +327,7 @@ pub fn detach_departed(
         .departed
         .iter()
         .flat_map(|(kind, slugs)| slugs.keys().map(move |slug| format!("rdc://{kind}/{slug}")))
+        .chain(dead_urls.iter().cloned())
         .collect();
     if gone.is_empty() {
         return Ok(Vec::new());
@@ -377,7 +381,7 @@ pub fn detach_departed(
             out.push(b'\n');
             crate::snapshot::writer::write_atomic(&path, &out)
                 .with_context(|| format!("writing {}", path.display()))?;
-            progress.event(Action::Info, &format!("{kind}/{slug}: detached from what this sync deleted"));
+            progress.event(Action::Info, &format!("{kind}/{slug}: dropping refs to deleted objects"));
             rewritten.push((kind, slug, path));
         }
     }

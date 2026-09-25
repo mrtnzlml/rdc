@@ -6,6 +6,7 @@ pub mod cross_refs;
 pub mod deploy_flow;
 pub mod email_templates;
 pub mod engines;
+pub mod hand_rename;
 pub mod janitor;
 pub mod mdh;
 pub mod migrate_promotion;

@@ -277,6 +277,10 @@ A write can change objects rdc did not touch: a new rule appears in its queue's 
 
 Deleting a queue also removes its email templates and inbox. Rossum refuses to delete the queue's schema while the queue is pending deletion (24 hours), and keeps it afterwards with no queue. rdc stops tracking the schema in the same run and warns that it stays on the env. Rossum also keeps the draining queue in hooks' and rules' `queues` and in saved views' `queues_filter`, and keeps a deleted label in rule actions for good. So when a sync deletes an object, rdc removes it from the hooks, rules and saved views that still name it, and pushes them in the same run.
 
+A rule that names a label deleted elsewhere, in the Rossum UI for example, is repaired on the env in the same way: Rossum refuses every edit of such a rule until the dead label is gone.
+
+Renaming a file or directory by hand (`hooks/a.json` → `hooks/b.json`, with the same `id` inside) is followed as a rename, not a delete plus a create. The object keeps its id; its refs, overlay keys, hook secrets and a `.rdc/mapping.toml` row follow the new slug, as they do for a `doctor` rename.
+
 ### Edit a file
 
 Most files are plain JSON — open them in your editor and save. After any edit, run `rdc sync <env>`.

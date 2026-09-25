@@ -31,12 +31,32 @@ pub async fn run(env: &str, dry_run: bool) -> Result<()> {
     let paths = Paths::for_env(&cwd, env);
     let log = Log::new(crate::cli::resolve::detect_color_mode());
 
+    // 0. Files renamed by hand (same `id`, new slug). Followed first, so the
+    //    unpushed count below does not read each one as a delete plus a create.
+    if paths.lockfile().exists() {
+        let mut lockfile = Lockfile::load(&paths.lockfile())?;
+        lockfile.api_base = api_base.clone();
+        let (renamed, warnings) =
+            crate::cli::deploy::realign::follow_hand_renames(&paths, &mut lockfile, dry_run)?;
+        for line in &renamed {
+            let verb = if dry_run { "would follow" } else { "followed" };
+            log.event(Action::Info, &format!("renamed by hand, {verb} as a rename: {line}"));
+        }
+        for w in warnings {
+            log.event(Action::Warn, w.trim());
+        }
+        if !dry_run && !renamed.is_empty() {
+            lockfile.save(&paths.lockfile())?;
+        }
+    }
+
     // 1. Pre-flight: local changes not yet pushed to the remote (offline).
     let Unpushed {
         changes: unpushed,
         limit_violations,
         missing_create_fields,
         engine_conflicts,
+        missing_formulas,
     } = scan_unpushed(&paths, &api_base)?;
 
     // Fields the API will reject on length. Reported here — the offline
@@ -99,6 +119,22 @@ pub async fn run(env: &str, dry_run: bool) -> Result<()> {
                 c.slug,
                 c.path.display(),
                 c.fields.join(", "),
+            ),
+        );
+    }
+
+    // Formula fields whose formula is gone. The API refuses the schema on every
+    // push, and only the user knows whether the formula or the field is wrong.
+    for m in &missing_formulas {
+        log.event(
+            Action::Warn,
+            &format!(
+                "schemas/{} -- {}: formula field(s) {} have no formula, which the Rossum \
+                 API refuses; `rdc sync {env}` will refuse to push until each has a \
+                 formulas/<field_id>.py or another type",
+                m.slug,
+                m.path.display(),
+                m.fields.join(", "),
             ),
         );
     }
@@ -179,6 +215,7 @@ fn scan_unpushed(paths: &Paths, api_base: &str) -> Result<Unpushed> {
         limit_violations: changes.field_limit_violations(),
         missing_create_fields: changes.missing_create_fields(&lockfile),
         engine_conflicts: changes.queue_engine_conflicts(),
+        missing_formulas: changes.schemas_missing_formulas(),
     })
 }
 
@@ -193,4 +230,5 @@ struct Unpushed {
     limit_violations: Vec<crate::cli::push::scan::FieldLimitViolation>,
     missing_create_fields: Vec<crate::cli::push::scan::MissingCreateField>,
     engine_conflicts: Vec<crate::snapshot::limits::EngineSlotConflict>,
+    missing_formulas: Vec<crate::snapshot::limits::FormulaFieldWithoutFormula>,
 }
