@@ -11,14 +11,26 @@ use std::sync::Arc;
 
 const KIND: &str = "saved_views";
 
-/// Keep only the views rdc manages.
+/// Keep only the views rdc manages: shared ones.
 ///
 /// Split out so it can be unit-tested without a client.
 pub(crate) fn retain_shared(views: Vec<SavedView>) -> Vec<SavedView> {
     views.into_iter().filter(|v| v.shared).collect()
 }
 
-/// Phase 1: list saved views, keeping only the SHARED ones.
+/// Whether `view` belongs to org `org_id`. Rossum scopes `/saved_views` by
+/// creator, not organization, so a token's listing on a shared host also
+/// returns (writable) views of the other orgs its user created. A view with
+/// no `organization` is kept: nothing says it is foreign.
+fn in_org(view: &SavedView, org_id: u64) -> bool {
+    match view.extra.get("organization").and_then(|o| o.as_str()) {
+        Some(url) => url.trim_end_matches('/').rsplit('/').next() == Some(&org_id.to_string()),
+        None => true,
+    }
+}
+
+/// Phase 1: list saved views, keeping only the SHARED ones of org `org_id`
+/// (see [`in_org`] for why the org check is needed).
 ///
 /// The filter MUST happen client-side: the server accepts `?shared=true` and
 /// then ignores it, returning private views too (verified on the wire). It is
@@ -26,7 +38,7 @@ pub(crate) fn retain_shared(views: Vec<SavedView>) -> Vec<SavedView> {
 /// view belongs to one user, its `query` holds that user's own filter values
 /// (customer business data), and `created_by` is read-only so rdc could never
 /// restore one to its owner. See the design doc, section B.
-pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<Log>) -> Result<Vec<SavedView>> {
+pub async fn list(ctx: &PullCtx<'_>, org_id: u64, progress: &Arc<Log>) -> Result<Vec<SavedView>> {
     let all = skip_on_permission_denied(
         ctx.client
             .list_saved_views(Some(progress.clone()))
@@ -35,8 +47,15 @@ pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<Log>) -> Result<Vec<SavedVie
         KIND,
         progress,
     )?;
-    let total = all.len();
-    let shared = retain_shared(all);
+    let (mine, foreign): (Vec<_>, Vec<_>) = all.into_iter().partition(|v| in_org(v, org_id));
+    if !foreign.is_empty() {
+        progress.event(
+            Action::Skip,
+            &format!("saved_views ({} of another organization)", foreign.len()),
+        );
+    }
+    let total = mine.len();
+    let shared = retain_shared(mine);
     let dropped = total - shared.len();
     if dropped > 0 {
         progress.event(
@@ -284,7 +303,7 @@ mod tests {
     /// helper in isolation and would keep passing even if `list()` stopped
     /// calling it — this test would not.
     #[tokio::test]
-    async fn list_filters_out_private_views_over_the_wire() {
+    async fn list_filters_out_private_and_foreign_views_over_the_wire() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -305,6 +324,15 @@ mod tests {
                     "url": format!("{}/api/v1/saved_views/2", server.uri()),
                     "name": "My private filter",
                     "shared": false,
+                    "queues_filter": [],
+                    "query": { "$and": [] }
+                },
+                {
+                    "id": 3,
+                    "url": format!("{}/api/v1/saved_views/3", server.uri()),
+                    "name": "Another org's dashboard",
+                    "shared": true,
+                    "organization": format!("{}/api/v1/organizations/2", server.uri()),
                     "queues_filter": [],
                     "query": { "$and": [] }
                 }
@@ -330,9 +358,9 @@ mod tests {
             interactive: false,
         };
 
-        let views = list(&ctx, &progress).await.unwrap();
+        let views = list(&ctx, 1, &progress).await.unwrap();
 
-        assert_eq!(views.len(), 1, "the private view must not survive list()");
+        assert_eq!(views.len(), 1, "private and foreign-org views must not survive list()");
         assert_eq!(views[0].id, 1);
         assert_eq!(views[0].name, "Team dashboard");
     }
