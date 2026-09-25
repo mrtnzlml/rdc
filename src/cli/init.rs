@@ -489,6 +489,14 @@ fn parse_env_spec(spec: &str) -> Result<(String, EnvConfig)> {
     let (env_name, rest) = spec
         .split_once('=')
         .ok_or_else(|| anyhow!("invalid --env spec '{spec}': expected `<env>=<api_base>:<org_id>`"))?;
+    // The name becomes a directory under envs/ and a key in rdc.toml, so the
+    // wizard's rule applies here too.
+    if !crate::config::valid_env_name(env_name) {
+        return Err(anyhow!(
+            "invalid --env spec '{spec}': {}",
+            crate::config::INVALID_ENV_NAME_MSG
+        ));
+    }
     let last_colon = rest
         .rfind(':')
         .ok_or_else(|| anyhow!("invalid --env spec '{spec}': missing :<org_id>"))?;
