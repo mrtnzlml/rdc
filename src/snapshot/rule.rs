@@ -69,7 +69,14 @@ pub fn read_rule_value(dir: &Path, slug: &str) -> Result<Value> {
         .with_context(|| format!("reading {}", json_path.display()))?;
     let mut value: Value = serde_json::from_str(&raw)
         .with_context(|| format!("parsing {}", json_path.display()))?;
+    splice_rule_code(&mut value, dir, slug)?;
+    Ok(value)
+}
 
+/// Splice `<dir>/<slug>.py` into `value`'s `trigger_condition`, as
+/// [`read_rule_value`] does. Also used on a rule body edited at the push
+/// drift prompt, which carries only the JSON half.
+pub fn splice_rule_code(value: &mut Value, dir: &Path, slug: &str) -> Result<()> {
     let py_path = dir.join(format!("{slug}.py"));
     if py_path.exists() {
         let code = std::fs::read_to_string(&py_path)
@@ -78,8 +85,7 @@ pub fn read_rule_value(dir: &Path, slug: &str) -> Result<Value> {
             obj.insert("trigger_condition".to_string(), Value::String(code));
         }
     }
-
-    Ok(value)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -87,6 +93,15 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::TempDir;
+
+    #[test]
+    fn splice_rule_code_restores_the_code_an_edited_body_lacks() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("r.py"), "True\n").unwrap();
+        let mut edited = json!({"name": "r"});
+        splice_rule_code(&mut edited, tmp.path(), "r").unwrap();
+        assert_eq!(edited["trigger_condition"], "True\n");
+    }
 
     /// Write a rule to disk: a JSON file under `<dir>/<slug>.json` and, if
     /// the rule has a `trigger_condition`, a sibling `<dir>/<slug>.py` file.

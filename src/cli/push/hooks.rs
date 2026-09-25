@@ -896,6 +896,8 @@ async fn push_one_drifted(
             if let Some(bytes) = payload_override {
                 let mut ov: serde_json::Value = serde_json::from_slice(&bytes)
                     .with_context(|| format!("re-deserializing edited hook '{slug}'"))?;
+                // The prompt edits the JSON alone; keep the local code.
+                crate::snapshot::hook::splice_hook_code(&mut ov, hooks_dir, slug)?;
                 // The edited body replaces the one deferral was computed
                 // from, so recompute it (mirrors `push::queues`).
                 deferred = crate::snapshot::refs::resolve_value_deferring(&mut ov, lockfile);

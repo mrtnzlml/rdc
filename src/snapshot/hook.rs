@@ -142,8 +142,15 @@ pub fn read_hook_value(dir: &Path, slug: &str) -> Result<Value> {
         .with_context(|| format!("reading {}", json_path.display()))?;
     let mut value: Value =
         serde_json::from_str(&raw).with_context(|| format!("parsing {}", json_path.display()))?;
+    splice_hook_code(&mut value, dir, slug)?;
+    Ok(value)
+}
 
-    let ext = hook_code_extension_from_value(&value);
+/// Splice `<dir>/<slug>.<ext>` into `value`'s `config.code`, as
+/// [`read_hook_value`] does. Also used on a hook body edited at the push
+/// drift prompt, which carries only the JSON half.
+pub fn splice_hook_code(value: &mut Value, dir: &Path, slug: &str) -> Result<()> {
+    let ext = hook_code_extension_from_value(value);
     let primary = dir.join(format!("{slug}.{ext}"));
     let code_path = if primary.exists() {
         Some(primary)
@@ -164,8 +171,7 @@ pub fn read_hook_value(dir: &Path, slug: &str) -> Result<Value> {
             config.insert("code".to_string(), Value::String(code));
         }
     }
-
-    Ok(value)
+    Ok(())
 }
 
 /// Helper: given one of `"py"` / `"js"`, return the other. Used when
@@ -180,6 +186,15 @@ mod tests {
     use crate::model::Hook;
     use serde_json::json;
     use tempfile::TempDir;
+
+    #[test]
+    fn splice_hook_code_restores_the_code_an_edited_body_lacks() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("h.py"), "print('local')\n").unwrap();
+        let mut edited = json!({"name": "h", "config": {"runtime": "python3.12"}});
+        splice_hook_code(&mut edited, tmp.path(), "h").unwrap();
+        assert_eq!(edited["config"]["code"], "print('local')\n");
+    }
 
     /// Write a hook to disk: a JSON file under `<dir>/<slug>.json` and, if the hook
     /// has inline code, a sibling `<slug>.<ext>` file. The extension is derived

@@ -519,6 +519,8 @@ async fn push_one_drifted(
                 let mut ov: serde_json::Value = serde_json::from_slice(&bytes).with_context(|| {
                     format!("re-deserializing edited schema for queue '{q_slug}'")
                 })?;
+                // The prompt edits the JSON alone; keep the local formulas.
+                crate::snapshot::schema::splice_schema_formulas(&mut ov, queue_dir)?;
                 crate::snapshot::refs::resolve_value(&mut ov, lockfile);
                 payload_to_send = serde_json::from_value(ov).with_context(|| {
                     format!("re-deserializing edited schema for queue '{q_slug}'")

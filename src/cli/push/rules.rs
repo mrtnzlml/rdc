@@ -485,6 +485,8 @@ async fn push_one_drifted(
             if let Some(bytes) = payload_override {
                 let mut ov: serde_json::Value = serde_json::from_slice(&bytes)
                     .with_context(|| format!("re-deserializing edited rule '{slug}'"))?;
+                // The prompt edits the JSON alone; keep the local code.
+                crate::snapshot::rule::splice_rule_code(&mut ov, rules_dir, slug)?;
                 crate::snapshot::refs::resolve_value(&mut ov, lockfile);
                 payload_to_send = serde_json::from_value(ov)
                     .with_context(|| format!("re-deserializing edited rule '{slug}'"))?;

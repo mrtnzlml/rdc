@@ -86,7 +86,14 @@ pub fn read_schema_value(queue_dir: &Path) -> Result<Value> {
         .with_context(|| format!("reading {}", json_path.display()))?;
     let mut value: Value = serde_json::from_str(&raw)
         .with_context(|| format!("parsing {}", json_path.display()))?;
+    splice_schema_formulas(&mut value, queue_dir)?;
+    Ok(value)
+}
 
+/// Splice `<queue_dir>/formulas/<id>.py` into every datapoint of `value`
+/// that has no inline `formula`, as [`read_schema_value`] does. Also used on
+/// a schema edited at the push drift prompt, which carries only the JSON half.
+pub fn splice_schema_formulas(value: &mut Value, queue_dir: &Path) -> Result<()> {
     let formulas_dir = queue_dir.join("formulas");
     if formulas_dir.is_dir()
         && let Some(content) = value.get_mut("content").and_then(|c| c.as_array_mut()) {
@@ -94,8 +101,7 @@ pub fn read_schema_value(queue_dir: &Path) -> Result<Value> {
                 merge_formulas(node, &formulas_dir)?;
             }
         }
-
-    Ok(value)
+    Ok(())
 }
 
 /// Walk schema `content[]`, extract every datapoint `formula` (removing it
@@ -271,6 +277,18 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::TempDir;
+
+    #[test]
+    fn splice_schema_formulas_restores_the_formulas_an_edited_body_lacks() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("formulas")).unwrap();
+        std::fs::write(tmp.path().join("formulas/total.py"), "1 + 1\n").unwrap();
+        let mut edited = json!({"content": [{"category": "section", "id": "s", "children": [
+            {"category": "datapoint", "id": "total"}
+        ]}]});
+        splice_schema_formulas(&mut edited, tmp.path()).unwrap();
+        assert_eq!(edited["content"][0]["children"][0]["formula"], "1 + 1\n");
+    }
 
     /// Write a schema to `<queue_dir>/schema.json`, extracting any formula field
     /// `formula` strings into `<queue_dir>/formulas/<field_id>.py` files.
