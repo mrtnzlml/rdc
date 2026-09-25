@@ -147,6 +147,8 @@ async fn conflict_prompt_answers() {
             local: Some(Some(LOCAL)),
             remote: Some(Some(LOCAL)),
             shadow: Some(false),
+            says: &["[k] keep local (push it to test)"],
+            never_says: &["next sync"],
             ..After::default()
         })
         .await,
@@ -197,11 +199,12 @@ async fn conflict_prompt_answers() {
             ..After::default()
         })
         .await,
-        // --no-push: the answer is taken, the push is not made.
+        // --no-push: the answer is taken, the push waits, and the label says so.
         check(State::Conflict, &["--no-push"], &[(MENU_END, "k")], After {
             ok: Some(true),
             local: Some(Some(LOCAL)),
             remote: Some(Some(REMOTE)),
+            says: &["[k] keep local (push it to test on the next sync)"],
             ..After::default()
         })
         .await,
@@ -319,6 +322,7 @@ async fn edit_vs_remote_delete_answers() {
         check(s, &["--no-push"], &[(MENU_END, "k")], After {
             ok: Some(true),
             local: Some(Some(LOCAL)),
+            says: &["[k] keep local (restore it on test on the next sync)"],
             never_says: &["post   label"],
             ..After::default()
         })
@@ -380,6 +384,16 @@ async fn local_delete_vs_remote_edit_answers() {
             remote: Some(None),
             never_says: &[GATE_END],
             ..wording()
+        })
+        .await,
+        // --no-push: the deletion is recorded; the DELETE waits.
+        check(s, &["--no-push"], &[(MENU_END, "k")], After {
+            ok: Some(true),
+            local: Some(None),
+            remote: Some(Some(REMOTE)),
+            says: &["[k] keep local (delete it on test on the next sync)"],
+            never_says: &[GATE_END],
+            ..After::default()
         })
         .await,
         // --no-pull: "decide later" leaves the local deletion as it was.

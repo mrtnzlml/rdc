@@ -242,6 +242,7 @@ pub fn prompt_resolve_with_color<R: BufRead, W: Write>(
         env,
         mode,
         None,
+        false,
     )
 }
 
@@ -295,6 +296,7 @@ pub fn prompt_resolve_with_bytes_and_color<R: BufRead, W: Write>(
     env: &str,
     mode: ColorMode,
     bulk: Option<&BulkPrompt>,
+    push_deferred: bool,
 ) -> Result<Resolution> {
     // Canonicalize both sides for display. Two goals: strip server-churn noise
     // (`modified_at`) so only real changes show, AND render every reference in
@@ -375,7 +377,7 @@ pub fn prompt_resolve_with_bytes_and_color<R: BufRead, W: Write>(
             keys.push(PromptKey::new('K', "keep ALL local"));
             keys.push(PromptKey::new('R', &format!("use {env} for ALL")));
         }
-        keys.push(PromptKey::new('k', &format!("keep local (push it to {env})")));
+        keys.push(PromptKey::new('k', &format!("keep local (push it to {env}{})", when(push_deferred))));
         keys.push(PromptKey::new('r', &format!("use {env} (overwrite local)")));
         keys.push(PromptKey::new('e', "edit in $EDITOR"));
         if hunk_count >= 2 {
@@ -489,7 +491,7 @@ pub fn prompt_remote_delete<R: BufRead, W: Write>(
     env: &str,
 ) -> Result<Resolution> {
     let mode = detect_color_mode();
-    prompt_remote_delete_with_color(input, output, index, total, obj, local_path, env, mode, None)
+    prompt_remote_delete_with_color(input, output, index, total, obj, local_path, env, mode, None, false)
 }
 
 /// Color-aware variant. Tests pin the mode; production goes through
@@ -504,8 +506,9 @@ pub fn prompt_remote_delete_with_color<R: BufRead, W: Write>(
     env: &str,
     mode: ColorMode,
     bulk: Option<&BulkPrompt>,
+    push_deferred: bool,
 ) -> Result<Resolution> {
-    prompt_one_sided_delete(input, output, index, total, obj, local_path, env, mode, bulk, DeletedOn::Env)
+    prompt_one_sided_delete(input, output, index, total, obj, local_path, env, mode, bulk, DeletedOn::Env, push_deferred)
 }
 
 /// The prompt for an object deleted locally and edited on the env: the mirror
@@ -523,8 +526,15 @@ pub fn prompt_local_delete_remote_edit_with_color<R: BufRead, W: Write>(
     env: &str,
     mode: ColorMode,
     bulk: Option<&BulkPrompt>,
+    push_deferred: bool,
 ) -> Result<Resolution> {
-    prompt_one_sided_delete(input, output, index, total, obj, local_path, env, mode, bulk, DeletedOn::Local)
+    prompt_one_sided_delete(input, output, index, total, obj, local_path, env, mode, bulk, DeletedOn::Local, push_deferred)
+}
+
+/// The suffix a `[k]` label takes when `--no-push` defers its env write, so
+/// the prompt does not promise a push this run will not make.
+pub(crate) fn when(push_deferred: bool) -> &'static str {
+    if push_deferred { " on the next sync" } else { "" }
 }
 
 /// Which side of a delete-vs-edit conflict deleted the object.
@@ -546,6 +556,7 @@ fn prompt_one_sided_delete<R: BufRead, W: Write>(
     mode: ColorMode,
     bulk: Option<&BulkPrompt>,
     deleted_on: DeletedOn,
+    push_deferred: bool,
 ) -> Result<Resolution> {
     let local_bytes = read_local(local_path)?;
     let preview = prettify_json_for_diff(&local_bytes);
@@ -624,8 +635,14 @@ fn prompt_one_sided_delete<R: BufRead, W: Write>(
             keys.push(PromptKey::new('R', &format!("use {env} for ALL")));
         }
         let (keep, take) = match deleted_on {
-            DeletedOn::Env => (format!("keep local (restore it on {env})"), format!("use {env} (delete local)")),
-            DeletedOn::Local => (format!("keep local (delete it on {env})"), format!("use {env} (restore local)")),
+            DeletedOn::Env => (
+                format!("keep local (restore it on {env}{})", when(push_deferred)),
+                format!("use {env} (delete local)"),
+            ),
+            DeletedOn::Local => (
+                format!("keep local (delete it on {env}{})", when(push_deferred)),
+                format!("use {env} (restore local)"),
+            ),
         };
         keys.push(PromptKey::new('k', &keep));
         keys.push(PromptKey::new('r', &take));
@@ -2102,6 +2119,7 @@ mod tests {
             "production",
             ColorMode::Plain,
             None,
+            false,
         )
         .unwrap();
         assert!(matches!(res, Resolution::Skip));
@@ -2128,7 +2146,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let input = Cursor::new(b"k\n");
         let res =
-            prompt_remote_delete_with_color(input, &mut out, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &local, "test", ColorMode::Plain, None)
+            prompt_remote_delete_with_color(input, &mut out, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &local, "test", ColorMode::Plain, None, false)
                 .unwrap();
         assert!(matches!(res, Resolution::KeepLocal));
     }
@@ -2142,7 +2160,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let input = Cursor::new(b"r\n");
         let res =
-            prompt_remote_delete_with_color(input, &mut out, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &local, "test", ColorMode::Plain, None)
+            prompt_remote_delete_with_color(input, &mut out, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &local, "test", ColorMode::Plain, None, false)
                 .unwrap();
         assert!(matches!(res, Resolution::KeepRemote));
     }
@@ -2156,7 +2174,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let input = Cursor::new(b"a\n");
         let res =
-            prompt_remote_delete_with_color(input, &mut out, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &local, "test", ColorMode::Plain, None)
+            prompt_remote_delete_with_color(input, &mut out, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &local, "test", ColorMode::Plain, None, false)
                 .unwrap();
         assert!(matches!(res, Resolution::Abort));
     }
@@ -3081,6 +3099,7 @@ mod tests {
         let r = prompt_resolve_with_bytes_and_color(
             input, &mut out, 1, 3, ObjectRef { kind: "queues", slug: "invoices" }, &path,
             b"{\"a\":1}", b"{\"a\":2}", "prod", ColorMode::Plain, Some(&bulk),
+            false,
         )
         .unwrap();
         assert!(matches!(r, Resolution::KeepRemoteAll));
@@ -3102,6 +3121,7 @@ mod tests {
         let r = prompt_resolve_with_bytes_and_color(
             input, &mut out, 1, 3, ObjectRef { kind: "queues", slug: "invoices" }, &path,
             b"{\"a\":1}", b"{\"a\":2}", "prod", ColorMode::Plain, Some(&bulk),
+            false,
         )
         .unwrap();
         assert!(matches!(r, Resolution::KeepLocalAll));
@@ -3121,6 +3141,7 @@ mod tests {
         let r = prompt_resolve_with_bytes_and_color(
             input, &mut out, 1, 3, ObjectRef { kind: "queues", slug: "invoices" }, &path,
             b"{\"a\":1}", b"{\"a\":2}", "prod", ColorMode::Plain, Some(&bulk),
+            false,
         )
         .unwrap();
         assert!(matches!(r, Resolution::KeepLocal));
@@ -3135,6 +3156,7 @@ mod tests {
         let r = prompt_resolve_with_bytes_and_color(
             input, &mut out, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path,
             b"{\"a\":1}", b"{\"a\":2}", "prod", ColorMode::Plain, None,
+            false,
         )
         .unwrap();
         assert!(matches!(r, Resolution::KeepRemote), "uppercase R must still mean single KeepRemote when bulk is None");
@@ -3154,7 +3176,7 @@ mod tests {
         };
         let input = Cursor::new(b"R\ny\n");
         let mut out: Vec<u8> = Vec::new();
-        let r = prompt_remote_delete_with_color(input, &mut out, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path, "prod", ColorMode::Plain, Some(&bulk)).unwrap();
+        let r = prompt_remote_delete_with_color(input, &mut out, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path, "prod", ColorMode::Plain, Some(&bulk), false).unwrap();
         assert!(matches!(r, Resolution::KeepRemoteAll));
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("[R] use prod for ALL"), "bulk options must be shown: {s}");
@@ -3172,7 +3194,7 @@ mod tests {
         std::fs::write(&path, b"{\"a\":1}\n").unwrap();
         let input = Cursor::new(b"r\n");
         let mut out: Vec<u8> = Vec::new();
-        let r = prompt_remote_delete_with_color(input, &mut out, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path, "prod", ColorMode::Plain, None).unwrap();
+        let r = prompt_remote_delete_with_color(input, &mut out, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path, "prod", ColorMode::Plain, None, false).unwrap();
         assert!(matches!(r, Resolution::KeepRemote));
     }
 
@@ -3214,6 +3236,35 @@ mod tests {
         pin("conflict", &actual);
     }
 
+    /// Under `--no-push` the `[k]` label names when the push happens.
+    #[test]
+    fn conflict_prompt_under_no_push_bytes_are_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("queues/invoices.json");
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        std::fs::write(&local, b"{\"name\":\"Invoices\"}").unwrap();
+
+        let t = Transcript::new();
+        let _ = prompt_resolve_with_bytes_and_color(
+            t.input("s\n"),
+            t.output(),
+            1,
+            1,
+            ObjectRef { kind: "queues", slug: "invoices" },
+            &local,
+            b"{\"name\":\"Invoices\"}",
+            b"{\"name\":\"Invoices EU\"}",
+            "dev",
+            ColorMode::Plain,
+            None,
+            true,
+        )
+        .unwrap();
+
+        let actual = redact_tempdir(&t.text(), dir.path());
+        pin("conflict_no_push", &actual);
+    }
+
     #[test]
     fn remote_delete_prompt_bytes_are_pinned() {
         
@@ -3233,6 +3284,7 @@ mod tests {
             "dev",
             ColorMode::Plain,
             None,
+            false,
         )
         .unwrap();
 
@@ -3259,6 +3311,7 @@ mod tests {
             "dev",
             ColorMode::Plain,
             None,
+            false,
         )
         .unwrap();
 
@@ -3352,7 +3405,7 @@ mod tests {
         // The real builder, not a stand-in: its summary is a question plus
         // one consequence line per class, and that shape is what the pin is
         // for. 4 content conflicts remain, this one included.
-        let bulk = crate::cli::sync::execute::build_bulk_prompt("dev", 4, 0, 0)
+        let bulk = crate::cli::sync::execute::build_bulk_prompt("dev", 4, 0, 0, false)
             .expect("more than one conflict remains");
 
         let t = Transcript::new();
@@ -3368,6 +3421,7 @@ mod tests {
             "dev",
             ColorMode::Plain,
             Some(&bulk),
+            false,
         )
         .unwrap();
         assert!(matches!(r, Resolution::KeepLocalAll));
@@ -3411,7 +3465,7 @@ mod tests {
         let local = dir.path().join("labels/audit-hold.json");
         std::fs::create_dir_all(local.parent().unwrap()).unwrap();
         std::fs::write(&local, b"{\"name\":\"Audit hold\"}").unwrap();
-        let bulk = crate::cli::sync::execute::build_bulk_prompt("dev", 0, 3, 0)
+        let bulk = crate::cli::sync::execute::build_bulk_prompt("dev", 0, 3, 0, false)
             .expect("more than one conflict remains");
 
         let t = Transcript::new();
@@ -3426,6 +3480,7 @@ mod tests {
             "dev",
             ColorMode::Plain,
             Some(&bulk),
+            false,
         )
         .unwrap();
         assert!(matches!(r, Resolution::KeepRemoteAll));

@@ -582,6 +582,35 @@ async fn no_push_keep_local_pushes_on_the_next_sync() {
     assert!(!fx.project.exists(&fx.shadow));
 }
 
+/// The same deferral for both edit-vs-delete conflicts: `keep-local` under
+/// --no-push is carried out by the next sync that pushes, without asking
+/// again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_push_keep_local_on_edit_vs_delete_waits_for_the_next_sync() {
+    // Local edit, env deleted: the next sync re-creates it.
+    let fx = LabelFx::new().await;
+    fx.apply(State::LocalEditRemoteDelete).await;
+    let first = fx.project.run_rdc(&["sync", "test", "--no-push", "--conflict", "keep-local"]);
+    assert!(first.status.success(), "{}", combined(&first));
+    assert!(!fx.remote_names().await.contains(&"Priority".to_string()));
+    let second = fx.project.run_rdc(&["sync", "test"]);
+    assert!(second.status.success(), "{}", combined(&second));
+    assert!(fx.remote_names().await.contains(&"Priority".to_string()), "{}", combined(&second));
+    assert_eq!(fx.local().as_deref(), Some(LOCAL));
+
+    // Local delete, env edited: the next sync deletes it, as a plain delete.
+    let fx = LabelFx::new().await;
+    fx.apply(State::LocalDeleteRemoteEdit).await;
+    let first = fx.project.run_rdc(&["sync", "test", "--no-push", "--conflict", "keep-local"]);
+    assert!(first.status.success(), "{}", combined(&first));
+    assert_eq!(fx.remote().await.as_deref(), Some(REMOTE));
+    let second = fx.project.run_rdc(&["sync", "test", "--allow-deletes"]);
+    assert!(second.status.success(), "{}", combined(&second));
+    assert_eq!(fx.remote().await, None, "{}", combined(&second));
+    assert_eq!(fx.local(), None);
+    assert!(!fx.project.exists(&fx.marker));
+}
+
 /// A conflict parked non-interactively stays parked across syncs, and a later
 /// `--conflict` resolves it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

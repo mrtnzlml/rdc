@@ -82,7 +82,9 @@ pub(crate) fn build_bulk_prompt(
     content: usize,        // BothDiverged remaining, including the current one
     delete_local: usize,   // LocalEditRemoteDelete remaining
     recreate_local: usize, // LocalDeleteRemoteEdit remaining
+    push_deferred: bool,
 ) -> Option<BulkPrompt> {
+    let later = crate::cli::resolve::when(push_deferred);
     let total = content + delete_local + recreate_local;
     if total <= 1 {
         return None;
@@ -91,7 +93,7 @@ pub(crate) fn build_bulk_prompt(
     let mut remote = format!("Use {env} for all {total} remaining conflicts?");
     if content > 0 {
         keep.push_str(&format!(
-            "\n  {} kept and pushed to {env}",
+            "\n  {} kept and pushed to {env}{later}",
             count_noun(content, "local file", "local files")
         ));
         remote.push_str(&format!(
@@ -101,7 +103,7 @@ pub(crate) fn build_bulk_prompt(
     }
     if delete_local > 0 {
         keep.push_str(&format!(
-            "\n  {} restored on {env}",
+            "\n  {} restored on {env}{later}",
             count_noun(delete_local, "file", "files")
         ));
         remote.push_str(&format!(
@@ -111,8 +113,9 @@ pub(crate) fn build_bulk_prompt(
     }
     if recreate_local > 0 {
         // The DELETEs join this run's delete phase, behind its own gate.
+        let how = if push_deferred { "on the next sync" } else { "too, once you confirm the deletes" };
         keep.push_str(&format!(
-            "\n  {} deleted on {env} too, once you confirm the deletes",
+            "\n  {} deleted on {env} {how}",
             count_noun(recreate_local, "object", "objects")
         ));
         remote.push_str(&format!(
@@ -168,6 +171,7 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
         progress,
         bulk_sticky,
         &projection,
+        false,
     )
     .await
 }
@@ -187,6 +191,7 @@ async fn resolve_conflicts_projected<R: BufRead>(
     progress: &Arc<Log>,
     bulk_sticky: &mut Option<BulkChoice>,
     projection: &crate::state::Lockfile,
+    no_push: bool,
 ) -> Result<ConflictOutcome> {
     let mut outcome = ConflictOutcome::default();
 
@@ -722,7 +727,7 @@ async fn resolve_conflicts_projected<R: BufRead>(
             crate::cli::pull::common::portabilize_proposed(&refs.remote_bytes, projection);
 
         let content_remaining = total - idx;
-        let bulk = build_bulk_prompt(&env, content_remaining, lerd_total, ldre_total);
+        let bulk = build_bulk_prompt(&env, content_remaining, lerd_total, ldre_total, no_push);
         resolve_one_conflict(
             ctx,
             it,
@@ -738,6 +743,7 @@ async fn resolve_conflicts_projected<R: BufRead>(
             &mut outcome,
             bulk_sticky,
             bulk.as_ref(),
+            no_push,
         )?;
     }
 
@@ -1228,6 +1234,7 @@ fn resolve_one_conflict<R: BufRead>(
     outcome: &mut ConflictOutcome,
     bulk_sticky: &mut Option<BulkChoice>,
     bulk: Option<&BulkPrompt>,
+    no_push: bool,
 ) -> Result<()> {
     let ConflictRefs {
         remote_bytes,
@@ -1589,6 +1596,7 @@ fn resolve_one_conflict<R: BufRead>(
                             env,
                             detect_color_mode(),
                             bulk,
+                            no_push,
                         )?,
                     };
                     (
@@ -1644,6 +1652,7 @@ fn resolve_one_conflict<R: BufRead>(
                             env,
                             detect_color_mode(),
                             bulk,
+                            no_push,
                         )?,
                     };
                     // For schemas we don't write the sidecar from the
@@ -1673,6 +1682,7 @@ fn resolve_one_conflict<R: BufRead>(
                     env,
                     detect_color_mode(),
                     bulk,
+                    no_push,
                 )?,
             };
             (
@@ -1994,6 +2004,30 @@ fn deleted_marker_path(paths: &crate::paths::Paths, local_path: &Path) -> PathBu
     let mut s = shadow.into_os_string();
     s.push("-deleted");
     PathBuf::from(s)
+}
+
+/// Record the env's copy of a `LocalDeleteRemoteEdit` object as its lockfile
+/// base: content hash (sidecars included), `modified_at` and `modified_by`.
+fn record_env_as_base(ctx: &mut PullCtx<'_>, it: &ClassifiedItem, refs: &RemoteDeleteRefs) {
+    let Some(bytes) = refs.restore_bytes.as_ref() else { return };
+    // For schema kinds, use hash_schema so the formula sidecars are included
+    // in the hash.
+    let h = if matches!(refs.hash_strategy, HashStrategy::Schema) {
+        refs.hash_strategy.hash_schema(bytes, &refs.restore_formulas, &crate::state::Lockfile::default())
+    } else {
+        refs.hash_strategy.hash(bytes, &refs.restore_code, &crate::state::Lockfile::default())
+    };
+    if let Some(id) = refs.id {
+        crate::cli::pull::common::record_object(
+            ctx.lockfile,
+            &it.kind,
+            &it.slug,
+            id,
+            refs.modified_at.clone(),
+            refs.modified_by.clone(),
+            Some(h),
+        );
+    }
 }
 
 /// Which side's deletion a `-deleted` marker defers, for its warning.
@@ -2502,6 +2536,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
         interactive,
         None,
         false,
+        false,
         progress,
         bulk_sticky,
         &projection,
@@ -2520,6 +2555,7 @@ async fn resolve_remote_deletes_projected<R: BufRead>(
     interactive: bool,
     conflict_strategy: Option<ConflictStrategy>,
     no_pull: bool,
+    no_push: bool,
     progress: &Arc<Log>,
     bulk_sticky: &mut Option<BulkChoice>,
     projection: &crate::state::Lockfile,
@@ -3307,6 +3343,7 @@ async fn resolve_remote_deletes_projected<R: BufRead>(
                             0,
                             lerd_total - processed_lerd,
                             ldre_total - processed_ldre,
+                            no_push,
                         )
                     } else {
                         None
@@ -3330,6 +3367,7 @@ async fn resolve_remote_deletes_projected<R: BufRead>(
                             &env,
                             detect_color_mode(),
                             bulk.as_ref(),
+                            no_push,
                         )?;
                         *prompt_res.borrow_mut() = Some(r);
                         Ok(())
@@ -3378,14 +3416,11 @@ async fn resolve_remote_deletes_projected<R: BufRead>(
                             for path in &restored {
                                 let _ = std::fs::remove_file(path);
                             }
-                            if let Some(entry) = ctx
-                                .lockfile
-                                .objects
-                                .get_mut(it.kind.as_str())
-                                .and_then(|m| m.get_mut(it.slug.as_str()))
-                            {
-                                entry.modified_at = refs.modified_at.clone();
-                            }
+                            // The base becomes the env's copy, so from here
+                            // on this is a plain local delete: if the gate is
+                            // declined, or --no-push defers it, the next sync
+                            // offers the DELETE instead of this question.
+                            record_env_as_base(ctx, it, &refs);
                             outcome.promoted_to_delete.push((it.kind.clone(), it.slug.clone()));
                         } else {
                             // Restore on env: drop the lockfile entry so
@@ -3407,38 +3442,7 @@ async fn resolve_remote_deletes_projected<R: BufRead>(
                             // (done above before prompting). Align the
                             // lockfile to the env hash so subsequent
                             // syncs see Clean state.
-                            if let Some(bytes) = refs.restore_bytes.as_ref() {
-                                // For schema kinds, use hash_schema so the
-                                // formula sidecars are included in the hash.
-                                let h = if matches!(refs.hash_strategy, HashStrategy::Schema) {
-                                    refs.hash_strategy.hash_schema(
-                                        bytes,
-                                        &refs.restore_formulas,
-                                        &crate::state::Lockfile::default(),
-                                    )
-                                } else {
-                                    refs.hash_strategy.hash(
-                                        bytes,
-                                        &refs.restore_code,
-                                        &crate::state::Lockfile::default(),
-                                    )
-                                };
-                                if let (Some(id), modified_at, modified_by) = (
-                                    refs.id,
-                                    refs.modified_at.clone(),
-                                    refs.modified_by.clone(),
-                                ) {
-                                    crate::cli::pull::common::record_object(
-                                        ctx.lockfile,
-                                        &it.kind,
-                                        &it.slug,
-                                        id,
-                                        modified_at,
-                                        modified_by,
-                                        Some(h),
-                                    );
-                                }
-                            }
+                            record_env_as_base(ctx, it, &refs);
                         } else {
                             // Mirror the env's deletion: remove local +
                             // sidecars + marker, drop the lockfile entry.
@@ -3650,6 +3654,7 @@ pub async fn run(
         progress,
         &mut bulk_sticky,
         &projection,
+        no_push,
     )
     .await?;
 
@@ -3680,6 +3685,7 @@ pub async fn run(
         interactive,
         conflict_strategy,
         no_pull,
+        no_push,
         progress,
         &mut bulk_sticky,
         &projection,
@@ -4683,14 +4689,23 @@ mod tests {
 
     #[test]
     fn build_bulk_prompt_hides_when_single() {
-        assert!(build_bulk_prompt("prod", 1, 0, 0).is_none());
-        assert!(build_bulk_prompt("prod", 0, 1, 0).is_none());
-        assert!(build_bulk_prompt("prod", 0, 0, 0).is_none());
+        assert!(build_bulk_prompt("prod", 1, 0, 0, false).is_none());
+        assert!(build_bulk_prompt("prod", 0, 1, 0, false).is_none());
+        assert!(build_bulk_prompt("prod", 0, 0, 0, false).is_none());
+    }
+
+    #[test]
+    fn build_bulk_prompt_under_no_push_says_the_env_writes_wait() {
+        let b = build_bulk_prompt("prod", 2, 1, 1, true).expect("should offer when >1");
+        assert!(b.keep_local_summary.contains("2 local files kept and pushed to prod on the next sync"));
+        assert!(b.keep_local_summary.contains("1 file restored on prod on the next sync"));
+        assert!(b.keep_local_summary.contains("1 object deleted on prod on the next sync"));
+        assert!(!b.use_remote_summary.contains("next sync"), "{}", b.use_remote_summary);
     }
 
     #[test]
     fn build_bulk_prompt_lists_nonzero_classes() {
-        let b = build_bulk_prompt("prod", 39, 2, 1).expect("should offer when >1");
+        let b = build_bulk_prompt("prod", 39, 2, 1, false).expect("should offer when >1");
         assert!(b.use_remote_summary.contains("all 42 remaining"));
         assert!(b.use_remote_summary.contains("39 local files overwritten with prod"));
         assert!(b.use_remote_summary.contains("2 local files deleted"));
