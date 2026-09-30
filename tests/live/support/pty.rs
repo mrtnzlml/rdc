@@ -52,8 +52,10 @@ impl PtySession {
         // Wide, so no prompt line wraps and a needle never straddles a break.
         let mut ws = libc::winsize { ws_row: 60, ws_col: 240, ws_xpixel: 0, ws_ypixel: 0 };
         // SAFETY: out-pointers are valid; a null name and termios are allowed.
+        // `&raw mut`, not `&mut`: glibc takes `*const winsize` and macOS
+        // `*mut`, and clippy rejects `&mut ws` where only `*const` is needed.
         let rc = unsafe {
-            libc::openpty(&mut m, &mut s, std::ptr::null_mut(), std::ptr::null_mut(), &mut ws)
+            libc::openpty(&mut m, &mut s, std::ptr::null_mut(), std::ptr::null_mut(), &raw mut ws)
         };
         assert_eq!(rc, 0, "openpty failed: {}", std::io::Error::last_os_error());
         // Neither end may leak into the child beyond the three dup'd slaves:

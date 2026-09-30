@@ -667,8 +667,8 @@ async fn push_one_drifted(
 mod tests {
     use super::*;
 
-    /// Spec D9: clean engine updates PATCH concurrently. Four engines whose
-    /// PATCHes each take 200ms cost ~800ms in series and ~200-400ms fanned out.
+    /// Spec D9: clean engine updates PATCH concurrently. Four engines
+    /// must have all their PATCHes in flight at once (see `push::overlap`).
     #[tokio::test(flavor = "multi_thread")]
     async fn push_engines_patches_updates_concurrently() {
         use wiremock::matchers::{method, path};
@@ -686,6 +686,7 @@ mod tests {
         };
         let mut changes = BTreeMap::new();
         let mut remotes = Vec::new();
+        let arrivals = crate::cli::push::overlap::Arrivals::default();
         for (i, slug) in slugs.iter().enumerate() {
             let id = 700 + i as u64;
             let dir = paths.engine_dir(slug);
@@ -740,11 +741,10 @@ mod tests {
             let id = 700 + i as u64;
             Mock::given(method("PATCH"))
                 .and(path(format!("/api/v1/engines/{id}")))
-                .respond_with(
-                    ResponseTemplate::new(200)
-                        .set_body_json(list["results"][i].clone())
-                        .set_delay(std::time::Duration::from_millis(200)),
-                )
+                .respond_with(crate::cli::push::overlap::Stamped::new(
+                    list["results"][i].clone(),
+                    &arrivals,
+                ))
                 .mount(&server)
                 .await;
         }
@@ -752,19 +752,14 @@ mod tests {
         let client = crate::api::RossumClient::new(api.clone(), "TEST".into()).unwrap();
         let progress = Arc::new(crate::log::Log::new(crate::cli::resolve::ColorMode::Plain));
         let mut relink = Vec::new();
-        let start = std::time::Instant::now();
         let (pushed, skipped) = push(
             &paths, &client, &mut lockfile, false, &changes, &mut relink, &progress, "dev",
         )
         .await
         .expect("push should succeed");
-        let elapsed = start.elapsed();
 
         assert_eq!((pushed, skipped), (4, 0));
-        assert!(
-            elapsed < std::time::Duration::from_millis(650),
-            "four 200ms PATCHes must overlap; sequential would be >= 800ms, took {elapsed:?}",
-        );
+        crate::cli::push::overlap::assert_overlapped(&arrivals);
     }
 
     /// Deferred refs must survive the concurrent/sequential boundary.
