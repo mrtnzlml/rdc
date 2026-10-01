@@ -251,55 +251,6 @@ pub(crate) async fn push_classified(
     Ok((pushed, skipped))
 }
 
-/// Proof that a push fans its PATCHes out, whatever the machine's load.
-///
-/// A wall-clock bound on the whole push flakes on a busy CI runner: it once
-/// took 1.7s for four 200ms PATCHes that did overlap. Arrival times do not
-/// flake that way. A PATCH sent only after the previous one was answered
-/// arrives at least [`DELAY`] later, so a spread under [`DELAY`] means every
-/// PATCH was in flight at once.
-#[cfg(test)]
-pub(crate) mod overlap {
-    use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
-
-    /// How long each stamped response takes. Wider than any fan-out jitter.
-    pub(crate) const DELAY: Duration = Duration::from_millis(500);
-
-    pub(crate) type Arrivals = Arc<Mutex<Vec<Instant>>>;
-
-    /// Answers 200 with `body` after [`DELAY`], noting when each request arrived.
-    pub(crate) struct Stamped {
-        body: serde_json::Value,
-        arrivals: Arrivals,
-    }
-
-    impl Stamped {
-        pub(crate) fn new(body: serde_json::Value, arrivals: &Arrivals) -> Self {
-            Self { body, arrivals: arrivals.clone() }
-        }
-    }
-
-    impl wiremock::Respond for Stamped {
-        fn respond(&self, _: &wiremock::Request) -> wiremock::ResponseTemplate {
-            self.arrivals.lock().unwrap().push(Instant::now());
-            wiremock::ResponseTemplate::new(200).set_body_json(self.body.clone()).set_delay(DELAY)
-        }
-    }
-
-    pub(crate) fn assert_overlapped(arrivals: &Arrivals) {
-        let stamps = arrivals.lock().unwrap();
-        let first = stamps.iter().min().expect("no stamped request arrived");
-        let spread = *stamps.iter().max().unwrap() - *first;
-        assert!(
-            spread < DELAY,
-            "{} PATCHes must overlap: the last arrived {spread:?} after the first, \
-             but each takes {DELAY:?} to answer",
-            stamps.len(),
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

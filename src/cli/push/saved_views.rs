@@ -590,7 +590,7 @@ mod tests {
     use super::*;
 
     /// Spec D9: clean saved view updates PATCH concurrently. Four saved views
-    /// must have all their PATCHes in flight at once (see `push::overlap`).
+    /// must have all their PATCHes in flight at once (see `cli::overlap`).
     #[tokio::test(flavor = "multi_thread")]
     async fn push_saved_views_patches_updates_concurrently() {
         use wiremock::matchers::{method, path};
@@ -610,7 +610,7 @@ mod tests {
         };
         let mut changes = BTreeMap::new();
         let mut remotes = Vec::new();
-        let arrivals = crate::cli::push::overlap::Arrivals::default();
+        let arrivals = crate::cli::overlap::Arrivals::default();
         for (i, slug) in slugs.iter().enumerate() {
             let id = 500 + i as u64;
             // `shared` / `queues_filter` / `query` are typed `SavedView` fields
@@ -682,7 +682,7 @@ mod tests {
             let id = 500 + i as u64;
             Mock::given(method("PATCH"))
                 .and(path(format!("/api/v1/saved_views/{id}")))
-                .respond_with(crate::cli::push::overlap::Stamped::new(
+                .respond_with(crate::cli::overlap::Stamped::new(
                     list["results"][i].clone(),
                     &arrivals,
                 ))
@@ -699,7 +699,7 @@ mod tests {
         .expect("push should succeed");
 
         assert_eq!((pushed, skipped), (4, 0));
-        crate::cli::push::overlap::assert_overlapped(&arrivals);
+        crate::cli::overlap::assert_overlapped(&arrivals, 4);
     }
 
     /// The create barrier and the caller-owned drift cache, pinned together.

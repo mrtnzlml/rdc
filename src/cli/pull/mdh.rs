@@ -1970,20 +1970,17 @@ mod tests {
     /// SAME set of datasets it always did (the ones with a local
     /// `indexes.json`) and returning items in listing order.
     ///
-    /// Three datasets have a local file and one does not. With every listing
-    /// delayed 200ms, sequential costs >= 6 x 200ms; concurrent costs ~200ms.
+    /// Three datasets have a local file and one does not. All six listings
+    /// must be in flight at once (see `cli::overlap`).
     #[tokio::test(flavor = "multi_thread")]
     async fn plan_mdh_index_edits_fans_out_across_datasets() {
         use crate::state::{Lockfile, ObjectEntry, content_hash};
         use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::{Mock, MockServer};
 
         let server = MockServer::start().await;
-        let delayed = |body: serde_json::Value| {
-            ResponseTemplate::new(200)
-                .set_body_json(body)
-                .set_delay(std::time::Duration::from_millis(200))
-        };
+        let arrivals = crate::cli::overlap::Arrivals::default();
+        let delayed = |body: serde_json::Value| crate::cli::overlap::Stamped::new(body, &arrivals);
         // Env advertises index "acct"; the local snapshots below say "acct_v2".
         Mock::given(method("POST"))
             .and(path("/v1/indexes/list"))
@@ -2030,11 +2027,9 @@ mod tests {
         );
         let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
 
-        let start = std::time::Instant::now();
         let items = plan_mdh_index_edits(&listed, &lockfile, &paths, &progress)
             .await
             .unwrap();
-        let elapsed = start.elapsed();
 
         assert_eq!(
             items.iter().map(|i| i.describe()).collect::<Vec<_>>(),
@@ -2051,10 +2046,7 @@ mod tests {
             "scope is unchanged: 3 datasets with a local file x 2 calls; the \
              one without a local dir is still never fetched"
         );
-        assert!(
-            elapsed < std::time::Duration::from_millis(500),
-            "3 datasets must overlap; sequential would be >= 1.2s, took {elapsed:?}",
-        );
+        crate::cli::overlap::assert_overlapped(&arrivals, 6);
     }
 
     /// A dataset with no `"data": "manual"` flag must cost ZERO row calls — the
@@ -2477,19 +2469,15 @@ mod tests {
     }
 
     /// Spec D3: the regular and search index listings for ONE dataset are
-    /// independent, so they must overlap. With both mocks delayed 200ms, a
-    /// sequential fetch costs ~400ms and a joined one ~200ms.
+    /// independent, so both must be in flight at once (see `cli::overlap`).
     #[tokio::test(flavor = "multi_thread")]
     async fn fetch_index_set_overlaps_regular_and_search() {
         use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::{Mock, MockServer};
 
         let server = MockServer::start().await;
-        let delayed = |body: serde_json::Value| {
-            ResponseTemplate::new(200)
-                .set_body_json(body)
-                .set_delay(std::time::Duration::from_millis(200))
-        };
+        let arrivals = crate::cli::overlap::Arrivals::default();
+        let delayed = |body: serde_json::Value| crate::cli::overlap::Stamped::new(body, &arrivals);
         Mock::given(method("POST"))
             .and(path("/v1/indexes/list"))
             .respond_with(delayed(
@@ -2505,16 +2493,11 @@ mod tests {
 
         let client = DataStorageClient::new(server.uri(), "TEST".to_string()).unwrap();
         let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
-        let start = std::time::Instant::now();
         let set = fetch_index_set(&client, "gl-codes", &progress).await.unwrap();
-        let elapsed = start.elapsed();
 
         assert_eq!(set.regular.len(), 1, "regular indexes must still be decoded");
         assert!(set.search.is_empty(), "search indexes must still be decoded");
-        assert!(
-            elapsed < std::time::Duration::from_millis(350),
-            "the two listings must overlap; sequential would be ~400ms, took {elapsed:?}",
-        );
+        crate::cli::overlap::assert_overlapped(&arrivals, 2);
     }
 
     /// A collection can be dropped between the listing that named it and the
@@ -2641,14 +2624,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn fetch_dataset_rows_fans_out_but_counts_before_finding() {
         use wiremock::matchers::{body_partial_json, method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::{Mock, MockServer};
 
         let server = MockServer::start().await;
-        let slow = |body: serde_json::Value| {
-            ResponseTemplate::new(200)
-                .set_body_json(body)
-                .set_delay(std::time::Duration::from_millis(200))
-        };
+        let arrivals = crate::cli::overlap::Arrivals::default();
+        let slow = |body: serde_json::Value| crate::cli::overlap::Stamped::new(body, &arrivals);
         Mock::given(method("POST"))
             .and(path("/v1/data/aggregate"))
             .respond_with(slow(
@@ -2682,19 +2662,14 @@ mod tests {
             ("vendors".to_string(), "VENDORS".to_string()),
         ];
 
-        let start = std::time::Instant::now();
         let rows = fetch_dataset_rows(&client, &paths, &wanted, &progress)
             .await
             .unwrap();
-        let elapsed = start.elapsed();
 
         assert_eq!(rows["gl-codes"].0, 2, "count is carried back for the warn");
         assert_eq!(rows["gl-codes"].1.len(), 2);
         assert_eq!(rows["vendors"].1.len(), 1);
-        assert!(
-            elapsed < std::time::Duration::from_millis(700),
-            "the two datasets must overlap; sequential would be ~800ms, took {elapsed:?}",
-        );
+        crate::cli::overlap::assert_overlapped(&arrivals, 2);
 
         // Within a dataset, its $count must precede its find.
         let requests = server.received_requests().await.unwrap();

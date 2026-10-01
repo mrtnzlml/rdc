@@ -837,8 +837,8 @@ mod tests {
     }
 
     /// Spec D9: the per-item drift GET plus its PATCH is two round trips per
-    /// slug. Four schemas at 150ms per call cost ~1.2s in series; overlapped
-    /// they cost roughly one slug's worth.
+    /// slug. All four GETs, then all four PATCHes, must be in flight at once
+    /// (see `cli::overlap`).
     #[tokio::test(flavor = "multi_thread")]
     async fn push_schemas_overlaps_the_per_item_drift_get_and_patch() {
         let server = MockServer::start().await;
@@ -849,32 +849,28 @@ mod tests {
             &api,
             &[("q-a", 800), ("q-b", 801), ("q-c", 802), ("q-d", 803)],
         );
+        let arrivals = crate::cli::overlap::Arrivals::default();
         for (i, remote) in remotes.iter().enumerate() {
-            mount_get_and_patch(
-                &server,
-                800 + i as u64,
-                remote.clone(),
-                remote.clone(),
-                std::time::Duration::from_millis(150),
-            )
-            .await;
+            let id = 800 + i as u64;
+            for verb in ["GET", "PATCH"] {
+                Mock::given(method(verb))
+                    .and(path(format!("/api/v1/schemas/{id}")))
+                    .respond_with(crate::cli::overlap::Stamped::new(remote.clone(), &arrivals))
+                    .mount(&server)
+                    .await;
+            }
         }
 
         let client = crate::api::RossumClient::new(api.clone(), "TEST".into()).unwrap();
         let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
-        let start = std::time::Instant::now();
         let (pushed, skipped) = push(
             &paths, &client, &mut lockfile, false, &changes, &progress, "dev",
         )
         .await
         .expect("push should succeed");
-        let elapsed = start.elapsed();
 
         assert_eq!((pushed, skipped), (4, 0));
-        assert!(
-            elapsed < std::time::Duration::from_millis(900),
-            "the four GET+PATCH pairs must overlap; sequential would be >= 1.2s, took {elapsed:?}",
-        );
+        crate::cli::overlap::assert_overlapped(&arrivals, 4);
     }
 
     /// Request-count parity, and the property most likely to regress: the

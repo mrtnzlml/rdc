@@ -671,7 +671,7 @@ mod tests {
 
 
     /// Spec D9: clean queue updates PATCH concurrently. Four queues
-    /// must have all their PATCHes in flight at once (see `push::overlap`).
+    /// must have all their PATCHes in flight at once (see `cli::overlap`).
     #[tokio::test(flavor = "multi_thread")]
     async fn push_queues_patches_updates_concurrently() {
         use crate::paths::Paths;
@@ -762,12 +762,12 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(list.clone()))
             .mount(&server)
             .await;
-        let arrivals = crate::cli::push::overlap::Arrivals::default();
+        let arrivals = crate::cli::overlap::Arrivals::default();
         for i in 0..slugs.len() {
             let id = 800 + i as u64;
             Mock::given(method("PATCH"))
                 .and(path(format!("/api/v1/queues/{id}")))
-                .respond_with(crate::cli::push::overlap::Stamped::new(
+                .respond_with(crate::cli::overlap::Stamped::new(
                     list["results"][i].clone(),
                     &arrivals,
                 ))
@@ -785,7 +785,7 @@ mod tests {
         .expect("push should succeed");
 
         assert_eq!((pushed, skipped), (4, 0));
-        crate::cli::push::overlap::assert_overlapped(&arrivals);
+        crate::cli::overlap::assert_overlapped(&arrivals, 4);
     }
 
     /// Deferred refs must survive the concurrent/sequential boundary.

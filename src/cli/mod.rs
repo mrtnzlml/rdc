@@ -704,6 +704,8 @@ pub mod env_picker;
 pub mod index;
 pub mod init;
 pub mod migrate;
+#[cfg(test)]
+pub(crate) mod overlap;
 pub mod pull;
 pub mod push;
 pub mod doctor;

@@ -692,10 +692,10 @@ mod tests {
     }
 
     /// Spec D9: an inbox update is THREE round trips — the per-item drift GET,
-    /// the PATCH, and the post-PATCH re-baseline GET. Four inboxes at 150ms
-    /// per call cost ~1.8s in series; fanned out they cost roughly one slug's
-    /// worth. The re-baseline GET only overlaps if it moved into the
-    /// concurrent stage with its PATCH.
+    /// the PATCH, and the post-PATCH re-baseline GET. Each of the three rounds
+    /// must have all four inboxes in flight at once (see `cli::overlap`). The
+    /// re-baseline GETs only overlap if they moved into the concurrent stage
+    /// with their PATCHes.
     #[tokio::test(flavor = "multi_thread")]
     async fn push_inboxes_overlaps_the_drift_get_patch_and_rebaseline_get() {
         let server = MockServer::start().await;
@@ -703,32 +703,27 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (paths, mut lockfile, changes, remotes) =
             seed_inboxes(&tmp, &api, &["q-a", "q-b", "q-c", "q-d"]);
+        let arrivals = crate::cli::overlap::Arrivals::default();
         for (i, remote) in remotes.iter().enumerate() {
-            mount_get_and_patch(
-                &server,
-                500 + i as u64,
-                remote.clone(),
-                remote.clone(),
-                std::time::Duration::from_millis(150),
-            )
-            .await;
+            let id = 500 + i as u64;
+            for verb in ["GET", "PATCH"] {
+                Mock::given(method(verb))
+                    .and(path(format!("/api/v1/inboxes/{id}")))
+                    .respond_with(crate::cli::overlap::Stamped::new(remote.clone(), &arrivals))
+                    .mount(&server)
+                    .await;
+            }
         }
 
         let client = crate::api::RossumClient::new(api.clone(), "TEST".into()).unwrap();
         let progress = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
-        let start = std::time::Instant::now();
         let (pushed, skipped) =
             push(&paths, &client, &mut lockfile, false, &changes, &progress, "dev")
                 .await
                 .expect("push should succeed");
-        let elapsed = start.elapsed();
 
         assert_eq!((pushed, skipped), (4, 0));
-        assert!(
-            elapsed < std::time::Duration::from_millis(1200),
-            "the four GET+PATCH+GET triples must overlap; sequential would be \
-             >= 1.8s, took {elapsed:?}",
-        );
+        crate::cli::overlap::assert_overlapped(&arrivals, 4);
     }
 
     /// The post-PATCH re-baseline must record the GET-derived body, never the

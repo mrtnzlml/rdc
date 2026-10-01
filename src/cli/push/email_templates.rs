@@ -1162,7 +1162,7 @@ mod tests {
     }
 
     /// Spec D9: clean email-template updates PATCH concurrently. Four templates
-    /// must have all their PATCHes in flight at once (see `push::overlap`).
+    /// must have all their PATCHes in flight at once (see `cli::overlap`).
     #[tokio::test(flavor = "multi_thread")]
     async fn push_email_templates_patches_updates_concurrently() {
         use crate::snapshot::codec::combined_hash;
@@ -1197,7 +1197,7 @@ mod tests {
         let slugs = ["t-a", "t-b", "t-c", "t-d"];
         let mut changes = BTreeMap::new();
         let mut remotes = Vec::new();
-        let arrivals = crate::cli::push::overlap::Arrivals::default();
+        let arrivals = crate::cli::overlap::Arrivals::default();
         for (i, slug) in slugs.iter().enumerate() {
             let id = 300 + i as u64;
             let key = format!("main/invoices/{slug}");
@@ -1255,7 +1255,7 @@ mod tests {
             let id = 300 + i as u64;
             Mock::given(method("PATCH"))
                 .and(path(format!("/api/v1/email_templates/{id}")))
-                .respond_with(crate::cli::push::overlap::Stamped::new(
+                .respond_with(crate::cli::overlap::Stamped::new(
                     list["results"][i].clone(),
                     &arrivals,
                 ))
@@ -1272,7 +1272,7 @@ mod tests {
         .expect("push should succeed");
 
         assert_eq!((pushed, skipped), (4, 0));
-        crate::cli::push::overlap::assert_overlapped(&arrivals);
+        crate::cli::overlap::assert_overlapped(&arrivals, 4);
     }
 
     /// This driver's "create" is really an ADOPT-OR-CREATE branch that
