@@ -164,13 +164,28 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _checkUpdate() async {
     if (Platform.environment.containsKey('FLUTTER_TEST')) return;
-    final info = await checkForUpdate();
+    final info = await checkForUpdate(await rdcVersion() ?? '');
     if (info != null && mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      ScaffoldMessenger.of(context).showSnackBar(_updateSnackBar(info));
+    }
+  }
+
+  SnackBar _updateSnackBar(UpdateInfo info) => SnackBar(
         content: Text('A newer version (${info.latest}) is available on GitHub Releases.'),
         duration: const Duration(seconds: 8),
-      ));
-    }
+        action: info.url.isEmpty
+            ? null
+            : SnackBarAction(label: 'Open', onPressed: () => _openUrl(info.url)),
+      );
+
+  /// Opens [url] in the default browser; best-effort, failures are ignored.
+  void _openUrl(String url) {
+    final (cmd, args) = Platform.isMacOS
+        ? ('open', [url])
+        : Platform.isWindows
+            ? ('explorer', [url])
+            : ('xdg-open', [url]);
+    Process.run(cmd, args).ignore();
   }
 
   Future<void> _run(Future<void> Function() action) async {
@@ -244,15 +259,19 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  void _about() => showAboutDialog(
-        context: context,
-        applicationName: 'rdc',
-        applicationVersion: 'v$kAppVersion  •  rdc core embedded',
-        children: const [
-          Text('Cross-platform desktop front-end for the rdc core '
-              '(Flutter + flutter_rust_bridge).'),
-        ],
-      );
+  Future<void> _about() async {
+    final version = await rdcVersion();
+    if (!mounted) return;
+    showAboutDialog(
+      context: context,
+      applicationName: 'rdc',
+      applicationVersion: 'v${version ?? '?'}  •  rdc core embedded',
+      children: const [
+        Text('Cross-platform desktop front-end for the rdc core '
+            '(Flutter + flutter_rust_bridge).'),
+      ],
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -354,13 +373,13 @@ class _HomePageState extends State<HomePage> {
             onAbout: _about,
             onCheckUpdate: () async {
               final messenger = ScaffoldMessenger.of(context);
-              final info = await checkForUpdate();
+              final info = await checkForUpdate(await rdcVersion() ?? '');
               if (!mounted) return;
-              messenger.showSnackBar(SnackBar(
-                content: Text(info == null
-                    ? "You're on the latest version (or the check couldn't reach GitHub)."
-                    : 'A newer version (${info.latest}) is available on GitHub Releases.'),
-              ));
+              messenger.showSnackBar(info == null
+                  ? const SnackBar(
+                      content: Text(
+                          "You're on the latest version (or the check couldn't reach GitHub)."))
+                  : _updateSnackBar(info));
             },
           );
         },
