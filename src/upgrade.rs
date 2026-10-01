@@ -236,6 +236,16 @@ struct ReleaseInfo {
     tag_name: String,
 }
 
+/// Base URLs of the GitHub API and of release downloads. Tests point both at
+/// one mock server through `RDC_UPGRADE_URL_BASE` (tests/cli_upgrade.rs);
+/// real use leaves it unset.
+fn url_bases() -> (String, String) {
+    match std::env::var("RDC_UPGRADE_URL_BASE") {
+        Ok(base) => (base.clone(), base),
+        Err(_) => ("https://api.github.com".into(), "https://github.com".into()),
+    }
+}
+
 fn http_client(timeout: Duration) -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(USER_AGENT)
@@ -245,7 +255,7 @@ fn http_client(timeout: Duration) -> Result<reqwest::Client> {
 }
 
 async fn fetch_latest_version_with_timeout(timeout: Duration) -> Result<Version> {
-    let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
+    let url = format!("{}/repos/{REPO}/releases/latest", url_bases().0);
     let resp = http_client(timeout)?
         .get(&url)
         .header("Accept", "application/vnd.github+json")
@@ -279,7 +289,7 @@ pub async fn fetch_latest_version() -> Result<Version> {
 
 /// Fetch a specific version's tarball asset URL.
 fn asset_download_url(version: &Version, asset: &str) -> String {
-    format!("https://github.com/{REPO}/releases/download/v{version}/{asset}")
+    format!("{}/{REPO}/releases/download/v{version}/{asset}", url_bases().1)
 }
 
 /// Cache file location. On Unix: `$XDG_CACHE_HOME/rdc/update.json`,
@@ -738,6 +748,31 @@ mod tests {
         assert_eq!(
             asset_name(&v("0.6.0"), "x86_64", "unknown-linux-gnu"),
             "rdc-x86_64-unknown-linux-gnu.tar.gz"
+        );
+    }
+
+    /// The name `rdc upgrade` downloads must be the name `release.yaml`
+    /// uploads. Nothing compared the two before, and they drifted apart at
+    /// v0.7.0 without a single failing test.
+    #[test]
+    fn asset_name_matches_the_release_workflow() {
+        let workflow = include_str!("../.github/workflows/release.yaml");
+        let line = workflow
+            .lines()
+            .find(|l| l.contains("tar czf \"dist/"))
+            .expect("release.yaml has a `tar czf \"dist/...\"` line");
+        let template = line
+            .split("dist/")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("the tar line names a dist/ file in quotes");
+        let uploaded = template
+            .replace("$version", "1.2.3")
+            .replace("${{ matrix.target }}", "x86_64-unknown-linux-gnu");
+        assert_eq!(
+            asset_name(&Version::parse("1.2.3").unwrap(), "x86_64", "unknown-linux-gnu"),
+            uploaded,
+            "release.yaml uploads `{template}`"
         );
     }
 
