@@ -167,12 +167,10 @@ jobs:
     # `HOMEBREW_TAP_TOKEN` -- a fine-grained PAT with contents:write on the
     # tap repo only.
     #
-    # NOTE: the API-backed download below makes this JOB green and the formula
-    # accurate; it does NOT make `brew install mrtnzlml/tap/rdc` work while this
-    # repo is private. Homebrew fetches the `url` fields with no token, and that
-    # URL 404s (verified directly). Fixing the install needs either a public
-    # repo or dropping Homebrew -- a separate decision. The urls stay on the
-    # browser path because that is the only form Homebrew understands.
+    # Homebrew fetches the `url` fields with no token. That works because this
+    # repo is public (since 2026-10-01); while it was private, those URLs 404d
+    # and `brew install` failed. The urls stay on the browser path because that
+    # is the only form Homebrew understands.
     name: Bump Homebrew tap formula
     needs: release
     runs-on: ubuntu-latest
@@ -196,10 +194,9 @@ jobs:
           set -euo pipefail
           version="${TAG#v}"
           base="https://github.com/mrtnzlml/rdc/releases/download/${TAG}"
-          # This repo is private, so the releases/download/... browser URL 404s
-          # even with a token -- that is what failed the last four releases.
-          # `gh release download` resolves the numeric asset id through the API,
-          # which is the only way in.
+          # `gh release download` resolves the numeric asset id through the API.
+          # It was the only way in while this repo was private, when the
+          # releases/download/... browser URL 404d even with a token.
           mkdir -p assets
           gh release download "$TAG" --repo mrtnzlml/rdc --dir assets --clobber \
             --pattern 'rdc-*-aarch64-apple-darwin.tar.gz' \

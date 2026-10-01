@@ -20,9 +20,7 @@ Homebrew (macOS, Linux x86_64):
 brew install mrtnzlml/tap/rdc
 ```
 
-Windows (PowerShell). Needs an authenticated [GitHub CLI](https://cli.github.com)
-(`gh auth login`) because this repo is private — `github.com/.../releases/download/...`
-serves a browser session only and 404s otherwise, even with a token:
+Windows (PowerShell), with the [GitHub CLI](https://cli.github.com):
 
 ```powershell
 $dest = "$env:USERPROFILE\.rdc\bin"
