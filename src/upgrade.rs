@@ -183,9 +183,23 @@ fn is_writable_in_place(path: &Path) -> bool {
     ok
 }
 
-/// Asset name for the current platform, matching what the release
-/// workflow uploads. Returns an error on platforms we don't build for.
-pub fn platform_asset_name() -> Result<String> {
+/// First release whose tarballs carry the version in their name. Earlier
+/// releases are `rdc-<arch>-<os>.tar.gz`; `rdc upgrade --version` can still
+/// target them.
+const VERSIONED_ASSETS_SINCE: Version = Version { major: 0, minor: 7, patch: 0 };
+
+/// Tarball name `release.yaml` uploads for `version` on `arch`-`os`.
+fn asset_name(version: &Version, arch: &str, os: &str) -> String {
+    if *version >= VERSIONED_ASSETS_SINCE {
+        format!("rdc-{version}-{arch}-{os}.tar.gz")
+    } else {
+        format!("rdc-{arch}-{os}.tar.gz")
+    }
+}
+
+/// Asset name of `version` for the current platform, matching what the
+/// release workflow uploads. Returns an error on platforms we don't build for.
+pub fn platform_asset_name(version: &Version) -> Result<String> {
     let os = match std::env::consts::OS {
         "macos" => "apple-darwin",
         "linux" => "unknown-linux-gnu",
@@ -203,7 +217,7 @@ pub fn platform_asset_name() -> Result<String> {
     if os == "pc-windows-msvc" && arch == "aarch64" {
         anyhow::bail!("windows aarch64 isn't pre-built; build from source instead");
     }
-    Ok(format!("rdc-{arch}-{os}.tar.gz"))
+    Ok(asset_name(version, arch, os))
 }
 
 /// Filename of the rdc binary on the current platform.
@@ -238,17 +252,14 @@ async fn fetch_latest_version_with_timeout(timeout: Duration) -> Result<Version>
         .send()
         .await
         .with_context(|| format!("GET {url}"))?;
-    // A 404 here is the repository being invisible, not the release being
-    // missing: GitHub answers an unauthorised read of a private repo with 404
-    // rather than 403, and rdc sends no credential of its own. Saying so is
-    // the difference between "there is no release" — which sends a reader
-    // looking in the wrong place — and "this build cannot see the releases".
+    // The repo is public, so a 404 means GitHub cannot show the repository
+    // or a published release to an anonymous reader — rdc sends no
+    // credential. GitHub answers a private repo with 404, not 403.
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         anyhow::bail!(
-            "GitHub returned 404 for {url}. The {REPO} releases are not readable without \
-             credentials, and rdc sends none, so self-upgrade cannot resolve a version. \
-             Install the release asset by hand, or re-run `cargo install` if you build \
-             from source."
+            "GitHub returned 404 for {url}: no published release of {REPO} is visible \
+             without credentials, and rdc sends none. Install the release asset by hand, \
+             or re-run `cargo install` if you build from source."
         );
     }
     let info: ReleaseInfo = resp
@@ -411,7 +422,7 @@ pub async fn run_upgrade(target: Option<Version>, check_only: bool) -> Result<()
             anyhow::bail!("cannot self-replace a cargo-installed binary");
         }
         InstallLocation::Unknown(path) => {
-            let asset = platform_asset_name().unwrap_or_else(|_| "<your-platform>.tar.gz".into());
+            let asset = platform_asset_name(&latest).unwrap_or_else(|_| "<your-platform>.tar.gz".into());
             let url = asset_download_url(&latest, &asset);
             let bin = binary_filename();
             #[cfg(windows)]
@@ -445,7 +456,7 @@ pub async fn run_upgrade(target: Option<Version>, check_only: bool) -> Result<()
         InstallLocation::Replaceable(path) => path.clone(),
     };
 
-    let asset_name = platform_asset_name()?;
+    let asset_name = platform_asset_name(&latest)?;
     let url = asset_download_url(&latest, &asset_name);
 
     // Wrap the download in a spinner so the user sees activity while
@@ -710,11 +721,31 @@ mod tests {
         assert!(Version::parse("").is_err());
     }
 
+    /// `rdc upgrade` downloaded `rdc-<arch>-<os>.tar.gz` for every target,
+    /// but releases since v0.7.0 upload `rdc-<version>-<arch>-<os>.tar.gz`,
+    /// so every upgrade 404ed. Names checked against the real release assets.
+    #[test]
+    fn asset_name_carries_the_version_from_v0_7_0() {
+        let v = |s| Version::parse(s).unwrap();
+        assert_eq!(
+            asset_name(&v("0.12.0"), "aarch64", "apple-darwin"),
+            "rdc-0.12.0-aarch64-apple-darwin.tar.gz"
+        );
+        assert_eq!(
+            asset_name(&v("0.7.0"), "x86_64", "pc-windows-msvc"),
+            "rdc-0.7.0-x86_64-pc-windows-msvc.tar.gz"
+        );
+        assert_eq!(
+            asset_name(&v("0.6.0"), "x86_64", "unknown-linux-gnu"),
+            "rdc-x86_64-unknown-linux-gnu.tar.gz"
+        );
+    }
+
     #[test]
     fn platform_asset_name_is_one_of_known() {
         // We can only assert on the current platform; just check format.
-        if let Ok(name) = platform_asset_name() {
-            assert!(name.starts_with("rdc-"));
+        if let Ok(name) = platform_asset_name(&Version::parse("1.2.3").unwrap()) {
+            assert!(name.starts_with("rdc-1.2.3-"));
             assert!(name.ends_with(".tar.gz"));
         }
     }
@@ -742,7 +773,7 @@ mod tests {
     #[test]
     fn platform_asset_name_windows_format() {
         // Just check the format hasn't regressed for current platform.
-        if let Ok(name) = platform_asset_name() {
+        if let Ok(name) = platform_asset_name(&current()) {
             assert!(name.ends_with(".tar.gz"));
             if cfg!(target_os = "windows") {
                 assert!(name.contains("pc-windows-msvc"));

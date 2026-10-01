@@ -123,10 +123,18 @@ Project-specific instructions for working in this repo.
   2026-09-21, in favour of the shape a real project's pipeline had been running:
   nothing in `.github/` ever consumed the series form. Reinstating it means
   re-adding that filter, not un-commenting something.
-- The repo is private, so the template installs rdc through
-  `api.github.com/repos/<repo>/releases/assets/<id>` (resolved from the tag).
-  The `releases/download/<tag>/<asset>` browser URL 404s even with a token —
-  don't "simplify" the install back to it.
+- The template installs rdc through
+  `api.github.com/repos/<repo>/releases/assets/<id>` (resolved from the tag)
+  because the repo was private until 2026-10-01, and on a private repo the
+  `releases/download/<tag>/<asset>` browser URL 404s even with a token. The
+  repo is public now, so both URLs work anonymously; the API form stays until
+  someone decides to change it.
+- `rdc upgrade` downloads `releases/download/v<version>/<asset>` with no
+  credential, so it only works because the repo is public. Release tarballs
+  are `rdc-<version>-<target>.tar.gz` since v0.7.0 and `rdc-<target>.tar.gz`
+  before; `asset_name` in `src/upgrade.rs` must follow `release.yaml`'s
+  `tar czf` line, or every upgrade 404s, which is what happened from v0.7.0
+  until this was fixed.
 - Keep the env names as placeholders (`dev` → `test` → `prod`) with `# TODO`
   markers. `rdc.toml` stores envs in a `BTreeMap`, so init cannot derive a
   promotion chain from them (`dev`, `prod`, `test` would chain dev → prod → test).
