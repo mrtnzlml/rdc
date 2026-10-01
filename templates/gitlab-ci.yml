@@ -5,7 +5,6 @@
 #   RDC_USER_<ENV> + RDC_PASS_<ENV>  one pair per env below; rdc exchanges them
 #     for a token itself, so CI needs no `rdc auth`. RDC_TOKEN_<ENV> also works.
 #     <ENV> is the env name uppercased, non-alphanumerics as '_' (dev-eu -> DEV_EU).
-#   RDC_GITHUB_TOKEN                 read access to the rdc repo (release asset).
 #   RDC_GIT_PUSH_TOKEN               write access to THIS repo's default branch
 #     for the commit-back, or RDC_GIT_PUSH_URL with a full authenticated URL.
 #
@@ -40,34 +39,25 @@ default:
   interruptible: true
 
 variables:
-  # The release to install, spelled as its api.github.com path: `latest` for the
-  # newest, or `tags/vX.Y.Z` to pin one. `latest` means fixes arrive without
-  # editing this file -- and that the deploy job below, which runs
-  # `rdc sync --allow-deletes --yes` unattended, can change behaviour with
-  # nobody watching. Pin to decide that in a commit, or in a manual job's
-  # "Run job" form to pin one press.
+  # The rdc release to install: `latest`, or `vX.Y.Z` to pin one. `latest`
+  # means fixes arrive without editing this file -- and that the deploy job
+  # below, which runs `rdc sync --allow-deletes --yes` unattended, can change
+  # behaviour with nobody watching. Pin to decide that in a commit, or in a
+  # manual job's "Run job" form to pin one press.
   RDC_RELEASE: "latest"
-  RDC_REPO: "mrtnzlml/rdc"
   # Commit-back author and committer. GitLab push rules can require these to
   # match a pattern; if yours does, use an address that satisfies it.
   RDC_GIT_EMAIL: "rdc-ci@example.com"  # TODO
 
-# github.com serves release downloads to a browser session only: that URL 404s
-# even with a token. api.github.com + the numeric asset id is the only way in.
 .rdc-install-script: &rdc-install-script |
   set -eu
-  : "${RDC_GITHUB_TOKEN:?set RDC_GITHUB_TOKEN (read access to $RDC_REPO)}"
-  auth="Authorization: Bearer $RDC_GITHUB_TOKEN"
-  api="https://api.github.com/repos/$RDC_REPO"
-  release=$(curl -sSfL -H "$auth" "$api/releases/$RDC_RELEASE")
-  # Asset names carry the version (rdc-<version>-x86_64-unknown-linux-gnu.tar.gz),
-  # so the target triple is the stable part to match on. Exactly one, or stop:
-  # a release also ships macOS, Windows and desktop builds, and two ids would
-  # silently become one broken URL. Swap the triple for another platform.
-  asset_id=$(printf '%s' "$release" | python3 -c 'import json,sys; m=[a["id"] for a in json.load(sys.stdin)["assets"] if a["name"].endswith("-x86_64-unknown-linux-gnu.tar.gz")]; sys.exit("expected exactly 1 linux asset, found "+str(len(m))) if len(m)!=1 else print(m[0])')
-  curl -sSfL -H "$auth" -H "Accept: application/octet-stream" \
-    "$api/releases/assets/$asset_id" \
-    | tar -xz -C /usr/local/bin
+  url=https://github.com/mrtnzlml/rdc/releases
+  tag=$RDC_RELEASE
+  if [ "$tag" = latest ]; then  # releases/latest redirects to releases/tag/<tag>
+    tag=$(curl -sSfI -o /dev/null -w '%{redirect_url}' "$url/latest")
+    tag=${tag##*/}
+  fi
+  curl -sSfL "$url/download/$tag/rdc-${tag#v}-x86_64-unknown-linux-gnu.tar.gz" | tar -xz -C /usr/local/bin
   rdc --version
 
 # Commits what rdc wrote to the default branch. before_script and script share
@@ -112,7 +102,7 @@ pytest:
 
 archive:
   stage: archive
-  image: python:3.12  # glibc binary: not alpine (musl); not -slim (needs git, curl, python3)
+  image: python:3.12  # glibc binary: not alpine (musl); not -slim (needs git, curl)
   needs: []  # an archive records what is live; never gate it on the tests
   resource_group: archive  # serialize the commit-backs, including across pipelines
   interruptible: false  # a newer pipeline must not cancel the queued sibling

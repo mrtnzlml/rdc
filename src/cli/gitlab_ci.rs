@@ -519,7 +519,7 @@ mod tests {
     ///
     /// Both halves are deliberate. A scaffold's job is to install a working rdc
     /// on a fresh project; a project that wants the release decided by a commit
-    /// sets `RDC_RELEASE` to `tags/vX.Y.Z` itself. And with no literal
+    /// sets `RDC_RELEASE` to `vX.Y.Z` itself. And with no literal
     /// anywhere, `.github/scripts/bump-version.sh` has nothing to rewrite in
     /// this file -- it edits three files, not four -- so no comment here can be
     /// silently falsified by a release.

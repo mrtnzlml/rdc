@@ -51,15 +51,18 @@ Project-specific instructions for working in this repo.
   arrive without editing the file. The cost is real and accepted: the deploy job
   runs `rdc sync --allow-deletes --yes` unattended, so a release changes what a
   destructive sync does with nobody watching. A project that wants that decided
-  by a commit sets `RDC_RELEASE: "tags/vX.Y.Z"`, or overrides it in a manual
+  by a commit sets `RDC_RELEASE: "vX.Y.Z"`, or overrides it in a manual
   job's "Run job" form for one press. (This replaced a pinned `RDC_VERSION` on
   2026-09-21; reverting means reinstating the bumper's fourth edit and its
   tests.)
-- The value is **the `api.github.com` path**, not a version — which is the whole
-  reason the install script is 14 lines and not 35: `releases/latest` and
-  `releases/tags/vX.Y.Z` are one `curl` with one variable in it. There is no
-  `vX.Y` series form any more, and no `RDC_ASSET_SUFFIX` / `RDC_INSTALL_DIR` /
-  `RDC_ASSET` either; the linux triple is inlined and one asset must match.
+- The value is a tag, `vX.Y.Z`, or `latest`. The install script downloads
+  `github.com/mrtnzlml/rdc/releases/download/<tag>/rdc-<version>-x86_64-unknown-linux-gnu.tar.gz`
+  with no token and no `api.github.com` call: `latest` is resolved from the
+  `releases/latest` redirect. That keeps shared GitLab runners clear of the
+  anonymous API's 60-requests-per-hour-per-IP limit. It depends on the repo
+  staying public and on `release.yaml`'s `tar czf` asset name. There is no
+  `vX.Y` series form, no `RDC_REPO` and no `RDC_GITHUB_TOKEN`; the repo and the
+  linux triple are inlined.
 - Therefore the **full version literal must appear nowhere** in
   `templates/gitlab-ci.yml`, and `.github/scripts/bump-version.sh` must not
   touch that file: it edits three files, not four.
@@ -117,18 +120,13 @@ Project-specific instructions for working in this repo.
   target in `release.yaml`, under `shell: bash` because windows-latest defaults
   to pwsh). Bump `channel` deliberately and meet the new lints when you choose;
   the pin is in the cargo cache keys so a stale `target/` cannot outlive it.
-- The install script accepts exactly **two** forms, because `RDC_RELEASE` is an
-  API path: `latest` (the default) and `tags/vX.Y.Z`. The `vX.Y` series form
-  and its list-endpoint `python3` filter were **deleted on purpose** on
-  2026-09-21, in favour of the shape a real project's pipeline had been running:
-  nothing in `.github/` ever consumed the series form. Reinstating it means
-  re-adding that filter, not un-commenting something.
-- The template installs rdc through
-  `api.github.com/repos/<repo>/releases/assets/<id>` (resolved from the tag)
-  because the repo was private until 2026-10-01, and on a private repo the
-  `releases/download/<tag>/<asset>` browser URL 404s even with a token. The
-  repo is public now, so both URLs work anonymously; the API form stays until
-  someone decides to change it.
+- The install script accepts exactly **two** forms: `latest` (the default)
+  and `vX.Y.Z`. The `vX.Y` series form was **deleted on purpose** on
+  2026-09-21; nothing in `.github/` ever consumed it. Until 2026-10-01 the
+  value was an API path (`tags/vX.Y.Z`) and the script needed a token plus a
+  `python3` asset-id lookup, because the repo was private and the browser
+  download URL 404'd. Pipelines scaffolded before then keep that script:
+  `rdc init` never rewrites the static half of an existing file.
 - `rdc upgrade` downloads `releases/download/v<version>/<asset>` with no
   credential, so it only works because the repo is public. Release tarballs
   are `rdc-<version>-<target>.tar.gz` since v0.7.0 and `rdc-<target>.tar.gz`

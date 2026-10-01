@@ -55,7 +55,6 @@ version = "0.1.0"
 /// exactly as it is.
 const TEMPLATE: &str = r#"variables:
   RDC_RELEASE: "latest"
-  RDC_REPO: "mrtnzlml/rdc"
 "#;
 
 fn tree() -> TempDir {
