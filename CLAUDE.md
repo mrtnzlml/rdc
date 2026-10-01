@@ -102,7 +102,11 @@ Project-specific instructions for working in this repo.
   ran. The three gate steps are **duplicated on purpose** in `ci.yaml` and
   `weekly-release.yaml`; whatever CI accepts the release gate must also accept,
   so change one and you must change the other. `cargo fmt` is absent from both
-  — this tree is not fmt-clean and never has been.
+  — this tree is not fmt-clean and never has been. `ci.yaml` also has two
+  **CI-only** jobs, `testkit` (`pytest` in `templates/`) and `desktop`
+  (`flutter test`, the bridge integration test, `cargo test` in
+  `desktop/rust`, on macOS because the goldens were rendered there). CI may be
+  stricter than the release gate, never looser. The live suite runs nowhere.
 - **`rust-toolchain.toml` is the only place the Rust version is decided**, and
   no workflow may use `dtolnay/rust-toolchain` again: that action picks its
   toolchain from its own `@rev` and **never reads the file**, so it would
