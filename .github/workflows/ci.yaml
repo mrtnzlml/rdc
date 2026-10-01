@@ -34,8 +34,7 @@ permissions:
 
 # A newer push to the same ref makes the older run pointless. Note the release
 # workflows deliberately do NOT cancel in progress -- never kill a release
-# halfway -- but a superseded CI run is just spent minutes on a private repo's
-# monthly quota.
+# halfway -- but a superseded CI run is just wasted runner time.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true

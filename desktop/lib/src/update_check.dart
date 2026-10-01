@@ -13,11 +13,11 @@ class UpdateInfo {
 
 /// Best-effort launch-time check for a newer `desktop-v*` GitHub release.
 ///
-/// NOTE: the rdc repository is currently private, so unauthenticated release
-/// queries return 404 (the same pre-existing distribution blocker deferred for
-/// `rdc upgrade`/Homebrew). This check therefore degrades gracefully — any
-/// non-200, timeout, or parse failure yields `null` (no update surfaced) and
-/// never throws. It becomes live once releases are publicly reachable.
+/// The rdc repository is public, so the unauthenticated release query
+/// succeeds. NOTE: no `desktop-v*` release exists — the app ships as
+/// `rdc-desktop-*` assets on the CLI's `v*` releases — so this currently
+/// surfaces nothing. It degrades gracefully: any non-200, timeout, or parse
+/// failure yields `null` (no update surfaced) and never throws.
 Future<UpdateInfo?> checkForUpdate() async {
   HttpClient? client;
   try {
