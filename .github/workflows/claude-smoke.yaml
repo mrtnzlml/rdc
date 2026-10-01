@@ -1,0 +1,35 @@
+# Temporary: proves a Claude subscription token (`claude setup-token`) can run
+# anthropics/claude-code-action in this repo. Delete once answered.
+name: Claude auth smoke test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          prompt: |
+            Read Cargo.toml and report the package name. Do not run any other tool.
+          claude_args: |
+            --max-turns 3
+            --allowedTools Read
+            --json-schema '{"type":"object","properties":{"package":{"type":"string"}},"required":["package"]}'
+
+      - name: Check the structured output
+        env:
+          OUT: ${{ steps.claude.outputs.structured_output }}
+        run: |
+          echo "structured_output: $OUT"
+          test "$(echo "$OUT" | jq -r .package)" = "rdc"
