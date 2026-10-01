@@ -343,28 +343,29 @@ impl DataStorageClient {
     }
 
     /// `POST /v1/search_indexes/create` — create an Atlas Search index
-    /// on the given collection. `mappings` is the field-mapping spec;
-    /// `analyzers` carries any custom analyzer definitions (typically
-    /// omitted / an empty array for the default analyzer).
+    /// on the given collection. `definition` is the normalised on-disk
+    /// definition (`mappings` plus any of `analyzer`, `analyzers`,
+    /// `searchAnalyzer`, `synonyms`); every key but `name` rides along
+    /// in the body, so nothing the user wrote is dropped on the way out.
     pub async fn create_search_index(
         &self,
         collection: &str,
         index_name: &str,
-        mappings: &Value,
-        analyzers: &Value,
+        definition: &Value,
         progress: ProgressHandle,
     ) -> Result<()> {
-        self.post_envelope_void(
-            "/v1/search_indexes/create",
-            json!({
-                "collectionName": collection,
-                "indexName": index_name,
-                "mappings": mappings,
-                "analyzers": analyzers,
-            }),
-            progress,
-        )
-        .await
+        let mut body = serde_json::Map::new();
+        body.insert("collectionName".to_string(), json!(collection));
+        body.insert("indexName".to_string(), json!(index_name));
+        if let Value::Object(def) = definition {
+            for (k, v) in def {
+                if k != "name" {
+                    body.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        self.post_envelope_void("/v1/search_indexes/create", Value::Object(body), progress)
+            .await
     }
 
     /// `POST /v1/search_indexes/drop` — drop an Atlas Search index
@@ -534,6 +535,55 @@ mod tests {
             .await
             .expect("create_collection should succeed on an ok envelope");
         // `.expect(1)` on drop verifies exactly one matching request was made.
+    }
+
+    /// `create_search_index` must forward every definition key but `name` —
+    /// `analyzer`, `searchAnalyzer` and `synonyms` included — and must not
+    /// invent an `analyzers` the definition does not carry.
+    #[tokio::test]
+    async fn create_search_index_forwards_the_whole_definition() {
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let synonyms = json!([{
+            "name": "syn",
+            "analyzer": "lucene.english",
+            "source": {"collection": "vendor_synonyms"}
+        }]);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/search_indexes/create"))
+            .and(body_json(json!({
+                "collectionName": "vendors",
+                "indexName": "sx",
+                "mappings": {"dynamic": true},
+                "analyzer": "lucene.english",
+                "searchAnalyzer": "lucene.english",
+                "synonyms": synonyms,
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "code": "accept", "message": ""
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = DataStorageClient::new(server.uri(), "TOKEN".into()).unwrap();
+        client
+            .create_search_index(
+                "vendors",
+                "sx",
+                &json!({
+                    "name": "sx",
+                    "mappings": {"dynamic": true},
+                    "analyzer": "lucene.english",
+                    "searchAnalyzer": "lucene.english",
+                    "synonyms": synonyms,
+                }),
+                None,
+            )
+            .await
+            .expect("create_search_index should succeed on an accept envelope");
     }
 
     /// A non-ok envelope (e.g. permission error) must surface as an error, not

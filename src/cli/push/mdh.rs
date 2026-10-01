@@ -149,7 +149,7 @@ pub async fn push_dataset(
     )?;
 
     // Reshape the raw remote search-index list entries to the same canonical
-    // {name, mappings, analyzers?} form the pull writes locally, so the diff
+    // {name, mappings, analyzer?, analyzers?, searchAnalyzer?, synonyms?} form the pull writes locally, so the diff
     // compares like-with-like. Without this, every search index looks "changed"
     // (local normalized vs remote raw) and is needlessly dropped+recreated on
     // every sync.
@@ -356,21 +356,11 @@ pub(crate) async fn apply_diff(
         if dropped_search.contains(name) {
             wait_for_search_drop(client, collection_name, name, progress).await?;
         }
-        let mappings = def
-            .get("mappings")
-            .ok_or_else(|| anyhow!("search index '{name}' missing `mappings` field"))?;
-        let analyzers = def
-            .get("analyzers")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!([]));
+        if def.get("mappings").is_none() {
+            return Err(anyhow!("search index '{name}' missing `mappings` field"));
+        }
         client
-            .create_search_index(
-                collection_name,
-                name,
-                mappings,
-                &analyzers,
-                Some(progress.clone()),
-            )
+            .create_search_index(collection_name, name, def, Some(progress.clone()))
             .await
             .with_context(|| format!("creating search index '{name}' on '{collection_name}'"))?;
         progress.event(Action::Post, &format!("mdh/{slug} search index '{name}'"));

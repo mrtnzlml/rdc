@@ -178,7 +178,7 @@ impl MdhRaw {
     pub async fn try_create_search_index(&self, coll: &str, name: &str) -> Result<bool> {
         let client = self.ds_client();
         match client
-            .create_search_index(coll, name, &json!({ "dynamic": true }), &json!([]), None)
+            .create_search_index(coll, name, &json!({ "mappings": { "dynamic": true } }), None)
             .await
         {
             Ok(()) => Ok(true),

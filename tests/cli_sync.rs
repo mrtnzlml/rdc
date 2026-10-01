@@ -13964,3 +13964,128 @@ async fn sync_creates_the_collection_for_a_search_only_mdh_dataset() {
         "one collection create plus one search-index create"
     );
 }
+
+/// A search index's `analyzer`, `searchAnalyzer` and `synonyms` must survive
+/// a pull, and a re-sync of an unchanged project must not touch the index.
+/// Regression shape: the normaliser kept only `mappings` + `analyzers`, so
+/// pull silently dropped the synonyms from `indexes.json`, and a push of that
+/// file would re-create the index without them.
+#[tokio::test]
+async fn sync_keeps_search_index_synonyms_and_does_not_churn() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(&server)
+        .await;
+    mock_empty_lists_except(&server, &[]).await;
+
+    use wiremock::matchers::body_partial_json;
+    Mock::given(method("POST"))
+        .and(path("/svc/data-storage/api/v1/collections/list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "ok", "message": "",
+            "result": [{ "name": "vendors", "type": "collection", "options": {} }]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/svc/data-storage/api/v1/indexes/list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "ok", "message": "",
+            "result": [{ "v": 2, "name": "_id_", "key": { "_id": 1 } }]
+        })))
+        .mount(&server)
+        .await;
+    // The live-verified list shape (snake_case inside `latest_definition`).
+    Mock::given(method("POST"))
+        .and(path("/svc/data-storage/api/v1/search_indexes/list"))
+        .and(body_partial_json(serde_json::json!({"collectionName": "vendors"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "ok", "message": "",
+            "result": [{
+                "name": "sx",
+                "type": "search",
+                "status": "READY",
+                "queryable": true,
+                "latest_definition": {
+                    "mappings": { "dynamic": true },
+                    "analyzer": "lucene.english",
+                    "analyzers": null,
+                    "search_analyzer": "lucene.english",
+                    "synonyms": [{
+                        "name": "syn",
+                        "analyzer": "lucene.english",
+                        "source": { "collection": "vendor_synonyms" }
+                    }],
+                    "stored_source": null,
+                    "num_partitions": null
+                },
+                "latest_definition_version": null
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(
+        project.path().join("secrets/dev.secrets.json"),
+        r#"{"api_token":"TEST_TOKEN"}"#,
+    )
+    .unwrap();
+
+    let _cwd_guard = cwd_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    let mut results = Vec::new();
+    for _ in 0..2 {
+        results.push(
+            rdc::cli::sync::run(
+                "dev", /* interactive = */ false, /* dry_run = */ false,
+                /* allow_deletes = */ false, /* no_push = */ false, /* no_pull = */ false,
+                None,
+            )
+            .await,
+        );
+    }
+    std::env::set_current_dir(&prev_cwd).unwrap();
+    for r in results {
+        r.expect("sync should succeed");
+    }
+
+    let body = std::fs::read_to_string(project.path().join("envs/dev/mdh/vendors/indexes.json"))
+        .unwrap();
+    let disk: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        disk["search"],
+        serde_json::json!([{
+            "name": "sx",
+            "mappings": { "dynamic": true },
+            "analyzer": "lucene.english",
+            "searchAnalyzer": "lucene.english",
+            "synonyms": [{
+                "name": "syn",
+                "analyzer": "lucene.english",
+                "source": { "collection": "vendor_synonyms" }
+            }]
+        }]),
+        "indexes.json must keep every user-authored search-index key: {body}"
+    );
+
+    let writes: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .filter(|p| p.contains("/search_indexes/create") || p.contains("/search_indexes/drop"))
+        .collect();
+    assert!(writes.is_empty(), "an unchanged index must not be touched: {writes:?}");
+}

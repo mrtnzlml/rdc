@@ -79,8 +79,8 @@ impl KindCodec for Mdh {
 ///   `v` index-version field (server-assigned).
 /// - **Search indexes**: the list response wraps user-authored `mappings` /
 ///   `analyzers` inside a `latest_definition` envelope and adds server-status
-///   fields. Normalise to the shape the create body expects:
-///   `{name, mappings, analyzers?}`.
+///   fields. Normalise to the shape the create body expects — see
+///   [`normalize_search_index`].
 fn strip_server_managed(set: &IndexSet) -> IndexSet {
     let mut regular: Vec<Value> = set
         .regular
@@ -101,9 +101,25 @@ fn strip_server_managed(set: &IndexSet) -> IndexSet {
     IndexSet { regular, search }
 }
 
-/// Reshape a search-index list response to the create-body shape. Returns
-/// `None` for entries that can't supply the minimum fields (`name` and
-/// `mappings`) — defensive against future API drift.
+/// The user-authored search-index definition keys, as `(on-disk / create-body
+/// name, list-response name)`. The list endpoint answers in snake_case inside
+/// `latest_definition`; the create body is camelCase. Each key is written only
+/// when set: the list reports an unset key as `null` (or `[]` for the arrays),
+/// and the create body accepts its absence. `stored_source` / `num_partitions`
+/// are listed too, but `search_indexes/create` silently drops them
+/// (live-verified), so they are not part of what rdc can manage.
+const SEARCH_DEF_KEYS: [(&str, &str); 4] = [
+    ("analyzer", "analyzer"),
+    ("analyzers", "analyzers"),
+    ("searchAnalyzer", "search_analyzer"),
+    ("synonyms", "synonyms"),
+];
+
+/// Reshape a search-index list response to the create-body shape
+/// `{name, mappings, analyzer?, analyzers?, searchAnalyzer?, synonyms?}`.
+/// Idempotent: an already-normalised definition maps to itself. Returns `None`
+/// for entries that can't supply the minimum fields (`name` and `mappings`) —
+/// defensive against future API drift.
 pub(crate) fn normalize_search_index(remote: &Value) -> Option<Value> {
     let obj = remote.as_object()?;
     let name = obj.get("name")?.clone();
@@ -115,16 +131,18 @@ pub(crate) fn normalize_search_index(remote: &Value) -> Option<Value> {
     let mut out = serde_json::Map::new();
     out.insert("name".to_string(), name);
     out.insert("mappings".to_string(), mappings);
-    // Only include `analyzers` when the user actually configured them
-    // (non-empty array). The default-empty case matches the create body's
-    // optional shape and keeps the on-disk JSON minimal.
-    let analyzers = definition
-        .and_then(|d| d.get("analyzers"))
-        .or_else(|| obj.get("analyzers"));
-    if let Some(a) = analyzers {
-        let non_empty = a.as_array().map(|arr| !arr.is_empty()).unwrap_or(true);
-        if non_empty {
-            out.insert("analyzers".to_string(), a.clone());
+    for (key, listed) in SEARCH_DEF_KEYS {
+        let value = match definition {
+            Some(d) => d.get(listed),
+            None => obj.get(key),
+        };
+        let unset = match value {
+            None | Some(Value::Null) => true,
+            Some(Value::Array(a)) => a.is_empty(),
+            Some(_) => false,
+        };
+        if !unset {
+            out.insert(key.to_string(), value.cloned().expect("checked set"));
         }
     }
     Some(Value::Object(out))
@@ -231,6 +249,73 @@ mod tests {
         });
         let got = normalize_search_index(&raw).expect("normalizes");
         assert_eq!(got, json!({"name": "sx_a", "mappings": {"dynamic": true}}));
+    }
+
+    /// The live-verified list shape of a search index that sets every
+    /// user-authored key. All four must survive (renamed to the create
+    /// body's camelCase), or pull silently loses them and push re-creates the
+    /// index without them.
+    #[test]
+    fn normalize_search_index_keeps_analyzers_and_synonyms() {
+        let raw = json!({
+            "name": "sx_full",
+            "type": "search",
+            "status": "READY",
+            "queryable": true,
+            "latest_definition": {
+                "mappings": {"dynamic": false, "fields": {"title": {"type": "string"}}},
+                "analyzer": "lucene.english",
+                "analyzers": [{"name": "custom", "tokenizer": {"type": "whitespace"}}],
+                "search_analyzer": "lucene.english",
+                "synonyms": [{
+                    "name": "syn",
+                    "analyzer": "lucene.english",
+                    "source": {"collection": "vendor_synonyms"}
+                }],
+                "stored_source": null,
+                "num_partitions": null
+            },
+            "latest_definition_version": null
+        });
+        let want = json!({
+            "name": "sx_full",
+            "mappings": {"dynamic": false, "fields": {"title": {"type": "string"}}},
+            "analyzer": "lucene.english",
+            "analyzers": [{"name": "custom", "tokenizer": {"type": "whitespace"}}],
+            "searchAnalyzer": "lucene.english",
+            "synonyms": [{
+                "name": "syn",
+                "analyzer": "lucene.english",
+                "source": {"collection": "vendor_synonyms"}
+            }]
+        });
+        let got = normalize_search_index(&raw).expect("normalizes");
+        assert_eq!(got, want);
+        assert_eq!(
+            normalize_search_index(&got).expect("normalizes"),
+            want,
+            "normalizing the on-disk form must be a no-op"
+        );
+    }
+
+    /// The live API reports an unset key as `null` — `analyzers` too, not
+    /// only `[]`. None of them may reach the on-disk form.
+    #[test]
+    fn normalize_search_index_omits_null_keys() {
+        let raw = json!({
+            "name": "sx_min",
+            "latest_definition": {
+                "mappings": {"dynamic": true},
+                "analyzer": null,
+                "analyzers": null,
+                "search_analyzer": null,
+                "synonyms": null
+            }
+        });
+        assert_eq!(
+            normalize_search_index(&raw).expect("normalizes"),
+            json!({"name": "sx_min", "mappings": {"dynamic": true}})
+        );
     }
 
     /// A dataset column can legitimately be named `modified_at`/`modified_by`,

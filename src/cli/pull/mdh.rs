@@ -512,8 +512,8 @@ pub(crate) async fn plan_mdh_index_edits(
 /// - **Search indexes**: the list response wraps the user-authored
 ///   `mappings` / `analyzers` inside a `latest_definition` envelope
 ///   and adds server-status fields (`type`, `status`, `queryable`,
-///   `analyzer`, `search_analyzer`, `synonyms`). Normalise to the
-///   shape the create body expects: `{name, mappings, analyzers?}`.
+///   `stored_source`, …). Normalise to the shape the create body
+///   expects — see `snapshot::codec::normalize_search_index`.
 ///   Without this normalisation, push would round-trip user edits
 ///   against a remote shape they never wrote, producing spurious
 ///   drop+create churn on every sync.
@@ -532,7 +532,7 @@ fn strip_server_managed(set: &IndexSet) -> IndexSet {
     let mut search: Vec<Value> = set
         .search
         .iter()
-        .filter_map(normalize_search_index)
+        .filter_map(crate::snapshot::codec::normalize_search_index)
         .collect();
     // Canonically name-sort both lists. The Data Storage list endpoints return
     // indexes in an order that is unstable across environments; writing that raw
@@ -554,35 +554,6 @@ fn sort_indexes_by_name(list: &mut [Value]) {
         let bn = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
         an.cmp(bn).then_with(|| a.to_string().cmp(&b.to_string()))
     });
-}
-
-/// Reshape a search-index list response to the create-body shape.
-/// Returns `None` for entries that can't supply the minimum fields
-/// (`name` and `mappings`) — defensive against future API drift.
-fn normalize_search_index(remote: &Value) -> Option<Value> {
-    let obj = remote.as_object()?;
-    let name = obj.get("name")?.clone();
-    let definition = obj.get("latest_definition").and_then(|v| v.as_object());
-    let mappings = definition
-        .and_then(|d| d.get("mappings"))
-        .or_else(|| obj.get("mappings"))?
-        .clone();
-    let mut out = serde_json::Map::new();
-    out.insert("name".to_string(), name);
-    out.insert("mappings".to_string(), mappings);
-    // Only include `analyzers` when the user actually configured them
-    // (non-empty array). The default-empty case matches the create
-    // body's optional shape and keeps the on-disk JSON minimal.
-    let analyzers = definition
-        .and_then(|d| d.get("analyzers"))
-        .or_else(|| obj.get("analyzers"));
-    if let Some(a) = analyzers {
-        let non_empty = a.as_array().map(|arr| !arr.is_empty()).unwrap_or(true);
-        if non_empty {
-            out.insert("analyzers".to_string(), a.clone());
-        }
-    }
-    Some(Value::Object(out))
 }
 
 /// Serialize a fetched index set into the exact on-disk `indexes.json` bytes a
