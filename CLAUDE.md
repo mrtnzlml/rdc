@@ -140,3 +140,13 @@ Project-specific instructions for working in this repo.
   tree). Use neutral placeholders instead (e.g. `acme`, `main`, `invoices`,
   `test`/`dev`/`prod`, `dev-eu`/`dev-us`). If customer-specific strings ever land,
   scrub them from both the file content and the commit history.
+- **`.github/workflows/confidentiality.yaml`** has Claude review every push to
+  `main` and every same-repo PR for such values, and fails on any finding. It has
+  **no denylist on purpose**: a list of real customer names would itself be
+  customer data, so the review is Claude's judgement against this repo's
+  placeholders — add a new placeholder to the prompt's "Do NOT flag" list when
+  it starts being flagged. The repo is public, so findings carry only file,
+  line, kind and confidence, **never the value**; keep it that way. On `main` it
+  runs after the push, so it reports a leak, it does not prevent one. Auth is
+  the `CLAUDE_CODE_OAUTH_TOKEN` secret, a subscription token from
+  `claude setup-token`.
