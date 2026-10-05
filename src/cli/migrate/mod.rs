@@ -2665,34 +2665,47 @@ fn recreate_pairs(
         // Slug order first, so equal scores pair the same way on every run.
         dels.sort_by(|a, b| a.0.cmp(&b.0));
         news.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut scored: Vec<(f64, usize, usize)> = Vec::new();
-        for (d, (_, old)) in dels.iter().enumerate() {
-            for (n, (_, new)) in news.iter().enumerate() {
-                let score = similarity(old, new);
-                if score >= RENAME_SIMILARITY {
-                    scored.push((score, d, n));
-                }
-            }
-        }
-        scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
-        let (mut used_d, mut used_n) = (BTreeSet::new(), BTreeSet::new());
-        let mut kind_pairs = Vec::new();
-        for (_, d, n) in scored {
-            if used_d.contains(&d) || used_n.contains(&n) {
-                continue;
-            }
-            used_d.insert(d);
-            used_n.insert(n);
-            kind_pairs.push(RecreatePair {
+        let olds: Vec<&BTreeSet<String>> = dels.iter().map(|(_, t)| t).collect();
+        let fresh: Vec<&BTreeSet<String>> = news.iter().map(|(_, t)| t).collect();
+        let mut kind_pairs: Vec<RecreatePair> = pair_best_first(&olds, &fresh)
+            .into_iter()
+            .map(|(d, n)| RecreatePair {
                 kind,
                 deleted: dels[d].0.clone(),
                 created: news[n].0.clone(),
-            });
-        }
+            })
+            .collect();
         kind_pairs.sort_by(|a, b| a.deleted.cmp(&b.deleted));
         pairs.extend(kind_pairs);
     }
     Ok(pairs)
+}
+
+/// Pairs `olds[d]` with `news[n]` best [`similarity`] first, each index in at
+/// most one pair, skipping scores below [`RENAME_SIMILARITY`]. Equal scores
+/// pair in index order.
+fn pair_best_first(olds: &[&BTreeSet<String>], news: &[&BTreeSet<String>]) -> Vec<(usize, usize)> {
+    let mut scored: Vec<(f64, usize, usize)> = Vec::new();
+    for (d, old) in olds.iter().enumerate() {
+        for (n, new) in news.iter().enumerate() {
+            let score = similarity(old, new);
+            if score >= RENAME_SIMILARITY {
+                scored.push((score, d, n));
+            }
+        }
+    }
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    let (mut used_d, mut used_n) = (BTreeSet::new(), BTreeSet::new());
+    let mut pairs = Vec::new();
+    for (_, d, n) in scored {
+        if used_d.contains(&d) || used_n.contains(&n) {
+            continue;
+        }
+        used_d.insert(d);
+        used_n.insert(n);
+        pairs.push((d, n));
+    }
+    pairs
 }
 
 /// The content of the object whose main file is `rel`, as tokens for
@@ -7016,5 +7029,103 @@ If they are unrelated, run it again with --allow-recreate."
             &live(&[("hooks", "export", 7)]),
         );
         assert!(pairs.is_empty(), "{pairs:?}");
+    }
+
+    fn tokens(items: &[&str]) -> BTreeSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A delete whose best match is already taken must stay free for its next
+    /// one. Here `b` loses `n1` to `a` and still pairs with `n2`.
+    #[test]
+    fn pair_best_first_keeps_a_loser_free_for_its_next_match() {
+        let a = tokens(&["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]);
+        let b = tokens(&["1", "2", "3", "4", "5", "6", "7", "8", "9", "b"]);
+        let n1 = a.clone(); // a: 1.0, b: 9/11
+        let n2 = tokens(&["1", "2", "3", "4", "5", "b", "c"]); // a: 5/12, b: 6/11
+        assert!(similarity(&a, &n2) < RENAME_SIMILARITY, "a must not match n2");
+        assert_eq!(pair_best_first(&[&a, &b], &[&n1, &n2]), vec![(0, 0), (1, 1)]);
+    }
+
+    /// The threshold is inclusive: 0.5 pairs, 0.4 does not.
+    #[test]
+    fn pair_best_first_pairs_from_the_threshold_up() {
+        let old = tokens(&["a", "b"]);
+        let half = tokens(&["a", "b", "c", "d"]);
+        let less = tokens(&["a", "b", "c", "d", "e"]);
+        assert_eq!(similarity(&old, &half), 0.5);
+        assert_eq!(pair_best_first(&[&old], &[&half]), vec![(0, 0)]);
+        assert_eq!(similarity(&old, &less), 0.4);
+        assert!(pair_best_first(&[&old], &[&less]).is_empty());
+    }
+
+    /// With nothing to compare, the guard cannot tell, so it refuses.
+    #[test]
+    fn two_empty_objects_count_as_identical() {
+        assert_eq!(similarity(&BTreeSet::new(), &BTreeSet::new()), 1.0);
+    }
+
+    /// Code counts line by line, trimmed and without blank lines; only the
+    /// object's own directory counts (not a sibling whose name extends it);
+    /// and a `name` below the top level is content, not the object's name.
+    #[test]
+    fn object_tokens_read_code_lines_and_stay_in_the_object_directory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let main = PathBuf::from("workspaces/main/queues/invoices/schema.json");
+        let code = PathBuf::from("workspaces/main/queues/invoices/formulas/total.py");
+        let sibling = PathBuf::from("workspaces/main/queues/invoices-2/schema.json");
+        put(root, &main, &serde_json::json!({ "name": "Invoices", "content": [{ "name": "Total" }] }));
+        std::fs::create_dir_all(root.join(code.parent().unwrap())).unwrap();
+        std::fs::write(root.join(&code), "  return 1\n\n").unwrap();
+        put(root, &sibling, &serde_json::json!({ "content": "other" }));
+
+        let files = vec![main.clone(), code, sibling];
+        assert_eq!(
+            object_tokens(root, &files, &main, "invoices").unwrap(),
+            tokens(&["formulas/total.py#return 1", "schema.json:/content/0/name=\"Total\""]),
+        );
+    }
+
+    /// Engines are guarded: an engine renamed in the source is refused.
+    #[test]
+    fn recreate_pairs_guards_engines() {
+        let body = serde_json::json!({ "type": "extractor", "learning_enabled": true });
+        let pairs = pairs_for(
+            Path::new("engines/extractor/engine.json"),
+            &body,
+            Path::new("engines/invoice-extractor/engine.json"),
+            &body,
+            &live(&[("engines", "extractor", 501)]),
+        );
+        assert_eq!(
+            pairs,
+            vec![RecreatePair {
+                kind: "engines",
+                deleted: ("extractor".into(), 501),
+                created: "invoice-extractor".into(),
+            }]
+        );
+    }
+
+    /// Inboxes are guarded: a recreated inbox gets a new address.
+    #[test]
+    fn recreate_pairs_guards_inboxes() {
+        let body = serde_json::json!({ "bounce_unprocessable_attachments": true });
+        let pairs = pairs_for(
+            Path::new("workspaces/main/queues/invoices/inbox.json"),
+            &body,
+            Path::new("workspaces/main/queues/vendor-invoices/inbox.json"),
+            &body,
+            &live(&[("inboxes", "invoices", 504)]),
+        );
+        assert_eq!(
+            pairs,
+            vec![RecreatePair {
+                kind: "inboxes",
+                deleted: ("invoices".into(), 504),
+                created: "vendor-invoices".into(),
+            }]
+        );
     }
 }
