@@ -2543,37 +2543,49 @@ fn should_skip(name: &str, env: &str) -> bool {
         || crate::paths::is_shadow_artifact(name, env)
 }
 
-/// One kind in which a `--mirror` run would DELETE a live target object while
-/// creating another of the same kind — the shape a slug rename takes when
-/// nothing recorded it.
+/// The kinds whose recreate costs more than an id. Deleting a queue deletes its
+/// documents; its schema and inbox share its slug, so they are recreated with
+/// it, and the inbox comes back under a new address. Deleting an engine deletes
+/// what it has learned. Every other kind is recreated without asking.
+const RECREATE_GUARDED_KINDS: [&str; 4] = ["queues", "schemas", "inboxes", "engines"];
+
+/// The [`similarity`] at or above which a delete and a create count as one
+/// renamed object. Measured on a real project: the same queue or engine in two
+/// of its envs never scored below 0.56, and unrelated ones had a median of
+/// 0.12. Cloned queues often score higher; they are refused, which is the safe
+/// side of the guess.
+const RENAME_SIMILARITY: f64 = 0.5;
+
+/// A `--mirror` prune of a live target object paired with a create that looks
+/// like it — the shape a slug rename takes when nothing recorded it.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct RecreateGroup {
+pub(crate) struct RecreatePair {
     pub kind: &'static str,
-    /// `(slug, remote id)` per target object the prune would destroy.
-    pub deleted: Vec<(String, u64)>,
-    /// Target slugs this run would create.
-    pub created: Vec<String>,
+    /// `(slug, remote id)` of the target object the prune would destroy.
+    pub deleted: (String, u64),
+    /// The target slug this run would create in its place.
+    pub created: String,
 }
 
-/// Target-env relative paths the migration WOULD produce: every source file,
-/// minus the un-creatable unique-typed email templates, remapped through the
-/// oriented mapping. Shared by the `--mirror` prune (everything else in the
-/// target is target-only) and by the recreate guard (everything not already on
-/// disk is a create).
+/// Target-env relative paths the migration WOULD produce, each mapped to the
+/// source file it comes from: every source file, minus the un-creatable
+/// unique-typed email templates, remapped through the oriented mapping. Shared
+/// by the `--mirror` prune (everything else in the target is target-only) and
+/// by the recreate guard (everything not already on disk is a create).
 fn produced_paths(
     src_root: &Path,
     src_env: &str,
     mapping: &Mapping,
-    skip: &std::collections::BTreeSet<PathBuf>,
-) -> Result<std::collections::BTreeSet<PathBuf>> {
+    skip: &BTreeSet<PathBuf>,
+) -> Result<BTreeMap<PathBuf, PathBuf>> {
     Ok(enumerate_files(src_root, src_env)?
         .into_iter()
         .filter(|rel| !skip.contains(rel))
-        .map(|rel| remap_relative(&rel, mapping))
+        .map(|rel| (remap_relative(&rel, mapping), rel))
         .collect())
 }
 
-/// Detect the delete-and-recreate shape, per kind.
+/// Detect the delete-and-recreate shape in [`RECREATE_GUARDED_KINDS`].
 ///
 /// A pruned object counts only when the target LOCKFILE still holds a remote id
 /// for it: a local-only file the target never pushed has nothing to lose, and
@@ -2582,35 +2594,51 @@ fn produced_paths(
 /// within the target (a queue changing workspace), written at its new path in
 /// the same run.
 ///
-/// The pairing is deliberately coarse: one live prune plus one create in the
-/// same kind. It is not trying to identify WHICH object was renamed — after a
-/// create has had its `id` stripped there is nothing left to match on — only to
-/// stop a shape that is almost never deliberate, and to stay rare enough that
-/// `--allow-recreate` never becomes a permanent fixture of a pipeline.
-fn recreate_groups(
+/// A create has had its `id` stripped, so nothing but content ties it to the
+/// object it may replace. A pruned object and a create whose [`similarity`]
+/// reaches [`RENAME_SIMILARITY`] are reported as one rename. Pairs are taken
+/// best score first, each object in at most one pair, so an unrelated delete
+/// and create of the same kind go through without `--allow-recreate`.
+fn recreate_pairs(
     prune: &[PathBuf],
-    produced: &std::collections::BTreeSet<PathBuf>,
+    produced: &BTreeMap<PathBuf, PathBuf>,
+    src_root: &Path,
+    src_env: &str,
     tgt_root: &Path,
     tgt_env: &str,
     tgt_lockfile: &crate::state::Lockfile,
-) -> Result<Vec<RecreateGroup>> {
-    use std::collections::{BTreeMap, BTreeSet};
+) -> Result<Vec<RecreatePair>> {
+    /// Per kind, each object with its [`object_tokens`].
+    type Candidates<K> = BTreeMap<&'static str, Vec<(K, BTreeSet<String>)>>;
 
+    let guarded = |rel: &Path| {
+        classify(rel).filter(|(kind, _)| RECREATE_GUARDED_KINDS.contains(kind))
+    };
     let produced_objs: BTreeSet<(&'static str, String)> =
-        produced.iter().filter_map(|rel| classify(rel)).collect();
-    let existing_objs: BTreeSet<(&'static str, String)> = enumerate_files(tgt_root, tgt_env)?
-        .iter()
-        .filter_map(|rel| classify(rel))
-        .collect();
+        produced.keys().filter_map(|rel| classify(rel)).collect();
+    let tgt_files = enumerate_files(tgt_root, tgt_env)?;
+    let existing_objs: BTreeSet<(&'static str, String)> =
+        tgt_files.iter().filter_map(|rel| classify(rel)).collect();
+    let src_files = enumerate_files(src_root, src_env)?;
 
-    let mut created: BTreeMap<&'static str, BTreeSet<String>> = BTreeMap::new();
-    for (kind, slug) in produced_objs.difference(&existing_objs) {
-        created.entry(kind).or_default().insert(slug.clone());
+    let mut created: Candidates<String> = BTreeMap::new();
+    for (tgt_rel, src_rel) in produced {
+        let Some((kind, slug)) = guarded(tgt_rel) else {
+            continue;
+        };
+        if existing_objs.contains(&(kind, slug.clone())) {
+            continue;
+        }
+        let Some((_, src_slug)) = classify(src_rel) else {
+            continue;
+        };
+        let tokens = object_tokens(src_root, &src_files, src_rel, &src_slug)?;
+        created.entry(kind).or_default().push((slug, tokens));
     }
 
-    let mut deleted: BTreeMap<&'static str, BTreeMap<String, u64>> = BTreeMap::new();
+    let mut deleted: Candidates<(String, u64)> = BTreeMap::new();
     for rel in prune {
-        let Some((kind, slug)) = classify(rel) else {
+        let Some((kind, slug)) = guarded(rel) else {
             continue;
         };
         if produced_objs.contains(&(kind, slug.clone())) {
@@ -2625,20 +2653,124 @@ fn recreate_groups(
         else {
             continue; // never pushed: no remote object to lose
         };
-        deleted.entry(kind).or_default().insert(slug, id);
+        let tokens = object_tokens(tgt_root, &tgt_files, rel, &slug)?;
+        deleted.entry(kind).or_default().push(((slug, id), tokens));
     }
 
-    Ok(deleted
-        .into_iter()
-        .filter_map(|(kind, dels)| {
-            let created = created.get(kind)?;
-            Some(RecreateGroup {
+    let mut pairs = Vec::new();
+    for (kind, dels) in &mut deleted {
+        let Some(news) = created.get_mut(kind) else {
+            continue;
+        };
+        // Slug order first, so equal scores pair the same way on every run.
+        dels.sort_by(|a, b| a.0.cmp(&b.0));
+        news.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut scored: Vec<(f64, usize, usize)> = Vec::new();
+        for (d, (_, old)) in dels.iter().enumerate() {
+            for (n, (_, new)) in news.iter().enumerate() {
+                let score = similarity(old, new);
+                if score >= RENAME_SIMILARITY {
+                    scored.push((score, d, n));
+                }
+            }
+        }
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        let (mut used_d, mut used_n) = (BTreeSet::new(), BTreeSet::new());
+        let mut kind_pairs = Vec::new();
+        for (_, d, n) in scored {
+            if used_d.contains(&d) || used_n.contains(&n) {
+                continue;
+            }
+            used_d.insert(d);
+            used_n.insert(n);
+            kind_pairs.push(RecreatePair {
                 kind,
-                deleted: dels.into_iter().collect(),
-                created: created.iter().cloned().collect(),
-            })
-        })
-        .collect())
+                deleted: dels[d].0.clone(),
+                created: news[n].0.clone(),
+            });
+        }
+        kind_pairs.sort_by(|a, b| a.deleted.cmp(&b.deleted));
+        pairs.extend(kind_pairs);
+    }
+    Ok(pairs)
+}
+
+/// The content of the object whose main file is `rel`, as tokens for
+/// [`similarity`]: every JSON leaf as `<file>:<pointer>=<value>` and every
+/// non-blank line of any other file, over all files in the object's directory
+/// (so a queue's schema, inbox, templates and formula code all count). The
+/// top-level keys a rename or another env always changes are left out, and a
+/// ref to the object's own slug is written without the slug.
+fn object_tokens(
+    env_root: &Path,
+    files: &[PathBuf],
+    rel: &Path,
+    slug: &str,
+) -> Result<BTreeSet<String>> {
+    let home = rel.parent().unwrap_or(Path::new(""));
+    let mut out = BTreeSet::new();
+    for file in files.iter().filter(|f| f.starts_with(home)) {
+        let inner = file.strip_prefix(home).expect("filtered on the prefix");
+        let inner = inner.to_string_lossy();
+        let path = env_root.join(file);
+        let bytes =
+            std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        let json = (file.extension().is_some_and(|e| e == "json"))
+            .then(|| serde_json::from_slice::<Value>(&bytes).ok())
+            .flatten();
+        match json {
+            Some(value) => json_tokens(&value, &format!("{inner}:"), slug, true, &mut out),
+            None => {
+                for line in String::from_utf8_lossy(&bytes).lines().map(str::trim) {
+                    if !line.is_empty() {
+                        out.insert(format!("{inner}#{line}"));
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn json_tokens(value: &Value, path: &str, slug: &str, top: bool, out: &mut BTreeSet<String>) {
+    match value {
+        Value::Object(map) if map.is_empty() => {
+            out.insert(format!("{path}={{}}"));
+        }
+        Value::Object(map) => {
+            for (key, v) in map {
+                let volatile =
+                    matches!(key.as_str(), "id" | "url" | "name" | "modified_at" | "modified_by");
+                if !(top && volatile) {
+                    json_tokens(v, &format!("{path}/{key}"), slug, false, out);
+                }
+            }
+        }
+        Value::Array(items) if items.is_empty() => {
+            out.insert(format!("{path}=[]"));
+        }
+        Value::Array(items) => {
+            for (i, v) in items.iter().enumerate() {
+                json_tokens(v, &format!("{path}/{i}"), slug, false, out);
+            }
+        }
+        Value::String(s) if s.starts_with(RDC_SCHEME) && s.ends_with(&format!("/{slug}")) => {
+            out.insert(format!("{path}={}~self", &s[..s.len() - slug.len()]));
+        }
+        leaf => {
+            out.insert(format!("{path}={leaf}"));
+        }
+    }
+}
+
+/// Jaccard similarity of two token sets. Two objects with no content at all
+/// count as identical: with nothing to compare, the guard refuses.
+fn similarity(a: &BTreeSet<String>, b: &BTreeSet<String>) -> f64 {
+    let union = a.union(b).count();
+    if union == 0 {
+        return 1.0;
+    }
+    a.intersection(b).count() as f64 / union as f64
 }
 
 /// The singular noun the refusal uses for a kind.
@@ -2684,56 +2816,39 @@ fn rerun_command(src: &str, tgt: &str, dry_run: bool, only: &[String], carry: Ca
     cmd
 }
 
-/// The refusal. Names every object at risk and the steps that keep them.
-///
-/// A kind with exactly one delete and one create is shown as a pair, with the
-/// mapping row that turns it back into a rename. That pairing is a guess, which
-/// is why the steps start with "if". A kind with several of either cannot be
-/// paired, so it gets a row to fill in instead.
-fn format_recreate_error(groups: &[RecreateGroup], src: &str, tgt: &str, rerun: &str) -> String {
+/// The refusal. Names every suspected rename, what deleting it loses, and the
+/// mapping rows that keep it. The pairing is a guess from content, which is why
+/// the steps start with "if".
+fn format_recreate_error(pairs: &[RecreatePair], src: &str, tgt: &str, rerun: &str) -> String {
     use std::fmt::Write as _;
 
-    let width = groups.iter().map(|g| kind_noun(g.kind).len()).max().unwrap_or(0);
-    let with_id = |(slug, id): &(String, u64)| format!("{slug} (id {id})");
+    let width = pairs.iter().map(|p| kind_noun(p.kind).len()).max().unwrap_or(0);
     let mut table = String::new();
     let mut rows = String::new();
-    for g in groups {
-        let noun = kind_noun(g.kind);
-        if let ([del], [new]) = (&g.deleted[..], &g.created[..]) {
-            let _ = writeln!(table, "  {noun:<width$}  {}  \u{2192}  {new}", with_id(del));
-            let _ = write!(rows, "\n     [[{}]]\n     {src} = \"{new}\"\n     {tgt} = \"{}\"\n", g.kind, del.0);
-        } else {
-            let dels: Vec<String> = g.deleted.iter().map(with_id).collect();
-            let _ = writeln!(table, "  {noun:<width$}  delete  {}", dels.join(", "));
-            let _ = writeln!(table, "  {:<width$}  create  {}", "", g.created.join(", "));
-            let _ = write!(
-                rows,
-                "\n     [[{}]]\n     {src} = \"<name in {src}>\"\n     {tgt} = \"<name in {tgt}>\"\n",
-                g.kind
-            );
-        }
+    for p in pairs {
+        let noun = kind_noun(p.kind);
+        let (old, id) = &p.deleted;
+        let _ = writeln!(table, "  {noun:<width$}  {old} (id {id})  \u{2192}  {}", p.created);
+        let _ = write!(rows, "\n     [[{}]]\n     {src} = \"{}\"\n     {tgt} = \"{old}\"\n", p.kind, p.created);
     }
-    let paired = groups.iter().all(|g| g.deleted.len() == 1 && g.created.len() == 1);
-    let add = if paired {
-        "Add these lines to .rdc/mapping.toml:"
-    } else {
-        "Add one entry to .rdc/mapping.toml for each renamed object:"
-    };
-    let documents = if groups.iter().any(|g| g.kind == "queues") {
-        "\nDeleting a queue also deletes all its documents.\n"
-    } else {
-        ""
-    };
+    let mut losses = Vec::new();
+    if pairs.iter().any(|p| p.kind == "queues") {
+        losses.push("Deleting a queue also deletes all its documents.");
+    }
+    if pairs.iter().any(|p| p.kind == "engines") {
+        losses.push("Deleting an engine also deletes what it has learned.");
+    }
+    let losses = if losses.is_empty() { String::new() } else { format!("\n{}\n", losses.join("\n")) };
     format!(
         "{tgt} would lose objects it already has.\n\
          \n\
-         --mirror deletes these from {tgt} and creates new ones in their place:\n\
+         --mirror deletes these from {tgt} and creates new ones that look like them:\n\
          \n\
-         {table}{documents}\
+         {table}{losses}\
          \n\
          If these were renamed in {src}, keep them in {tgt}:\n\
          \n  \
-         1. {add}\n\
+         1. Add these lines to .rdc/mapping.toml:\n\
          {rows}\
          \n  \
          2. Run the command again:\n\
@@ -2768,7 +2883,7 @@ fn mirror_prune_paths(
         // A per-env singleton is never a "target-only object": the target's org
         // file must survive even when the source env has never been pulled.
         .filter(|rel| rel != Path::new("organization.json"))
-        .filter(|rel| !produced.contains(rel))
+        .filter(|rel| !produced.contains_key(rel))
         .collect())
 }
 
@@ -2986,8 +3101,8 @@ pub enum MirrorMode {
     /// The default: extras in the target are left intact.
     Additive,
     /// `--mirror`: prune target-only objects. `allow_recreate` waives the
-    /// guard that refuses to prune a LIVE target object while creating one of
-    /// the same kind — see `recreate_groups`.
+    /// guard that refuses to prune a LIVE queue or engine while creating one
+    /// that looks like it — see `recreate_pairs`.
     Mirror { allow_recreate: bool },
 }
 
@@ -3220,10 +3335,18 @@ pub fn run_at(
     };
     if mirror && !mirror_mode.allows_recreate() {
         let produced = produced_paths(&src_root, src, &mapping, &unique_tpl_skips)?;
-        let groups = recreate_groups(&prune_plan, &produced, &tgt_root, tgt, &tgt_lockfile)?;
-        if !groups.is_empty() {
+        let pairs = recreate_pairs(
+            &prune_plan,
+            &produced,
+            &src_root,
+            src,
+            &tgt_root,
+            tgt,
+            &tgt_lockfile,
+        )?;
+        if !pairs.is_empty() {
             let rerun = rerun_command(src, tgt, dry_run, &only, carry);
-            anyhow::bail!(format_recreate_error(&groups, src, tgt, &rerun));
+            anyhow::bail!(format_recreate_error(&pairs, src, tgt, &rerun));
         }
     }
 
@@ -6705,47 +6828,49 @@ mod tests {
         }
     }
 
-    /// A kind with several deletes or creates cannot be paired: it is listed
-    /// as delete/create and gets a row to fill in, while a one-to-one kind
-    /// beside it still gets its arrow and its real row.
+    /// Every suspected rename gets its arrow and its real mapping row, and
+    /// each guarded loss is named once.
     #[test]
-    fn format_recreate_error_pairs_only_one_to_one_kinds() {
-        let groups = vec![
-            RecreateGroup {
-                kind: "queues",
-                deleted: vec![("invoices".into(), 502), ("orders".into(), 504)],
-                created: vec!["vendor-invoices".into(), "sales-orders".into()],
-            },
-            RecreateGroup {
-                kind: "email_templates",
-                deleted: vec![("main/invoices/welcome".into(), 505)],
-                created: vec!["main/vendor-invoices/welcome".into()],
-            },
+    fn format_recreate_error_names_each_pair_and_what_it_loses() {
+        let pair = |kind, old: &str, id, new: &str| RecreatePair {
+            kind,
+            deleted: (old.into(), id),
+            created: new.into(),
+        };
+        let pairs = vec![
+            pair("engines", "extractor", 501, "invoice-extractor"),
+            pair("queues", "invoices", 502, "vendor-invoices"),
+            pair("schemas", "invoices", 503, "vendor-invoices"),
         ];
-        let msg = format_recreate_error(&groups, "dev", "prod", "rdc migrate dev prod --mirror");
+        let msg = format_recreate_error(&pairs, "dev", "prod", "rdc migrate dev prod --mirror");
         assert_eq!(
             msg,
             "prod would lose objects it already has.
 
---mirror deletes these from prod and creates new ones in their place:
+--mirror deletes these from prod and creates new ones that look like them:
 
-  queue           delete  invoices (id 502), orders (id 504)
-                  create  vendor-invoices, sales-orders
-  email template  main/invoices/welcome (id 505)  \u{2192}  main/vendor-invoices/welcome
+  engine  extractor (id 501)  \u{2192}  invoice-extractor
+  queue   invoices (id 502)  \u{2192}  vendor-invoices
+  schema  invoices (id 503)  \u{2192}  vendor-invoices
 
 Deleting a queue also deletes all its documents.
+Deleting an engine also deletes what it has learned.
 
 If these were renamed in dev, keep them in prod:
 
-  1. Add one entry to .rdc/mapping.toml for each renamed object:
+  1. Add these lines to .rdc/mapping.toml:
+
+     [[engines]]
+     dev = \"invoice-extractor\"
+     prod = \"extractor\"
 
      [[queues]]
-     dev = \"<name in dev>\"
-     prod = \"<name in prod>\"
+     dev = \"vendor-invoices\"
+     prod = \"invoices\"
 
-     [[email_templates]]
-     dev = \"main/vendor-invoices/welcome\"
-     prod = \"main/invoices/welcome\"
+     [[schemas]]
+     dev = \"vendor-invoices\"
+     prod = \"invoices\"
 
   2. Run the command again:
 
@@ -6765,49 +6890,131 @@ If they are unrelated, run it again with --allow-recreate."
         assert_eq!(rerun_command("dev", "prod", false, &[], Carry::NONE), "rdc migrate dev prod --mirror");
     }
 
+    fn live(entries: &[(&str, &str, u64)]) -> crate::state::Lockfile {
+        let mut lf = crate::state::Lockfile::default();
+        for (kind, slug, id) in entries {
+            lf.upsert(
+                kind,
+                slug,
+                crate::state::ObjectEntry {
+                    id: *id,
+                    modified_at: None,
+                    modified_by: None,
+                    content_hash: None,
+                    secrets_hash: None,
+                },
+            );
+        }
+        lf
+    }
+
+    /// Writes `body` at `rel` under `root`, creating its directory.
+    fn put(root: &Path, rel: &Path, body: &serde_json::Value) {
+        std::fs::create_dir_all(root.join(rel.parent().unwrap())).unwrap();
+        std::fs::write(root.join(rel), serde_json::to_vec_pretty(body).unwrap()).unwrap();
+    }
+
+    /// Runs the guard for one pruned target file and one created source file,
+    /// both at the given paths, the create under its own (unmapped) path.
+    fn pairs_for(
+        old: &Path,
+        old_body: &serde_json::Value,
+        new: &Path,
+        new_body: &serde_json::Value,
+        lf: &crate::state::Lockfile,
+    ) -> Vec<RecreatePair> {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (src_root, tgt_root) = (tmp.path().join("envs/dev"), tmp.path().join("envs/prod"));
+        put(&tgt_root, old, old_body);
+        put(&src_root, new, new_body);
+        let produced = BTreeMap::from([(new.to_path_buf(), new.to_path_buf())]);
+        recreate_pairs(
+            std::slice::from_ref(&old.to_path_buf()),
+            &produced,
+            &src_root,
+            "dev",
+            &tgt_root,
+            "prod",
+            lf,
+        )
+        .unwrap()
+    }
+
     /// The guard reads the target's lockfile, so an object the target tracks
     /// with no remote id (or none at all) is not something a prune destroys.
     #[test]
-    fn recreate_groups_ignores_a_prune_with_no_remote_identity() {
-        use std::collections::BTreeSet;
-        let tmp = tempfile::TempDir::new().unwrap();
-        let tgt_root = tmp.path().join("envs/prod");
-        let old = PathBuf::from("workspaces/main/queues/invoices/queue.json");
-        let new = PathBuf::from("workspaces/main/queues/vendor-invoices/queue.json");
-        std::fs::create_dir_all(tgt_root.join(old.parent().unwrap())).unwrap();
-        std::fs::write(tgt_root.join(&old), b"{}").unwrap();
+    fn recreate_pairs_ignores_a_prune_with_no_remote_identity() {
+        let old = Path::new("workspaces/main/queues/invoices/queue.json");
+        let new = Path::new("workspaces/main/queues/vendor-invoices/queue.json");
+        let body = serde_json::json!({ "name": "Invoices", "settings": { "columns": [] } });
 
-        let produced: BTreeSet<PathBuf> = BTreeSet::from([new]);
         // Empty lockfile: prod has never pushed this queue.
-        let groups =
-            recreate_groups(
-                std::slice::from_ref(&old),
-                &produced,
-                &tgt_root,
-                "prod",
-                &Default::default(),
-            )
-            .unwrap();
-        assert!(groups.is_empty(), "nothing live to lose: {groups:?}");
+        let pairs = pairs_for(old, &body, new, &body, &Default::default());
+        assert!(pairs.is_empty(), "nothing live to lose: {pairs:?}");
 
         // Same run, now with an id recorded for it.
-        let mut lf = crate::state::Lockfile::default();
-        lf.upsert(
-            "queues",
-            "invoices",
-            crate::state::ObjectEntry {
-                id: 502,
-                modified_at: None,
-                modified_by: None,
-                content_hash: None,
-                secrets_hash: None,
-            },
+        let pairs = pairs_for(old, &body, new, &body, &live(&[("queues", "invoices", 502)]));
+        assert_eq!(
+            pairs,
+            vec![RecreatePair {
+                kind: "queues",
+                deleted: ("invoices".into(), 502),
+                created: "vendor-invoices".into(),
+            }]
         );
-        let groups =
-            recreate_groups(std::slice::from_ref(&old), &produced, &tgt_root, "prod", &lf).unwrap();
-        assert_eq!(groups.len(), 1, "{groups:?}");
-        assert_eq!(groups[0].kind, "queues");
-        assert_eq!(groups[0].deleted, vec![("invoices".to_string(), 502)]);
-        assert_eq!(groups[0].created, vec!["vendor-invoices".to_string()]);
+    }
+
+    /// A rename changes the name and the refs to the object's own slug, and
+    /// nothing else; neither may count against the match.
+    #[test]
+    fn a_rename_scores_as_identical_content() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let old = PathBuf::from("workspaces/main/queues/invoices/queue.json");
+        let new = PathBuf::from("workspaces/main/queues/vendor-invoices/queue.json");
+        put(root, &old, &serde_json::json!({
+            "id": 502, "name": "Invoices", "schema": "rdc://schemas/invoices",
+            "workspace": "rdc://workspaces/main",
+        }));
+        put(root, &new, &serde_json::json!({
+            "name": "Vendor Invoices", "schema": "rdc://schemas/vendor-invoices",
+            "workspace": "rdc://workspaces/main",
+        }));
+        let files = vec![old.clone(), new.clone()];
+        let a = object_tokens(root, &files, &old, "invoices").unwrap();
+        let b = object_tokens(root, &files, &new, "vendor-invoices").unwrap();
+        assert_eq!(a, b);
+        assert_eq!(similarity(&a, &b), 1.0);
+    }
+
+    /// The case the guard used to refuse: one live queue deleted and an
+    /// unrelated one created. Different content is not a rename.
+    #[test]
+    fn recreate_pairs_lets_an_unrelated_delete_and_create_through() {
+        let old = Path::new("workspaces/main/queues/invoices/queue.json");
+        let new = Path::new("workspaces/main/queues/orders/queue.json");
+        let pairs = pairs_for(
+            old,
+            &serde_json::json!({ "locale": "en_US", "settings": { "columns": ["a", "b"] } }),
+            new,
+            &serde_json::json!({ "locale": "de_DE", "settings": { "upload": true } }),
+            &live(&[("queues", "invoices", 502)]),
+        );
+        assert!(pairs.is_empty(), "unrelated queues must pass: {pairs:?}");
+    }
+
+    /// A hook costs only its id when recreated, so even an identical one
+    /// is no business of the guard.
+    #[test]
+    fn recreate_pairs_ignores_kinds_that_lose_nothing() {
+        let body = serde_json::json!({ "type": "function", "events": ["annotation_content"] });
+        let pairs = pairs_for(
+            Path::new("hooks/export.json"),
+            &body,
+            Path::new("hooks/sftp-export.json"),
+            &body,
+            &live(&[("hooks", "export", 7)]),
+        );
+        assert!(pairs.is_empty(), "{pairs:?}");
     }
 }

@@ -2960,7 +2960,7 @@ fn mirror_refuses_to_delete_a_live_target_object_while_creating_one() {
         format!("{err:#}"),
         "prod would lose objects it already has.
 
---mirror deletes these from prod and creates new ones in their place:
+--mirror deletes these from prod and creates new ones that look like them:
 
   queue   invoices (id 502)  \u{2192}  vendor-invoices
   schema  invoices (id 503)  \u{2192}  vendor-invoices
@@ -3125,6 +3125,61 @@ fn mirror_allows_a_deletion_with_no_create_in_that_kind() {
             .join("envs/prod/workspaces/main/queues/retired/queue.json")
             .exists()
     );
+}
+
+/// The shape the guard used to refuse by mistake: the source deleted one queue
+/// and created an unrelated one. Their content differs, so it is no rename.
+#[test]
+fn mirror_allows_an_unrelated_queue_delete_and_create() {
+    let project = init_two_env_project();
+    let root = project.path();
+    write_queue_at(root, "test", "main", "orders", "Orders");
+    write_queue_at(root, "prod", "main", "invoices", "Invoices");
+    write(
+        &root.join("envs/test/workspaces/main/queues/orders/schema.json"),
+        &serde_json::json!({ "name": "Orders", "content": [{
+            "id": "order_details", "label": "Order details", "category": "section",
+            "children": [{ "id": "order_id", "type": "string", "category": "datapoint" }],
+        }] }),
+    );
+    write(
+        &root.join("envs/prod/workspaces/main/queues/invoices/schema.json"),
+        &serde_json::json!({ "name": "Invoices", "content": [{
+            "id": "basic_info", "label": "Basic information", "category": "section",
+            "children": [{ "id": "due_date", "type": "date", "category": "datapoint" }],
+        }] }),
+    );
+    write_lockfile(
+        root,
+        "prod",
+        &[
+            ("workspaces", "main", 501),
+            ("queues", "invoices", 502),
+            ("schemas", "invoices", 503),
+        ],
+    );
+
+    run_migrate(root, MirrorMode::Mirror { allow_recreate: false }, false)
+        .expect("an unrelated delete + create must not be blocked");
+    assert!(!root.join("envs/prod/workspaces/main/queues/invoices/queue.json").exists());
+    assert!(root.join("envs/prod/workspaces/main/queues/orders/queue.json").exists());
+}
+
+/// Hooks lose nothing but their id when recreated, so a hook delete + create
+/// passes even when the two look alike.
+#[test]
+fn mirror_allows_a_hook_delete_and_create() {
+    let project = init_two_env_project();
+    let root = project.path();
+    let hook = serde_json::json!({ "name": "Export", "type": "function", "events": [] });
+    write(&root.join("envs/test/hooks/sftp-export.json"), &hook);
+    write(&root.join("envs/prod/hooks/export.json"), &hook);
+    write_lockfile(root, "prod", &[("hooks", "export", 701)]);
+
+    run_migrate(root, MirrorMode::Mirror { allow_recreate: false }, false)
+        .expect("a hook recreate needs no --allow-recreate");
+    assert!(!root.join("envs/prod/hooks/export.json").exists());
+    assert!(root.join("envs/prod/hooks/sftp-export.json").exists());
 }
 
 /// A create with nothing pruned is an ordinary addition.

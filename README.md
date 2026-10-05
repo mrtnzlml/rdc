@@ -416,7 +416,7 @@ Re-running on an already-migrated snapshot is a no-op (matched objects keep the 
 
 Without `--mirror`, migrate is additive — objects that exist only in the target are left intact and nothing is ever removed. That is the deliberate alternative for a target that legitimately holds work the source lacks. `--mirror` instead deletes target snapshot files with no source counterpart; those are local file removals, so they reach the tenant only when the following `rdc sync <tgt>` is given `--allow-deletes` (or you confirm its prompt). Review with `git diff` before syncing.
 
-`--mirror` refuses one shape outright: pruning a target object the target's lockfile still holds a live id for, while creating another of the same kind. That is what an unrecorded rename looks like, and pushing it deletes the target object — for a queue, its documents — and creates a replacement. The refusal names the mapping row that turns it back into a rename. Objects that really are unrelated pass with `--allow-recreate`.
+`--mirror` refuses one shape outright: pruning a queue or an engine that the target's lockfile still holds a live id for, while creating one with similar content. That is what an unrecorded rename looks like, and pushing it deletes the target object and creates a replacement. A queue takes its documents with it (its schema and inbox share its slug and go too; the inbox comes back under a new address), and an engine what it has learned. The refusal names the mapping rows that turn it back into a rename. Objects that really are unrelated pass with `--allow-recreate`. Other kinds lose only their id when recreated, so the guard ignores them, and a delete plus an unrelated create of a queue or engine is not refused either.
 
 ### Selective migrate
 

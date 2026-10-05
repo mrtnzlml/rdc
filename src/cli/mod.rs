@@ -419,14 +419,14 @@ pub enum Command {
         /// The deletions are local file removals — read `git diff` before you
         /// sync.
         ///
-        /// rdc refuses when a prune would destroy a LIVE target object while
-        /// creating another of the same kind. That is what an unrecorded slug
-        /// rename looks like, and pushing it deletes the target object (for a
-        /// queue, its documents) and creates a replacement.
+        /// rdc refuses when a prune would destroy a LIVE queue or engine while
+        /// creating one with similar content. That is what an unrecorded slug
+        /// rename looks like, and pushing it deletes the target object (a
+        /// queue's documents, an engine's learning) and creates a replacement.
         #[arg(long)]
         mirror: bool,
-        /// Go ahead with a `--mirror` prune that deletes live target objects
-        /// while creating others of the same kind. Use it only for objects
+        /// Go ahead with a `--mirror` prune that deletes a live queue or engine
+        /// while creating one that looks like it. Use it only for objects
         /// that really are unrelated. A renamed one belongs in
         /// `.rdc/mapping.toml`, which `rdc doctor` writes for you.
         #[arg(long = "allow-recreate", requires = "mirror")]
