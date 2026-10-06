@@ -17,7 +17,7 @@ rdc = { path = "../.." }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "time", "io-util", "io-std", "sync", "signal", "parking_lot"] }
+tokio = { version = "1", features = ["rt"] }
 trash = "5"
 
 [dev-dependencies]

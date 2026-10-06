@@ -24,14 +24,14 @@ clap_complete = { version = "4", features = ["unstable-dynamic"] }
 deunicode = "1"
 flate2 = "1"
 fs4 = "1"
-futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+futures = { version = "0.3", default-features = false, features = ["alloc"] }
 indexmap = { version = "2", features = ["serde"] }
 inquire = { version = "0.9", default-features = false, features = ["crossterm"] }
 notify = "8"
 reqwest = { version = "0.13", features = ["json", "rustls"], default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-sha2 = { version = "0.11", default-features = false, features = ["alloc"] }
+sha2 = { version = "0.11", default-features = false }
 similar = { version = "3", features = ["inline"] }
 tar = { version = "0.4", default-features = false }
 tempfile = "3"
@@ -46,7 +46,7 @@ predicates = "3"
 pretty_assertions = "1"
 proptest = "1"
 wiremock = "0.6"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
+tokio = { version = "1", features = ["test-util"] }
 
 # `openpty(3)` for the PTY-driven prompt tests (tests/live/support/pty.rs).
 # Already in Cargo.lock through the runtime dependencies.
