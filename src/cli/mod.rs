@@ -105,8 +105,8 @@ A project is a directory with these files:
   envs/<env>/                 the snapshot. One JSON file per object, plus
                               .py/.js files for hook code, rule trigger
                               conditions and queue formulas.
-  envs/<env>/_index.md        a list of every object in the env, its path,
-                              and what it references. Read this first. Every
+  envs/<env>/_index.md        every object in the env, one line each, with
+                              what it references. Read this first. Every
                               sync rewrites it.
   envs/<env>/overlay.toml     per-env field values. Only migrate applies
                               them.

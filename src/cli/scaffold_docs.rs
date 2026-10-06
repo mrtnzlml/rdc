@@ -50,15 +50,19 @@ fn render_envs(envs: &BTreeMap<String, EnvConfig>) -> String {
                 `rdc init --env <env>=<api_base>:<org_id>`._"
             .to_string();
     }
-    let mut out =
-        String::from("| Env | API base | Org id | Credential suffix |\n|---|---|---|---|\n");
+    // The index column names the real path, so an agent opens it without
+    // first resolving `<env>` itself.
+    let mut out = String::from(
+        "| Env | API base | Org id | Credential suffix | Object index |\n|---|---|---|---|---|\n",
+    );
     for (name, cfg) in envs {
         out.push_str(&format!(
-            "| `{}` | `{}` | {} | `{}` |\n",
+            "| `{}` | `{}` | {} | `{}` | `envs/{}/_index.md` |\n",
             md_cell(name),
             md_cell(&cfg.api_base),
             cfg.org_id,
             md_cell(&crate::secrets::env_var_suffix(name)),
+            md_cell(name),
         ));
     }
     // The suffix rule is the thing people derive wrong by hand (dev-us -> DEV_US).
@@ -150,10 +154,14 @@ mod tests {
     fn env_table_carries_api_base_org_and_credential_suffix() {
         let r = render_doc_regions(&envs(&["dev", "dev-us"]));
         let table = &r[REGION_ENVS];
-        assert!(table.contains("| Env | API base | Org id | Credential suffix |"));
-        assert!(table.contains("| `dev` | `https://example.rossum.app/api/v1` | 100 | `DEV` |"));
+        assert!(table.contains("| Env | API base | Org id | Credential suffix | Object index |"));
+        assert!(table.contains(
+            "| `dev` | `https://example.rossum.app/api/v1` | 100 | `DEV` | `envs/dev/_index.md` |"
+        ));
         // the suffix is the thing people derive wrong by hand
-        assert!(table.contains("| `dev-us` | `https://example.rossum.app/api/v1` | 101 | `DEV_US` |"));
+        assert!(table.contains(
+            "| `dev-us` | `https://example.rossum.app/api/v1` | 101 | `DEV_US` | `envs/dev-us/_index.md` |"
+        ));
         assert!(table.contains("RDC_TOKEN_<suffix>"));
     }
 

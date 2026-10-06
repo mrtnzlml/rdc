@@ -914,8 +914,8 @@ fn write_readme(root: &Path, cfg: &ProjectConfig, force: bool) -> Result<Scaffol
     md.push_str(
         "- `CLAUDE.md` — editing recipes, repo layout, common commands, \
          conflict + promote workflows.\n\
-         - `envs/<env>/_index.md` — auto-generated map of every object in \
-         `<env>` with paths and cross-references.\n\
+         - `envs/<env>/_index.md` — auto-generated list of every object in \
+         `<env>`, one line each, with what it references.\n\
          - `.gitlab-ci.yml` — scheduled archive + one manual deploy button per \
          env; its header lists the CI variables to set.\n",
     );
@@ -1026,11 +1026,14 @@ code.
 
 ## Where to look first
 
-- **`envs/<env>/_index.md`** — inventory of every object in `<env>`
-  with its on-disk path, human name, type-specific signals, and the
-  related objects it points at (or that point at it). Start here when
-  you need to find something or understand the shape of an env.
+- **`envs/<env>/_index.md`** — every object in `<env>`, one line each:
+  slug, id, human name, and the objects it links to. The paths for each
+  env are in the table under Environments. Start here when you need to
+  find something or understand the shape of an env; search it for a
+  slug rather than reading it whole, since a large env makes it long.
   Regenerated on every `rdc sync` — never hand-edit.
+- **Everything that uses one schema field** — the index does not list
+  field ids; run `grep -rn '<field_id>' envs/<env>` instead.
 - **`rdc.toml`** — the per-env API base URL and org id. There is no project
   name; the config is just envs.
 
