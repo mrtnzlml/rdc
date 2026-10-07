@@ -119,6 +119,9 @@ pub enum InstallLocation {
     /// it would break cargo's bookkeeping — instruct the user to run
     /// `cargo install` instead.
     Cargo(PathBuf),
+    /// Path is inside a Homebrew Cellar. Replacing it would leave brew
+    /// reporting the old version — instruct the user to run `brew upgrade`.
+    Homebrew(PathBuf),
     /// Path is writable and not managed by cargo. Safe to self-replace.
     Replaceable(PathBuf),
     /// Path is read-only or otherwise non-replaceable. Print manual
@@ -136,6 +139,10 @@ pub fn classify_install() -> Result<InstallLocation> {
         return Ok(InstallLocation::Cargo(canonical));
     }
 
+    if is_in_homebrew_cellar(&canonical) {
+        return Ok(InstallLocation::Homebrew(canonical));
+    }
+
     if is_writable_in_place(&canonical) {
         Ok(InstallLocation::Replaceable(canonical))
     } else {
@@ -151,6 +158,12 @@ fn is_under_cargo_bin(path: &Path) -> bool {
         .or_else(|| home_dir().map(|h| h.join(".cargo")));
     let Some(cargo_home) = cargo_home else { return false };
     path.starts_with(cargo_home.join("bin"))
+}
+
+/// Homebrew keeps every formula at `<prefix>/Cellar/<name>/<version>/`, and
+/// `canonicalize` resolves the `<prefix>/bin/rdc` symlink to that path.
+fn is_in_homebrew_cellar(path: &Path) -> bool {
+    path.components().any(|c| c.as_os_str() == "Cellar")
 }
 
 /// User home directory: `$HOME` on Unix, `%USERPROFILE%` on Windows
@@ -430,6 +443,18 @@ pub async fn run_upgrade(target: Option<Version>, check_only: bool) -> Result<()
                 ),
             );
             anyhow::bail!("cannot self-replace a cargo-installed binary");
+        }
+        InstallLocation::Homebrew(path) => {
+            log.event(
+                crate::log::Action::Warn,
+                &format!(
+                    "rdc was installed via Homebrew (binary at {}).\n\
+                     To upgrade, run:\n\n  \
+                     brew upgrade mrtnzlml/tap/rdc\n",
+                    path.display()
+                ),
+            );
+            anyhow::bail!("cannot self-replace a Homebrew-installed binary");
         }
         InstallLocation::Unknown(path) => {
             let asset = platform_asset_name(&latest).unwrap_or_else(|_| "<your-platform>.tar.gz".into());
@@ -792,6 +817,15 @@ mod tests {
         assert!(is_under_cargo_bin(&p));
         let p2 = home.join(".local").join("bin").join("rdc");
         assert!(!is_under_cargo_bin(&p2));
+    }
+
+    #[test]
+    fn homebrew_cellar_detection() {
+        assert!(is_in_homebrew_cellar(Path::new("/opt/homebrew/Cellar/rdc/0.13.0/bin/rdc")));
+        assert!(is_in_homebrew_cellar(Path::new(
+            "/home/linuxbrew/.linuxbrew/Cellar/rdc/0.13.0/bin/rdc"
+        )));
+        assert!(!is_in_homebrew_cellar(Path::new("/usr/local/bin/rdc")));
     }
 
     #[test]

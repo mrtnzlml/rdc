@@ -20,19 +20,18 @@ Homebrew (macOS, Linux x86_64):
 brew install mrtnzlml/tap/rdc
 ```
 
-Windows (PowerShell), with the [GitHub CLI](https://cli.github.com):
+Windows (PowerShell):
 
 ```powershell
 $dest = "$env:USERPROFILE\.rdc\bin"
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
-gh release download --repo mrtnzlml/rdc --pattern "*-x86_64-pc-windows-msvc.tar.gz" --dir $env:TEMP --clobber
-$tgz = Get-ChildItem "$env:TEMP\*-x86_64-pc-windows-msvc.tar.gz" | Select-Object -First 1
-tar -xzf $tgz.FullName -C $dest
+$asset = (Invoke-RestMethod https://api.github.com/repos/mrtnzlml/rdc/releases/latest).assets |
+  Where-Object name -like "*-x86_64-pc-windows-msvc.tar.gz"
+$tgz = "$env:TEMP\$($asset.name)"
+Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $tgz
+tar -xzf $tgz -C $dest
 [Environment]::SetEnvironmentVariable("Path", "$env:Path;$dest", "User")
 ```
-
-The `--pattern` matches on the platform suffix rather than a full filename, so it
-keeps working as the version in the asset name changes.
 
 From source:
 
@@ -608,7 +607,7 @@ Rename the GitLab CI variables named after the env (`RDC_TOKEN_DEV` →
 | `rdc migrate <src> <tgt>` | Copy one env's snapshot into another's, locally (slug remap, ref rewrite, overlay) — then push with `rdc sync <tgt>`. |
 | `rdc doctor <env>` | Offline check of the local snapshot — report unpushed local changes, realign stale slugs (cascade-aware) and record them in `.rdc/mapping.toml`, prune orphan base-cache entries. |
 | `rdc edit env rename <old> <new>` | Rename an env everywhere in the project, offline: files, state, `rdc.toml`, mapping, generated doc and pipeline regions. |
-| `rdc upgrade` | Self-update the binary. |
+| `rdc upgrade` | Self-update the binary. For a Homebrew or cargo install, it prints the `brew upgrade` or `cargo install` command instead. |
 
 Every command that writes to the remote takes `--dry-run`. Use `rdc <command> --help` for the full flag list.
 
