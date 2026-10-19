@@ -1794,8 +1794,9 @@ fn reconcile_score_thresholds(value: &mut serde_json::Value, kind: &str, tgt_pat
 
     match kind {
         "schemas" => {
-            // Target's `datapoint id -> score_threshold` (only ids that carry
-            // one). Empty for a new target, so every source threshold drops.
+            // Target's `datapoint id -> datapoint` (only ids that carry a
+            // threshold). Empty for a new target, so every source threshold
+            // drops.
             let target_thresholds = target
                 .as_ref()
                 .map(collect_datapoint_thresholds)
@@ -1816,14 +1817,20 @@ fn reconcile_score_thresholds(value: &mut serde_json::Value, kind: &str, tgt_pat
                             .and_then(|t| t.get("settings"))
                             .and_then(|s| s.get(KEY))
                             .is_some();
-                        if let Some(obj) = value.as_object_mut() {
+                        let t = target.as_ref().and_then(|t| t.as_object());
+                        if let (Some(obj), Some(t)) = (value.as_object_mut(), t) {
                             if under_settings {
-                                obj.entry("settings")
-                                    .or_insert_with(|| serde_json::json!({}))
-                                    .as_object_mut()
-                                    .map(|s| s.insert(KEY.to_string(), v));
+                                let ts = t.get("settings").and_then(|s| s.as_object());
+                                if let (Some(s), Some(ts)) = (
+                                    obj.entry("settings")
+                                        .or_insert_with(|| serde_json::json!({}))
+                                        .as_object_mut(),
+                                    ts,
+                                ) {
+                                    insert_like(s, ts, KEY, v);
+                                }
                             } else {
-                                obj.insert(KEY.to_string(), v);
+                                insert_like(obj, t, KEY, v);
                             }
                         }
                     }
@@ -2186,20 +2193,25 @@ fn format_org_columns_missing_warning(tgt: &str, missing: &[String]) -> String {
     msg
 }
 
-/// Collect `id -> score_threshold` for every object that has BOTH a string `id`
-/// and a `score_threshold`, anywhere in the tree. Schema datapoint ids are
-/// unique within a schema, so this is an unambiguous per-field map.
+/// Collect `id -> object` for every object that has BOTH a string `id` and a
+/// `score_threshold`, anywhere in the tree. Schema datapoint ids are unique
+/// within a schema, so this is an unambiguous per-field map. The whole object
+/// is kept, not just the threshold, so [`insert_like`] can place the key where
+/// the target has it.
 fn collect_datapoint_thresholds(
     value: &serde_json::Value,
-) -> BTreeMap<String, serde_json::Value> {
+) -> BTreeMap<String, serde_json::Map<String, serde_json::Value>> {
     let mut out = BTreeMap::new();
-    fn walk(value: &serde_json::Value, out: &mut BTreeMap<String, serde_json::Value>) {
+    fn walk(
+        value: &serde_json::Value,
+        out: &mut BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
+    ) {
         match value {
             serde_json::Value::Object(map) => {
-                if let (Some(serde_json::Value::String(id)), Some(th)) =
+                if let (Some(serde_json::Value::String(id)), Some(_)) =
                     (map.get("id"), map.get("score_threshold"))
                 {
-                    out.insert(id.clone(), th.clone());
+                    out.insert(id.clone(), map.clone());
                 }
                 for v in map.values() {
                     walk(v, out);
@@ -2218,12 +2230,12 @@ fn collect_datapoint_thresholds(
 }
 
 /// For every object carrying a string `id`, adopt the target's threshold for
-/// that id (adding or overwriting `score_threshold`), or remove any existing
-/// `score_threshold` when the target has none for that id. Objects without an
-/// `id` are left alone but still recursed into.
+/// that id (adding or overwriting `score_threshold`, at the target's position),
+/// or remove any existing `score_threshold` when the target has none for that
+/// id. Objects without an `id` are left alone but still recursed into.
 fn apply_datapoint_thresholds(
     value: &mut serde_json::Value,
-    target: &BTreeMap<String, serde_json::Value>,
+    target: &BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
 ) {
     match value {
         serde_json::Value::Object(map) => {
@@ -2233,8 +2245,9 @@ fn apply_datapoint_thresholds(
             };
             if let Some(id) = id {
                 match target.get(&id) {
-                    Some(th) => {
-                        map.insert("score_threshold".to_string(), th.clone());
+                    Some(t) => {
+                        let th = t["score_threshold"].clone();
+                        insert_like(map, t, "score_threshold", th);
                     }
                     None => {
                         map.shift_remove("score_threshold");
@@ -2252,6 +2265,30 @@ fn apply_datapoint_thresholds(
         }
         _ => {}
     }
+}
+
+/// Set `key` to `v` in `obj` at the position `key` holds in `like`, the
+/// target's pulled copy of the same object: right after the nearest key before
+/// it in `like` that `obj` also has, or first if there is none.
+///
+/// A plain `insert` appends a new key at the END, where the server never puts
+/// it. The next `rdc sync` pull then moved it back, so every migrate/sync pair
+/// produced a key-order-only diff. A key already in `obj` is moved too, which
+/// also repairs a file an older migrate wrote out of order.
+fn insert_like(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    like: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    v: serde_json::Value,
+) {
+    obj.shift_remove(key);
+    let at = like
+        .keys()
+        .take_while(|k| *k != key)
+        .filter_map(|k| obj.keys().position(|o| o == k))
+        .last()
+        .map_or(0, |i| i + 1);
+    obj.shift_insert(at, key.to_string(), v);
 }
 
 /// Recursively return a clone of the first value stored under `key` anywhere in
@@ -5577,6 +5614,56 @@ mod tests {
         assert!(kids[1].get("score_threshold").is_none(), "vendor threshold must be dropped");
         // newfield: absent from target (a field being introduced) → dropped.
         assert!(kids[2].get("score_threshold").is_none(), "new-field threshold must be dropped");
+    }
+
+    #[test]
+    fn reconcile_schema_places_adopted_threshold_where_the_target_has_it() {
+        // The source datapoint has no threshold (or one misplaced by an older
+        // migrate); the target's pulled copy has it mid-object. The adopted key
+        // must land at the target's position, not appended at the end — or the
+        // next `rdc sync` pull moves it back and every migrate/sync pair churns.
+        let mut source = serde_json::json!({
+            "content": [
+                { "category": "datapoint", "id": "amount", "type": "number", "label": "A" },
+                { "category": "datapoint", "id": "vendor", "type": "string", "label": "V",
+                  "score_threshold": 0.5 }
+            ]
+        });
+        let (_d, tgt) = tgt_file(&serde_json::json!({
+            "content": [
+                { "category": "datapoint", "id": "amount", "score_threshold": 0.9,
+                  "type": "number", "label": "A" },
+                { "category": "datapoint", "id": "vendor", "type": "string",
+                  "score_threshold": 0.7, "label": "V" }
+            ]
+        }));
+
+        reconcile_score_thresholds(&mut source, "schemas", &tgt);
+
+        let keys = |v: &serde_json::Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+        assert_eq!(
+            keys(&source["content"][0]),
+            ["category", "id", "score_threshold", "type", "label"]
+        );
+        assert_eq!(
+            keys(&source["content"][1]),
+            ["category", "id", "type", "score_threshold", "label"]
+        );
+        assert_eq!(source["content"][0]["score_threshold"], serde_json::json!(0.9));
+        assert_eq!(source["content"][1]["score_threshold"], serde_json::json!(0.7));
+    }
+
+    #[test]
+    fn reconcile_queue_places_added_default_where_the_target_has_it() {
+        let mut source = serde_json::json!({ "name": "Q", "settings": {}, "schema": "s" });
+        let (_d, tgt) = tgt_file(&serde_json::json!({
+            "name": "Q", "default_score_threshold": 0.85, "settings": {}, "schema": "s"
+        }));
+        reconcile_score_thresholds(&mut source, "queues", &tgt);
+        assert_eq!(
+            source.as_object().unwrap().keys().cloned().collect::<Vec<_>>(),
+            ["name", "default_score_threshold", "settings", "schema"]
+        );
     }
 
     #[test]
