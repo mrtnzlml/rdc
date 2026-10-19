@@ -383,7 +383,7 @@ Promotes one env's snapshot to another. The usual promotion is one chain:
 rdc sync test && rdc migrate test prod --mirror && rdc sync prod --allow-deletes
 ```
 
-`rdc sync test` refreshes the source snapshot, so you promote the source's current state rather than a stale one. `rdc migrate test prod --mirror` is pure-local — zero remote calls: it copies `envs/test/` into `envs/prod/`, renaming slugs per the mapping, rewriting portable `rdc://<kind>/<slug>` references, applying the target env's `overlay.toml`, and (because of `--mirror`) pruning target files with no source counterpart. `rdc sync prod --allow-deletes` pushes the result: it creates missing objects in dependency order and turns those pruned files into remote deletions.
+`rdc sync test` refreshes the source snapshot, so you promote the source's current state rather than a stale one. `rdc migrate test prod --mirror` is pure-local — zero remote calls: it copies `envs/test/` into `envs/prod/`, renaming slugs per the mapping, rewriting portable `rdc://<kind>/<slug>` references, applying the target env's `overlay.toml`, and (because of `--mirror`) pruning target files with no source counterpart. `rdc sync prod --allow-deletes` pushes the result: it creates missing objects in dependency order and turns those pruned files into remote deletions. MDH datasets are the exception: rdc never drops a collection, so the sync pulls a pruned dataset straight back. To remove one, drop the collection on each env by hand, then run `rdc sync <env>`, which removes the local copy.
 
 **The chain deletes.** `--mirror` plus `--allow-deletes` removes objects from the target that the source does not have. Rehearse both halves before the first run against a new target, and on the real run stop between the migrate and the sync to read `git diff` — that diff is exactly what the sync will push:
 
@@ -726,7 +726,7 @@ Notes:
 - A row's `_id` is dropped from the file when the server generated it. Give a row
   an explicit `_id` (any string) to pin its identity across environments — edits
   then replace it in place instead of removing and re-adding it.
-- rdc warns above 1 000 rows and refuses above 10 000. Import-fed datasets are
+- rdc warns above 1 000 rows and refuses above 25 000. Import-fed datasets are
   out of scope; rdc warns if a flagged dataset's rows carry the import
   extension's `__digest_md5` marker.
 - An absent `data.jsonl` means "not pulled yet", never "delete every row".

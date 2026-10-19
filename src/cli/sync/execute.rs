@@ -2324,11 +2324,11 @@ fn remove_mdh_dataset(ctx: &mut PullCtx<'_>, slug: &str, indexes_path: &Path) {
 ///   mirror, drop the lockfile entry. The dominant case.
 /// - `[s]` skip: write a `<indexes.json>.<env>-deleted` marker; the next
 ///   sync re-presents the choice.
-/// - `[k]` keep local: MDH has no remote-restore path (`push_dataset`
-///   only edits indexes of an *existing* collection — it can't recreate
-///   a deleted one), so this keeps the on-disk files but drops the
-///   lockfile entry + base cache so the dataset isn't re-flagged every
-///   sync. A warning explains the collection is not recreated on the env.
+/// - `[k]` keep local: keeps the on-disk files but drops the lockfile
+///   entry + base cache. Restoring is deferred, not absent: with no
+///   lockfile entry the dataset reads as never-synced, so the next
+///   pushing sync's stage 2 recreates the collection (indexes, and rows
+///   for a manual dataset). The info line says so.
 /// - `[a]` abort: propagate [`PullAborted`].
 ///
 /// `interactive == false` (CI / `--yes`) falls back to `[s]` for every
@@ -2443,17 +2443,16 @@ async fn prune_mdh_orphans<R: BufRead>(
                 pruned += 1;
             }
             Resolution::KeepLocal => {
-                // No remote-restore path for MDH collections. Keep the
-                // local files but stop tracking so the dataset isn't
-                // re-flagged every sync.
+                // Keep the local files but stop tracking. Without a lockfile
+                // entry the dataset reads as never-synced, so the next
+                // pushing sync's stage 2 recreates it on the env.
                 crate::state::base_cache::forget(ctx.paths, &indexes_path).ok();
                 drop_lockfile_entry(ctx, "mdh_indexes", &slug);
                 progress.event(
                     Action::Info,
                     &format!(
-                        "mdh/{slug}: kept local files; the collection is NOT recreated on {env} \
-                         (MDH collections can't be pushed). Recreate it on {env} and re-sync to \
-                         re-establish tracking."
+                        "mdh/{slug}: kept local files; the next `rdc sync {env}` recreates the \
+                         collection on {env} from them (skipped under --no-push)."
                     ),
                 );
             }
