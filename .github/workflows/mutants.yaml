@@ -1,0 +1,131 @@
+name: Mutants
+
+# Weekly mutation-testing report (https://mutants.rs). It answers "would the
+# tests notice if this line were wrong?" -- a missed mutant is code the suite
+# executes but never checks. It is a REPORT, not a gate: nothing here blocks a
+# merge or a release, and a missed mutant does not turn the run red.
+#
+# Scope: unit tests only (`-- --lib`). The 1,400+ lib tests run in seconds;
+# the integration tests take over a minute per mutant and would not fit. A
+# 2026-10-19 pilot on two files found the lib-only pass misses 3 of 123
+# mutants that the integration tests catch, so treat a missed mutant as "no
+# unit test notices", and confirm with the full suite before writing a test.
+#
+# Working with the report locally:
+#
+#   gh run download <run-id> -n mutants-report      # missed.txt, timeout.txt
+#   cargo mutants -f src/<file>.rs -- --lib         # re-check after a fix
+#
+# Never run `--in-place` locally on a tree with uncommitted work: it edits
+# the sources and an interrupted run can leave a mutant behind. Here the
+# checkout is disposable, and in-place lets the restored cargo cache count.
+#
+# `--cap-lints=true` because the workspace denies `dead_code`: a mutant that
+# leaves a helper unused would otherwise be "unviable" and never tested (8 of
+# the pilot's 20 unviable mutants). The docs warn capped lints can let a build
+# hang on const evaluation, hence `--build-timeout`.
+
+on:
+  schedule:
+    # Sunday, so the report is waiting on Monday. Away from weekly-release's
+    # Monday ticks so the two never compete for runners.
+    - cron: '43 2 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutants
+  cancel-in-progress: false
+
+jobs:
+  shard:
+    name: Shard ${{ matrix.shard }}/32
+    runs-on: ubuntu-latest
+    # ~160 mutants per shard. GitHub kills a job at 6 h; stop earlier so the
+    # partial results still upload.
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        # Pinned by rust-toolchain.toml -- see the note in that file for why
+        # this is `rustup show` and not dtolnay/rust-toolchain.
+        run: rustup show
+
+      - name: Restore cargo cache
+        # Restore-only: ci.yaml owns this cache. Saving a target/ built from
+        # mutated sources back into it would be pointless at best.
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-ci-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-ci-
+
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants@27.1.0
+
+      - name: Mutate
+        # Exit 2 = some mutants missed, 3 = some timed out: both are the
+        # report doing its job. Anything else (4 = baseline tests fail) is a
+        # real failure.
+        run: |
+          rc=0
+          cargo mutants --in-place --no-shuffle \
+            --shard ${{ matrix.shard }}/32 \
+            --cap-lints=true --build-timeout 900 --timeout 120 \
+            -- --lib || rc=$?
+          case $rc in 0|2|3) ;; *) exit $rc ;; esac
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutants-out-${{ matrix.shard }}
+          path: mutants.out
+
+  report:
+    name: Report
+    needs: shard
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: mutants-out-*
+          path: shards
+
+      - name: Merge shards
+        run: |
+          mkdir report
+          for kind in caught missed timeout unviable; do
+            cat shards/*/"$kind".txt 2>/dev/null | sort > "report/$kind.txt"
+          done
+          {
+            echo "## Mutants"
+            echo
+            echo "| caught | missed | timeout | unviable | shards reported |"
+            echo "|---|---|---|---|---|"
+            echo "| $(wc -l < report/caught.txt) | $(wc -l < report/missed.txt) | $(wc -l < report/timeout.txt) | $(wc -l < report/unviable.txt) | $(find shards -mindepth 1 -maxdepth 1 -type d | wc -l)/32 |"
+            echo
+            echo '```'
+            cat report/missed.txt report/timeout.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutants-report
+          path: report
