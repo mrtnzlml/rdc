@@ -493,6 +493,27 @@ mod tests {
         assert!(format!("{err:#}").contains("version"));
     }
 
+    #[test]
+    fn next_version_asks_for_an_upgrade() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("dev.lock.json");
+        std::fs::write(&path, format!(r#"{{"version":{},"objects":{{}}}}"#, LOCKFILE_VERSION + 1)).unwrap();
+        let err = format!("{:#}", Lockfile::load(&path).unwrap_err());
+        assert!(err.contains("written by a newer rdc"), "got: {err}");
+        assert!(err.contains("rdc upgrade"), "got: {err}");
+    }
+
+    /// Below v1 is not "newer": it is unknown, and the fix is to rebuild it.
+    #[test]
+    fn version_zero_is_unknown_not_newer() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("dev.lock.json");
+        std::fs::write(&path, r#"{"version":0,"objects":{}}"#).unwrap();
+        let err = format!("{:#}", Lockfile::load(&path).unwrap_err());
+        assert!(err.contains("has unknown version 0"), "got: {err}");
+        assert!(!err.contains("newer"), "got: {err}");
+    }
+
     /// `modified_by` rides alongside `modified_at`: recorded on pull, kept out
     /// of the snapshot JSON. Both survive a save/load round-trip.
     #[test]
@@ -778,6 +799,56 @@ mod tests {
         assert_eq!(
             lf.lookup_url("https://api.elis.rossum.ai/v1/queues/999"),
             None
+        );
+    }
+
+    /// A departed object's URL still resolves to ITS slug, by id, for the
+    /// rest of the run.
+    #[test]
+    fn lookup_url_resolves_departed_objects_by_id() {
+        let mut lf = Lockfile::default();
+        for (slug, id) in [("q1", 123), ("q2", 456)] {
+            lf.upsert(
+                "queues",
+                slug,
+                ObjectEntry {
+                    id,
+                    modified_at: None,
+                    modified_by: None,
+                    content_hash: None,
+                    secrets_hash: None,
+                },
+            );
+        }
+        lf.depart("queues", "q1").unwrap();
+        lf.depart("queues", "q2").unwrap();
+        assert_eq!(lf.slug_for_id("queues", 123), None);
+        assert_eq!(
+            lf.lookup_url("https://api.elis.rossum.ai/v1/queues/123"),
+            Some(("queues", "q1"))
+        );
+        assert_eq!(
+            lf.lookup_url("https://api.elis.rossum.ai/v1/queues/456"),
+            Some(("queues", "q2"))
+        );
+        assert_eq!(lf.lookup_url("https://api.elis.rossum.ai/v1/queues/999"), None);
+    }
+
+    /// Recorded in every lockfile: a change to the encoding would make every
+    /// project read its hook secrets as edited.
+    #[test]
+    fn hook_secrets_hash_is_sha256_of_the_compact_json_object() {
+        // printf '{}' | shasum -a 256
+        assert_eq!(
+            hook_secrets_hash(&BTreeMap::new()),
+            "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+        );
+        // printf '{"a":"1","b":"2"}' | shasum -a 256
+        let map: BTreeMap<String, String> =
+            [("b", "2"), ("a", "1")].into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        assert_eq!(
+            hook_secrets_hash(&map),
+            "21f76dfbfe6dfe21f762080ef484112cf2952974cef30741fd1931e1c6d92112"
         );
     }
 

@@ -441,6 +441,17 @@ mod tests {
         }
     }
 
+    /// `(merged, local_paths, remote_paths)`. The path lists are not just a
+    /// log line: a non-empty `local_paths` is what makes sync push the merge.
+    fn merged_with_paths(out: MergeOutcome<Value>) -> (Value, Vec<String>, Vec<String>) {
+        match out {
+            MergeOutcome::Merged { merged, local_paths, remote_paths } => {
+                (merged, local_paths, remote_paths)
+            }
+            MergeOutcome::Conflict { reasons } => panic!("unexpected conflict: {reasons:?}"),
+        }
+    }
+
     #[test]
     fn identical_inputs_return_base() {
         let v = json!({"a": 1});
@@ -490,6 +501,28 @@ mod tests {
             }
             MergeOutcome::Conflict { reasons } => panic!("unexpected conflict: {reasons:?}"),
         }
+    }
+
+    #[test]
+    fn unchanged_sibling_key_is_recorded_on_neither_side() {
+        let base = json!({"a": 1, "b": 1, "c": 1});
+        let local = json!({"a": 2, "b": 1, "c": 1});
+        let remote = json!({"a": 1, "b": 2, "c": 1});
+        let (merged, local_paths, remote_paths) = merged_with_paths(merge3_json(&base, &local, &remote));
+        assert_eq!(merged, json!({"a": 2, "b": 2, "c": 1}));
+        assert_eq!(local_paths, vec!["a".to_string()]);
+        assert_eq!(remote_paths, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn same_change_on_both_sides_is_recorded_as_local() {
+        let base = json!({"a": 1, "b": 1});
+        let local = json!({"a": 2, "b": 1});
+        let remote = json!({"a": 2, "b": 3});
+        let (merged, local_paths, remote_paths) = merged_with_paths(merge3_json(&base, &local, &remote));
+        assert_eq!(merged, json!({"a": 2, "b": 3}));
+        assert_eq!(local_paths, vec!["a".to_string()]);
+        assert_eq!(remote_paths, vec!["b".to_string()]);
     }
 
     #[test]
@@ -599,6 +632,109 @@ mod tests {
         let remote = json!({"queues": ["a", "b", "c"]}); // unchanged
         let out = merge3_json(&base, &local, &remote);
         assert_eq!(merged_value(out), json!({"queues": ["a", "c"]}));
+    }
+
+    #[test]
+    fn string_set_array_additions_on_both_sides_record_both_sides() {
+        let base = json!({"queues": ["a"]});
+        let local = json!({"queues": ["a", "b"]});
+        let remote = json!({"queues": ["a", "c"]});
+        let (merged, local_paths, remote_paths) = merged_with_paths(merge3_json(&base, &local, &remote));
+        assert_eq!(merged, json!({"queues": ["a", "b", "c"]}));
+        assert_eq!(local_paths, vec!["queues".to_string()]);
+        assert_eq!(remote_paths, vec!["queues".to_string()]);
+    }
+
+    /// A set has no order, so reordering it is not a change: the side that
+    /// only reordered must not be recorded (for local, that would push).
+    #[test]
+    fn string_set_array_local_reorder_is_not_a_local_change() {
+        let base = json!({"queues": ["a", "b"]});
+        let local = json!({"queues": ["b", "a"]});
+        let remote = json!({"queues": ["a", "b", "c"]});
+        let (merged, local_paths, remote_paths) = merged_with_paths(merge3_json(&base, &local, &remote));
+        assert_eq!(merged, json!({"queues": ["a", "b", "c"]}));
+        assert!(local_paths.is_empty(), "got {local_paths:?}");
+        assert_eq!(remote_paths, vec!["queues".to_string()]);
+    }
+
+    #[test]
+    fn string_set_array_remote_reorder_is_not_a_remote_change() {
+        let base = json!({"queues": ["a", "b"]});
+        let local = json!({"queues": ["a"]});
+        let remote = json!({"queues": ["b", "a"]});
+        let (merged, local_paths, remote_paths) = merged_with_paths(merge3_json(&base, &local, &remote));
+        assert_eq!(merged, json!({"queues": ["a"]}));
+        assert_eq!(local_paths, vec!["queues".to_string()]);
+        assert!(remote_paths.is_empty(), "got {remote_paths:?}");
+    }
+
+    /// An empty array is all-strings AND all-id-keyed. One side going to
+    /// strings and the other to objects is a shape mismatch, not a set merge
+    /// that would silently drop the objects.
+    #[test]
+    fn strings_on_one_side_and_objects_on_the_other_is_conflict() {
+        let base = json!({"x": []});
+        let local = json!({"x": [{"id": "a"}]});
+        let remote = json!({"x": ["s"]});
+        assert_eq!(conflict_paths(merge3_json(&base, &local, &remote)), vec!["x".to_string()]);
+    }
+
+    /// Numeric ids key the merge like string ids do, and the output keeps the
+    /// array's order, not the ids' string order ("10" < "2").
+    #[test]
+    fn id_keyed_array_with_numeric_ids_merges_in_array_order() {
+        let base = json!([{"id": 2, "v": 1}, {"id": 10, "v": 1}]);
+        let local = json!([{"id": 2, "v": 5}, {"id": 10, "v": 1}]);
+        let remote = json!([{"id": 2, "v": 1}, {"id": 10, "v": 7}]);
+        assert_eq!(
+            merged_value(merge3_json(&base, &local, &remote)),
+            json!([{"id": 2, "v": 5}, {"id": 10, "v": 7}]),
+        );
+    }
+
+    #[test]
+    fn id_keyed_array_same_element_added_on_both_sides_is_kept_once() {
+        let base = json!({"content": [{"id": "a", "v": 1}]});
+        let local = json!({"content": [{"id": "a", "v": 2}, {"id": "c", "v": 1}]});
+        let remote = json!({"content": [{"id": "a", "v": 1}, {"id": "c", "v": 1}]});
+        assert_eq!(
+            merged_value(merge3_json(&base, &local, &remote)),
+            json!({"content": [{"id": "a", "v": 2}, {"id": "c", "v": 1}]}),
+        );
+    }
+
+    #[test]
+    fn id_keyed_array_same_id_added_with_different_bodies_is_conflict() {
+        let base = json!({"content": [{"id": "a"}]});
+        let local = json!({"content": [{"id": "a"}, {"id": "c", "v": 1}]});
+        let remote = json!({"content": [{"id": "a"}, {"id": "c", "v": 2}]});
+        assert_eq!(
+            conflict_paths(merge3_json(&base, &local, &remote)),
+            vec!["content[id=c]".to_string()],
+        );
+    }
+
+    #[test]
+    fn id_keyed_array_remote_deletes_element_local_left_alone() {
+        let base = json!({"content": [{"id": "f1", "label": "1"}, {"id": "f2", "label": "2"}]});
+        let local = json!({"content": [{"id": "f1", "label": "1 edited"}, {"id": "f2", "label": "2"}]});
+        let remote = json!({"content": [{"id": "f1", "label": "1"}]});
+        let (merged, local_paths, remote_paths) = merged_with_paths(merge3_json(&base, &local, &remote));
+        assert_eq!(merged, json!({"content": [{"id": "f1", "label": "1 edited"}]}));
+        assert_eq!(local_paths, vec!["content[id=f1]".to_string()]);
+        assert_eq!(remote_paths, vec!["content[id=f2]".to_string()]);
+    }
+
+    #[test]
+    fn id_keyed_array_remote_delete_vs_local_edit_is_conflict() {
+        let base = json!({"content": [{"id": "f1", "label": "1"}]});
+        let local = json!({"content": [{"id": "f1", "label": "1 edited"}]});
+        let remote = json!({"content": []});
+        assert_eq!(
+            conflict_paths(merge3_json(&base, &local, &remote)),
+            vec!["content[id=f1]".to_string()],
+        );
     }
 
     #[test]
