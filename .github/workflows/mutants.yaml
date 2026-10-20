@@ -2,8 +2,9 @@ name: Mutants
 
 # Weekly mutation-testing report (https://mutants.rs). It answers "would the
 # tests notice if this line were wrong?" -- a missed mutant is code the suite
-# executes but never checks. It is a REPORT, not a gate: nothing here blocks a
-# merge or a release, and a missed mutant does not turn the run red.
+# executes but never checks. Nothing here blocks a merge or a release. A
+# missed mutant alone does not turn the run red; the run fails only when the
+# score drops below MIN_SCORE (see the report job) or a shard does not report.
 #
 # Scope: unit tests only (`-- --lib`). The 1,400+ lib tests run in seconds;
 # the integration tests take over a minute per mutant and would not fit. A
@@ -138,3 +139,29 @@ jobs:
         with:
           name: mutants-report
           path: report
+
+      - name: Check score
+        # Score = caught / (caught + missed). Unviable mutants never ran, and
+        # a timeout depends on runner speed, so both are left out.
+        #
+        # MIN_SCORE is a ratchet: the score measured on main, minus 0.2
+        # points of margin. Between the 2026-10-19 runs only 3 of 4,717
+        # unchanged mutants changed outcome (0.06 points), all of them
+        # timeouts. Raise MIN_SCORE when tests raise the score; never lower it
+        # to make a run pass -- cover the new code instead.
+        env:
+          MIN_SCORE: "62.2"
+        run: |
+          shards=$(( $(find shards -mindepth 1 -maxdepth 1 -type d | wc -l) ))
+          if [ "$shards" -ne 32 ]; then
+            echo "::error::only $shards of 32 shards reported; the score would be partial"
+            exit 1
+          fi
+          caught=$(( $(wc -l < report/caught.txt) ))
+          missed=$(( $(wc -l < report/missed.txt) ))
+          score=$(awk -v c="$caught" -v m="$missed" 'BEGIN { printf "%.2f", 100 * c / (c + m) }')
+          echo "Score: $score% ($caught caught, $missed missed); minimum $MIN_SCORE%" | tee -a "$GITHUB_STEP_SUMMARY"
+          if ! awk -v s="$score" -v t="$MIN_SCORE" 'BEGIN { exit !(s >= t) }'; then
+            echo "::error::mutation score $score% is below the minimum $MIN_SCORE%"
+            exit 1
+          fi
