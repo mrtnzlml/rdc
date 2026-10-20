@@ -55,8 +55,10 @@ fn write_json(p: &Path, v: serde_json::Value) {
     std::fs::write(p, b).unwrap();
 }
 
-/// An env that starts empty and lets a workspace, a schema, a queue and a hook
-/// be created, each listed only after its POST.
+/// An env that starts empty and lets a workspace, a schema, a queue, a hook and
+/// a label be created, each listed only after its POST. A create without a
+/// `name` is refused with 400, and every engine create with 403 (engines not
+/// writable on the plan).
 struct Env {
     server: MockServer,
     cwd: tempfile::TempDir,
@@ -74,7 +76,7 @@ impl Env {
             .mount(&server)
             .await;
         for kind in [
-            "inboxes", "rules", "labels", "engines", "engine_fields", "workflows",
+            "inboxes", "rules", "engines", "engine_fields", "workflows",
             "workflow_steps", "email_templates", "saved_views",
         ] {
             Mock::given(method("GET"))
@@ -106,11 +108,16 @@ impl Env {
             "config": { "url": "https://example.com/notify" },
             "modified_at": "2026-05-01T08:00:00Z"
         });
+        let label = serde_json::json!({
+            "id": 50, "url": format!("{base}/labels/50"), "name": "Urgent",
+            "organization": format!("{base}/organizations/1")
+        });
         for (p, obj) in [
             ("/workspaces", ws),
             ("/schemas", schema.clone()),
             ("/queues", queue),
             ("/hooks", hook),
+            ("/labels", label),
         ] {
             let created = Arc::new(AtomicBool::new(false));
             let (flag, listed) = (created.clone(), obj.clone());
@@ -125,13 +132,25 @@ impl Env {
                 .await;
             Mock::given(method("POST"))
                 .and(path(p))
-                .respond_with(move |_: &Request| {
+                .respond_with(move |req: &Request| {
+                    let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                    if body.get("name").is_none() {
+                        return ResponseTemplate::new(400)
+                            .set_body_json(serde_json::json!({ "name": ["This field is required."] }));
+                    }
                     created.store(true, Ordering::SeqCst);
                     ResponseTemplate::new(201).set_body_json(&obj)
                 })
                 .mount(&server)
                 .await;
         }
+        Mock::given(method("POST"))
+            .and(path("/engines"))
+            .respond_with(
+                ResponseTemplate::new(403).set_body_json(serde_json::json!({ "detail": "forbidden" })),
+            )
+            .mount(&server)
+            .await;
         Mock::given(method("GET"))
             .and(path("/schemas/20"))
             .respond_with(ResponseTemplate::new(200).set_body_json(&schema))
@@ -316,6 +335,128 @@ async fn watch_holds_back_a_hook_whose_queue_file_is_not_written_yet() {
             serde_json::json!([format!("{}/queues/30", env.server.uri())]),
             "the hook is created linked to its queue"
         );
+    })
+    .await;
+}
+
+fn write_queue_with_engine(env: &Env) {
+    write_json(
+        &env.envs().join("engines/extractor/engine.json"),
+        serde_json::json!({ "name": "Extractor", "type": "extractor" }),
+    );
+    write_json(
+        &env.envs().join("workspaces/main/queues/invoices/queue.json"),
+        serde_json::json!({
+            "name": "Invoices",
+            "workspace": "rdc://workspaces/main",
+            "schema": "rdc://schemas/invoices",
+            "engine": "rdc://engines/extractor"
+        }),
+    );
+}
+
+/// The engine has a file, but the server refuses to create it. The queue that
+/// names it must not be created without it: that create would also rewrite
+/// queue.json from the server's answer and drop the `engine` line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watch_holds_back_a_queue_whose_engine_create_is_refused() {
+    let env = Env::start().await;
+    write_workspace(&env);
+    write_schema(&env);
+    write_queue_with_engine(&env);
+    let queue_json = env.envs().join("workspaces/main/queues/invoices/queue.json");
+
+    let env = &env;
+    env.watch(|log, stopped| async move {
+        wait_for("the schema create", &log, &stopped, || async {
+            env.posts("/schemas").await.len() == 1
+        })
+        .await;
+        wait_for("the hold warning", &log, &stopped, || async {
+            log.text().contains("not pushed yet")
+        })
+        .await;
+        assert!(env.posts("/queues").await.is_empty(), "the queue must be held back");
+        assert!(log.text().contains("rdc://engines/extractor"), "log:\n{}", log.text());
+        let on_disk = std::fs::read_to_string(&queue_json).unwrap();
+        assert!(on_disk.contains("rdc://engines/extractor"), "queue.json lost its engine:\n{on_disk}");
+    })
+    .await;
+}
+
+/// The same refusal in a one-shot sync: the queue is not created, its file
+/// keeps the ref, and the run fails naming it.
+#[tokio::test]
+async fn sync_refuses_a_queue_whose_engine_create_is_refused() {
+    let env = Env::start().await;
+    write_workspace(&env);
+    write_schema(&env);
+    write_queue_with_engine(&env);
+
+    let err = rdc::cli::sync::embed::sync_logged(
+        env.cwd.path(),
+        "test",
+        "tok",
+        rdc::cli::sync::embed::EmbedSyncOptions::default(),
+        Box::new(std::io::sink()),
+    )
+    .await
+    .expect_err("the run must fail on the held queue");
+
+    let msg = format!("{err:#}");
+    assert!(msg.contains("queues/invoices") && msg.contains("rdc://engines/extractor"), "{msg}");
+    assert!(env.posts("/queues").await.is_empty(), "the queue must not be created");
+    let on_disk =
+        std::fs::read_to_string(env.envs().join("workspaces/main/queues/invoices/queue.json")).unwrap();
+    assert!(on_disk.contains("rdc://engines/extractor"), "queue.json lost its engine:\n{on_disk}");
+}
+
+/// A file the server rejects (400) does not stop the watch; fixing the file
+/// does push it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watch_survives_a_rejected_create_and_pushes_the_fixed_file() {
+    let env = Env::start().await;
+    let label = env.envs().join("labels/urgent.json");
+    write_json(&label, serde_json::json!({ "color": "red" }));
+
+    let env = &env;
+    env.watch(|log, stopped| async move {
+        wait_for("the rejected create", &log, &stopped, || async {
+            log.text().contains("cycle failed (fix the file and save it)")
+        })
+        .await;
+        assert!(log.text().contains("This field is required"), "log:\n{}", log.text());
+
+        write_json(&label, serde_json::json!({ "name": "Urgent", "color": "red" }));
+        wait_for("the fixed create", &log, &stopped, || async {
+            env.posts("/labels").await.iter().any(|b| b["name"] == "Urgent")
+        })
+        .await;
+    })
+    .await;
+}
+
+/// A file that is not valid JSON (a save half-way through an edit) does not
+/// stop the watch either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watch_survives_a_file_that_is_not_valid_json() {
+    let env = Env::start().await;
+    let label = env.envs().join("labels/urgent.json");
+    std::fs::create_dir_all(label.parent().unwrap()).unwrap();
+    std::fs::write(&label, b"{\"name\": \"Urgent\",").unwrap();
+
+    let env = &env;
+    env.watch(|log, stopped| async move {
+        wait_for("the refused cycle", &log, &stopped, || async {
+            log.text().contains("cycle failed")
+        })
+        .await;
+
+        write_json(&label, serde_json::json!({ "name": "Urgent" }));
+        wait_for("the fixed create", &log, &stopped, || async {
+            env.posts("/labels").await.len() == 1
+        })
+        .await;
     })
     .await;
 }

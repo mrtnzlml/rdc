@@ -324,7 +324,7 @@ pub(crate) async fn run_watch_with(
         if !cfg.no_bell {
             crate::cli::stdin_coord::arm_bell();
         }
-        crate::cli::sync::run_cycle(
+        let reconciled = crate::cli::sync::run_cycle(
             cfg.env,
             cfg.interactive,
             false,
@@ -337,7 +337,20 @@ pub(crate) async fn run_watch_with(
             cfg.token.clone(),
             true, // hold_unresolved: see `run_cycle`
         )
-        .await?;
+        .await;
+        // A local file the push refuses, or the server rejects, is fixed by
+        // editing it — which is what the watch is for. Any other failure
+        // still stops the watch before it starts.
+        match reconciled {
+            Ok(_) => {}
+            Err(e) if is_fixable_by_editing(&e) => {
+                renderer.event(
+                    crate::log::Action::Watch,
+                    &format!("cycle failed (fix the file and save it): {e:#}"),
+                );
+            }
+            Err(e) => return Err(e),
+        }
     }
 
     // Fires exactly once, right after the reconcile above and before the
@@ -584,6 +597,18 @@ pub(crate) async fn event_loop(
                         while events.try_recv().is_ok() {}
                         continue;
                     }
+                    Err(e) if is_fixable_by_editing(&e) => {
+                        if let Some(r) = renderer.as_ref() {
+                            r.event(crate::log::Action::Watch, &format!("cycle failed (fix the file and save it): {e:#}"));
+                        } else {
+                            eprintln!("watch: cycle failed (fix the file and save it): {e:#}");
+                        }
+                        if let Some(w) = watcher.as_mut() {
+                            let _ = w.watch(&env_root, RecursiveMode::Recursive);
+                        }
+                        while events.try_recv().is_ok() {}
+                        continue;
+                    }
                     Err(e) => return Err(e),
                 };
                 drop(_lock);
@@ -626,6 +651,33 @@ fn is_local_parse_error(e: &anyhow::Error) -> bool {
     e.chain().any(|c| {
         let s = c.to_string();
         s.contains("invalid JSON") || s.contains("serde_json") || s.contains("expected value")
+    })
+}
+
+/// Does this cycle failure come from the content of a local file, so that
+/// editing the file is the fix? Three kinds:
+///
+/// - the offline pre-flight refused a changed file (`refuse_on_offline_defects`:
+///   invalid JSON, an over-long field, a missing required field, …);
+/// - the server answered a 4xx other than 401 (which the loop refreshes) and
+///   429 (which the client retries);
+/// - a ref could not resolve at send time (`ensure_no_residual_refs`) or in
+///   the relink pass after the push.
+///
+/// The cycle saved what it had already written to the lockfile before
+/// returning (see `run_cycle`), so the next cycle resumes instead of
+/// creating those objects again.
+fn is_fixable_by_editing(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        if let Some(crate::api::ApiError::Status { status, .. }) =
+            c.downcast_ref::<crate::api::ApiError>()
+        {
+            return (400..500).contains(status) && !matches!(status, 401 | 429);
+        }
+        let s = c.to_string();
+        s.contains("refusing to push before any remote write")
+            || s.contains("unresolved portable reference")
+            || s.contains("deferred relink could not complete")
     })
 }
 
@@ -803,6 +855,37 @@ mod tests {
         .await;
 
         assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn fixable_by_editing_is_a_refused_file_or_a_rejected_request() {
+        let status = |status: u16| -> anyhow::Error {
+            anyhow::Error::new(crate::api::ApiError::Status { status, body: "{}".into() })
+                .context("POST /labels (creating 'urgent')")
+        };
+        assert!(is_fixable_by_editing(&status(400)));
+        assert!(is_fixable_by_editing(&status(409)));
+        assert!(!is_fixable_by_editing(&status(401)), "the loop refreshes the token");
+        assert!(!is_fixable_by_editing(&status(429)), "the client retries");
+        assert!(!is_fixable_by_editing(&status(500)));
+        assert!(!is_fixable_by_editing(&anyhow::anyhow!("connection refused")));
+
+        let refused = crate::cli::sync::refuse_on_offline_defects(
+            &[crate::cli::push::scan::JsonParseError {
+                kind: "labels",
+                slug: "urgent".into(),
+                path: "labels/urgent.json".into(),
+                error: "EOF while parsing an object".into(),
+            }],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap_err();
+        assert!(is_fixable_by_editing(&refused), "{refused:#}");
     }
 
     #[tokio::test]

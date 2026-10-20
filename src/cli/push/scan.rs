@@ -384,6 +384,34 @@ impl ChangeList {
         }
     }
 
+    /// Hand `kind`'s objects to its push driver, minus any held back.
+    ///
+    /// `self` is what the push has not yet handed out. First every object in
+    /// it that names something neither deployed nor still pending is held
+    /// into `held`. Then this kind's objects leave `self`: from here on a ref
+    /// to one of them is satisfied only if its driver put it in the lockfile.
+    /// So an object whose create the driver skipped (an engine refused with
+    /// 403, an email template refused with 400) holds back every later object
+    /// that names it, instead of letting it be created without the link.
+    ///
+    /// `of_kind` is that kind's map in the full change list, and the result
+    /// is the part of it still pending.
+    pub fn release(
+        &mut self,
+        kind: &str,
+        of_kind: &BTreeMap<String, std::path::PathBuf>,
+        lockfile: &Lockfile,
+        held: &mut Vec<HeldBack>,
+    ) -> BTreeMap<String, std::path::PathBuf> {
+        held.extend(self.hold_unresolved(lockfile));
+        let pending = std::mem::take(self.map_mut(kind));
+        of_kind
+            .iter()
+            .filter(|(slug, _)| pending.contains_key(*slug))
+            .map(|(slug, path)| (slug.clone(), path.clone()))
+            .collect()
+    }
+
     fn map(&self, kind: &str) -> &BTreeMap<String, std::path::PathBuf> {
         match kind {
             "workspaces" => &self.workspaces,
@@ -2945,6 +2973,46 @@ mod tests {
 
         assert!(cl.hold_unresolved(&tracked("schemas", "invoices")).is_empty());
         assert!(cl.queues.contains_key("invoices"));
+    }
+
+    /// An engine its driver skipped is not in the lockfile, and no longer
+    /// pending once released, so the queue that names it is held when the
+    /// queues are released.
+    #[test]
+    fn release_holds_what_names_an_object_its_driver_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cl = ChangeList::default();
+        cl.engines.insert(
+            "extractor".into(),
+            json_file(dir.path(), "engine.json", serde_json::json!({ "name": "E" })),
+        );
+        cl.queues.insert(
+            "invoices".into(),
+            json_file(
+                dir.path(),
+                "queue.json",
+                serde_json::json!({ "schema": "rdc://schemas/invoices", "engine": "rdc://engines/extractor" }),
+            ),
+        );
+        let lockfile = tracked("schemas", "invoices");
+        let full = cl.clone();
+        let mut pending = cl;
+        let mut held = Vec::new();
+
+        let engines = pending.release("engines", &full.engines, &lockfile, &mut held);
+        assert!(engines.contains_key("extractor") && held.is_empty());
+        // The engines driver skips the create: the lockfile stays as it was.
+        let queues = pending.release("queues", &full.queues, &lockfile, &mut held);
+
+        assert!(queues.is_empty(), "the queue must not reach its driver");
+        assert_eq!(
+            held,
+            vec![HeldBack {
+                kind: "queues",
+                slug: "invoices".into(),
+                missing: vec!["rdc://engines/extractor".into()],
+            }]
+        );
     }
 
     /// A file that does not parse is left for `json_parse_errors` to report.

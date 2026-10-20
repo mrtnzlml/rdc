@@ -3957,21 +3957,11 @@ pub async fn run(
         }
         // Watch mode: an object naming something with neither a deployment nor
         // a local file waits for a later cycle instead of failing this one.
+        // Held here, before the dead-label repair below reads `change_list`;
+        // `push_classified` holds the same way again as each driver runs.
+        let mut held = Vec::new();
         if hold_unresolved {
-            let held = change_list.hold_unresolved(ctx.lockfile);
-            outcome.items_pushed = outcome.items_pushed.saturating_sub(held.len());
-            for h in held {
-                progress.event(
-                    Action::Warn,
-                    &format!(
-                        "{}/{}: not pushed yet, it names {} which has no local file and is \
-                         not deployed; it goes out on the cycle after that file exists",
-                        h.kind,
-                        h.slug,
-                        h.missing.join(", ")
-                    ),
-                );
-            }
+            held = change_list.hold_unresolved(ctx.lockfile);
         }
         // A rule this run pushes from its local file is repaired by that push.
         // Any other rule naming a dead label (one that arrived with a remote
@@ -4044,6 +4034,7 @@ pub async fn run(
                 &change_list,
                 &catalog.hooks,
                 &mut relink_items,
+                &mut held,
                 progress,
             )
             .await?;
@@ -4066,6 +4057,35 @@ pub async fn run(
                         failures.join("\n  - ")
                     );
                 }
+            }
+
+            outcome.items_pushed = outcome.items_pushed.saturating_sub(held.len());
+            let lines: Vec<String> = held
+                .iter()
+                .map(|h| {
+                    format!(
+                        "{}/{} names {}, which this env does not have: no local file, or its \
+                         create was skipped above",
+                        h.kind,
+                        h.slug,
+                        h.missing.join(", ")
+                    )
+                })
+                .collect();
+            if hold_unresolved {
+                for line in &lines {
+                    progress.event(
+                        Action::Warn,
+                        &format!("not pushed yet: {line}; it goes out on a later cycle"),
+                    );
+                }
+            } else if !lines.is_empty() {
+                anyhow::bail!(
+                    "{} object(s) were not pushed because they name an object this env does \
+                     not have:\n  - {}",
+                    lines.len(),
+                    lines.join("\n  - ")
+                );
             }
         }
     }

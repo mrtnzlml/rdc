@@ -124,6 +124,7 @@ pub(crate) async fn push_classified(
     changes: &scan::ChangeList,
     catalog_hooks: &[crate::model::Hook],
     relink: &mut Vec<relink::DeferredRelink>,
+    held: &mut Vec<scan::HeldBack>,
     progress: &Arc<Log>,
 ) -> Result<(usize, usize)> {
     // Aggregate (pushed, skipped) across every per-kind driver so the
@@ -158,6 +159,12 @@ pub(crate) async fn push_classified(
         engine_fields,
         organization,
     } = changes;
+    // What no driver has had yet. Each kind is `release`d from it just before
+    // its driver runs, which also holds back (into `held`) whatever names an
+    // object that is neither deployed nor still to come — including one an
+    // earlier driver skipped instead of creating.
+    let mut pending = changes.clone();
+    let workspaces = &pending.release("workspaces", workspaces, lockfile, held);
     if !workspaces.is_empty() {
         tally(workspaces::push(paths, client, lockfile, interactive, workspaces, progress, env).await
             .with_context(|| format!("pushing workspaces for env '{env}'"))?);
@@ -186,26 +193,32 @@ pub(crate) async fn push_classified(
     // `relink::undeferrable`, where `engines` protects only `url`), so it is
     // postponed to the relink pass exactly as a hook's `run_after` is. Engine
     // fields reference only their engine, which is why they stay behind it.
+    let engines = &pending.release("engines", engines, lockfile, held);
     if !engines.is_empty() {
         tally(engines::push(paths, client, lockfile, interactive, engines, relink, progress, env).await
             .with_context(|| format!("pushing engines for env '{env}'"))?);
     }
+    let engine_fields = &pending.release("engine_fields", engine_fields, lockfile, held);
     if !engine_fields.is_empty() {
         tally(engine_fields::push(paths, client, lockfile, interactive, engine_fields, progress, env).await
             .with_context(|| format!("pushing engine fields for env '{env}'"))?);
     }
+    let schemas = &pending.release("schemas", schemas, lockfile, held);
     if !schemas.is_empty() {
         tally(schemas::push(paths, client, lockfile, interactive, schemas, progress, env).await
             .with_context(|| format!("pushing schemas for env '{env}'"))?);
     }
+    let queues = &pending.release("queues", queues, lockfile, held);
     if !queues.is_empty() {
         tally(queues::push(paths, client, lockfile, interactive, queues, relink, progress, env).await
             .with_context(|| format!("pushing queues for env '{env}'"))?);
     }
+    let inboxes = &pending.release("inboxes", inboxes, lockfile, held);
     if !inboxes.is_empty() {
         tally(inboxes::push(paths, client, lockfile, interactive, inboxes, progress, env).await
             .with_context(|| format!("pushing inboxes for env '{env}'"))?);
     }
+    let email_templates = &pending.release("email_templates", email_templates, lockfile, held);
     if !email_templates.is_empty() {
         tally(email_templates::push(paths, client, lockfile, interactive, email_templates, progress, env).await
             .with_context(|| format!("pushing email templates for env '{env}'"))?);
@@ -215,6 +228,7 @@ pub(crate) async fn push_classified(
     // `secrets/<env>.hook-secrets.json` that aren't accompanied by a
     // hook JSON/code edit. The function returns (0, 0) when neither
     // content nor secrets have drifted.
+    let hooks = &pending.release("hooks", hooks, lockfile, held);
     tally(hooks::push(paths, client, lockfile, interactive, hooks, catalog_hooks, relink, progress, env)
         .await
         .with_context(|| format!("pushing hooks for env '{env}'"))?);
@@ -224,6 +238,7 @@ pub(crate) async fn push_classified(
     // organization), so creating them first lets the rule's label refs
     // resolve against the lockfile instead of failing with "Invalid
     // hyperlink - No URL match".
+    let labels = &pending.release("labels", labels, lockfile, held);
     if !labels.is_empty() {
         tally(labels::push(paths, client, lockfile, interactive, labels, progress, env).await
             .with_context(|| format!("pushing labels for env '{env}'"))?);
@@ -231,10 +246,12 @@ pub(crate) async fn push_classified(
     // A saved view's `queues_filter` can reference a queue, already pushed
     // above; unlike labels/rules it does not itself participate in another
     // kind's create-time ref resolution, so its ordering here is otherwise free.
+    let saved_views = &pending.release("saved_views", saved_views, lockfile, held);
     if !saved_views.is_empty() {
         tally(saved_views::push(paths, client, lockfile, interactive, saved_views, progress, env).await
             .with_context(|| format!("pushing saved views for env '{env}'"))?);
     }
+    let rules = &pending.release("rules", rules, lockfile, held);
     if !rules.is_empty() {
         tally(rules::push(paths, client, lockfile, interactive, rules, progress, env).await
             .with_context(|| format!("pushing rules for env '{env}'"))?);
