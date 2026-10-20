@@ -414,4 +414,35 @@ columns = [ { visible = true, column_type = "meta", width = 1.0, meta_name = "st
         let o: Overlay = toml::from_str("version = 1\n").unwrap();
         assert!(o.saved_views.is_empty());
     }
+
+    /// Every per-slug accessor reads its own kind's table, and only by slug.
+    #[test]
+    fn each_accessor_reads_its_own_kind() {
+        let kinds = [
+            "hooks", "rules", "labels", "schemas", "queues", "inboxes",
+            "email_templates", "engines", "engine_fields", "saved_views",
+        ];
+        let text: String = std::iter::once("version = 1\n".to_string())
+            .chain(kinds.iter().map(|k| format!("[{k}.s]\nkind = \"{k}\"\n")))
+            .collect();
+        let o: Overlay = toml::from_str(&text).unwrap();
+        type Accessor = for<'a> fn(&'a Overlay, &str) -> Option<&'a BTreeMap<String, Value>>;
+        let accessors: [(&str, Accessor); 10] = [
+            ("hooks", Overlay::hook),
+            ("rules", Overlay::rule),
+            ("labels", Overlay::label),
+            ("schemas", Overlay::schema),
+            ("queues", Overlay::queue),
+            ("inboxes", Overlay::inbox),
+            ("email_templates", Overlay::email_template),
+            ("engines", Overlay::engine),
+            ("engine_fields", Overlay::engine_field),
+            ("saved_views", Overlay::saved_view),
+        ];
+        for (kind, get) in accessors {
+            let expected = BTreeMap::from([("kind".to_string(), json!(kind))]);
+            assert_eq!(get(&o, "s"), Some(&expected), "{kind}");
+            assert_eq!(get(&o, "other"), None, "{kind}");
+        }
+    }
 }

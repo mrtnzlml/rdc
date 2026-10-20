@@ -1188,4 +1188,176 @@ prod = "invoices"
             "the promotion must target prod's existing slug"
         );
     }
+
+    /// A legacy entry is kept only when BOTH sides are `<engine>/<field>`.
+    #[test]
+    fn load_drops_half_scoped_engine_field_keys() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy.toml");
+        std::fs::write(&path, r#"
+version = 1
+
+[engine_fields]
+"my-engine/total" = "total"
+"amount" = "my-engine/amount"
+"#).unwrap();
+        assert!(Mapping::load(&path).unwrap().engine_fields.is_empty());
+    }
+
+    #[test]
+    fn kind_map_reads_the_field_of_every_kind() {
+        let one = |kind: &str| BTreeMap::from([(kind.to_string(), format!("{kind}-tgt"))]);
+        let m = Mapping {
+            version: 1,
+            workspaces: one("workspaces"),
+            hooks: one("hooks"),
+            rules: one("rules"),
+            labels: one("labels"),
+            schemas: one("schemas"),
+            queues: one("queues"),
+            inboxes: one("inboxes"),
+            email_templates: one("email_templates"),
+            engines: one("engines"),
+            engine_fields: one("engine_fields"),
+            saved_views: one("saved_views"),
+        };
+        for kind in [
+            "workspaces", "hooks", "rules", "labels", "schemas", "queues", "inboxes",
+            "email_templates", "engines", "engine_fields", "saved_views",
+        ] {
+            assert_eq!(m.lookup_tgt_slug(kind, kind), Some(format!("{kind}-tgt").as_str()), "{kind}");
+        }
+        assert!(m.kind_map("hook_templates").is_none());
+    }
+
+    /// Two rows built from unrelated edges, then one edge naming a node in
+    /// each: they become one row. Both orientations, because the merge
+    /// removes one row and must re-index the other.
+    #[test]
+    fn from_legacy_bridges_two_existing_rows() {
+        for bridge_from_the_later_row in [false, true] {
+            let mut dev_test = Mapping::default();
+            dev_test.hooks.insert("x".into(), "x-test".into());
+            let mut prod_stage = Mapping::default();
+            prod_stage.hooks.insert("z".into(), "z-stage".into());
+            let mut bridge = Mapping::default();
+            let bridge_envs = if bridge_from_the_later_row {
+                bridge.hooks.insert("z".into(), "x-test".into());
+                ("prod".to_string(), "test".to_string())
+            } else {
+                bridge.hooks.insert("x-test".into(), "z".into());
+                ("test".to_string(), "prod".to_string())
+            };
+            let g = GenericMapping::from_legacy(&[
+                ("dev".to_string(), "test".to_string(), dev_test),
+                ("prod".to_string(), "stage".to_string(), prod_stage),
+                (bridge_envs.0, bridge_envs.1, bridge),
+            ])
+            .unwrap();
+            assert_eq!(
+                g.hooks,
+                vec![BTreeMap::from([
+                    ("dev".to_string(), "x".to_string()),
+                    ("test".to_string(), "x-test".to_string()),
+                    ("prod".to_string(), "z".to_string()),
+                    ("stage".to_string(), "z-stage".to_string()),
+                ])],
+                "bridge_from_the_later_row = {bridge_from_the_later_row}"
+            );
+        }
+    }
+
+    /// `dev-to-test` and `test-to-dev` can state the same edge; the second
+    /// time both endpoints are already in one row.
+    #[test]
+    fn from_legacy_accepts_the_same_edge_from_both_directions() {
+        let mut dev_test = Mapping::default();
+        dev_test.hooks.insert("x".into(), "x-test".into());
+        let mut test_dev = Mapping::default();
+        test_dev.hooks.insert("x-test".into(), "x".into());
+        let g = GenericMapping::from_legacy(&[
+            ("dev".to_string(), "test".to_string(), dev_test),
+            ("test".to_string(), "dev".to_string(), test_dev),
+        ])
+        .unwrap();
+        assert_eq!(
+            g.hooks,
+            vec![BTreeMap::from([
+                ("dev".to_string(), "x".to_string()),
+                ("test".to_string(), "x-test".to_string()),
+            ])]
+        );
+    }
+
+    #[test]
+    fn split_off_comment_splits_at_the_first_unquoted_hash() {
+        assert_eq!(split_off_comment(r#"dev = "x"  # note"#), (r#"dev = "x"  "#, "# note"));
+        assert_eq!(split_off_comment("# only a comment"), ("", "# only a comment"));
+        assert_eq!(split_off_comment(r#"dev = "x""#), (r#"dev = "x""#, ""));
+        // A `#` inside either quote style is part of the value.
+        assert_eq!(split_off_comment(r#"dev = "a#b" # c"#), (r#"dev = "a#b" "#, "# c"));
+        assert_eq!(split_off_comment("dev = 'a#b' # c"), ("dev = 'a#b' ", "# c"));
+        // `\"` does not close a basic string...
+        assert_eq!(split_off_comment(r##"dev = "a\"#b" # c"##), (r##"dev = "a\"#b" "##, "# c"));
+        // ...but a literal string has no escapes: its `\` is just a character.
+        assert_eq!(split_off_comment(r"dev = 'a\' # c"), (r"dev = 'a\' ", "# c"));
+    }
+
+    #[test]
+    fn array_table_header_names_only_plain_kinds() {
+        assert_eq!(array_table_header("[[queues]]"), Some("queues"));
+        assert_eq!(array_table_header("  [[ queues ]]  # renamed in prod"), Some("queues"));
+        assert_eq!(array_table_header("[[]]"), None);
+        assert_eq!(array_table_header("[[a.b]]"), None);
+        assert_eq!(array_table_header("[[a[b]]"), None);
+        assert_eq!(array_table_header("[queues]"), None);
+        assert_eq!(array_table_header(r#"dev = "[[queues]]""#), None);
+    }
+
+    #[test]
+    fn key_and_value_span_finds_the_quoted_value() {
+        let kv = |key: &str, span: std::ops::Range<usize>, value: &str| {
+            Some((key.to_string(), span, value.to_string()))
+        };
+        assert_eq!(key_and_value_span(r#"dev = "x""#), kv("dev", 6..9, "x"));
+        // Spacing around `=` is free.
+        assert_eq!(key_and_value_span(r#"dev="x""#), kv("dev", 4..7, "x"));
+        assert_eq!(key_and_value_span(r#"dev= "x""#), kv("dev", 5..8, "x"));
+        assert_eq!(key_and_value_span(r#"dev =  "x""#), kv("dev", 7..10, "x"));
+        // A quoted key may hold `=`, and `\"` does not end a basic-string key.
+        assert_eq!(key_and_value_span(r#""a=b" = "x""#), kv("a=b", 8..11, "x"));
+        assert_eq!(key_and_value_span(r#"'a=b' = "x""#), kv("a=b", 8..11, "x"));
+        assert_eq!(key_and_value_span(r#""a\"=b" = "x""#), kv(r#"a\"=b"#, 10..13, "x"));
+        // Values: both quote styles; escapes only in a basic string.
+        assert_eq!(key_and_value_span("dev = 'x'"), kv("dev", 6..9, "x"));
+        assert_eq!(key_and_value_span(r#"dev = "a\"b""#), kv("dev", 6..12, r#"a\"b"#));
+        assert_eq!(key_and_value_span(r"dev = 'a\'"), kv("dev", 6..10, r"a\"));
+        // Not a quoted-string assignment.
+        assert_eq!(key_and_value_span("version = 1"), None);
+        assert_eq!(key_and_value_span("[[queues]]"), None);
+        assert_eq!(key_and_value_span(""), None);
+        assert_eq!(key_and_value_span(r#" = "x""#), None);
+        assert_eq!(key_and_value_span(r#"dev = "unterminated"#), None);
+    }
+
+    #[test]
+    fn append_row_separates_rows_with_exactly_one_blank_line() {
+        let cols = BTreeMap::from([("dev".to_string(), "a".to_string())]);
+        let expected = "version = 1\n\n[[labels]]\ndev = \"a\"\n";
+        assert_eq!(append_row("version = 1\n", "labels", &cols), expected);
+        assert_eq!(append_row("version = 1\n\n", "labels", &cols), expected);
+        assert_eq!(append_row("version = 1", "labels", &cols), expected);
+    }
+
+    #[test]
+    fn append_row_keeps_dash_and_underscore_env_names_bare_and_escapes_values() {
+        let cols = BTreeMap::from([
+            ("dev-eu".to_string(), r#"a"b\c"#.to_string()),
+            ("prod_us".to_string(), "x".to_string()),
+        ]);
+        let out = append_row("", "hooks", &cols);
+        assert_eq!(out, "version = 1\n\n[[hooks]]\ndev-eu = \"a\\\"b\\\\c\"\nprod_us = \"x\"\n");
+        let g: GenericMapping = toml::from_str(&out).unwrap();
+        assert_eq!(g.row_naming("hooks", "dev-eu", r#"a"b\c"#), Some(0));
+    }
 }

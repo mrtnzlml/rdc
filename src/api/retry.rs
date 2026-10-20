@@ -376,6 +376,46 @@ mod tests {
     }
 
     #[test]
+    fn retry_after_reads_integer_seconds_and_caps_them() {
+        let resp = |value: Option<&str>| {
+            let mut b = http::Response::builder().status(429);
+            if let Some(v) = value {
+                b = b.header("Retry-After", v);
+            }
+            Response::from(b.body("").unwrap())
+        };
+        assert_eq!(retry_after(&resp(Some("7"))), Some(Duration::from_secs(7)));
+        assert_eq!(retry_after(&resp(Some("3600"))), Some(Duration::from_secs(MAX_SLEEP_SECS)));
+        // Only the seconds form is read; anything else falls back to backoff.
+        assert_eq!(retry_after(&resp(Some("Wed, 21 Oct 2015 07:28:00 GMT"))), None);
+        assert_eq!(retry_after(&resp(None)), None);
+    }
+
+    /// The other half of the transport predicate: a failure that is not
+    /// connect-class is returned at once, from attempt 1, not retried.
+    #[tokio::test(start_paused = true)]
+    async fn a_non_connect_failure_is_returned_from_the_first_attempt() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let client = reqwest::Client::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let err = send_with_retry(
+            || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                client.get("not a url")
+            },
+            "probe",
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(format!("{err:#}").contains("probe (attempt 1)"), "{err:#}");
+    }
+
+    #[test]
     fn retriable_classification() {
         assert_eq!(retriable_reason(StatusCode::TOO_MANY_REQUESTS), Some("rate limited"));
         assert_eq!(retriable_reason(StatusCode::BAD_GATEWAY), Some("bad gateway"));

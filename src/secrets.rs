@@ -1061,6 +1061,113 @@ mod tests {
         );
     }
 
+    /// The skew window is inclusive: a token expiring exactly `skew` seconds
+    /// from now is already treated as expired.
+    #[test]
+    fn lookup_token_expiring_exactly_at_the_skew_is_expired() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("secrets")).unwrap();
+        std::fs::write(
+            dir.path().join("secrets/dev.secrets.json"),
+            format!(r#"{{"api_token":"edge","expires_at":{}}}"#, 1000 + TOKEN_EXPIRY_SKEW_SECS),
+        )
+        .unwrap();
+        let get_env = |k: &str| match k {
+            "RDC_USER_DEV" => Some("alice".to_string()),
+            "RDC_PASS_DEV" => Some("pw".to_string()),
+            _ => None,
+        };
+        let lookup = resolve_token_lookup_from_at(dir.path(), "dev", get_env, 1000).unwrap();
+        assert!(matches!(lookup, TokenLookup::NeedsLogin { .. }), "{lookup:?}");
+    }
+
+    /// Desktop password mode: credentials persisted in the secrets file
+    /// stand in for `RDC_USER_<ENV>` / `RDC_PASS_<ENV>`, but only when both
+    /// are non-empty.
+    #[test]
+    fn lookup_uses_persisted_credentials_only_when_both_are_set() {
+        let dir = TempDir::new().unwrap();
+        save_password_credentials(dir.path(), "dev", "alice", "pw").unwrap();
+        let lookup = resolve_token_lookup_from_at(dir.path(), "dev", |_| None, 1000).unwrap();
+        assert!(
+            matches!(lookup, TokenLookup::NeedsLogin { ref username, ref password } if username == "alice" && password == "pw"),
+            "{lookup:?}"
+        );
+        for (user, pass) in [("alice", ""), ("", "pw")] {
+            save_password_credentials(dir.path(), "dev", user, pass).unwrap();
+            let lookup = resolve_token_lookup_from_at(dir.path(), "dev", |_| None, 1000).unwrap();
+            assert!(matches!(lookup, TokenLookup::Missing { .. }), "({user:?}, {pass:?}): {lookup:?}");
+        }
+    }
+
+    #[test]
+    fn save_password_credentials_keeps_the_cached_token() {
+        let dir = TempDir::new().unwrap();
+        let token_path = write_secrets_file(dir.path(), "dev", "tok", Some(5)).unwrap();
+        let creds_path = save_password_credentials(dir.path(), "dev", "alice", "pw").unwrap();
+        let expected = dir.path().join("secrets").join("dev.secrets.json");
+        assert_eq!(token_path, expected);
+        assert_eq!(creds_path, expected);
+        let file = read_secrets_file(dir.path(), "dev").unwrap();
+        assert_eq!(file.api_token.as_deref(), Some("tok"));
+        assert_eq!(file.expires_at, Some(5));
+        assert_eq!(file.username.as_deref(), Some("alice"));
+        assert_eq!(file.password.as_deref(), Some("pw"));
+    }
+
+    #[test]
+    fn rename_hook_secret_moves_the_entry_and_keeps_the_rest() {
+        let dir = TempDir::new().unwrap();
+        let path = hook_secrets_path(dir.path(), "dev");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"//": "doc", "hooks": {"old": {"k": "v"}, "other": {"a": "b"}}}"#,
+        )
+        .unwrap();
+        assert!(rename_hook_secret(dir.path(), "dev", "old", "new").unwrap());
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            after,
+            serde_json::json!({"//": "doc", "hooks": {"new": {"k": "v"}, "other": {"a": "b"}}})
+        );
+        // Nothing left under `old`, so a second rename moves nothing.
+        assert!(!rename_hook_secret(dir.path(), "dev", "old", "newer").unwrap());
+    }
+
+    #[test]
+    fn rename_hook_secret_without_a_file_moves_nothing() {
+        let dir = TempDir::new().unwrap();
+        assert!(!rename_hook_secret(dir.path(), "dev", "old", "new").unwrap());
+        assert!(!hook_secrets_path(dir.path(), "dev").exists());
+    }
+
+    #[test]
+    fn rename_hook_secret_refuses_to_overwrite_the_new_slug() {
+        let dir = TempDir::new().unwrap();
+        let path = hook_secrets_path(dir.path(), "dev");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let before = r#"{"hooks": {"old": {"k": "1"}, "new": {"k": "2"}}}"#;
+        std::fs::write(&path, before).unwrap();
+        let err = rename_hook_secret(dir.path(), "dev", "old", "new").unwrap_err();
+        assert!(format!("{err:#}").contains("already holds secrets for hook 'new'"), "{err:#}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn force_relogin_refuses_incomplete_persisted_credentials() {
+        let tmp = tempfile::tempdir().unwrap();
+        save_password_credentials(tmp.path(), "dev", "alice", "").unwrap();
+        let err = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(force_relogin(tmp.path(), "dev", "https://acme.test/api/v1"))
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("credentials are incomplete"), "{err:#}");
+    }
+
     #[test]
     fn force_relogin_refuses_without_persisted_credentials() {
         let tmp = tempfile::tempdir().unwrap();

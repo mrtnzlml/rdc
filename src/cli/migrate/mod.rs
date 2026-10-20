@@ -3895,6 +3895,25 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
+    /// Each migratable kind dispatches to its own overlay table, so a target
+    /// env's overrides land on the right objects.
+    #[test]
+    fn overlay_slug_dispatches_every_kind_to_its_own_table() {
+        let kinds = [
+            "hooks", "rules", "labels", "schemas", "queues", "inboxes",
+            "email_templates", "engines", "engine_fields", "saved_views",
+        ];
+        let text: String = std::iter::once("version = 1\n".to_string())
+            .chain(kinds.iter().map(|k| format!("[{k}.s]\nkind = \"{k}\"\n")))
+            .collect();
+        let overlay: Overlay = toml::from_str(&text).unwrap();
+        for kind in kinds {
+            let got = overlay_slug(&overlay, kind, "s").unwrap_or_else(|| panic!("{kind}: no overlay"));
+            assert_eq!(got.get("kind"), Some(&serde_json::json!(kind)));
+        }
+        assert_eq!(overlay_slug(&overlay, "workspaces", "s"), None);
+    }
+
     /// Proves `run_at` takes its project root from the `cwd` PARAMETER, not
     /// `std::env::current_dir()` — the whole reason `run` (the CLI entry
     /// point) can call it without a `std::env::set_current_dir` dance. Builds
