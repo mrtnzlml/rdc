@@ -187,7 +187,8 @@ pub(crate) async fn validate_and_save_token(
 ///   token and computed expiry land in `secrets/<env>.secrets.json`.
 ///   Returns `Ok(())` silently — `with_401_retry` then retries the
 ///   failed operation once.
-/// - **TTY:** prompts for a new token via `inquire::Password`,
+/// - **TTY:** prompts for a new token via `inquire::Password` (or, under
+///   `--watch`, through the stdin coordinator — see `read_new_token`),
 ///   validates it, and saves it (same path as `rdc auth --token`).
 /// - **Non-TTY without creds:** actionable error naming the three
 ///   recovery options (env vars, `rdc auth`, TTY re-run).
@@ -236,21 +237,9 @@ pub async fn refresh_token_for_401(env: &str) -> Result<()> {
         &format!("token for env '{env}' rejected (401); refreshing"),
     );
 
-    use inquire::error::InquireError;
-    use inquire::{Password, PasswordDisplayMode};
-
     loop {
-        let new_token = match Password::new("New API token")
-            .with_display_mode(PasswordDisplayMode::Masked)
-            .without_confirmation()
-            .with_help_message("Ctrl+C to cancel")
-            .prompt()
-        {
-            Ok(s) => s,
-            Err(InquireError::OperationCanceled) | Err(InquireError::OperationInterrupted) => {
-                return Err(anyhow!("token refresh cancelled"));
-            }
-            Err(e) => return Err(anyhow!("token prompt failed: {e}")),
+        let Some(new_token) = read_new_token()? else {
+            return Err(anyhow!("token refresh cancelled"));
         };
         let trimmed = new_token.trim();
         if trimmed.is_empty() {
@@ -270,6 +259,71 @@ pub async fn refresh_token_for_401(env: &str) -> Result<()> {
                 continue;
             }
             Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Read one token for [`refresh_token_for_401`]. `Ok(None)` = cancelled.
+///
+/// Under `rdc sync --watch` the watch reader owns stdin (`cli::stdin_coord`),
+/// and inquire reading the terminal directly races it: the reader can take
+/// the whole pasted line, and the prompt never sees it (issue #2). So while
+/// the coordinator is active the token is read as a coordinated line, with
+/// terminal echo off. An empty line cancels there, because Ctrl-C does not
+/// interrupt a coordinated read.
+fn read_new_token() -> Result<Option<String>> {
+    if crate::cli::stdin_coord::is_active() {
+        eprint!("? New API token (input hidden; empty line cancels): ");
+        let _echo = EchoOff::new();
+        let line = crate::cli::stdin_coord::read_line_coordinated()?;
+        eprintln!();
+        return Ok(line.filter(|l| !l.trim().is_empty()));
+    }
+
+    use inquire::error::InquireError;
+    use inquire::{Password, PasswordDisplayMode};
+    match Password::new("New API token")
+        .with_display_mode(PasswordDisplayMode::Masked)
+        .without_confirmation()
+        .with_help_message("Ctrl+C to cancel")
+        .prompt()
+    {
+        Ok(s) => Ok(Some(s)),
+        Err(InquireError::OperationCanceled) | Err(InquireError::OperationInterrupted) => Ok(None),
+        Err(e) => Err(anyhow!("token prompt failed: {e}")),
+    }
+}
+
+/// Turns terminal echo off until dropped, so a token typed into a
+/// coordinated read does not appear on screen. Uses `stty` on the inherited
+/// stdin rather than termios, to keep `unsafe` out of the crate. A no-op
+/// where `stty` is missing or fails (Windows): the input is then visible.
+struct EchoOff(Option<String>);
+
+impl EchoOff {
+    fn new() -> Self {
+        use std::process::{Command, Stdio};
+        let saved = Command::new("stty")
+            .arg("-g")
+            .stdin(Stdio::inherit())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+        if saved.is_some() {
+            let _ = Command::new("stty").arg("-echo").stdin(Stdio::inherit()).status();
+        }
+        EchoOff(saved)
+    }
+}
+
+impl Drop for EchoOff {
+    fn drop(&mut self) {
+        if let Some(saved) = &self.0 {
+            let _ = std::process::Command::new("stty")
+                .arg(saved)
+                .stdin(std::process::Stdio::inherit())
+                .status();
         }
     }
 }

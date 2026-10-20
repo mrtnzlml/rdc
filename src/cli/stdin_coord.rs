@@ -179,6 +179,13 @@ pub fn activate() -> &'static StdinCoordinator {
     COORD.get_or_init(StdinCoordinator::new)
 }
 
+/// Whether the watch reader owns stdin. A prompt that would read the
+/// terminal itself (inquire) must go through [`read_line_coordinated`]
+/// instead while this is true, or it races the reader for the input.
+pub fn is_active() -> bool {
+    COORD.get().is_some()
+}
+
 impl StdinCoordinator {
     fn new() -> Self {
         Self {

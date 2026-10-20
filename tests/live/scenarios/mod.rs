@@ -22,3 +22,5 @@ pub mod saved_views;
 pub mod server_truth;
 pub mod settle;
 pub mod sidecars;
+#[cfg(unix)]
+pub mod watch_reauth;

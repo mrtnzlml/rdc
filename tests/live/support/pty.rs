@@ -147,6 +147,16 @@ impl PtySession {
         self.master.flush().unwrap();
     }
 
+    /// Kill rdc (for a `--watch` that never exits) and return the transcript.
+    pub fn kill(mut self) -> String {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(r) = self.reader.take() {
+            let _ = r.join();
+        }
+        self.transcript()
+    }
+
     /// Wait for rdc to exit and return its status and the full transcript.
     pub fn wait(mut self) -> (ExitStatus, String) {
         let deadline = Instant::now() + TIMEOUT;
