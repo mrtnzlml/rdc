@@ -89,6 +89,7 @@ pub async fn sync_logged(
         Some(renderer),
         Some(cwd),
         Some(token.to_string()),
+        false,
     )
     .await
 }

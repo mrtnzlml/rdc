@@ -3553,6 +3553,9 @@ fn find_engine_field_engine_slug(paths: &crate::paths::Paths, field_slug: &str) 
 /// `interactive` flows through to the conflict resolver and the push
 /// driver's drift prompt; on the pull side each per-kind driver consults
 /// `ctx.interactive` (set by the caller to the same value).
+///
+/// `hold_unresolved` keeps a change that names an unsatisfiable `rdc://` ref
+/// out of the push and warns about it (watch mode; see `sync::run_cycle`).
 pub async fn run(
     ctx: &mut PullCtx<'_>,
     catalog: &RemoteCatalog,
@@ -3563,6 +3566,7 @@ pub async fn run(
     interactive: bool,
     conflict_strategy: Option<ConflictStrategy>,
     settle: bool,
+    hold_unresolved: bool,
     progress: &Arc<Log>,
 ) -> Result<crate::cli::sync::CycleOutcome> {
     // A settle pass (see `sync::run_cycle`) only takes in what the server
@@ -3949,6 +3953,24 @@ pub async fn run(
             };
             if list.insert(slug, path).is_none() {
                 outcome.items_pushed += 1;
+            }
+        }
+        // Watch mode: an object naming something with neither a deployment nor
+        // a local file waits for a later cycle instead of failing this one.
+        if hold_unresolved {
+            let held = change_list.hold_unresolved(ctx.lockfile);
+            outcome.items_pushed = outcome.items_pushed.saturating_sub(held.len());
+            for h in held {
+                progress.event(
+                    Action::Warn,
+                    &format!(
+                        "{}/{}: not pushed yet, it names {} which has no local file and is \
+                         not deployed; it goes out on the cycle after that file exists",
+                        h.kind,
+                        h.slug,
+                        h.missing.join(", ")
+                    ),
+                );
             }
         }
         // A rule this run pushes from its local file is repaired by that push.

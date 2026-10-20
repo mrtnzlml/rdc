@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 
 /// Items needing PATCH, grouped by kind. Slug is the key; the value is the
 /// on-disk path so phase-2 drivers don't re-walk.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ChangeList {
     pub workspaces: BTreeMap<String, std::path::PathBuf>,
     pub hooks: BTreeMap<String, std::path::PathBuf>,
@@ -330,6 +330,94 @@ impl ChangeList {
         out
     }
 
+    /// Remove every object that names an `rdc://` ref this push cannot
+    /// satisfy, and return them with the refs they are waiting for.
+    ///
+    /// Watch mode only. Files written by hand land one at a time, so a watch
+    /// cycle can fire after a queue that names `rdc://schemas/<slug>` and
+    /// before the schema file exists. Pushed anyway, that queue is refused (a
+    /// required ref) or created without the link (a deferrable one, whose
+    /// relink then fails the cycle). Held back, it stays a local change and
+    /// goes out on a later cycle.
+    ///
+    /// A ref is satisfied when its object is deployed or in this list, and
+    /// the list shrinks as objects are held, so an object that names a held
+    /// object is held too. The file is stripped
+    /// with `strip_for_create` first: a ref in a server-filled field (a
+    /// queue's `hooks`, a schema's `queues`) never reaches the wire, and
+    /// neither does the object's own `url`. An unreadable or unparseable file
+    /// is kept: other checks report it.
+    pub fn hold_unresolved(&mut self, lockfile: &Lockfile) -> Vec<HeldBack> {
+        let mut held = Vec::new();
+        loop {
+            let mut newly = Vec::new();
+            for kind in PUSH_KINDS {
+                for (slug, path) in self.map(kind) {
+                    let Ok(bytes) = std::fs::read(path) else {
+                        continue;
+                    };
+                    let Ok(mut body) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                        continue;
+                    };
+                    crate::snapshot::create::strip_for_create(&mut body, kind);
+                    let missing: Vec<String> = crate::snapshot::refs::residual_rdc_refs(&body)
+                        .into_iter()
+                        .filter(|r| {
+                            crate::snapshot::refs::parse_rdc_ref(r).is_some_and(|(rk, rs)| {
+                                (rk, rs) != (kind, slug.as_str())
+                                    && !satisfies(lockfile, self, rk, rs)
+                            })
+                        })
+                        .collect();
+                    if !missing.is_empty() {
+                        newly.push(HeldBack { kind, slug: slug.clone(), missing });
+                    }
+                }
+            }
+            if newly.is_empty() {
+                return held;
+            }
+            for h in &newly {
+                self.map_mut(h.kind).remove(&h.slug);
+            }
+            held.extend(newly);
+        }
+    }
+
+    fn map(&self, kind: &str) -> &BTreeMap<String, std::path::PathBuf> {
+        match kind {
+            "workspaces" => &self.workspaces,
+            "hooks" => &self.hooks,
+            "rules" => &self.rules,
+            "labels" => &self.labels,
+            "saved_views" => &self.saved_views,
+            "queues" => &self.queues,
+            "schemas" => &self.schemas,
+            "inboxes" => &self.inboxes,
+            "email_templates" => &self.email_templates,
+            "engines" => &self.engines,
+            "engine_fields" => &self.engine_fields,
+            _ => unreachable!("not a ChangeList map: {kind}"),
+        }
+    }
+
+    fn map_mut(&mut self, kind: &str) -> &mut BTreeMap<String, std::path::PathBuf> {
+        match kind {
+            "workspaces" => &mut self.workspaces,
+            "hooks" => &mut self.hooks,
+            "rules" => &mut self.rules,
+            "labels" => &mut self.labels,
+            "saved_views" => &mut self.saved_views,
+            "queues" => &mut self.queues,
+            "schemas" => &mut self.schemas,
+            "inboxes" => &mut self.inboxes,
+            "email_templates" => &mut self.email_templates,
+            "engines" => &mut self.engines,
+            "engine_fields" => &mut self.engine_fields,
+            _ => unreachable!("not a ChangeList map: {kind}"),
+        }
+    }
+
     /// Structural problems in the organization's `settings` — the subtree push
     /// sends. See [`crate::snapshot::limits::check_organization_settings`] for
     /// why this is worth catching offline.
@@ -567,6 +655,32 @@ pub struct MissingCreateField {
     /// environment has neither deployed nor holds a local file for`). `None`
     /// when the key is plainly absent or null on disk.
     pub detail: Option<String>,
+}
+
+/// The per-slug maps of a [`ChangeList`]. The organization is not here: it is
+/// a singleton that names no other object.
+const PUSH_KINDS: [&str; 11] = [
+    "workspaces",
+    "hooks",
+    "rules",
+    "labels",
+    "saved_views",
+    "queues",
+    "schemas",
+    "inboxes",
+    "email_templates",
+    "engines",
+    "engine_fields",
+];
+
+/// One object [`ChangeList::hold_unresolved`] kept out of a push.
+#[derive(Debug, PartialEq)]
+pub struct HeldBack {
+    pub kind: &'static str,
+    pub slug: String,
+    /// The `rdc://` refs that name neither a deployed object nor one this
+    /// push writes, sorted.
+    pub missing: Vec<String>,
 }
 
 /// One unparseable changed local file, as reported by
@@ -2743,5 +2857,106 @@ mod tests {
         assert!(!cl.tracks("mdh"));
         assert!(!cl.contains("mdh", "anything"));
         assert!(!cl.tracks("workflows"));
+    }
+
+    fn json_file(dir: &std::path::Path, name: &str, body: serde_json::Value) -> std::path::PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, serde_json::to_vec(&body).unwrap()).unwrap();
+        p
+    }
+
+    fn tracked(kind: &str, slug: &str) -> Lockfile {
+        let mut lf = Lockfile::default();
+        lf.upsert(kind, slug, ObjectEntry {
+            id: 1,
+            modified_at: None,
+            modified_by: None,
+            content_hash: None,
+            secrets_hash: None,
+        });
+        lf
+    }
+
+    /// A rule naming a hook that names a missing queue: the hook is held for
+    /// the queue, and the rule for the hook, because a held hook is not pushed.
+    #[test]
+    fn hold_unresolved_holds_what_names_a_held_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cl = ChangeList::default();
+        cl.workspaces.insert(
+            "main".into(),
+            json_file(dir.path(), "ws.json", serde_json::json!({ "name": "Main" })),
+        );
+        cl.hooks.insert(
+            "notify".into(),
+            json_file(dir.path(), "hook.json", serde_json::json!({ "queues": ["rdc://queues/invoices"] })),
+        );
+        cl.rules.insert(
+            "check".into(),
+            json_file(dir.path(), "rule.json", serde_json::json!({ "hook": "rdc://hooks/notify" })),
+        );
+
+        let held = cl.hold_unresolved(&Lockfile::default());
+
+        assert_eq!(
+            held,
+            vec![
+                HeldBack { kind: "hooks", slug: "notify".into(), missing: vec!["rdc://queues/invoices".into()] },
+                HeldBack { kind: "rules", slug: "check".into(), missing: vec!["rdc://hooks/notify".into()] },
+            ]
+        );
+        assert!(cl.hooks.is_empty() && cl.rules.is_empty());
+        assert!(cl.workspaces.contains_key("main"), "an object naming nothing goes out");
+    }
+
+    /// A ref is satisfied by a deployed object or by one this push writes.
+    #[test]
+    fn hold_unresolved_keeps_refs_to_deployed_or_pushed_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cl = ChangeList::default();
+        cl.queues.insert("invoices".into(), queue_file(dir.path(), "rdc://schemas/invoices"));
+        cl.schemas.insert(
+            "invoices".into(),
+            json_file(dir.path(), "schema.json", serde_json::json!({ "name": "S" })),
+        );
+
+        assert!(cl.hold_unresolved(&tracked("workspaces", "main")).is_empty());
+        assert!(cl.queues.contains_key("invoices") && cl.schemas.contains_key("invoices"));
+    }
+
+    /// The object's own `url` and a server-filled back-ref (a queue's `hooks`)
+    /// never reach the wire, so neither holds the object.
+    #[test]
+    fn hold_unresolved_ignores_refs_that_are_stripped_before_sending() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cl = ChangeList::default();
+        cl.queues.insert(
+            "invoices".into(),
+            json_file(
+                dir.path(),
+                "queue.json",
+                serde_json::json!({
+                    "url": "rdc://queues/invoices",
+                    "schema": "rdc://schemas/invoices",
+                    "hooks": ["rdc://hooks/not-written-yet"],
+                }),
+            ),
+        );
+
+        assert!(cl.hold_unresolved(&tracked("schemas", "invoices")).is_empty());
+        assert!(cl.queues.contains_key("invoices"));
+    }
+
+    /// A file that does not parse is left for `json_parse_errors` to report.
+    #[test]
+    fn hold_unresolved_keeps_an_unparseable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("broken.json");
+        std::fs::write(&p, b"{\"queues\": [\"rdc://queues/x\"").unwrap();
+        let mut cl = ChangeList::default();
+        cl.hooks.insert("broken".into(), p);
+
+        assert!(cl.hold_unresolved(&Lockfile::default()).is_empty());
+        assert!(cl.hooks.contains_key("broken"));
     }
 }

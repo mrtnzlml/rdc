@@ -169,6 +169,7 @@ pub async fn run(
         None,
         None,
         None,
+        false,
     )
     .await
 }
@@ -188,6 +189,12 @@ pub async fn run(
 /// Every current caller — `cli::sync::run`, the `cli::sync::watch` loop,
 /// and `cli::sync::embed::sync_logged` — acquires it before invoking. New
 /// callers must do the same.
+///
+/// `hold_unresolved` is the watch loop's: a local change that names an
+/// `rdc://` ref nothing satisfies is left out of this cycle's push (see
+/// [`crate::cli::push::scan::ChangeList::hold_unresolved`]) instead of failing
+/// it. A one-shot sync passes `false` and refuses such a change.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_cycle(
     env: &str,
     interactive: bool,
@@ -199,6 +206,7 @@ pub(crate) async fn run_cycle(
     renderer: Option<Arc<Log>>,
     cwd_override: Option<&std::path::Path>,
     token_override: Option<String>,
+    hold_unresolved: bool,
 ) -> Result<CycleOutcome> {
     if no_push && no_pull {
         anyhow::bail!(
@@ -274,13 +282,26 @@ pub(crate) async fn run_cycle(
         progress.event(Action::Info, &format!("email_templates/{old} moved to {new}"));
     }
     let (_scanned, changes, tombstones) = crate::cli::push::scan::scan(&paths, &lockfile)?;
-    let parse_errors = changes.json_parse_errors();
-    let limit_violations = changes.field_limit_violations();
-    let missing_create_fields = changes.missing_create_fields(&lockfile);
-    let settings_problems = changes.organization_settings_problems();
-    let unshared_views = changes.unshared_saved_views();
-    let engine_conflicts = changes.queue_engine_conflicts();
-    let missing_formulas = changes.schemas_missing_formulas();
+    // The checks below judge what the push will send. In watch mode that
+    // excludes what `hold_unresolved` will keep back (the executor holds the
+    // same objects and reports them), so a queue waiting for its schema file
+    // is not refused as a queue without a schema.
+    let held_changes;
+    let changes_to_check = if hold_unresolved && !no_push {
+        let mut c = changes.clone();
+        c.hold_unresolved(&lockfile);
+        held_changes = c;
+        &held_changes
+    } else {
+        &changes
+    };
+    let parse_errors = changes_to_check.json_parse_errors();
+    let limit_violations = changes_to_check.field_limit_violations();
+    let missing_create_fields = changes_to_check.missing_create_fields(&lockfile);
+    let settings_problems = changes_to_check.organization_settings_problems();
+    let unshared_views = changes_to_check.unshared_saved_views();
+    let engine_conflicts = changes_to_check.queue_engine_conflicts();
+    let missing_formulas = changes_to_check.schemas_missing_formulas();
 
     // `--no-push` is an audit mode: there is nothing to half-apply, so it
     // proceeds and merely reports. `--dry-run` proceeds too — its job is
@@ -764,6 +785,7 @@ pub(crate) async fn run_cycle(
             interactive,
             conflict_strategy,
             false,
+            hold_unresolved,
             &progress,
         )
         .await
@@ -920,6 +942,7 @@ async fn settle_pass(
         interactive,
         None,
         true,
+        false,
         progress,
     )
     .await

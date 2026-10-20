@@ -335,6 +335,7 @@ pub(crate) async fn run_watch_with(
             Some(renderer.clone()),
             cfg.cwd,
             cfg.token.clone(),
+            true, // hold_unresolved: see `run_cycle`
         )
         .await?;
     }
@@ -538,7 +539,7 @@ pub(crate) async fn event_loop(
                 }
                 let _outcome = match crate::cli::sync::run_cycle(
                     cfg.env, cfg.interactive, false, cfg.allow_deletes, cfg.no_push, cfg.no_pull,
-                    None, renderer.clone(), cfg.cwd, cfg.token.clone(),
+                    None, renderer.clone(), cfg.cwd, cfg.token.clone(), true,
                 ).await {
                     Ok(o) => o,
                     Err(e) if crate::api::anyhow_has_status(&e, 401) => {
@@ -555,7 +556,7 @@ pub(crate) async fn event_loop(
                         let token = fresh.or_else(|| cfg.token.clone());
                         crate::cli::sync::run_cycle(
                             cfg.env, cfg.interactive, false, cfg.allow_deletes, cfg.no_push, cfg.no_pull,
-                            None, renderer.clone(), cfg.cwd, token,
+                            None, renderer.clone(), cfg.cwd, token, true,
                         ).await?
                     }
                     Err(e) if is_transient_network_error(&e) => {
