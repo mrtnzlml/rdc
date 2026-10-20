@@ -150,7 +150,7 @@ jobs:
         # timeouts. Raise MIN_SCORE when tests raise the score; never lower it
         # to make a run pass -- cover the new code instead.
         env:
-          MIN_SCORE: "62.2"
+          MIN_SCORE: "63.9"
         run: |
           shards=$(( $(find shards -mindepth 1 -maxdepth 1 -type d | wc -l) ))
           if [ "$shards" -ne 32 ]; then
