@@ -1,4 +1,4 @@
-//! `rdc auth <env> [--token <value> | --username <user>]` — set or refresh
+//! `rdc auth <env> [--token <value> | --username <user> | --browser]` — set or refresh
 //! an env's API token (per spec §6).
 //!
 //! The new token is validated by `GET /organizations/{org_id}` before being
@@ -10,6 +10,8 @@
 //! - `--username <user>` — reads password from stdin (or prompts via
 //!   `inquire::Password` on TTY), calls `POST /v1/auth/login`, caches the
 //!   issued token + computed expiry (162h from now).
+//! - `--browser` — take the token in a one-time local web form (see
+//!   [`crate::cli::auth_browser`]); for callers with no terminal.
 //! - Neither — read a token from stdin (e.g. `read -s T && echo $T | rdc auth dev`).
 
 use crate::api::{anyhow_has_status, RossumClient};
@@ -25,6 +27,7 @@ pub async fn run(
     env: &str,
     token_arg: Option<String>,
     username_arg: Option<String>,
+    browser: bool,
 ) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let cfg_path = cwd.join("rdc.toml");
@@ -33,6 +36,15 @@ pub async fn run(
     let paths = Paths::for_env(&cwd, env);
 
     let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode());
+
+    if browser {
+        let org_name = crate::cli::auth_browser::run(env_cfg, &cwd, env).await?;
+        log.event(
+            Action::Auth,
+            &format!("saved token to {} (org '{}')", paths.secrets_file().display(), org_name),
+        );
+        return Ok(());
+    }
 
     if let Some(username) = username_arg {
         // --username flow: read password, exchange for a token via
@@ -72,7 +84,8 @@ pub async fn run(
             if trimmed.is_empty() {
                 return Err(anyhow!(
                     "no token provided; pass `--token <value>`, pipe a token via stdin, \
-                     or use `--username <U>` to log in with credentials"
+                     use `--username <U>` to log in with credentials, \
+                     or use `--browser` to enter the token in a local web form"
                 ));
             }
             trimmed

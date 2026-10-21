@@ -496,6 +496,11 @@ pub enum Command {
         /// exchanges the pair at POST /v1/auth/login.
         #[arg(long, conflicts_with = "token")]
         username: Option<String>,
+        /// Enter the token in a one-time form on 127.0.0.1, opened in the
+        /// browser. Keeps the token out of argv, stdin and the output, so it
+        /// works from a caller with no terminal, such as Claude Code's `!`.
+        #[arg(long, conflicts_with_all = ["token", "username"])]
+        browser: bool,
     },
     /// Diagnose and repair the local snapshot for `<env>` in one offline pass.
     #[command(long_about = DOCTOR_LONG_ABOUT)]
@@ -622,9 +627,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 crate::cli::migrate::Carry::from_groups(&carry),
             )
         }
-        Some(Command::Auth { env, token, username }) => {
+        Some(Command::Auth { env, token, username, browser }) => {
             let env = crate::cli::env_picker::pick_env("Set the token for which environment?", "rdc auth <env>", env)?;
-            crate::cli::auth::run(&env, token, username).await
+            crate::cli::auth::run(&env, token, username, browser).await
         }
         Some(Command::Doctor { env, dry_run }) => {
             let env = crate::cli::env_picker::pick_env("Run the doctor on which environment?", "rdc doctor <env>", env)?;
@@ -696,6 +701,7 @@ fn parse_duration(s: &str) -> anyhow::Result<std::time::Duration> {
 }
 
 pub mod auth;
+pub mod auth_browser;
 pub mod change_view;
 pub mod deploy;
 pub mod gitlab_ci;

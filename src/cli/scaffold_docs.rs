@@ -71,7 +71,11 @@ fn render_envs(envs: &BTreeMap<String, EnvConfig>) -> String {
          `RDC_USER_<suffix>` + `RDC_PASS_<suffix>` when rdc should exchange a login \
          for a token itself. A validated token is cached in \
          `secrets/<env>.secrets.json`, and hook secret values live in \
-         `secrets/<env>.hook-secrets.json` — both gitignored.",
+         `secrets/<env>.hook-secrets.json` — both gitignored. When an env has no \
+         valid token, ask the user to run `! rdc auth <env> --browser`: it takes \
+         the token in a local browser form, so the token never enters the \
+         conversation. Never ask for a token in the chat or put one on a \
+         command line.",
     );
     out.trim_end().to_string()
 }

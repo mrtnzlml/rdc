@@ -24,6 +24,7 @@ clap_complete = { version = "4", features = ["unstable-dynamic"] }
 deunicode = "1"
 flate2 = "1"
 fs4 = "1"
+getrandom = "0.4"
 futures = { version = "0.3", default-features = false, features = ["alloc"] }
 indexmap = { version = "2", features = ["serde"] }
 inquire = { version = "0.9", default-features = false, features = ["crossterm"] }

@@ -632,6 +632,12 @@ rdc auth test --username alice@example.com
 # password is prompted on TTY (masked)
 ```
 
+```sh
+rdc auth test --browser
+```
+
+`--browser` opens a one-time form on `127.0.0.1` and waits up to 5 minutes for the token. Use it where there is no terminal to type into, such as a `!` command in Claude Code: the token goes from the browser to `secrets/test.secrets.json` and never appears in the command line, the output or the conversation. A `!` command that runs longer than 120 s moves to the background but keeps waiting.
+
 ## Live integration testing
 
 A high-fidelity, opt-in suite drives the real `rdc` binary against a real
