@@ -177,12 +177,17 @@ fn percent_decode(s: &str) -> String {
 }
 
 fn respond(stream: &mut TcpStream, status: &str, body: &str) {
+    // A fresh nonce per response lets the page's one `<script>` run and
+    // nothing else.
+    let nonce = random_hex().unwrap_or_default();
+    let body = body.replace(NONCE, &nonce);
     let _ = write!(
         stream,
         "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\n\
          Cache-Control: no-store\r\nReferrer-Policy: no-referrer\r\n\
          Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; \
-         script-src-attr 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+         script-src 'nonce-{nonce}'; script-src-attr 'unsafe-inline'; connect-src 'self'; \
+         form-action 'self'; frame-ancestors 'none'\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
 }
@@ -235,12 +240,33 @@ input:focus-visible,button:focus-visible{outline:3px solid var(--signal);outline
 code{font:.875em ui-monospace,"SF Mono",Menlo,Consolas,monospace}
 "#;
 
+const NONCE: &str = "__RDC_NONCE__";
+
+/// Submits the form with `fetch()` and swaps the answer in place, so the tab
+/// keeps a single history entry. Browsers let a script close only such a tab,
+/// so after a save it closes itself. Without script the form posts normally
+/// and the page still says the tab can be closed.
+const SCRIPT: &str = r#"
+document.addEventListener('submit',async e=>{
+const f=e.target;e.preventDefault();f.querySelector('.save').disabled=true;
+let html;
+try{const r=await fetch(location.pathname,{method:'POST',body:new URLSearchParams(new FormData(f))});html=await r.text()}
+catch(_){f.submit();return}
+const main=new DOMParser().parseFromString(html,'text/html').querySelector('main');
+document.querySelector('main').replaceWith(document.adoptNode(main));
+if(main.classList.contains('saved')){
+main.querySelector('.status').lastChild.textContent='Token saved. This tab closes in 3 seconds.';
+setTimeout(()=>{window.close();main.querySelector('.status').lastChild.textContent='Token saved. You can close this tab.'},3000);
+}else{const t=document.getElementById('token');if(t)t.focus()}
+});
+"#;
+
 fn page(env: &str, class: &str, body: &str) -> String {
     format!(
         "<!doctype html><html lang=en><meta charset=utf-8>\
          <meta name=viewport content='width=device-width,initial-scale=1'>\
          <title>rdc auth {env}</title><style>{STYLE}</style>\
-         <main class={class}>{body}</main></html>",
+         <main class={class}>{body}</main><script nonce={NONCE}>{SCRIPT}</script></html>",
         env = escape(env),
     )
 }

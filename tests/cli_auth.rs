@@ -221,6 +221,7 @@ async fn auth_browser_takes_the_token_through_the_local_form() {
     assert_eq!(http.get(format!("{base}/wrong")).send().await.unwrap().status(), 404);
     let form = http.get(&url).send().await.unwrap().text().await.unwrap();
     assert!(form.contains("rdc auth dev") && form.contains("name=token"));
+    assert!(form.contains("<script nonce=") && !form.contains("__RDC_NONCE__"), "{form}");
 
     let retry = http.post(&url).header("Content-Type", "application/x-www-form-urlencoded").body("token=BAD_TOKEN").send().await.unwrap();
     assert!(retry.text().await.unwrap().contains("Rossum rejected this token"));
