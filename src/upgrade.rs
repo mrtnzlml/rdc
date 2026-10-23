@@ -322,13 +322,6 @@ fn cache_path() -> Option<PathBuf> {
     Some(base.join("rdc").join("update.json"))
 }
 
-fn now_unix_seconds() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 fn load_cache() -> Option<UpdateCache> {
     let path = cache_path()?;
     let raw = std::fs::read_to_string(&path).ok()?;
@@ -372,7 +365,7 @@ pub fn cached_upgrade_available() -> Option<Version> {
 pub async fn refresh_cache_if_stale() {
     let existing = load_cache();
     let stale = match &existing {
-        Some(c) => now_unix_seconds().saturating_sub(c.checked_at) >= CACHE_TTL.as_secs(),
+        Some(c) => crate::secrets::now_unix_secs().saturating_sub(c.checked_at) >= CACHE_TTL.as_secs(),
         None => true,
     };
     if !stale {
@@ -384,7 +377,7 @@ pub async fn refresh_cache_if_stale() {
         .or_else(|| existing.as_ref().map(|c| c.latest.clone()))
         .unwrap_or_default();
     save_cache(&UpdateCache {
-        checked_at: now_unix_seconds(),
+        checked_at: crate::secrets::now_unix_secs(),
         latest,
     });
 }
@@ -423,7 +416,7 @@ pub async fn run_upgrade(target: Option<Version>, check_only: bool) -> Result<()
         println!("rdc v{current_v} is already the latest");
         // Refresh the cache so the nudge stops appearing next time.
         save_cache(&UpdateCache {
-            checked_at: now_unix_seconds(),
+            checked_at: crate::secrets::now_unix_secs(),
             latest: latest.to_string(),
         });
         return Ok(());
@@ -673,7 +666,7 @@ pub async fn run_upgrade(target: Option<Version>, check_only: bool) -> Result<()
     // Refresh the nudge cache so we don't keep telling the user about
     // the upgrade they just did.
     save_cache(&UpdateCache {
-        checked_at: now_unix_seconds(),
+        checked_at: crate::secrets::now_unix_secs(),
         latest: latest.to_string(),
     });
 

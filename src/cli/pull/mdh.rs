@@ -269,11 +269,7 @@ pub(crate) fn plan_mdh(
                 continue;
             };
             let local_hash = crate::state::raw_content_hash(&bytes);
-            let base = lockfile
-                .objects
-                .get("mdh_data")
-                .and_then(|m| m.get(slug))
-                .and_then(|e| e.content_hash.clone());
+            let base = lockfile.base_hash("mdh_data", slug);
             if base.as_deref() != Some(local_hash.as_str()) {
                 items.push(MdhPlanItem {
                     dir: MdhPlanDir::Push,
@@ -453,11 +449,7 @@ pub(crate) async fn plan_mdh_index_edits(
             continue;
         };
         let proposed = proposed_index_bytes(set)?;
-        let base = lockfile
-            .objects
-            .get("mdh_indexes")
-            .and_then(|m| m.get(slug))
-            .and_then(|e| e.content_hash.clone());
+        let base = lockfile.base_hash("mdh_indexes", slug);
         if let Some(item) = index_edit_item(slug, &ix_path, base.as_deref(), &proposed)? {
             items.push(item);
         }
@@ -476,11 +468,7 @@ pub(crate) async fn plan_mdh_index_edits(
             if data_path.is_file() {
                 let rows = listed.client.find_all(name, Some(progress.clone())).await?;
                 let proposed = crate::snapshot::mdh_data::to_jsonl(&rows)?;
-                let base = lockfile
-                    .objects
-                    .get("mdh_data")
-                    .and_then(|m| m.get(slug))
-                    .and_then(|e| e.content_hash.clone());
+                let base = lockfile.base_hash("mdh_data", slug);
                 // `HashMode::Raw`: same reasoning as the pull driver at
                 // `apply_dataset_rows` — the bytes ARE the artifact, so
                 // hashing must be verbatim, never through the canonical
@@ -762,12 +750,7 @@ pub(crate) async fn apply_dataset_rows(
 
     let proposed = to_jsonl(&rows)?;
     let data_path = ctx.paths.dataset_data(slug);
-    let base = ctx
-        .lockfile
-        .objects
-        .get("mdh_data")
-        .and_then(|m| m.get(slug))
-        .and_then(|e| e.content_hash.clone());
+    let base = ctx.lockfile.base_hash("mdh_data", slug);
     // `HashMode::Raw`: the bytes ARE the artifact (customer row data, not a
     // Rossum object) — see `HashMode` for why the canonical hash and the
     // format-migration nudge both misfire on JSONL.
@@ -1107,12 +1090,7 @@ pub async fn process(
             // Serialize to the exact on-disk bytes a pull would write.
             let ix_proposed = proposed_index_bytes(index_set)?;
 
-            let ix_base = ctx
-                .lockfile
-                .objects
-                .get("mdh_indexes")
-                .and_then(|m| m.get(slug))
-                .and_then(|e| e.content_hash.clone());
+            let ix_base = ctx.lockfile.base_hash("mdh_indexes", slug);
             let (i_action, i_remote_hash) =
                 decide_pull_action(&ix_path, ix_base.as_deref(), &ix_proposed)?;
             if i_action == PullAction::Conflict {

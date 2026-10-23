@@ -1,3 +1,4 @@
+use super::drift_base;
 use crate::api::RossumClient;
 use crate::log::{Action, Log};
 use crate::paths::Paths;
@@ -598,9 +599,7 @@ async fn push_update_batch(
                         pushed += 1;
                     }
                     Err(e) => {
-                        if first_error.is_none() {
-                            first_error = Some(e);
-                        }
+                        first_error.get_or_insert(e);
                     }
                 }
             }
@@ -634,16 +633,12 @@ async fn push_update_batch(
                         skipped += s;
                     }
                     Err(e) => {
-                        if first_error.is_none() {
-                            first_error = Some(e);
-                        }
+                        first_error.get_or_insert(e);
                     }
                 }
             }
             Err(e) => {
-                if first_error.is_none() {
-                    first_error = Some(e);
-                }
+                first_error.get_or_insert(e);
             }
         }
     }
@@ -673,25 +668,6 @@ struct HookPatched {
     /// has no secrets, which is itself meaningful ("no secrets", as opposed to
     /// `None`'s "never tried to sync secrets").
     secrets_hash: Option<String>,
-}
-
-/// Whether this entry can reach the drift check at all — and, if so, the base
-/// the remote is checked against.
-///
-/// A hook entry carries TWO hashes and only `content_hash` gates this check.
-/// `secrets_hash` tracks the separate `secrets/<env>.hook-secrets.json` file
-/// and is what the secrets-only pass at the bottom of [`push`] compares; it
-/// says nothing about whether the hook's snapshot bytes drifted remotely, and
-/// the old sequential loop's guard (`let Some(base) = &entry.content_hash`)
-/// never consulted it.
-///
-/// The hoisted list fetch and the per-item guard inside the concurrent stage
-/// MUST agree on this predicate. If the hoist guard were ever narrower than the
-/// per-item one, an item would consult an empty list and silently take the
-/// "remote id missing" skip instead of a real drift check — no error, just
-/// wrong. One expression, called from both, so they cannot drift apart.
-fn drift_base(entry: &ObjectEntry) -> Option<&str> {
-    entry.content_hash.as_deref()
 }
 
 /// Build the PATCH body for one hook and send it.

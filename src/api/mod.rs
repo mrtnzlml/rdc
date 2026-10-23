@@ -5,6 +5,7 @@ pub mod retry;
 
 pub use data_storage::DataStorageClient;
 pub use error::{anyhow_has_status, ApiError};
+use error::ensure_success;
 pub use rate_limit::RateLimiter;
 
 use crate::model::{
@@ -456,11 +457,7 @@ impl RossumClient {
             self.limiter.as_ref(),
         ).await?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status { status: status.as_u16(), body }.into());
-        }
+        let resp = ensure_success(resp).await?;
         resp.json::<T>().await
             .with_context(|| format!("decoding response from {url}"))
     }
@@ -502,11 +499,7 @@ impl RossumClient {
             progress,
             self.limiter.as_ref(),
         ).await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status { status: status.as_u16(), body }.into());
-        }
+        let resp = ensure_success(resp).await?;
         resp.json::<TResp>().await
             .with_context(|| format!("decoding PATCH response from {url}"))
     }
@@ -532,11 +525,7 @@ impl RossumClient {
             progress,
             self.limiter.as_ref(),
         ).await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status { status: status.as_u16(), body }.into());
-        }
+        let resp = ensure_success(resp).await?;
         resp.json::<TResp>().await
             .with_context(|| format!("decoding POST response from {url}"))
     }
@@ -568,15 +557,7 @@ pub async fn login(api_base: &str, username: &str, password: &str) -> Result<Str
         None, // no rate limiter — login is rare
     )
     .await?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body_text = resp.text().await.unwrap_or_default();
-        return Err(ApiError::Status {
-            status: status.as_u16(),
-            body: body_text,
-        }
-        .into());
-    }
+    let resp = ensure_success(resp).await?;
     #[derive(Deserialize)]
     struct LoginResponse {
         key: String,

@@ -14,22 +14,14 @@ use serde_json::Value;
 
 use crate::overlay::Overlay;
 use crate::paths::Paths;
-use crate::snapshot::codec::{DiskArtifact, KindCodec};
+use crate::snapshot::codec::{DiskArtifact, KindCodec, plain_json_artifact};
 use crate::snapshot::create::strip_for_cross_env_patch;
-use crate::snapshot::key_order::strip_hidden_fields;
 
 pub struct Inboxes;
 
 impl KindCodec for Inboxes {
     fn disk_bytes(&self, value: &Value) -> anyhow::Result<DiskArtifact> {
-        let mut v = value.clone();
-        strip_hidden_fields(&mut v);
-        let mut json = serde_json::to_vec_pretty(&v)?;
-        json.push(b'\n');
-        Ok(DiskArtifact {
-            json,
-            sidecars: vec![],
-        })
+        plain_json_artifact(value.clone())
     }
 
     fn cross_env_body(&self, body: &mut Value) {

@@ -280,6 +280,13 @@ fn resolve_token_lookup_from<F: Fn(&str) -> Option<String>>(
     resolve_token_lookup_from_at(project_root, env, get_env, now_unix_secs())
 }
 
+/// Persist a token obtained by logging in, expiring
+/// `LOGIN_TOKEN_LIFETIME_SECS` from now.
+pub(crate) fn write_login_token(project_root: &Path, env: &str, token: &str) -> Result<PathBuf> {
+    let expires_at = now_unix_secs().saturating_add(LOGIN_TOKEN_LIFETIME_SECS);
+    write_secrets_file(project_root, env, token, Some(expires_at))
+}
+
 pub(crate) fn now_unix_secs() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -313,8 +320,7 @@ pub async fn resolve_token(project_root: &Path, env: &str, api_base: &str) -> Re
                         env_var_for(env, "PASS"),
                     )
                 })?;
-            let expires_at = now_unix_secs().saturating_add(LOGIN_TOKEN_LIFETIME_SECS);
-            write_secrets_file(project_root, env, &token, Some(expires_at))?;
+            write_login_token(project_root, env, &token)?;
             Ok(token)
         }
         TokenLookup::Missing { message } => Err(anyhow!(message)),
@@ -352,8 +358,7 @@ pub async fn force_relogin(project_root: &Path, env: &str, api_base: &str) -> Re
     let token = crate::api::login(api_base, username, password)
         .await
         .with_context(|| format!("re-signing in to env '{env}' after a 401"))?;
-    let expires_at = now_unix_secs().saturating_add(LOGIN_TOKEN_LIFETIME_SECS);
-    write_secrets_file(project_root, env, &token, Some(expires_at))?;
+    write_login_token(project_root, env, &token)?;
     Ok(token)
 }
 

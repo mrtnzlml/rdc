@@ -127,12 +127,7 @@ pub async fn process(
             let remote_combined_hash =
                 crate::state::hook_combined_hash(&proposed_json, &proposed_code, ctx.lockfile);
 
-            let base_hash = ctx
-                .lockfile
-                .objects
-                .get(KIND)
-                .and_then(|m| m.get(&slug))
-                .and_then(|e| e.content_hash.clone());
+            let base_hash = ctx.lockfile.base_hash(KIND, &slug);
             // Use codec-compatible combined_hash for local disk bytes so the
             // three-way merge works correctly after the one-time rehash.
             let local_combined = pre_local_json
@@ -207,8 +202,7 @@ pub async fn process(
                     // shaped — it's a Write/Delete decision the resolver
                     // doesn't model in v1.
                     let local_json = pre_local_json.as_ref().unwrap();
-                    let symmetric = matches!((&pre_local_code, &proposed_code), (Some(_), Some(_)))
-                        || matches!((&pre_local_code, &proposed_code), (None, None));
+                    let symmetric = pre_local_code.is_some() == proposed_code.is_some();
                     let total = if symmetric && pre_local_code.is_some() {
                         2
                     } else {

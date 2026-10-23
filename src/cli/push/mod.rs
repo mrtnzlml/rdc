@@ -27,6 +27,38 @@ pub mod scan;
 mod schemas;
 mod workspaces;
 
+/// Whether this entry can reach the drift check at all — and, if so, the base
+/// the remote is checked against.
+///
+/// Each driver's hoisted list fetch (or schema prefetch) and its per-item guard
+/// inside the concurrent stage MUST agree on this predicate. If the hoist guard
+/// were ever narrower than the per-item one, an item would consult an empty
+/// list and silently take the "remote id missing" skip instead of a real drift
+/// check — no error, just wrong. One expression, called from both, so they
+/// cannot drift apart.
+fn drift_base(entry: &crate::state::ObjectEntry) -> Option<&str> {
+    entry.content_hash.as_deref()
+}
+
+/// The canonical on-disk artifact for a remote object of a codec `kind`, as the
+/// drift check, the drift prompt and the write-back need it. One function so
+/// the bytes the concurrent stage hashes and the bytes the prompt shows are the
+/// same bytes, and the same KindCodec path the pull driver uses, so the hash
+/// matches the lockfile baseline. `noun` only names the object in errors.
+fn remote_artifact(
+    kind: &str,
+    remote: &impl serde::Serialize,
+    noun: &str,
+) -> Result<crate::snapshot::codec::DiskArtifact> {
+    let codec = crate::snapshot::codec::codec(kind).unwrap();
+    codec
+        .disk_bytes(
+            &serde_json::to_value(remote)
+                .with_context(|| format!("serializing remote {noun} for drift check"))?,
+        )
+        .with_context(|| format!("codec disk_bytes for remote {noun}"))
+}
+
 /// Top-level fields a PATCH asked to change that the server kept at their old
 /// value: `sent` differs from `before`, and `after` (the re-fetched body)
 /// still equals `before`. A 200 does not prove a field was applied, and the

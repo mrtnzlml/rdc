@@ -21,8 +21,7 @@ use serde_json::Value;
 use crate::model::IndexSet;
 use crate::overlay::Overlay;
 use crate::paths::Paths;
-use crate::snapshot::codec::{DiskArtifact, KindCodec};
-use crate::snapshot::key_order::strip_hidden_fields;
+use crate::snapshot::codec::{DiskArtifact, KindCodec, plain_json_artifact};
 
 pub struct Mdh;
 
@@ -39,15 +38,9 @@ impl KindCodec for Mdh {
         let set: IndexSet = serde_json::from_value(value.clone())
             .map_err(|e| anyhow::anyhow!("deserializing MDH index set: {e}"))?;
         let trimmed = strip_server_managed(&set);
-        let mut v = serde_json::to_value(&trimmed)
+        let v = serde_json::to_value(&trimmed)
             .map_err(|e| anyhow::anyhow!("re-encoding trimmed MDH index set: {e}"))?;
-        strip_hidden_fields(&mut v);
-        let mut json = serde_json::to_vec_pretty(&v)?;
-        json.push(b'\n');
-        Ok(DiskArtifact {
-            json,
-            sidecars: vec![],
-        })
+        plain_json_artifact(v)
     }
 
     fn cross_env_body(&self, _body: &mut Value) {

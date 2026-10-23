@@ -217,6 +217,11 @@ impl Lockfile {
         self.slug_for_id(kind, id)
     }
 
+    /// The recorded `content_hash` of `kind`/`slug`, if it is tracked and has one.
+    pub fn base_hash(&self, kind: &str, slug: &str) -> Option<String> {
+        self.objects.get(kind)?.get(slug)?.content_hash.clone()
+    }
+
     /// Find the slug of an object by its numeric ID within a kind.
     /// Returns None if no entry matches.
     /// Used by pull drivers to keep slugs stable across remote renames:
@@ -341,15 +346,13 @@ pub fn hook_secrets_hash(map: &std::collections::BTreeMap<String, String>) -> St
     to_hex(&hasher.finalize())
 }
 
-/// Hex-encode a digest as a 64-char lowercase string. Used by every
-/// `*_hash` function to format its SHA-256 output.
-fn to_hex(digest: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut hex = String::with_capacity(digest.len() * 2);
-    for b in digest {
-        write!(&mut hex, "{:02x}", b).expect("writing to String cannot fail");
-    }
-    hex
+use crate::snapshot::codec::{combined_hash, to_hex};
+
+/// The sidecar list for a kind with at most one code sidecar.
+fn single_sidecar(label: &str, code: &Option<String>) -> Vec<(String, Vec<u8>)> {
+    code.iter()
+        .map(|c| (label.to_string(), c.as_bytes().to_vec()))
+        .collect()
 }
 
 /// Compute a stable SHA-256 over a schema's combined content: the
@@ -366,27 +369,19 @@ fn to_hex(digest: &[u8]) -> String {
 ///     || ...   (continued for every formula, in field_id order)
 /// )
 /// ```
-/// EOF newlines and CRLF line endings in a code sidecar are not drift — see
-/// [`crate::snapshot::codec::sidecar_bytes_for_hash`], the single definition
-/// shared with `KindCodec::base_hash` so both hashing paths agree.
-use crate::snapshot::codec::sidecar_bytes_for_hash as code_bytes_for_hash;
-
+/// EOF newlines and CRLF line endings in a code sidecar are not drift. This
+/// delegates to [`combined_hash`], the single definition shared with
+/// `KindCodec::base_hash`, so both hashing paths agree.
 pub fn schema_combined_hash(
     json_bytes: &[u8],
     formulas: &[(String, Vec<u8>)],
     lockfile: &Lockfile,
 ) -> String {
-    let canonical = crate::snapshot::noise::canonicalize_for_hash(json_bytes, lockfile);
-    let mut hasher = Sha256::new();
-    hasher.update(&canonical);
-    for (field_id, bytes) in formulas {
-        hasher.update([0u8]);
-        let path = format!("formulas/{field_id}.py");
-        hasher.update(path.as_bytes());
-        hasher.update([0u8]);
-        hasher.update(&*code_bytes_for_hash(bytes));
-    }
-    to_hex(&hasher.finalize())
+    let sidecars: Vec<(String, Vec<u8>)> = formulas
+        .iter()
+        .map(|(field_id, bytes)| (format!("formulas/{field_id}.py"), bytes.clone()))
+        .collect();
+    combined_hash(json_bytes, &sidecars, lockfile)
 }
 
 /// Compute the combined hash for a hook: the post-extraction `<slug>.json`
@@ -409,16 +404,7 @@ pub fn schema_combined_hash(
 /// which is what `KindCodec::base_hash` computes — aligning pull, push,
 /// sync, deploy, and doctor on a single hash definition.
 pub fn hook_combined_hash(json_bytes: &[u8], code: &Option<String>, lockfile: &Lockfile) -> String {
-    let canonical = crate::snapshot::noise::canonicalize_for_hash(json_bytes, lockfile);
-    let mut hasher = Sha256::new();
-    hasher.update(&canonical);
-    if let Some(code) = code {
-        hasher.update([0u8]);
-        hasher.update(b"code");
-        hasher.update([0u8]);
-        hasher.update(&*code_bytes_for_hash(code.as_bytes()));
-    }
-    to_hex(&hasher.finalize())
+    combined_hash(json_bytes, &single_sidecar("code", code), lockfile)
 }
 
 /// Compute the combined hash for a rule: the post-extraction
@@ -436,16 +422,7 @@ pub fn hook_combined_hash(json_bytes: &[u8], code: &Option<String>, lockfile: &L
 /// future rule field that also carries Python wouldn't silently
 /// collide.
 pub fn rule_combined_hash(json_bytes: &[u8], code: &Option<String>, lockfile: &Lockfile) -> String {
-    let canonical = crate::snapshot::noise::canonicalize_for_hash(json_bytes, lockfile);
-    let mut hasher = Sha256::new();
-    hasher.update(&canonical);
-    if let Some(code) = code {
-        hasher.update([0u8]);
-        hasher.update(b"trigger_condition");
-        hasher.update([0u8]);
-        hasher.update(&*code_bytes_for_hash(code.as_bytes()));
-    }
-    to_hex(&hasher.finalize())
+    combined_hash(json_bytes, &single_sidecar("trigger_condition", code), lockfile)
 }
 
 #[cfg(test)]

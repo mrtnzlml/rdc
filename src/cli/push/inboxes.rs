@@ -1,3 +1,4 @@
+use super::{drift_base, remote_artifact};
 use crate::api::RossumClient;
 use crate::log::{Action, Log};
 use crate::paths::Paths;
@@ -220,7 +221,7 @@ async fn push_update_batch(
                 .get_inbox(id, Some(progress.clone()))
                 .await
                 .with_context(|| format!("fetching inbox {id} to verify drift before push"))?;
-            let remote_art = remote_artifact(&remote_inbox)?;
+            let remote_art = remote_artifact("inboxes", &remote_inbox, "inbox")?;
             if combined_hash(&remote_art.json, &remote_art.sidecars, lf) != base {
                 // Drift. NOT patched here — the sequential stage owns the prompt.
                 // Named binding + explicit `drop`, NOT a one-statement
@@ -277,9 +278,7 @@ async fn push_update_batch(
                         pushed += 1;
                     }
                     Err(e) => {
-                        if first_error.is_none() {
-                            first_error = Some(e);
-                        }
+                        first_error.get_or_insert(e);
                     }
                 }
             }
@@ -313,16 +312,12 @@ async fn push_update_batch(
                         skipped += s;
                     }
                     Err(e) => {
-                        if first_error.is_none() {
-                            first_error = Some(e);
-                        }
+                        first_error.get_or_insert(e);
                     }
                 }
             }
             Err(e) => {
-                if first_error.is_none() {
-                    first_error = Some(e);
-                }
+                first_error.get_or_insert(e);
             }
         }
     }
@@ -331,28 +326,6 @@ async fn push_update_batch(
     }
 
     Ok((pushed, skipped))
-}
-
-/// Whether this entry can reach the drift check at all — and, if so, the base
-/// the remote is checked against.
-///
-/// There is no hoisted list here for it to keep in step with, but the other
-/// fanned-out drivers all read their base through this one expression and the
-/// comparability is what makes them diff-able by eye.
-fn drift_base(entry: &ObjectEntry) -> Option<&str> {
-    entry.content_hash.as_deref()
-}
-
-/// The canonical on-disk artifact for a remote inbox, as the drift check, the
-/// drift prompt and the write-back all need it. Lifted verbatim from the old
-/// loop's `codec.disk_bytes(...)` block.
-fn remote_artifact(remote: &crate::model::Inbox) -> Result<crate::snapshot::codec::DiskArtifact> {
-    let codec = crate::snapshot::codec::codec("inboxes").unwrap();
-    codec
-        .disk_bytes(
-            &serde_json::to_value(remote).context("serializing remote inbox for drift check")?,
-        )
-        .context("codec disk_bytes for remote inbox")
 }
 
 /// PATCH one inbox and re-baseline it from a fresh GET.
@@ -502,7 +475,7 @@ async fn push_one_drifted(
     let payload_inbox: crate::model::Inbox = serde_json::from_value(payload)
         .with_context(|| format!("deserializing overlay-applied inbox '{q_slug}'"))?;
 
-    let remote_art = remote_artifact(remote_inbox)?;
+    let remote_art = remote_artifact("inboxes", remote_inbox, "inbox")?;
     let remote_bytes = remote_art.json;
     let remote_combined = combined_hash(&remote_bytes, &remote_art.sidecars, lockfile);
     let mut payload_to_send = payload_inbox;

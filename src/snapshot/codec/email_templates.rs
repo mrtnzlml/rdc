@@ -27,9 +27,8 @@ use serde_json::Value;
 
 use crate::overlay::Overlay;
 use crate::paths::Paths;
-use crate::snapshot::codec::{DiskArtifact, KindCodec};
+use crate::snapshot::codec::{DiskArtifact, KindCodec, plain_json_artifact};
 use crate::snapshot::create::strip_for_cross_env_patch;
-use crate::snapshot::key_order::strip_hidden_fields;
 
 pub struct EmailTemplates;
 
@@ -38,14 +37,7 @@ impl KindCodec for EmailTemplates {
         // Flat plain: no per-kind redaction (email_templates has no entry in
         // `create::redact_on_pull`). Only the universal hidden-field strip
         // (`modified_at`) is applied.
-        let mut v = value.clone();
-        strip_hidden_fields(&mut v);
-        let mut json = serde_json::to_vec_pretty(&v)?;
-        json.push(b'\n');
-        Ok(DiskArtifact {
-            json,
-            sidecars: vec![],
-        })
+        plain_json_artifact(value.clone())
     }
 
     fn cross_env_body(&self, body: &mut Value) {

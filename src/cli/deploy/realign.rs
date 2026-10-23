@@ -842,15 +842,8 @@ fn rewrite_refs_in_tree(
                 continue;
             };
             let mut updated = raw.clone();
-            for (old, new) in &needles {
-                if updated.contains(old.as_str()) {
-                    updated = updated.replace(old.as_str(), new.as_str());
-                }
-            }
-            for (old, new) in prefix_subst {
-                if updated.contains(old.as_str()) {
-                    updated = updated.replace(old.as_str(), new.as_str());
-                }
+            for (old, new) in needles.iter().chain(prefix_subst) {
+                updated = updated.replace(old.as_str(), new.as_str());
             }
             if updated != raw {
                 crate::snapshot::writer::write_atomic(&path, updated.as_bytes())?;

@@ -1,3 +1,4 @@
+use super::{drift_base, remote_artifact};
 use crate::api::{RossumClient, anyhow_has_status};
 use crate::log::{Action, Log};
 use crate::paths::Paths;
@@ -301,7 +302,7 @@ async fn push_update_batch(
                     event: format!("engine/{slug} (remote id {id} missing)"),
                 });
             };
-            let remote_art = remote_artifact(remote_engine)?;
+            let remote_art = remote_artifact("engines", remote_engine, "engine")?;
             if combined_hash(&remote_art.json, &remote_art.sidecars, lf) != base {
                 // Drift. NOT patched here — the sequential stage owns the prompt.
                 return Ok(Prepared::NeedsPrompt { slug: slug.clone() });
@@ -371,9 +372,7 @@ async fn push_update_batch(
                     pushed += 1;
                 }
                 Err(e) => {
-                    if first_error.is_none() {
-                        first_error = Some(e);
-                    }
+                    first_error.get_or_insert(e);
                 }
             },
             // 405. The old loop emitted this line once and stopped; a run that
@@ -430,16 +429,12 @@ async fn push_update_batch(
                         read_only |= ro;
                     }
                     Err(e) => {
-                        if first_error.is_none() {
-                            first_error = Some(e);
-                        }
+                        first_error.get_or_insert(e);
                     }
                 }
             }
             Err(e) => {
-                if first_error.is_none() {
-                    first_error = Some(e);
-                }
+                first_error.get_or_insert(e);
             }
         }
     }
@@ -448,32 +443,6 @@ async fn push_update_batch(
     }
 
     Ok((pushed, skipped, read_only))
-}
-
-/// Whether this entry can reach the drift check at all — and, if so, the base
-/// the remote is checked against.
-///
-/// The hoisted list fetch and the per-item guard inside the concurrent stage
-/// MUST agree on this predicate. If the hoist guard were ever narrower than the
-/// per-item one, an item would consult an empty list and silently take the
-/// "remote id missing" skip instead of a real drift check — no error, just
-/// wrong. One expression, called from both, so they cannot drift apart.
-fn drift_base(entry: &ObjectEntry) -> Option<&str> {
-    entry.content_hash.as_deref()
-}
-
-/// The canonical on-disk artifact for a remote engine, as the drift check and
-/// the drift prompt both need it. Lifted verbatim from the old loop's
-/// `codec.disk_bytes(...)` block: the same KindCodec path the pull driver uses,
-/// so the hash matches the lockfile baseline (redacts `agenda_id`, strips
-/// hidden fields).
-fn remote_artifact(remote: &crate::model::Engine) -> Result<crate::snapshot::codec::DiskArtifact> {
-    let codec = crate::snapshot::codec::codec("engines").unwrap();
-    codec
-        .disk_bytes(
-            &serde_json::to_value(remote).context("serializing remote engine for drift check")?,
-        )
-        .context("codec disk_bytes for remote engine")
 }
 
 /// Write one PATCH response back: canonical form to disk and the base cache,
@@ -575,7 +544,7 @@ async fn push_one_drifted(
         );
         return Ok((0, 1, false));
     };
-    let remote_art = remote_artifact(remote_engine)?;
+    let remote_art = remote_artifact("engines", remote_engine, "engine")?;
     let remote_bytes = remote_art.json;
     let remote_combined = combined_hash(&remote_bytes, &remote_art.sidecars, lockfile);
     let mut payload_to_send = payload_engine;

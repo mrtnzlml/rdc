@@ -12,6 +12,7 @@
 use crate::paths::Paths;
 use anyhow::{Result, anyhow, bail};
 use std::collections::BTreeSet;
+use std::path::Path;
 
 /// Kinds we deploy/migrate, in dependency order (POST order). Workflows are
 /// pull-only at the Rossum API (PATCH returns 405) and so are not deployable;
@@ -236,21 +237,19 @@ fn list_organization_slug(paths: &Paths) -> Result<Vec<String>> {
     })
 }
 
-/// MDH dataset slugs: directories under `mdh/` holding an `indexes.json`. Same
-/// definition `cli::pull::mdh::local_only_dataset_slugs` uses, so selection and
-/// the sync executor never disagree about what a dataset is.
-fn list_mdh_slugs(paths: &Paths) -> Result<Vec<String>> {
-    let dir = paths.mdh_dir();
+/// Sorted names of the subdirectories of `dir` that hold a `file`; empty when
+/// `dir` does not exist.
+fn subdirs_holding(dir: &Path, file: &str) -> Result<Vec<String>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(&dir)? {
+    for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
             continue;
         }
-        if entry.path().join("indexes.json").exists() {
+        if entry.path().join(file).exists() {
             out.push(entry.file_name().to_string_lossy().into_owned());
         }
     }
@@ -258,24 +257,32 @@ fn list_mdh_slugs(paths: &Paths) -> Result<Vec<String>> {
     Ok(out)
 }
 
-fn list_workspace_slugs(paths: &Paths) -> Result<Vec<String>> {
-    let dir = paths.workspaces_dir();
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
+/// Stems of the `.json` files directly in `dir`, skipping `env`'s shadow
+/// artifacts, in directory order.
+fn json_stems(dir: &Path, env: &str) -> Result<Vec<String>> {
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(&dir)? {
+    for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
-        if !entry.file_type()?.is_dir() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if crate::paths::is_shadow_artifact(&name, env) {
             continue;
         }
-        let slug = entry.file_name().to_string_lossy().into_owned();
-        if entry.path().join("workspace.json").exists() {
-            out.push(slug);
+        if let Some(stem) = name.strip_suffix(".json") {
+            out.push(stem.to_string());
         }
     }
-    out.sort();
     Ok(out)
+}
+
+/// MDH dataset slugs: directories under `mdh/` holding an `indexes.json`. Same
+/// definition `cli::pull::mdh::local_only_dataset_slugs` uses, so selection and
+/// the sync executor never disagree about what a dataset is.
+fn list_mdh_slugs(paths: &Paths) -> Result<Vec<String>> {
+    subdirs_holding(&paths.mdh_dir(), "indexes.json")
+}
+
+fn list_workspace_slugs(paths: &Paths) -> Result<Vec<String>> {
+    subdirs_holding(&paths.workspaces_dir(), "workspace.json")
 }
 
 fn list_queue_nested(paths: &Paths, kind: &str) -> Result<Vec<String>> {
@@ -339,15 +346,8 @@ fn list_email_template_keys(paths: &Paths) -> Result<Vec<String>> {
             if !et_dir.exists() {
                 continue;
             }
-            for f in std::fs::read_dir(&et_dir)? {
-                let f = f?;
-                let name = f.file_name().to_string_lossy().into_owned();
-                if crate::paths::is_shadow_artifact(&name, paths.env()) {
-                    continue;
-                }
-                if let Some(stem) = name.strip_suffix(".json") {
-                    out.push(format!("{ws_slug}/{q_slug}/{stem}"));
-                }
+            for stem in json_stems(&et_dir, paths.env())? {
+                out.push(format!("{ws_slug}/{q_slug}/{stem}"));
             }
         }
     }
@@ -368,38 +368,13 @@ fn list_flat_kind(paths: &Paths, kind: &str) -> Result<Vec<String>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
-    let mut out = Vec::new();
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if crate::paths::is_shadow_artifact(&name, paths.env()) {
-            continue;
-        }
-        if let Some(stem) = name.strip_suffix(".json") {
-            out.push(stem.to_string());
-        }
-    }
+    let mut out = json_stems(&dir, paths.env())?;
     out.sort();
     Ok(out)
 }
 
 fn list_engine_slugs(paths: &Paths) -> Result<Vec<String>> {
-    let dir = paths.engines_dir();
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut out = Vec::new();
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        if entry.path().join("engine.json").exists() {
-            out.push(entry.file_name().to_string_lossy().into_owned());
-        }
-    }
-    out.sort();
-    Ok(out)
+    subdirs_holding(&paths.engines_dir(), "engine.json")
 }
 
 fn list_engine_field_slugs(paths: &Paths) -> Result<Vec<String>> {
@@ -418,17 +393,10 @@ fn list_engine_field_slugs(paths: &Paths) -> Result<Vec<String>> {
         if !fields_dir.exists() {
             continue;
         }
-        for f_entry in std::fs::read_dir(&fields_dir)? {
-            let f_entry = f_entry?;
-            let name = f_entry.file_name().to_string_lossy().into_owned();
-            if crate::paths::is_shadow_artifact(&name, paths.env()) {
-                continue;
-            }
-            if let Some(stem) = name.strip_suffix(".json") {
-                // Composite `<engine_slug>/<field_slug>` matches the
-                // lockfile / mapping / overlay key shape.
-                out.push(format!("{e_slug}/{stem}"));
-            }
+        for stem in json_stems(&fields_dir, paths.env())? {
+            // Composite `<engine_slug>/<field_slug>` matches the
+            // lockfile / mapping / overlay key shape.
+            out.push(format!("{e_slug}/{stem}"));
         }
     }
     out.sort();

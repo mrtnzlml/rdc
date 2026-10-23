@@ -6,29 +6,12 @@ use crate::log::{Action, Log};
 use crate::model::Rule;
 use crate::slug::slugify_unique;
 use crate::snapshot::rule::{serialize_rule, write_rule_code};
+use crate::state::rule_combined_hash;
 use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 const KIND: &str = "rules";
-
-/// Compute the combined hash for a rule in codec format (byte-identical to
-/// the legacy `rule_combined_hash`).
-///
-/// Uses `combined_hash(json, [("trigger_condition", bytes)])` which matches
-/// the sidecar label the rules codec uses, reproducing the legacy formula.
-fn local_rule_combined_hash(
-    json_bytes: &[u8],
-    code: &Option<String>,
-    lockfile: &crate::state::Lockfile,
-) -> String {
-    let sidecars: Vec<(String, Vec<u8>)> = if let Some(c) = code {
-        vec![("trigger_condition".to_string(), c.as_bytes().to_vec())]
-    } else {
-        vec![]
-    };
-    crate::snapshot::codec::combined_hash(json_bytes, &sidecars, lockfile)
-}
 
 /// Phase 1: list all rules from the API.
 pub async fn list(ctx: &PullCtx<'_>, progress: &Arc<Log>) -> Result<Vec<Rule>> {
@@ -105,17 +88,12 @@ pub async fn process(
             // (PRE-overlay) would diverge whenever an overlay is configured,
             // causing phantom drift on every subsequent pull.
             let remote_combined_hash =
-                local_rule_combined_hash(&proposed_json, &proposed_code, ctx.lockfile);
+                rule_combined_hash(&proposed_json, &proposed_code, ctx.lockfile);
 
-            let base_hash = ctx
-                .lockfile
-                .objects
-                .get(KIND)
-                .and_then(|m| m.get(&slug))
-                .and_then(|e| e.content_hash.clone());
+            let base_hash = ctx.lockfile.base_hash(KIND, &slug);
             let local_combined = pre_local_json
                 .as_ref()
-                .map(|lj| local_rule_combined_hash(lj, &pre_local_code, ctx.lockfile));
+                .map(|lj| rule_combined_hash(lj, &pre_local_code, ctx.lockfile));
             let action = super::common::classify_combined_pull(
                 base_hash.as_deref(),
                 local_combined.as_deref(),
@@ -158,13 +136,12 @@ pub async fn process(
                 }
                 PullAction::KeepLocal => {
                     let local_json = pre_local_json.as_ref().unwrap();
-                    local_rule_combined_hash(local_json, &pre_local_code, ctx.lockfile)
+                    rule_combined_hash(local_json, &pre_local_code, ctx.lockfile)
                 }
                 PullAction::NoChange => remote_combined_hash,
                 PullAction::Conflict => {
                     let local_json = pre_local_json.as_ref().unwrap();
-                    let symmetric = matches!((&pre_local_code, &proposed_code), (Some(_), Some(_)))
-                        || matches!((&pre_local_code, &proposed_code), (None, None));
+                    let symmetric = pre_local_code.is_some() == proposed_code.is_some();
                     let total = if symmetric && pre_local_code.is_some() {
                         2
                     } else {
@@ -230,14 +207,14 @@ pub async fn process(
                     if preserve_base {
                         match base_hash.as_deref() {
                             Some(prior) => prior.to_string(),
-                            None => local_rule_combined_hash(
+                            None => rule_combined_hash(
                                 &resolved_json,
                                 &resolved_code,
                                 ctx.lockfile,
                             ),
                         }
                     } else {
-                        local_rule_combined_hash(&resolved_json, &resolved_code, ctx.lockfile)
+                        rule_combined_hash(&resolved_json, &resolved_code, ctx.lockfile)
                     }
                 }
             };

@@ -36,12 +36,7 @@ pub async fn process(
             .context("serializing organization")?;
         let proposed = art.json;
 
-        let base_hash = ctx
-            .lockfile
-            .objects
-            .get(KIND)
-            .and_then(|m| m.get("self"))
-            .and_then(|e| e.content_hash.clone());
+        let base_hash = ctx.lockfile.base_hash(KIND, "self");
 
         let proposed = crate::cli::pull::common::portabilize_proposed(&proposed, &*ctx.lockfile);
         let (action, remote_hash) = decide_pull_action(&path, base_hash.as_deref(), &proposed)?;

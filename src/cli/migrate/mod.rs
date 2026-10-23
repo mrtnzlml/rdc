@@ -268,10 +268,7 @@ fn build_subst(mapping: &Mapping) -> BTreeMap<String, String> {
 /// hooks/labels/rules/workspaces/queues, and the compound `<engine>/<field>`
 /// (engine_fields) / `<ws>/<q>/<template>` (email_templates).
 pub(crate) fn classify(rel: &Path) -> Option<(&'static str, String)> {
-    let comps: Vec<String> = rel
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        .collect();
+    let comps = comps_of(rel);
     let leaf = comps.last()?;
 
     match comps.first().map(String::as_str) {
@@ -320,10 +317,7 @@ fn classify_for_selection(rel: &Path) -> Option<(&'static str, String)> {
     if let Some(hit) = classify(rel) {
         return Some(hit);
     }
-    let comps: Vec<String> = rel
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        .collect();
+    let comps = comps_of(rel);
     let leaf = comps.last()?;
     let strip_code = |l: &str| {
         l.strip_suffix(".py")
@@ -827,10 +821,7 @@ fn classify_workspace(comps: &[String]) -> Option<(&'static str, String)> {
 /// preserves that function's None-for-workflows/mdh contract that overlay-key
 /// validation, `--only` selection, and the substitution map all rely on.
 fn classify_managed_primary(rel: &Path) -> Option<(&'static str, String)> {
-    let comps: Vec<String> = rel
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        .collect();
+    let comps = comps_of(rel);
     match comps.first().map(String::as_str) {
         Some("workflows") if comps.len() == 3 && comps[2] == "workflow.json" => {
             Some(("workflows", comps[1].clone()))
@@ -1390,10 +1381,7 @@ fn owning_object(rel: &Path) -> Option<(&'static str, String)> {
     if let Some(hit) = classify_for_selection(rel) {
         return Some(hit);
     }
-    let comps: Vec<String> = rel
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        .collect();
+    let comps = comps_of(rel);
     if comps.len() < 3 {
         return None;
     }
@@ -2966,10 +2954,7 @@ fn unique_template_skips(
     type Member = (PathBuf, String, u64);
     let mut groups: BTreeMap<(PathBuf, String), Vec<Member>> = BTreeMap::new();
     for rel in files {
-        let comps: Vec<String> = rel
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-            .collect();
+        let comps = comps_of(rel);
         // workspaces/<ws>/queues/<q>/email-templates/<t>.json
         let is_template = comps.len() == 6
             && comps[0] == "workspaces"
@@ -2992,10 +2977,7 @@ fn unique_template_skips(
             continue;
         }
         let dst = remap_relative(rel, mapping);
-        let dst_comps: Vec<String> = dst
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-            .collect();
+        let dst_comps = comps_of(&dst);
         if dst_comps.len() != 6 {
             continue;
         }
@@ -3776,10 +3758,7 @@ pub fn run_at(
 /// - `workflows/…` and `mdh/…` are identity (pull-only / match-by-slug).
 /// - Anything else → identity.
 pub fn remap_relative(rel: &Path, mapping: &Mapping) -> PathBuf {
-    let comps: Vec<String> = rel
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        .collect();
+    let comps = comps_of(rel);
     if comps.is_empty() {
         return rel.to_path_buf();
     }
@@ -3874,6 +3853,13 @@ fn remap_workspace(comps: &[String], mapping: &Mapping) -> PathBuf {
         out.extend_from_slice(&comps[2..]);
     }
     join_comps(&out)
+}
+
+/// The components of `p` as owned strings.
+fn comps_of(p: &Path) -> Vec<String> {
+    p.components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect()
 }
 
 fn join_comps(comps: &[String]) -> PathBuf {

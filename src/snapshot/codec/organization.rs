@@ -20,8 +20,7 @@ use serde_json::Value;
 
 use crate::overlay::Overlay;
 use crate::paths::Paths;
-use crate::snapshot::codec::{DiskArtifact, KindCodec};
-use crate::snapshot::key_order::strip_hidden_fields;
+use crate::snapshot::codec::{DiskArtifact, KindCodec, plain_json_artifact};
 
 pub struct Organization;
 
@@ -30,14 +29,7 @@ impl KindCodec for Organization {
         // Flat plain: no per-kind redaction (organization has no entry in
         // `create::redact_on_pull`). Only the universal hidden-field strip
         // (`modified_at` / `modified_by`, top level) is applied.
-        let mut v = value.clone();
-        strip_hidden_fields(&mut v);
-        let mut json = serde_json::to_vec_pretty(&v)?;
-        json.push(b'\n');
-        Ok(DiskArtifact {
-            json,
-            sidecars: vec![],
-        })
+        plain_json_artifact(value.clone())
     }
 
     fn cross_env_body(&self, body: &mut Value) {

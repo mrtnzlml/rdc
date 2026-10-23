@@ -7,9 +7,8 @@ use serde_json::Value;
 
 use crate::overlay::Overlay;
 use crate::paths::Paths;
-use crate::snapshot::codec::{DiskArtifact, KindCodec};
+use crate::snapshot::codec::{DiskArtifact, KindCodec, plain_json_artifact};
 use crate::snapshot::create::{redact_for_disk, strip_for_cross_env_patch};
-use crate::snapshot::key_order::strip_hidden_fields;
 
 pub struct Queues;
 
@@ -17,13 +16,7 @@ impl KindCodec for Queues {
     fn disk_bytes(&self, value: &Value) -> anyhow::Result<DiskArtifact> {
         let mut v = value.clone();
         redact_for_disk(&mut v, "queues");
-        strip_hidden_fields(&mut v);
-        let mut json = serde_json::to_vec_pretty(&v)?;
-        json.push(b'\n');
-        Ok(DiskArtifact {
-            json,
-            sidecars: vec![],
-        })
+        plain_json_artifact(v)
     }
 
     fn cross_env_body(&self, body: &mut Value) {

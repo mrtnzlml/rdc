@@ -202,12 +202,7 @@ pub async fn process(
                 .disk_bytes(&value)
                 .context("serializing queue")?;
             let queue_proposed = art.json;
-            let queue_base = ctx
-                .lockfile
-                .objects
-                .get(KIND_QUEUES)
-                .and_then(|m| m.get(&q_slug))
-                .and_then(|e| e.content_hash.clone());
+            let queue_base = ctx.lockfile.base_hash(KIND_QUEUES, &q_slug);
             let queue_proposed =
                 crate::cli::pull::common::portabilize_proposed(&queue_proposed, &*ctx.lockfile);
             let (q_action, q_remote_hash) =
@@ -332,12 +327,7 @@ fn write_schema_for_queue(
     let remote_combined_hash =
         crate::state::schema_combined_hash(&remote_json_bytes, &remote_formulas, ctx.lockfile);
 
-    let schema_base = ctx
-        .lockfile
-        .objects
-        .get(KIND_SCHEMAS)
-        .and_then(|m| m.get(&w.q_slug))
-        .and_then(|e| e.content_hash.clone());
+    let schema_base = ctx.lockfile.base_hash(KIND_SCHEMAS, &w.q_slug);
     let local_combined = pre_local_json
         .as_ref()
         .map(|lj| crate::state::schema_combined_hash(lj, &pre_local_formulas, ctx.lockfile));
@@ -507,12 +497,7 @@ fn write_inbox_for_queue(
         .context("serializing inbox")?;
     let inbox_proposed = art.json;
 
-    let inbox_base = ctx
-        .lockfile
-        .objects
-        .get(KIND_INBOXES)
-        .and_then(|m| m.get(&w.q_slug))
-        .and_then(|e| e.content_hash.clone());
+    let inbox_base = ctx.lockfile.base_hash(KIND_INBOXES, &w.q_slug);
     let inbox_proposed =
         crate::cli::pull::common::portabilize_proposed(&inbox_proposed, &*ctx.lockfile);
     let (i_action, i_remote_hash) =

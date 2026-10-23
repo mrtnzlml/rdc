@@ -23,6 +23,7 @@
 //! parent domain plus a service path (`elis.rossum.ai/svc/data-storage/api`).
 
 use crate::api::ApiError;
+use crate::api::error::ensure_success;
 use crate::api::rate_limit::RateLimiter;
 use crate::api::retry::ProgressHandle;
 use crate::model::Collection;
@@ -442,10 +443,7 @@ impl DataStorageClient {
             self.limiter.as_ref(),
         ).await?;
         let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status { status: status.as_u16(), body }.into());
-        }
+        let resp = ensure_success(resp).await?;
         let env: Envelope<Value> = resp
             .json()
             .await

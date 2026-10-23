@@ -16,6 +16,17 @@ pub enum ApiError {
     Decode(#[from] serde_json::Error),
 }
 
+/// Pass a 2xx response through; turn any other into an [`ApiError::Status`]
+/// carrying the response body.
+pub(crate) async fn ensure_success(resp: reqwest::Response) -> anyhow::Result<reqwest::Response> {
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(ApiError::Status { status: status.as_u16(), body }.into());
+    }
+    Ok(resp)
+}
+
 /// Render an [`ApiError::Status`] into a human-facing diagnostic.
 ///
 /// Rossum reports validation failures as a field-keyed error map

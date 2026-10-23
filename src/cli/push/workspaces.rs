@@ -3,6 +3,7 @@
 //! inboxes, email_templates all root from a workspace by URL — so this
 //! driver runs first in the phase-2 dispatch.
 
+use super::{drift_base, remote_artifact};
 use crate::api::RossumClient;
 use crate::log::{Action, Log};
 use crate::paths::Paths;
@@ -217,7 +218,7 @@ async fn push_update_batch(
                 .get_workspace(id, Some(progress.clone()))
                 .await
                 .with_context(|| format!("fetching workspace {id} to verify drift before push"))?;
-            let remote_art = remote_artifact(&remote_workspace)?;
+            let remote_art = remote_artifact("workspaces", &remote_workspace, "workspace")?;
             if combined_hash(&remote_art.json, &remote_art.sidecars, lf) != base {
                 // Drift. NOT patched here — the sequential stage owns the prompt.
                 // Named binding + explicit `drop`, NOT a one-statement
@@ -283,9 +284,7 @@ async fn push_update_batch(
                         pushed += 1;
                     }
                     Err(e) => {
-                        if first_error.is_none() {
-                            first_error = Some(e);
-                        }
+                        first_error.get_or_insert(e);
                     }
                 }
             }
@@ -319,16 +318,12 @@ async fn push_update_batch(
                         skipped += s;
                     }
                     Err(e) => {
-                        if first_error.is_none() {
-                            first_error = Some(e);
-                        }
+                        first_error.get_or_insert(e);
                     }
                 }
             }
             Err(e) => {
-                if first_error.is_none() {
-                    first_error = Some(e);
-                }
+                first_error.get_or_insert(e);
             }
         }
     }
@@ -337,30 +332,6 @@ async fn push_update_batch(
     }
 
     Ok((pushed, skipped))
-}
-
-/// Whether this entry can reach the drift check at all — and, if so, the base
-/// the remote is checked against.
-///
-/// There is no hoisted list here for it to keep in step with, but the other
-/// seven fanned-out drivers all read their base through this one expression and
-/// the comparability is what makes them diff-able by eye.
-fn drift_base(entry: &ObjectEntry) -> Option<&str> {
-    entry.content_hash.as_deref()
-}
-
-/// The canonical on-disk artifact for a remote workspace, as the drift check and
-/// the drift prompt both need it. Lifted verbatim from the old loop's
-/// `codec.disk_bytes(...)` block.
-fn remote_artifact(
-    remote: &crate::model::Workspace,
-) -> Result<crate::snapshot::codec::DiskArtifact> {
-    let codec = crate::snapshot::codec::codec("workspaces").unwrap();
-    codec
-        .disk_bytes(
-            &serde_json::to_value(remote).context("serializing remote workspace for drift check")?,
-        )
-        .context("codec disk_bytes for remote workspace")
 }
 
 /// Write one PATCH response back: canonical form to disk and the base cache,
@@ -441,7 +412,7 @@ async fn push_one_drifted(
     let payload_workspace: crate::model::Workspace = serde_json::from_value(payload)
         .with_context(|| format!("deserializing overlay-applied workspace '{ws_slug}'"))?;
 
-    let remote_art = remote_artifact(remote_workspace)?;
+    let remote_art = remote_artifact("workspaces", remote_workspace, "workspace")?;
     let remote_bytes = remote_art.json;
     let remote_combined = combined_hash(&remote_bytes, &remote_art.sidecars, lockfile);
     let mut payload_to_send = payload_workspace;

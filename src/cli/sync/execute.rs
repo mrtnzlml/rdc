@@ -176,6 +176,218 @@ pub(crate) async fn resolve_conflicts<R: BufRead>(
     .await
 }
 
+/// Slug → remote-object indexes over a [`RemoteCatalog`], for the kinds the
+/// conflict and remote-delete resolvers handle. Each kind mirrors the slug
+/// derivation rule its pull driver uses (and `from_catalog_scan_lockfile`), so
+/// the slug looked up here matches the slug the classifier emitted.
+struct CatalogIndex<'a> {
+    label_by_slug: BTreeMap<String, &'a crate::model::Label>,
+    saved_view_by_slug: BTreeMap<String, &'a crate::model::SavedView>,
+    workspace_by_slug: BTreeMap<String, &'a crate::model::Workspace>,
+    engine_by_slug: BTreeMap<String, &'a crate::model::Engine>,
+    engine_field_by_slug: BTreeMap<String, &'a crate::model::EngineField>,
+    hook_by_slug: BTreeMap<String, &'a crate::model::Hook>,
+    rule_by_slug: BTreeMap<String, &'a crate::model::Rule>,
+    queue_by_slug: BTreeMap<String, (&'a crate::model::Queue, String /* ws_slug */)>,
+    email_template_by_compound: BTreeMap<String, &'a crate::model::EmailTemplate>,
+}
+
+impl<'a> CatalogIndex<'a> {
+    fn build(lockfile: &crate::state::Lockfile, catalog: &'a RemoteCatalog) -> Self {
+        // Build a stable label-slug index up-front. This mirrors the slug
+        // derivation rule used by `pull::labels::process` and
+        // `from_catalog_scan_lockfile` so the slug we look up here matches
+        // the slug the classifier emitted.
+        let mut label_by_slug: BTreeMap<String, &crate::model::Label> = BTreeMap::new();
+        {
+            let mut used: HashSet<String> = lockfile.claimed_slugs("labels");
+            for l in &catalog.labels {
+                let slug = match lockfile.slug_for_id("labels", l.id) {
+                    Some(existing) => existing.to_string(),
+                    None => slugify_unique(&l.name, &used),
+                };
+                used.insert(slug.clone());
+                label_by_slug.insert(slug, l);
+            }
+        }
+
+        // Same shape as `label_by_slug`: rdc's filtered (shared-only) saved-view
+        // listing, slugged the same way `pull::saved_views::process` does.
+        let mut saved_view_by_slug: BTreeMap<String, &crate::model::SavedView> = BTreeMap::new();
+        {
+            let mut used: HashSet<String> = lockfile.claimed_slugs("saved_views");
+            for v in &catalog.saved_views {
+                let slug = match lockfile.slug_for_id("saved_views", v.id) {
+                    Some(existing) => existing.to_string(),
+                    None => slugify_unique(&v.name, &used),
+                };
+                used.insert(slug.clone());
+                saved_view_by_slug.insert(slug, v);
+            }
+        }
+
+        // Build slug → object indexes for the kinds the resolver knows
+        // about. Each kind mirrors the slug derivation rule its pull driver
+        // uses. The maps stay scoped to this function; downstream resolution
+        // looks objects up by slug.
+        let mut workspace_by_slug: BTreeMap<String, &crate::model::Workspace> = BTreeMap::new();
+        // Side-map of `workspace_url → slug` populated alongside
+        // `workspace_by_slug`. Used by the queue loop below as a fallback
+        // when `lockfile.slug_for_url("workspaces", …)` misses — which
+        // it does when the lockfile starts empty (fresh checkout) and any
+        // resume path where queues were created on remote in a prior failed
+        // run but the lockfile was never persisted. Without this, every
+        // queue silently `continue`s and the conflict resolver reports
+        // "no matching remote object found" for the queue / its schema /
+        // its inbox even though the freshly-pulled catalog has them all.
+        let mut ws_url_to_slug: BTreeMap<String, String> = BTreeMap::new();
+        {
+            let mut used: HashSet<String> = lockfile.claimed_slugs("workspaces");
+            for w in &catalog.workspaces {
+                let slug = match lockfile.slug_for_id("workspaces", w.id) {
+                    Some(existing) => existing.to_string(),
+                    None => slugify_unique(&w.name, &used),
+                };
+                used.insert(slug.clone());
+                ws_url_to_slug.insert(w.url.clone(), slug.clone());
+                workspace_by_slug.insert(slug, w);
+            }
+        }
+        let mut engine_by_slug: BTreeMap<String, &crate::model::Engine> = BTreeMap::new();
+        {
+            let mut used: HashSet<String> = lockfile.claimed_slugs("engines");
+            for e in &catalog.engines {
+                let slug = match lockfile.slug_for_id("engines", e.id) {
+                    Some(existing) => existing.to_string(),
+                    None => slugify_unique(&e.name, &used),
+                };
+                used.insert(slug.clone());
+                engine_by_slug.insert(slug, e);
+            }
+        }
+        // Engine fields are nested under their parent engine — the lockfile
+        // key is the composite `<engine_slug>/<field_slug>` so two engines
+        // can both carry a field named e.g. `Amount` and keep clean
+        // per-engine slugs. `slug_for_id` returns a key that may be either
+        // composite (post-migration) or legacy flat (older lockfile); both
+        // shapes index the catalog by the same composite key here.
+        let mut engine_field_by_slug: BTreeMap<String, &crate::model::EngineField> = BTreeMap::new();
+        {
+            let mut per_engine_used: std::collections::HashMap<String, HashSet<String>> =
+                std::collections::HashMap::new();
+            for f in &catalog.engine_fields {
+                let Some(engine_slug) = lockfile
+                    .slug_for_url("engines", &f.engine)
+                    .map(|s| s.to_string())
+                else {
+                    continue;
+                };
+                let used = per_engine_used.entry(engine_slug.clone()).or_default();
+                let field_slug = match lockfile.slug_for_id("engine_fields", f.id) {
+                    Some(existing) => existing
+                        .strip_prefix(&format!("{engine_slug}/"))
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| existing.to_string()),
+                    None => slugify_unique(&f.name, used),
+                };
+                used.insert(field_slug.clone());
+                engine_field_by_slug.insert(format!("{engine_slug}/{field_slug}"), f);
+            }
+        }
+        let mut hook_by_slug: BTreeMap<String, &crate::model::Hook> = BTreeMap::new();
+        {
+            let mut used: HashSet<String> = lockfile.claimed_slugs("hooks");
+            for h in &catalog.hooks {
+                let slug = match lockfile.slug_for_id("hooks", h.id) {
+                    Some(existing) => existing.to_string(),
+                    None => slugify_unique(&h.name, &used),
+                };
+                used.insert(slug.clone());
+                hook_by_slug.insert(slug, h);
+            }
+        }
+        let mut rule_by_slug: BTreeMap<String, &crate::model::Rule> = BTreeMap::new();
+        {
+            let mut used: HashSet<String> = lockfile.claimed_slugs("rules");
+            for r in &catalog.rules {
+                let slug = match lockfile.slug_for_id("rules", r.id) {
+                    Some(existing) => existing.to_string(),
+                    None => slugify_unique(&r.name, &used),
+                };
+                used.insert(slug.clone());
+                rule_by_slug.insert(slug, r);
+            }
+        }
+
+        // Queue-tree slug indexes. The queue slug keys queue / schema /
+        // inbox; email templates use the compound `<ws>/<q>/<tpl>` slug.
+        // Slug derivation mirrors `pull::queues::process` and
+        // `pull::email_templates::process`.
+        let mut queue_by_slug: BTreeMap<String, (&crate::model::Queue, String /* ws_slug */)> =
+            BTreeMap::new();
+        let mut q_url_to_ws_q: BTreeMap<String, (String, String)> = BTreeMap::new();
+        {
+            // Global, id-pinned queue slugs (mirror pull::queues::process): dedup
+            // globally, pre-seeded with the already-pinned slugs.
+            let mut used_q: HashSet<String> = lockfile.claimed_slugs("queues");
+            for q in &catalog.queues {
+                let Some(ws_url) = q.workspace.as_ref() else {
+                    continue;
+                };
+                // Prefer the lockfile slug (preserves user-customised slugs);
+                // fall back to the freshly-derived slug from `ws_url_to_slug`
+                // when the lockfile has no entry yet. Without the fallback,
+                // an empty/freshly-rebuilt lockfile loses every queue here.
+                let ws_slug = lockfile
+                    .slug_for_url("workspaces", ws_url)
+                    .map(|s| s.to_string())
+                    .or_else(|| ws_url_to_slug.get(ws_url).cloned());
+                let Some(ws_slug) = ws_slug else { continue };
+                let q_slug = match lockfile.slug_for_id("queues", q.id) {
+                    Some(existing) => existing.to_string(),
+                    None => slugify_unique(&q.name, &used_q),
+                };
+                used_q.insert(q_slug.clone());
+                q_url_to_ws_q.insert(q.url.clone(), (ws_slug.clone(), q_slug.clone()));
+                queue_by_slug.insert(q_slug, (q, ws_slug));
+            }
+        }
+        let email_template_by_compound: BTreeMap<String, &crate::model::EmailTemplate> = {
+            let mut map: BTreeMap<String, &crate::model::EmailTemplate> = BTreeMap::new();
+            let mut per_q: std::collections::HashMap<(String, String), HashSet<String>> =
+                std::collections::HashMap::new();
+            for t in &catalog.email_templates {
+                let Some(queue_url) = t.queue.as_ref() else {
+                    continue;
+                };
+                let Some((ws_slug, q_slug)) = q_url_to_ws_q.get(queue_url).cloned() else {
+                    continue;
+                };
+                let used = per_q.entry((ws_slug.clone(), q_slug.clone())).or_default();
+                let template_slug = match lockfile.slug_for_id("email_templates", t.id) {
+                    Some(existing) => existing.rsplit('/').next().unwrap_or(existing).to_string(),
+                    None => slugify_unique(&t.name, used),
+                };
+                used.insert(template_slug.clone());
+                map.insert(format!("{ws_slug}/{q_slug}/{template_slug}"), t);
+            }
+            map
+        };
+
+        CatalogIndex {
+            label_by_slug,
+            saved_view_by_slug,
+            workspace_by_slug,
+            engine_by_slug,
+            engine_field_by_slug,
+            hook_by_slug,
+            rule_by_slug,
+            queue_by_slug,
+            email_template_by_compound,
+        }
+    }
+}
+
 /// `resolve_conflicts`, portabilizing the env's side against `projection`
 /// (see [`crate::cli::sync::project_catalog`]) so a ref to an object created
 /// on the env since the last sync reads as the `rdc://` ref the pull will
@@ -195,187 +407,19 @@ async fn resolve_conflicts_projected<R: BufRead>(
 ) -> Result<ConflictOutcome> {
     let mut outcome = ConflictOutcome::default();
 
-    // Build a stable label-slug index up-front. This mirrors the slug
-    // derivation rule used by `pull::labels::process` and
-    // `from_catalog_scan_lockfile` so the slug we look up here matches
-    // the slug the classifier emitted.
-    let mut label_by_slug: BTreeMap<String, &crate::model::Label> = BTreeMap::new();
-    {
-        let mut used: HashSet<String> = ctx.lockfile.claimed_slugs("labels");
-        for l in &catalog.labels {
-            let slug = match ctx.lockfile.slug_for_id("labels", l.id) {
-                Some(existing) => existing.to_string(),
-                None => slugify_unique(&l.name, &used),
-            };
-            used.insert(slug.clone());
-            label_by_slug.insert(slug, l);
-        }
-    }
-
-    // Same shape as `label_by_slug`: rdc's filtered (shared-only) saved-view
-    // listing, slugged the same way `pull::saved_views::process` does.
-    let mut saved_view_by_slug: BTreeMap<String, &crate::model::SavedView> = BTreeMap::new();
-    {
-        let mut used: HashSet<String> = ctx.lockfile.claimed_slugs("saved_views");
-        for v in &catalog.saved_views {
-            let slug = match ctx.lockfile.slug_for_id("saved_views", v.id) {
-                Some(existing) => existing.to_string(),
-                None => slugify_unique(&v.name, &used),
-            };
-            used.insert(slug.clone());
-            saved_view_by_slug.insert(slug, v);
-        }
-    }
-
-    // Build slug → object indexes for the kinds the resolver knows
-    // about. Each kind mirrors the slug derivation rule its pull driver
-    // uses. The maps stay scoped to this function; downstream resolution
-    // looks objects up by slug.
-    let mut workspace_by_slug: BTreeMap<String, &crate::model::Workspace> = BTreeMap::new();
-    // Side-map of `workspace_url → slug` populated alongside
-    // `workspace_by_slug`. Used by the queue loop below as a fallback
-    // when `ctx.lockfile.slug_for_url("workspaces", …)` misses — which
-    // it does when the lockfile starts empty (fresh checkout) and any
-    // resume path where queues were created on remote in a prior failed
-    // run but the lockfile was never persisted. Without this, every
-    // queue silently `continue`s and the conflict resolver reports
-    // "no matching remote object found" for the queue / its schema /
-    // its inbox even though the freshly-pulled catalog has them all.
-    let mut ws_url_to_slug: BTreeMap<String, String> = BTreeMap::new();
-    {
-        let mut used: HashSet<String> = ctx.lockfile.claimed_slugs("workspaces");
-        for w in &catalog.workspaces {
-            let slug = match ctx.lockfile.slug_for_id("workspaces", w.id) {
-                Some(existing) => existing.to_string(),
-                None => slugify_unique(&w.name, &used),
-            };
-            used.insert(slug.clone());
-            ws_url_to_slug.insert(w.url.clone(), slug.clone());
-            workspace_by_slug.insert(slug, w);
-        }
-    }
-    let mut engine_by_slug: BTreeMap<String, &crate::model::Engine> = BTreeMap::new();
-    {
-        let mut used: HashSet<String> = ctx.lockfile.claimed_slugs("engines");
-        for e in &catalog.engines {
-            let slug = match ctx.lockfile.slug_for_id("engines", e.id) {
-                Some(existing) => existing.to_string(),
-                None => slugify_unique(&e.name, &used),
-            };
-            used.insert(slug.clone());
-            engine_by_slug.insert(slug, e);
-        }
-    }
-    // Engine fields are nested under their parent engine — the lockfile
-    // key is the composite `<engine_slug>/<field_slug>` so two engines
-    // can both carry a field named e.g. `Amount` and keep clean
-    // per-engine slugs. `slug_for_id` returns a key that may be either
-    // composite (post-migration) or legacy flat (older lockfile); both
-    // shapes index the catalog by the same composite key here.
-    let mut engine_field_by_slug: BTreeMap<String, &crate::model::EngineField> = BTreeMap::new();
-    {
-        let mut per_engine_used: std::collections::HashMap<String, HashSet<String>> =
-            std::collections::HashMap::new();
-        for f in &catalog.engine_fields {
-            let Some(engine_slug) = ctx
-                .lockfile
-                .slug_for_url("engines", &f.engine)
-                .map(|s| s.to_string())
-            else {
-                continue;
-            };
-            let used = per_engine_used.entry(engine_slug.clone()).or_default();
-            let field_slug = match ctx.lockfile.slug_for_id("engine_fields", f.id) {
-                Some(existing) => existing
-                    .strip_prefix(&format!("{engine_slug}/"))
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| existing.to_string()),
-                None => slugify_unique(&f.name, used),
-            };
-            used.insert(field_slug.clone());
-            engine_field_by_slug.insert(format!("{engine_slug}/{field_slug}"), f);
-        }
-    }
-    let mut hook_by_slug: BTreeMap<String, &crate::model::Hook> = BTreeMap::new();
-    {
-        let mut used: HashSet<String> = ctx.lockfile.claimed_slugs("hooks");
-        for h in &catalog.hooks {
-            let slug = match ctx.lockfile.slug_for_id("hooks", h.id) {
-                Some(existing) => existing.to_string(),
-                None => slugify_unique(&h.name, &used),
-            };
-            used.insert(slug.clone());
-            hook_by_slug.insert(slug, h);
-        }
-    }
-    let mut rule_by_slug: BTreeMap<String, &crate::model::Rule> = BTreeMap::new();
-    {
-        let mut used: HashSet<String> = ctx.lockfile.claimed_slugs("rules");
-        for r in &catalog.rules {
-            let slug = match ctx.lockfile.slug_for_id("rules", r.id) {
-                Some(existing) => existing.to_string(),
-                None => slugify_unique(&r.name, &used),
-            };
-            used.insert(slug.clone());
-            rule_by_slug.insert(slug, r);
-        }
-    }
-
-    // Queue-tree slug indexes. The queue slug keys queue / schema /
-    // inbox; email templates use the compound `<ws>/<q>/<tpl>` slug.
-    // Slug derivation mirrors `pull::queues::process` and
-    // `pull::email_templates::process`.
-    let mut queue_by_slug: BTreeMap<String, (&crate::model::Queue, String /* ws_slug */)> =
-        BTreeMap::new();
-    let mut q_url_to_ws_q: BTreeMap<String, (String, String)> = BTreeMap::new();
-    {
-        // Global, id-pinned queue slugs (mirror pull::queues::process): dedup
-        // globally, pre-seeded with the already-pinned slugs.
-        let mut used_q: HashSet<String> = ctx.lockfile.claimed_slugs("queues");
-        for q in &catalog.queues {
-            let Some(ws_url) = q.workspace.as_ref() else {
-                continue;
-            };
-            // Prefer the lockfile slug (preserves user-customised slugs);
-            // fall back to the freshly-derived slug from `ws_url_to_slug`
-            // when the lockfile has no entry yet. Without the fallback,
-            // an empty/freshly-rebuilt lockfile loses every queue here.
-            let ws_slug = ctx
-                .lockfile
-                .slug_for_url("workspaces", ws_url)
-                .map(|s| s.to_string())
-                .or_else(|| ws_url_to_slug.get(ws_url).cloned());
-            let Some(ws_slug) = ws_slug else { continue };
-            let q_slug = match ctx.lockfile.slug_for_id("queues", q.id) {
-                Some(existing) => existing.to_string(),
-                None => slugify_unique(&q.name, &used_q),
-            };
-            used_q.insert(q_slug.clone());
-            q_url_to_ws_q.insert(q.url.clone(), (ws_slug.clone(), q_slug.clone()));
-            queue_by_slug.insert(q_slug, (q, ws_slug));
-        }
-    }
-    let email_template_by_compound: BTreeMap<String, &crate::model::EmailTemplate> = {
-        let mut map: BTreeMap<String, &crate::model::EmailTemplate> = BTreeMap::new();
-        let mut per_q: std::collections::HashMap<(String, String), HashSet<String>> =
-            std::collections::HashMap::new();
-        for t in &catalog.email_templates {
-            let Some(queue_url) = t.queue.as_ref() else {
-                continue;
-            };
-            let Some((ws_slug, q_slug)) = q_url_to_ws_q.get(queue_url).cloned() else {
-                continue;
-            };
-            let used = per_q.entry((ws_slug.clone(), q_slug.clone())).or_default();
-            let template_slug = match ctx.lockfile.slug_for_id("email_templates", t.id) {
-                Some(existing) => existing.rsplit('/').next().unwrap_or(existing).to_string(),
-                None => slugify_unique(&t.name, used),
-            };
-            used.insert(template_slug.clone());
-            map.insert(format!("{ws_slug}/{q_slug}/{template_slug}"), t);
-        }
-        map
-    };
+    // Slug → remote-object indexes, built the way the classifier slugs
+    // them (see [`CatalogIndex`]).
+    let CatalogIndex {
+        label_by_slug,
+        saved_view_by_slug,
+        workspace_by_slug,
+        engine_by_slug,
+        engine_field_by_slug,
+        hook_by_slug,
+        rule_by_slug,
+        queue_by_slug,
+        email_template_by_compound,
+    } = CatalogIndex::build(ctx.lockfile, catalog);
 
     let conflicts: Vec<&ClassifiedItem> = classified
         .iter()
@@ -2579,170 +2623,21 @@ async fn resolve_remote_deletes_projected<R: BufRead>(
     let mut processed_lerd = 0usize;
     let mut processed_ldre = 0usize;
 
-    // Build slug → object indexes for each kind that may surface here.
+    // Slug → remote-object indexes for each kind that may surface here.
     // LocalDeleteRemoteEdit needs the env-side body to restore the file
     // for review; KeepRemote on the same class then aligns the lockfile
-    // to the restored bytes' hash. Slug derivation mirrors the pull
-    // drivers (and `resolve_conflicts`).
-    let mut label_by_slug: BTreeMap<String, &crate::model::Label> = BTreeMap::new();
-    {
-        let mut used: HashSet<String> = ctx.lockfile.claimed_slugs("labels");
-        for l in &catalog.labels {
-            let slug = match ctx.lockfile.slug_for_id("labels", l.id) {
-                Some(existing) => existing.to_string(),
-                None => slugify_unique(&l.name, &used),
-            };
-            used.insert(slug.clone());
-            label_by_slug.insert(slug, l);
-        }
-    }
-    let mut saved_view_by_slug: BTreeMap<String, &crate::model::SavedView> = BTreeMap::new();
-    {
-        let mut used: HashSet<String> = ctx.lockfile.claimed_slugs("saved_views");
-        for v in &catalog.saved_views {
-            let slug = match ctx.lockfile.slug_for_id("saved_views", v.id) {
-                Some(existing) => existing.to_string(),
-                None => slugify_unique(&v.name, &used),
-            };
-            used.insert(slug.clone());
-            saved_view_by_slug.insert(slug, v);
-        }
-    }
-    let mut workspace_by_slug: BTreeMap<String, &crate::model::Workspace> = BTreeMap::new();
-    // Same `workspace_url → slug` side-map as the resolve_conflicts
-    // path, used below to map queue.workspace URLs to slugs when the
-    // lockfile is empty (fresh checkout or partial-deploy resume).
-    let mut ws_url_to_slug: BTreeMap<String, String> = BTreeMap::new();
-    {
-        let mut used: HashSet<String> = ctx.lockfile.claimed_slugs("workspaces");
-        for w in &catalog.workspaces {
-            let slug = match ctx.lockfile.slug_for_id("workspaces", w.id) {
-                Some(existing) => existing.to_string(),
-                None => slugify_unique(&w.name, &used),
-            };
-            used.insert(slug.clone());
-            ws_url_to_slug.insert(w.url.clone(), slug.clone());
-            workspace_by_slug.insert(slug, w);
-        }
-    }
-    let mut engine_by_slug: BTreeMap<String, &crate::model::Engine> = BTreeMap::new();
-    {
-        let mut used: HashSet<String> = ctx.lockfile.claimed_slugs("engines");
-        for e in &catalog.engines {
-            let slug = match ctx.lockfile.slug_for_id("engines", e.id) {
-                Some(existing) => existing.to_string(),
-                None => slugify_unique(&e.name, &used),
-            };
-            used.insert(slug.clone());
-            engine_by_slug.insert(slug, e);
-        }
-    }
-    // Engine fields are nested under their parent engine — the lockfile
-    // key is the composite `<engine_slug>/<field_slug>` so two engines
-    // can both carry a field named e.g. `Amount` and keep clean
-    // per-engine slugs. `slug_for_id` returns a key that may be either
-    // composite (post-migration) or legacy flat (older lockfile); both
-    // shapes index the catalog by the same composite key here.
-    let mut engine_field_by_slug: BTreeMap<String, &crate::model::EngineField> = BTreeMap::new();
-    {
-        let mut per_engine_used: std::collections::HashMap<String, HashSet<String>> =
-            std::collections::HashMap::new();
-        for f in &catalog.engine_fields {
-            let Some(engine_slug) = ctx
-                .lockfile
-                .slug_for_url("engines", &f.engine)
-                .map(|s| s.to_string())
-            else {
-                continue;
-            };
-            let used = per_engine_used.entry(engine_slug.clone()).or_default();
-            let field_slug = match ctx.lockfile.slug_for_id("engine_fields", f.id) {
-                Some(existing) => existing
-                    .strip_prefix(&format!("{engine_slug}/"))
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| existing.to_string()),
-                None => slugify_unique(&f.name, used),
-            };
-            used.insert(field_slug.clone());
-            engine_field_by_slug.insert(format!("{engine_slug}/{field_slug}"), f);
-        }
-    }
-    let mut hook_by_slug: BTreeMap<String, &crate::model::Hook> = BTreeMap::new();
-    {
-        let mut used: HashSet<String> = ctx.lockfile.claimed_slugs("hooks");
-        for h in &catalog.hooks {
-            let slug = match ctx.lockfile.slug_for_id("hooks", h.id) {
-                Some(existing) => existing.to_string(),
-                None => slugify_unique(&h.name, &used),
-            };
-            used.insert(slug.clone());
-            hook_by_slug.insert(slug, h);
-        }
-    }
-    let mut rule_by_slug: BTreeMap<String, &crate::model::Rule> = BTreeMap::new();
-    {
-        let mut used: HashSet<String> = ctx.lockfile.claimed_slugs("rules");
-        for r in &catalog.rules {
-            let slug = match ctx.lockfile.slug_for_id("rules", r.id) {
-                Some(existing) => existing.to_string(),
-                None => slugify_unique(&r.name, &used),
-            };
-            used.insert(slug.clone());
-            rule_by_slug.insert(slug, r);
-        }
-    }
-
-    // Queue-tree indexes for remote-delete dispatch. Mirrors
-    // `resolve_conflicts`. The same compound-slug map for email
-    // templates is built here so `<ws>/<q>/<tpl>` → template lookups
-    // share the slug derivation.
-    let mut queue_by_slug: BTreeMap<String, (&crate::model::Queue, String /* ws_slug */)> =
-        BTreeMap::new();
-    let mut q_url_to_ws_q: BTreeMap<String, (String, String)> = BTreeMap::new();
-    {
-        // Global, id-pinned queue slugs (mirror pull::queues::process): dedup
-        // globally, pre-seeded with the already-pinned slugs.
-        let mut used_q: HashSet<String> = ctx.lockfile.claimed_slugs("queues");
-        for q in &catalog.queues {
-            let Some(ws_url) = q.workspace.as_ref() else {
-                continue;
-            };
-            let ws_slug = ctx
-                .lockfile
-                .slug_for_url("workspaces", ws_url)
-                .map(|s| s.to_string())
-                .or_else(|| ws_url_to_slug.get(ws_url).cloned());
-            let Some(ws_slug) = ws_slug else { continue };
-            let q_slug = match ctx.lockfile.slug_for_id("queues", q.id) {
-                Some(existing) => existing.to_string(),
-                None => slugify_unique(&q.name, &used_q),
-            };
-            used_q.insert(q_slug.clone());
-            q_url_to_ws_q.insert(q.url.clone(), (ws_slug.clone(), q_slug.clone()));
-            queue_by_slug.insert(q_slug, (q, ws_slug));
-        }
-    }
-    let email_template_by_compound: BTreeMap<String, &crate::model::EmailTemplate> = {
-        let mut map: BTreeMap<String, &crate::model::EmailTemplate> = BTreeMap::new();
-        let mut per_q: std::collections::HashMap<(String, String), HashSet<String>> =
-            std::collections::HashMap::new();
-        for t in &catalog.email_templates {
-            let Some(queue_url) = t.queue.as_ref() else {
-                continue;
-            };
-            let Some((ws_slug, q_slug)) = q_url_to_ws_q.get(queue_url).cloned() else {
-                continue;
-            };
-            let used = per_q.entry((ws_slug.clone(), q_slug.clone())).or_default();
-            let template_slug = match ctx.lockfile.slug_for_id("email_templates", t.id) {
-                Some(existing) => existing.rsplit('/').next().unwrap_or(existing).to_string(),
-                None => slugify_unique(&t.name, used),
-            };
-            used.insert(template_slug.clone());
-            map.insert(format!("{ws_slug}/{q_slug}/{template_slug}"), t);
-        }
-        map
-    };
+    // to the restored bytes' hash.
+    let CatalogIndex {
+        label_by_slug,
+        saved_view_by_slug,
+        workspace_by_slug,
+        engine_by_slug,
+        engine_field_by_slug,
+        hook_by_slug,
+        rule_by_slug,
+        queue_by_slug,
+        email_template_by_compound,
+    } = CatalogIndex::build(ctx.lockfile, catalog);
 
     let env = ctx.paths.env().to_string();
 
@@ -3265,12 +3160,7 @@ async fn resolve_remote_deletes_projected<R: BufRead>(
                     // produce under `--watch` — it is no longer the
                     // clean class, and auto-deleting it would destroy
                     // the edit. Fall through to the prompt flow instead.
-                    let recorded_base = ctx
-                        .lockfile
-                        .objects
-                        .get(it.kind.as_str())
-                        .and_then(|m| m.get(it.slug.as_str()))
-                        .and_then(|e| e.content_hash.clone());
+                    let recorded_base = ctx.lockfile.base_hash(it.kind.as_str(), it.slug.as_str());
                     let still_clean =
                         recorded_base.is_some() && local_disk_hash(&refs) == recorded_base;
                     if still_clean {
@@ -4928,12 +4818,7 @@ mod tests {
     fn classified_for(fixture: &ConflictFixture) -> Vec<ClassifiedItem> {
         let local_hash = content_hash(&label_bytes(&fixture.local_edit), &fixture.lockfile);
         let remote_hash = content_hash(&label_bytes(&fixture.remote_label), &fixture.lockfile);
-        let base_hash = fixture
-            .lockfile
-            .objects
-            .get("labels")
-            .and_then(|m| m.get("audit-hold"))
-            .and_then(|e| e.content_hash.clone())
+        let base_hash = fixture.lockfile.base_hash("labels", "audit-hold")
             .unwrap();
         vec![ClassifiedItem {
             kind: "labels".to_string(),
@@ -4997,12 +4882,7 @@ mod tests {
         // check accepts the force-push.
         let remote_bytes = label_bytes(&fixture.remote_label);
         let remote_hash = content_hash(&remote_bytes, &fixture.lockfile);
-        let recorded = fixture
-            .lockfile
-            .objects
-            .get("labels")
-            .and_then(|m| m.get("audit-hold"))
-            .and_then(|e| e.content_hash.clone())
+        let recorded = fixture.lockfile.base_hash("labels", "audit-hold")
             .expect("lockfile entry must persist");
         assert_eq!(
             recorded, remote_hash,
@@ -5062,12 +4942,7 @@ mod tests {
         );
 
         // Lockfile records the remote hash.
-        let recorded = fixture
-            .lockfile
-            .objects
-            .get("labels")
-            .and_then(|m| m.get("audit-hold"))
-            .and_then(|e| e.content_hash.clone())
+        let recorded = fixture.lockfile.base_hash("labels", "audit-hold")
             .unwrap();
         assert_eq!(recorded, content_hash(&remote_bytes, &fixture.lockfile));
     }
@@ -5119,12 +4994,7 @@ mod tests {
             local_after, remote_bytes,
             "use-remote must overwrite local with the remote bytes"
         );
-        let recorded = fixture
-            .lockfile
-            .objects
-            .get("labels")
-            .and_then(|m| m.get("audit-hold"))
-            .and_then(|e| e.content_hash.clone())
+        let recorded = fixture.lockfile.base_hash("labels", "audit-hold")
             .unwrap();
         assert_eq!(recorded, content_hash(&remote_bytes, &fixture.lockfile));
         assert!(
@@ -5326,12 +5196,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_conflicts_skip_writes_shadow_and_preserves_base() {
         let mut fixture = setup_conflict_fixture();
-        let prior_base = fixture
-            .lockfile
-            .objects
-            .get("labels")
-            .and_then(|m| m.get("audit-hold"))
-            .and_then(|e| e.content_hash.clone())
+        let prior_base = fixture.lockfile.base_hash("labels", "audit-hold")
             .expect("fixture must seed a prior base hash");
         let catalog = catalog_with_labels(vec![fixture.remote_label.clone()]);
         let classified = classified_for(&fixture);
@@ -5390,12 +5255,7 @@ mod tests {
 
         // Lockfile entry MUST be pinned to the prior base — advancing it
         // would silently swallow the conflict on the next pull/sync.
-        let recorded = fixture
-            .lockfile
-            .objects
-            .get("labels")
-            .and_then(|m| m.get("audit-hold"))
-            .and_then(|e| e.content_hash.clone())
+        let recorded = fixture.lockfile.base_hash("labels", "audit-hold")
             .unwrap();
         assert_eq!(
             recorded, prior_base,
@@ -5410,12 +5270,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_conflicts_non_interactive_preserves_base() {
         let mut fixture = setup_conflict_fixture();
-        let prior_base = fixture
-            .lockfile
-            .objects
-            .get("labels")
-            .and_then(|m| m.get("audit-hold"))
-            .and_then(|e| e.content_hash.clone())
+        let prior_base = fixture.lockfile.base_hash("labels", "audit-hold")
             .expect("fixture must seed a prior base hash");
         let catalog = catalog_with_labels(vec![fixture.remote_label.clone()]);
         let classified = classified_for(&fixture);
@@ -5454,12 +5309,7 @@ mod tests {
         let local_after = std::fs::read(&fixture.local_path).unwrap();
         assert_eq!(local_after, local_before);
 
-        let recorded = fixture
-            .lockfile
-            .objects
-            .get("labels")
-            .and_then(|m| m.get("audit-hold"))
-            .and_then(|e| e.content_hash.clone())
+        let recorded = fixture.lockfile.base_hash("labels", "audit-hold")
             .unwrap();
         assert_eq!(
             recorded, prior_base,
@@ -7192,11 +7042,7 @@ mod tests {
             "local .py edit must survive a conflict-without-prompt"
         );
 
-        let recorded = lockfile
-            .objects
-            .get("hooks")
-            .and_then(|m| m.get("ap-reject-if-no-doc-id"))
-            .and_then(|e| e.content_hash.clone())
+        let recorded = lockfile.base_hash("hooks", "ap-reject-if-no-doc-id")
             .expect("lockfile entry must persist");
         assert_eq!(
             recorded, base_combined,
@@ -7272,11 +7118,7 @@ mod tests {
 
         // Lockfile base aligned to remote combined hash so the push
         // driver's drift check passes.
-        let recorded = lockfile
-            .objects
-            .get("hooks")
-            .and_then(|m| m.get("ap-reject-if-no-doc-id"))
-            .and_then(|e| e.content_hash.clone())
+        let recorded = lockfile.base_hash("hooks", "ap-reject-if-no-doc-id")
             .expect("lockfile entry must persist");
         let remote_hook = &catalog.hooks[0];
         let (remote_json_full, remote_code) =
@@ -7733,11 +7575,7 @@ mod tests {
             "local .py edit must survive when resolver prompts/skips"
         );
 
-        let recorded = lockfile
-            .objects
-            .get("hooks")
-            .and_then(|m| m.get("ap-validator"))
-            .and_then(|e| e.content_hash.clone())
+        let recorded = lockfile.base_hash("hooks", "ap-validator")
             .expect("lockfile entry must persist");
         assert_eq!(
             recorded, base_combined,
@@ -7883,11 +7721,7 @@ mod tests {
             outcome.promoted_to_push,
         );
 
-        let recorded = lockfile
-            .objects
-            .get("hooks")
-            .and_then(|m| m.get("ap-validator"))
-            .and_then(|e| e.content_hash.clone())
+        let recorded = lockfile.base_hash("hooks", "ap-validator")
             .expect("lockfile entry must persist");
         assert_eq!(
             recorded, base_combined,
@@ -8144,11 +7978,7 @@ mod tests {
             "local formula edit must survive"
         );
 
-        let recorded = lockfile
-            .objects
-            .get("schemas")
-            .and_then(|m| m.get("cost-invoices"))
-            .and_then(|e| e.content_hash.clone())
+        let recorded = lockfile.base_hash("schemas", "cost-invoices")
             .expect("lockfile entry must persist");
         assert_eq!(
             recorded, base_combined,
@@ -8335,11 +8165,7 @@ mod tests {
         // The recorded lockfile hash MUST match the hash of the bytes actually
         // written to disk (the full remote, description kept), so the next sync
         // classifies the hook as Clean instead of re-conflicting forever.
-        let recorded = lockfile
-            .objects
-            .get("hooks")
-            .and_then(|m| m.get(slug))
-            .and_then(|e| e.content_hash.clone())
+        let recorded = lockfile.base_hash("hooks", slug)
             .expect("lockfile must have entry after resolution");
         assert_eq!(
             recorded, expected_hash,
@@ -8544,11 +8370,7 @@ mod tests {
         // so the next sync sees Clean. The restore is written in `rdc://`
         // form, so hash the env's body portabilized the same way.
         let expected_hash = codec.base_hash(&schema_value, &lockfile).unwrap();
-        let recorded = lockfile
-            .objects
-            .get("schemas")
-            .and_then(|m| m.get(q_slug))
-            .and_then(|e| e.content_hash.clone())
+        let recorded = lockfile.base_hash("schemas", q_slug)
             .expect("lockfile must have schema entry after restore");
         assert_eq!(
             recorded, expected_hash,

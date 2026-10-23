@@ -94,12 +94,7 @@ pub async fn process(
             let proposed = art.json;
 
             let local_path = dir.join(format!("{template_slug}.json"));
-            let base_hash = ctx
-                .lockfile
-                .objects
-                .get(KIND)
-                .and_then(|m| m.get(&lockfile_key))
-                .and_then(|x| x.content_hash.clone());
+            let base_hash = ctx.lockfile.base_hash(KIND, &lockfile_key);
 
             let proposed =
                 crate::cli::pull::common::portabilize_proposed(&proposed, &*ctx.lockfile);

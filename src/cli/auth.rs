@@ -18,7 +18,6 @@ use crate::api::{anyhow_has_status, RossumClient};
 use crate::config::{EnvConfig, ProjectConfig};
 use crate::log::Action;
 use crate::paths::Paths;
-use crate::secrets::LOGIN_TOKEN_LIFETIME_SECS;
 use anyhow::{anyhow, Context, Result};
 use std::io::IsTerminal;
 use std::path::Path;
@@ -60,8 +59,7 @@ pub async fn run(
                 format!("logging in to env '{env}' as '{username}'")
             })?;
         let org_name = validate_token(env_cfg, &token).await?;
-        let expires_at = crate::secrets::now_unix_secs().saturating_add(LOGIN_TOKEN_LIFETIME_SECS);
-        crate::secrets::write_secrets_file(&cwd, env, &token, Some(expires_at))?;
+        crate::secrets::write_login_token(&cwd, env, &token)?;
         log.event(
             Action::Auth,
             &format!(
@@ -225,9 +223,7 @@ pub async fn refresh_token_for_401(env: &str) -> Result<()> {
             let token = crate::api::login(&env_cfg.api_base, &username, &password)
                 .await
                 .with_context(|| format!("silent re-login for env '{env}'"))?;
-            let expires_at = crate::secrets::now_unix_secs()
-                .saturating_add(crate::secrets::LOGIN_TOKEN_LIFETIME_SECS);
-            crate::secrets::write_secrets_file(&cwd, env, &token, Some(expires_at))?;
+            crate::secrets::write_login_token(&cwd, env, &token)?;
             log.event(Action::Auth, &format!("silent re-login OK for env '{env}'"));
             return Ok(());
         }

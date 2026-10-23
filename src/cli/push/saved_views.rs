@@ -1,3 +1,4 @@
+use super::{drift_base, remote_artifact};
 use crate::api::RossumClient;
 use crate::log::{Action, Log};
 use crate::paths::Paths;
@@ -236,7 +237,7 @@ async fn push_update_batch(
                     event: format!("saved_view/{slug} (remote id {id} missing)"),
                 });
             };
-            let remote_art = remote_artifact(remote_view)?;
+            let remote_art = remote_artifact("saved_views", remote_view, "saved view")?;
             if combined_hash(&remote_art.json, &remote_art.sidecars, lf) != base {
                 // Drift. NOT patched here — the sequential stage owns the prompt.
                 // Deliberately NOT residual-ref-checked on this branch: a
@@ -304,9 +305,7 @@ async fn push_update_batch(
                         pushed += 1;
                     }
                     Err(e) => {
-                        if first_error.is_none() {
-                            first_error = Some(e);
-                        }
+                        first_error.get_or_insert(e);
                     }
                 }
             }
@@ -337,16 +336,12 @@ async fn push_update_batch(
                         skipped += s;
                     }
                     Err(e) => {
-                        if first_error.is_none() {
-                            first_error = Some(e);
-                        }
+                        first_error.get_or_insert(e);
                     }
                 }
             }
             Err(e) => {
-                if first_error.is_none() {
-                    first_error = Some(e);
-                }
+                first_error.get_or_insert(e);
             }
         }
     }
@@ -383,32 +378,6 @@ fn ensure_no_residual_refs(slug: &str, payload: &serde_json::Value) -> Result<()
         );
     }
     Ok(())
-}
-
-/// Whether this entry can reach the drift check at all — and, if so, the base
-/// the remote is checked against.
-///
-/// The hoisted list fetch and the per-item guard inside the concurrent stage
-/// MUST agree on this predicate. If the hoist guard were ever narrower than the
-/// per-item one, an item would consult an empty list and silently take the
-/// "remote id missing" skip instead of a real drift check — no error, just
-/// wrong. One expression, called from both, so they cannot drift apart.
-fn drift_base(entry: &ObjectEntry) -> Option<&str> {
-    entry.content_hash.as_deref()
-}
-
-/// The canonical on-disk artifact for a remote saved view, as the drift check
-/// and the drift prompt both need it. One function so the bytes the concurrent
-/// stage hashes and the bytes the prompt shows are the same bytes — a second
-/// `codec.disk_bytes(...)` call site could diverge and make the prompt describe
-/// a drift the check did not find.
-fn remote_artifact(remote: &crate::model::SavedView) -> Result<crate::snapshot::codec::DiskArtifact> {
-    let codec = crate::snapshot::codec::codec("saved_views").unwrap();
-    codec
-        .disk_bytes(
-            &serde_json::to_value(remote).context("serializing remote saved view for drift check")?,
-        )
-        .context("codec disk_bytes for remote saved view")
 }
 
 /// Write one PATCH response back: canonical form to disk and the base cache,
@@ -494,7 +463,7 @@ async fn push_one_drifted(
         );
         return Ok((0, 1));
     };
-    let remote_art = remote_artifact(remote_view)?;
+    let remote_art = remote_artifact("saved_views", remote_view, "saved view")?;
     let remote_bytes = remote_art.json;
     let remote_combined = combined_hash(&remote_bytes, &remote_art.sidecars, lockfile);
     let mut payload_to_send = payload_view;

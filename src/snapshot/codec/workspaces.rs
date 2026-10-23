@@ -5,25 +5,17 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use crate::paths::Paths;
-use crate::snapshot::codec::{DiskArtifact, KindCodec};
+use crate::snapshot::codec::{DiskArtifact, KindCodec, plain_json_artifact};
 use crate::snapshot::create::strip_for_cross_env_patch;
-use crate::snapshot::key_order::strip_hidden_fields;
 
 pub struct Workspaces;
 
 impl KindCodec for Workspaces {
     fn disk_bytes(&self, value: &Value) -> anyhow::Result<DiskArtifact> {
-        let mut v = value.clone();
         // No redaction for workspaces — `redact_on_pull("workspaces")` is empty.
         // Strip `modified_at` recursively so that nested timestamps (e.g. inside
         // a sub-object) don't survive to disk and cause spurious sync drift.
-        strip_hidden_fields(&mut v);
-        let mut json = serde_json::to_vec_pretty(&v)?;
-        json.push(b'\n');
-        Ok(DiskArtifact {
-            json,
-            sidecars: vec![],
-        })
+        plain_json_artifact(value.clone())
     }
 
     fn cross_env_body(&self, body: &mut Value) {

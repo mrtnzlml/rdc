@@ -158,13 +158,25 @@ pub fn combined_hash(
     to_hex(&hasher.finalize())
 }
 
-fn to_hex(digest: &[u8]) -> String {
+pub(crate) fn to_hex(digest: &[u8]) -> String {
     use std::fmt::Write;
     let mut hex = String::with_capacity(digest.len() * 2);
     for b in digest {
         write!(&mut hex, "{:02x}", b).expect("writing to String cannot fail");
     }
     hex
+}
+
+/// The on-disk artifact of a flat, sidecar-less kind: `v` with the universal
+/// hidden fields stripped, pretty-printed with a trailing newline.
+pub(crate) fn plain_json_artifact(mut v: Value) -> anyhow::Result<DiskArtifact> {
+    crate::snapshot::key_order::strip_hidden_fields(&mut v);
+    let mut json = serde_json::to_vec_pretty(&v)?;
+    json.push(b'\n');
+    Ok(DiskArtifact {
+        json,
+        sidecars: vec![],
+    })
 }
 
 /// Look up the codec for `kind`. Returns `None` for unregistered kinds.

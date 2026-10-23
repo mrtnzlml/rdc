@@ -1539,10 +1539,7 @@ pub fn detect_color_mode() -> ColorMode {
 /// directly. The wrapping `detect_color_mode` plumbs in the live env +
 /// TTY readings.
 fn decide_color_mode(no_color_env: bool, is_tty: bool) -> ColorMode {
-    if no_color_env {
-        return ColorMode::Plain;
-    }
-    if is_tty {
+    if is_tty && !no_color_env {
         ColorMode::Color
     } else {
         ColorMode::Plain
@@ -1561,48 +1558,41 @@ pub(crate) const SGR_ADD: &str = "\x1b[38;2;120;180;90m";
 pub(crate) const SGR_ADD_BOLD: &str = "\x1b[1;38;2;120;180;90m";
 pub(crate) const SGR_DIM: &str = "\x1b[2m";
 
-/// Colorize the conflict header line in bold amber — matches the
-/// primary accent used by clap headers and prompt brackets.
-pub fn colorize_header(text: &str, mode: ColorMode) -> String {
+/// Wrap `text` in the `sgr` escape, or return it unchanged in plain mode.
+fn paint(text: &str, mode: ColorMode, sgr: &str) -> String {
     if mode == ColorMode::Plain {
         return text.to_string();
     }
-    format!("{SGR_AMBER_BOLD}{text}{SGR_RESET}")
+    format!("{sgr}{text}{SGR_RESET}")
+}
+
+/// Colorize the conflict header line in bold amber — matches the
+/// primary accent used by clap headers and prompt brackets.
+pub fn colorize_header(text: &str, mode: ColorMode) -> String {
+    paint(text, mode, SGR_AMBER_BOLD)
 }
 
 /// Colorize a success line (`✓ <name>`) in sage green — matches the
 /// hue used for added lines in unified diff output.
 pub fn colorize_success(text: &str, mode: ColorMode) -> String {
-    if mode == ColorMode::Plain {
-        return text.to_string();
-    }
-    format!("{SGR_ADD}{text}{SGR_RESET}")
+    paint(text, mode, SGR_ADD)
 }
 
 /// Colorize a warning line (`⚠️ <name>`) in bold amber — matches the
 /// primary accent used by clap headers and prompt brackets.
 pub fn colorize_warning(text: &str, mode: ColorMode) -> String {
-    if mode == ColorMode::Plain {
-        return text.to_string();
-    }
-    format!("{SGR_AMBER_BOLD}{text}{SGR_RESET}")
+    paint(text, mode, SGR_AMBER_BOLD)
 }
 
 /// Colorize an error line (`✗ <name>`) in bold red — matches the
 /// hue used for removed file headers in unified diff output.
 pub fn colorize_error(text: &str, mode: ColorMode) -> String {
-    if mode == ColorMode::Plain {
-        return text.to_string();
-    }
-    format!("{SGR_REMOVE_BOLD}{text}{SGR_RESET}")
+    paint(text, mode, SGR_REMOVE_BOLD)
 }
 
 /// Colorize the final summary line (`✔ Synced …`) in bold sage green.
 pub fn colorize_final_ok(text: &str, mode: ColorMode) -> String {
-    if mode == ColorMode::Plain {
-        return text.to_string();
-    }
-    format!("{SGR_ADD_BOLD}{text}{SGR_RESET}")
+    paint(text, mode, SGR_ADD_BOLD)
 }
 
 /// Colorize the action-letter prompt line. Bracketed single-letter tokens
@@ -1645,10 +1635,7 @@ pub fn colorize_prompt(text: &str, mode: ColorMode) -> String {
 /// Colorize text in dim/faint style. Used for the time prefix and
 /// low-importance action tokens (`skip`, `info`, `tick`, `idle`).
 pub fn colorize_dim(text: &str, mode: ColorMode) -> String {
-    if mode == ColorMode::Plain {
-        return text.to_string();
-    }
-    format!("{SGR_DIM}{text}{SGR_RESET}")
+    paint(text, mode, SGR_DIM)
 }
 
 #[cfg(test)]

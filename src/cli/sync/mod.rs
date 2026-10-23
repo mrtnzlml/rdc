@@ -104,6 +104,7 @@ pub mod lock;
 pub mod watch;
 
 use crate::api::RossumClient;
+use crate::cli::change_view::count_noun;
 use crate::cli::resolve::ConflictStrategy;
 use crate::config::ProjectConfig;
 use crate::log::{Action, Log};
@@ -680,73 +681,19 @@ pub(crate) async fn run_cycle(
         }
 
         if !renderer_was_supplied {
-            let parse_suffix = if parse_errors.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    ", {} parse error{}",
-                    parse_errors.len(),
-                    if parse_errors.len() == 1 { "" } else { "s" }
-                )
-            };
-            let limit_suffix = if limit_violations.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    ", {} field limit error{}",
-                    limit_violations.len(),
-                    if limit_violations.len() == 1 { "" } else { "s" }
-                )
-            };
-            let missing_suffix = if missing_create_fields.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    ", {} missing required field{}",
-                    missing_create_fields.len(),
-                    if missing_create_fields.len() == 1 { "" } else { "s" }
-                )
-            };
-            let settings_suffix = if settings_problems.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    ", {} organization settings problem{}",
-                    settings_problems.len(),
-                    if settings_problems.len() == 1 { "" } else { "s" }
-                )
-            };
-            let unshared_suffix = if unshared_views.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    ", {} unshared saved view{}",
-                    unshared_views.len(),
-                    if unshared_views.len() == 1 { "" } else { "s" }
-                )
-            };
-            let engine_suffix = if engine_conflicts.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    ", {} queue engine conflict{}",
-                    engine_conflicts.len(),
-                    if engine_conflicts.len() == 1 { "" } else { "s" }
-                )
-            };
-            let formula_suffix = if missing_formulas.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    ", {} schema{} with a formula field and no formula",
-                    missing_formulas.len(),
-                    if missing_formulas.len() == 1 { "" } else { "s" }
-                )
-            };
-            let parse_suffix = format!(
-                "{parse_suffix}{limit_suffix}{missing_suffix}{settings_suffix}\
-                 {unshared_suffix}{engine_suffix}{formula_suffix}"
-            );
+            let parse_suffix: String = [
+                (parse_errors.len(), "parse error", "parse errors", ""),
+                (limit_violations.len(), "field limit error", "field limit errors", ""),
+                (missing_create_fields.len(), "missing required field", "missing required fields", ""),
+                (settings_problems.len(), "organization settings problem", "organization settings problems", ""),
+                (unshared_views.len(), "unshared saved view", "unshared saved views", ""),
+                (engine_conflicts.len(), "queue engine conflict", "queue engine conflicts", ""),
+                (missing_formulas.len(), "schema", "schemas", " with a formula field and no formula"),
+            ]
+            .into_iter()
+            .filter(|(n, ..)| *n > 0)
+            .map(|(n, one, many, tail)| format!(", {}{tail}", count_noun(n, one, many)))
+            .collect();
             progress.event(
                 Action::Done,
                 &format!(
@@ -1063,7 +1010,6 @@ pub fn from_catalog_scan_lockfile(
     let mut remote_hashes: BTreeMap<(String, String), String> = BTreeMap::new();
     let mut scan_changes: BTreeMap<(String, String), String> = BTreeMap::new();
     let mut scan_tombstones: BTreeSet<(String, String)> = BTreeSet::new();
-    let mut locked: BTreeMap<(String, String), String> = BTreeMap::new();
 
     // Augment the lockfile with any catalog objects it's missing (e.g. an
     // empty lockfile on a fresh checkout). Reference normalization needs the
@@ -1120,15 +1066,6 @@ pub fn from_catalog_scan_lockfile(
         scan_tombstones.insert(("labels".to_string(), slug.clone()));
     }
 
-    // Locked: lockfile-recorded base hashes.
-    if let Some(map) = lockfile.objects.get("labels") {
-        for (slug, entry) in map {
-            if let Some(h) = &entry.content_hash {
-                locked.insert(("labels".to_string(), slug.clone()), h.clone());
-            }
-        }
-    }
-
     // --- saved views ---------------------------------------------------
     let saved_views_codec =
         crate::snapshot::codec::codec("saved_views").expect("saved_views codec must exist");
@@ -1167,14 +1104,6 @@ pub fn from_catalog_scan_lockfile(
         scan_tombstones.insert(("saved_views".to_string(), slug.clone()));
     }
 
-    if let Some(map) = lockfile.objects.get("saved_views") {
-        for (slug, entry) in map {
-            if let Some(h) = &entry.content_hash {
-                locked.insert(("saved_views".to_string(), slug.clone()), h.clone());
-            }
-        }
-    }
-
     // --- organization (pull-only singleton) ---------------------------
     // The org is a singleton — slug is always "self". Route through the
     // KindCodec so the adapter hash matches the pull baseline (the codec
@@ -1190,13 +1119,6 @@ pub fn from_catalog_scan_lockfile(
             if !json.is_empty() {
                 let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars, lockfile);
                 remote_hashes.insert(("organization".to_string(), "self".to_string()), hash);
-            }
-        }
-        if let Some(map) = lockfile.objects.get("organization") {
-            for (slug, entry) in map {
-                if let Some(h) = &entry.content_hash {
-                    locked.insert(("organization".to_string(), slug.clone()), h.clone());
-                }
             }
         }
         // Scan changes: the org is now push-capable (Task 4), so a local
@@ -1248,13 +1170,6 @@ pub fn from_catalog_scan_lockfile(
         let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars, lockfile);
         remote_hashes.insert(("workflows".to_string(), slug), hash);
     }
-    if let Some(map) = lockfile.objects.get("workflows") {
-        for (slug, entry) in map {
-            if let Some(h) = &entry.content_hash {
-                locked.insert(("workflows".to_string(), slug.clone()), h.clone());
-            }
-        }
-    }
 
     // --- workflow_steps (pull-only) -----------------------------------
     // Steps nest under workflows; the lockfile key is composite
@@ -1299,13 +1214,6 @@ pub fn from_catalog_scan_lockfile(
         let json = crate::cli::pull::common::portabilize_proposed(&json, lockfile);
         let hash = crate::snapshot::codec::combined_hash(&json, &art.sidecars, lockfile);
         remote_hashes.insert(("workflow_steps".to_string(), composite_key), hash);
-    }
-    if let Some(map) = lockfile.objects.get("workflow_steps") {
-        for (slug, entry) in map {
-            if let Some(h) = &entry.content_hash {
-                locked.insert(("workflow_steps".to_string(), slug.clone()), h.clone());
-            }
-        }
     }
 
     // --- workspaces ---------------------------------------------------
@@ -1364,13 +1272,6 @@ pub fn from_catalog_scan_lockfile(
     for slug in tombstones.workspaces.keys() {
         scan_tombstones.insert(("workspaces".to_string(), slug.clone()));
     }
-    if let Some(map) = lockfile.objects.get("workspaces") {
-        for (slug, entry) in map {
-            if let Some(h) = &entry.content_hash {
-                locked.insert(("workspaces".to_string(), slug.clone()), h.clone());
-            }
-        }
-    }
 
     // --- engines ------------------------------------------------------
     // Push-capable flat kind. Engines have an overlay and server-set
@@ -1417,13 +1318,6 @@ pub fn from_catalog_scan_lockfile(
     }
     for slug in tombstones.engines.keys() {
         scan_tombstones.insert(("engines".to_string(), slug.clone()));
-    }
-    if let Some(map) = lockfile.objects.get("engines") {
-        for (slug, entry) in map {
-            if let Some(h) = &entry.content_hash {
-                locked.insert(("engines".to_string(), slug.clone()), h.clone());
-            }
-        }
     }
 
     // --- engine_fields ------------------------------------------------
@@ -1478,13 +1372,6 @@ pub fn from_catalog_scan_lockfile(
     }
     for slug in tombstones.engine_fields.keys() {
         scan_tombstones.insert(("engine_fields".to_string(), slug.clone()));
-    }
-    if let Some(map) = lockfile.objects.get("engine_fields") {
-        for (slug, entry) in map {
-            if let Some(h) = &entry.content_hash {
-                locked.insert(("engine_fields".to_string(), slug.clone()), h.clone());
-            }
-        }
     }
 
     // --- mdh ----------------------------------------------------------
@@ -1555,13 +1442,6 @@ pub fn from_catalog_scan_lockfile(
     for slug in tombstones.hooks.keys() {
         scan_tombstones.insert(("hooks".to_string(), slug.clone()));
     }
-    if let Some(map) = lockfile.objects.get("hooks") {
-        for (slug, entry) in map {
-            if let Some(h) = &entry.content_hash {
-                locked.insert(("hooks".to_string(), slug.clone()), h.clone());
-            }
-        }
-    }
 
     // --- rules --------------------------------------------------------
     // Push-capable split-file kind, identical shape to hooks except the
@@ -1609,13 +1489,6 @@ pub fn from_catalog_scan_lockfile(
     }
     for slug in tombstones.rules.keys() {
         scan_tombstones.insert(("rules".to_string(), slug.clone()));
-    }
-    if let Some(map) = lockfile.objects.get("rules") {
-        for (slug, entry) in map {
-            if let Some(h) = &entry.content_hash {
-                locked.insert(("rules".to_string(), slug.clone()), h.clone());
-            }
-        }
     }
 
     // --- queues / schemas / inboxes / email_templates -----------------
@@ -1757,28 +1630,6 @@ pub fn from_catalog_scan_lockfile(
         scan_tombstones.insert(("inboxes".to_string(), slug.clone()));
     }
 
-    if let Some(map) = lockfile.objects.get("queues") {
-        for (slug, entry) in map {
-            if let Some(h) = &entry.content_hash {
-                locked.insert(("queues".to_string(), slug.clone()), h.clone());
-            }
-        }
-    }
-    if let Some(map) = lockfile.objects.get("schemas") {
-        for (slug, entry) in map {
-            if let Some(h) = &entry.content_hash {
-                locked.insert(("schemas".to_string(), slug.clone()), h.clone());
-            }
-        }
-    }
-    if let Some(map) = lockfile.objects.get("inboxes") {
-        for (slug, entry) in map {
-            if let Some(h) = &entry.content_hash {
-                locked.insert(("inboxes".to_string(), slug.clone()), h.clone());
-            }
-        }
-    }
-
     // email_templates — compound slug `<ws>/<q>/<tpl>`. Route through the
     // KindCodec for hash parity with the pull baseline.
     let email_templates_codec =
@@ -1839,10 +1690,30 @@ pub fn from_catalog_scan_lockfile(
     for slug in tombstones.email_templates.keys() {
         scan_tombstones.insert(("email_templates".to_string(), slug.clone()));
     }
-    if let Some(map) = lockfile.objects.get("email_templates") {
-        for (slug, entry) in map {
-            if let Some(h) = &entry.content_hash {
-                locked.insert(("email_templates".to_string(), slug.clone()), h.clone());
+
+    // Locked: lockfile-recorded base hashes.
+    let mut locked: BTreeMap<(String, String), String> = BTreeMap::new();
+    for kind in [
+        "labels",
+        "saved_views",
+        "organization",
+        "workflows",
+        "workflow_steps",
+        "workspaces",
+        "engines",
+        "engine_fields",
+        "hooks",
+        "rules",
+        "queues",
+        "schemas",
+        "inboxes",
+        "email_templates",
+    ] {
+        if let Some(map) = lockfile.objects.get(kind) {
+            for (slug, entry) in map {
+                if let Some(h) = &entry.content_hash {
+                    locked.insert((kind.to_string(), slug.clone()), h.clone());
+                }
             }
         }
     }

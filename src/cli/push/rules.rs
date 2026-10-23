@@ -1,3 +1,4 @@
+use super::drift_base;
 use crate::api::RossumClient;
 use crate::log::{Action, Log};
 use crate::paths::Paths;
@@ -300,9 +301,7 @@ async fn push_update_batch(
                         pushed += 1;
                     }
                     Err(e) => {
-                        if first_error.is_none() {
-                            first_error = Some(e);
-                        }
+                        first_error.get_or_insert(e);
                     }
                 }
             }
@@ -337,16 +336,12 @@ async fn push_update_batch(
                         skipped += s;
                     }
                     Err(e) => {
-                        if first_error.is_none() {
-                            first_error = Some(e);
-                        }
+                        first_error.get_or_insert(e);
                     }
                 }
             }
             Err(e) => {
-                if first_error.is_none() {
-                    first_error = Some(e);
-                }
+                first_error.get_or_insert(e);
             }
         }
     }
@@ -355,18 +350,6 @@ async fn push_update_batch(
     }
 
     Ok((pushed, skipped))
-}
-
-/// Whether this entry can reach the drift check at all — and, if so, the base
-/// the remote is checked against.
-///
-/// The hoisted list fetch and the per-item guard inside the concurrent stage
-/// MUST agree on this predicate. If the hoist guard were ever narrower than the
-/// per-item one, an item would consult an empty list and silently take the
-/// "remote id missing" skip instead of a real drift check — no error, just
-/// wrong. One expression, called from both, so they cannot drift apart.
-fn drift_base(entry: &ObjectEntry) -> Option<&str> {
-    entry.content_hash.as_deref()
 }
 
 /// Write one PATCH response back: canonical form to disk and the base cache,
