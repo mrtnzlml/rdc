@@ -127,11 +127,11 @@ impl BulkChoice {
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 #[value(rename_all = "kebab-case")]
 pub enum ConflictStrategy {
-    /// Resolve every conflict as `[r] use <env>`.
+    /// Replace the local file with the remote copy.
     UseRemote,
-    /// Resolve every conflict as `[k] keep local`.
+    /// Push the local file.
     KeepLocal,
-    /// Resolve every conflict as `[s] skip` (shadow-file fallback).
+    /// Write the remote copy to `.rdc/conflicts/<env>/` and keep the local file.
     Skip,
 }
 

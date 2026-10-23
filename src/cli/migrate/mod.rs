@@ -3065,8 +3065,9 @@ pub enum CarryGroup {
     /// A queue's `automation_enabled`, `automation_level` and
     /// `quality_spot_check_percentage`.
     Automation,
-    /// Every group above. A group added later widens it, which is the intended
-    /// reading of "carry everything the target normally owns".
+    /// Every group above.
+    // A group added later widens it, which is the intended reading of
+    // "carry everything the target normally owns".
     All,
 }
 

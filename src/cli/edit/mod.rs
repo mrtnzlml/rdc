@@ -11,7 +11,7 @@ use clap_complete::ArgValueCandidates;
 
 #[derive(Debug, Subcommand)]
 pub enum EditCommand {
-    /// Maintain the project's environments.
+    /// Manage the project's environments.
     Env {
         #[command(subcommand)]
         command: EnvCommand,
@@ -20,7 +20,7 @@ pub enum EditCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum EnvCommand {
-    /// Rename an environment everywhere in the project.
+    /// Rename an environment in the local project.
     #[command(long_about = RENAME_LONG_ABOUT)]
     Rename {
         /// The env's current name, as in `rdc.toml`.
@@ -28,19 +28,26 @@ pub enum EnvCommand {
         old: String,
         /// The new name. Letters, digits, `-` and `_` only.
         new: String,
-        /// Print what the rename would do, and write nothing.
+        /// Print the changes without writing.
         #[arg(long = "dry-run")]
         dry_run: bool,
     },
 }
 
-const RENAME_LONG_ABOUT: &str = r#"Rename an environment everywhere in the project. Rossum is not contacted: the org, its objects and the token stay as they are.
+const RENAME_LONG_ABOUT: &str = r#"Rename an environment in the local project. Makes no API calls.
 
-Moves envs/<old>/, secrets/<old>.secrets.json, secrets/<old>.hook-secrets.json and the env's state under .rdc/. Renames the env in rdc.toml and .rdc/mapping.toml. Refreshes the rdc regions of README.md, CLAUDE.md and .gitlab-ci.yml. In the pipeline's deploy jobs it changes only values equal to <old>, the deploy:<old> job key, and references to that job such as `needs:`. It refuses if a deploy:<new> job already exists.
+Moves envs/<old>/, secrets/<old>.secrets.json,
+secrets/<old>.hook-secrets.json and the env's files under .rdc/. Renames the
+env in rdc.toml and .rdc/mapping.toml, and updates the rdc regions of
+README.md, CLAUDE.md and .gitlab-ci.yml. In the pipeline's deploy jobs it
+changes values equal to <old>, the deploy:<old> job key, and references to
+that job such as `needs:`.
 
-It refuses before writing anything when <new> is taken, when a target path already exists, or when another rdc process holds <old>'s lock. If a step fails partway, it undoes every change.
+It refuses before writing when <new> is already an env, a target path
+exists, or another rdc process holds <old>'s lock. It also refuses when a
+deploy:<new> job exists. If a step fails, it reverts every change.
 
-The GitLab CI variables named after the env (RDC_TOKEN_<ENV>) cannot be renamed from here. The command prints what to rename."#;
+It prints the GitLab CI variables (RDC_TOKEN_<ENV>) to rename by hand."#;
 
 pub fn run(command: EditCommand) -> anyhow::Result<()> {
     match command {
