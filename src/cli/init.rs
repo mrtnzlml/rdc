@@ -1326,6 +1326,18 @@ mod tests {
         assert!(std::fs::read_dir(&project).unwrap().next().is_none(), "nothing written");
     }
 
+    /// pytest loads every `conftest.py` in a directory it collects; the
+    /// folders holding tenant code (hook and rule sidecars, formulas) must
+    /// never be entered, or an org-named `conftest` runs in CI.
+    #[test]
+    fn scaffolded_pytest_ini_never_enters_tenant_code_folders() {
+        let ini = TESTKIT_TEMPLATES.iter().find(|(n, _)| *n == "pytest.ini").unwrap().1;
+        let line = ini.lines().find(|l| l.starts_with("norecursedirs")).expect("norecursedirs is set");
+        for dir in ["hooks", "rules", "formulas", ".*"] {
+            assert!(line.split_whitespace().any(|w| w == dir), "{dir} missing: {line}");
+        }
+    }
+
     /// Embedders call this on every sync, so it must stay non-destructive.
     #[test]
     fn write_scaffold_files_never_clobbers_existing_files() {

@@ -524,6 +524,18 @@ mod tests {
     /// this file -- it edits three files, not four -- so no comment here can be
     /// silently falsified by a release.
     #[test]
+    fn the_archive_job_prepares_its_env_so_credentials_can_be_scoped() {
+        // GitLab hands an environment-scoped variable only to a job that
+        // declares that environment. The archive job uses the deploy job's
+        // env name without deploying to it, so one scope per env covers both
+        // and the pytest job, which runs tenant-pulled code, gets none.
+        let template = crate::cli::init::GITLAB_CI_TEMPLATE;
+        let archive = template.split("\narchive:\n").nth(1).unwrap().split("\n\n").next().unwrap();
+        assert!(archive.contains("\n  environment:"), "{archive}");
+        assert!(archive.contains("\n    name: \"$RDC_ENV\"\n    action: prepare\n"), "{archive}");
+    }
+
+    #[test]
     fn the_committed_template_floats_and_names_no_version() {
         let template = crate::cli::init::GITLAB_CI_TEMPLATE;
         let pins: Vec<&str> = template

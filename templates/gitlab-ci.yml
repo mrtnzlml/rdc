@@ -7,6 +7,12 @@
 #     <ENV> is the env name uppercased, non-alphanumerics as '_' (dev-eu -> DEV_EU).
 #   RDC_GIT_PUSH_TOKEN               write access to THIS repo's default branch
 #     for the commit-back, or RDC_GIT_PUSH_URL with a full authenticated URL.
+# Give each variable an Environment scope: RDC_*_<ENV> the env it belongs to,
+# RDC_GIT_PUSH_TOKEN one definition per env. The archive and deploy jobs both
+# declare their env, so they get them; the pytest job declares none and runs
+# code pulled from the tenant, so it must not. If an env is protected with
+# required approvals, check that the scheduled archive (`action: prepare`)
+# still runs unattended.
 #
 # Rehearse every new deploy target before its first press:
 #   rdc migrate <src> <tgt> --mirror --dry-run && rdc sync <tgt> --dry-run
@@ -106,6 +112,9 @@ archive:
   needs: []  # an archive records what is live; never gate it on the tests
   resource_group: archive  # serialize the commit-backs, including across pipelines
   interruptible: false  # a newer pipeline must not cancel the queued sibling
+  environment:  # the deploy job's env, used without deploying to it (see the header)
+    name: "$RDC_ENV"
+    action: prepare
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule"
     - if: $CI_PIPELINE_SOURCE == "web"

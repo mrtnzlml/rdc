@@ -43,11 +43,16 @@ pub fn is_safe_relative_key(key: &str) -> bool {
         .all(|seg| !seg.is_empty() && seg != "." && seg != ".." && !seg.contains(['\\', '\0']))
 }
 
+/// Slugs never used: a hook or rule named `conftest` would be written as
+/// `conftest.py`, which pytest runs while collecting the snapshot tree.
+const RESERVED: &[&str] = &["conftest"];
+
 /// Given a base slug and a set of slugs already in use, return a slug that does
-/// not collide. Adds `-2`, `-3`, ... as needed.
+/// not collide. Adds `-2`, `-3`, ... as needed. A [reserved](RESERVED) slug
+/// counts as taken.
 pub fn slugify_unique(input: &str, used: &std::collections::HashSet<String>) -> String {
     let base = slugify(input);
-    if !used.contains(&base) {
+    if !used.contains(&base) && !RESERVED.contains(&base.as_str()) {
         return base;
     }
     let mut n = 2;
@@ -117,6 +122,13 @@ mod tests {
     #[test]
     fn trims_leading_and_trailing_hyphens() {
         assert_eq!(slugify("---hello---"), "hello");
+    }
+
+    /// pytest runs any `conftest.py` it meets while collecting, and hook and
+    /// rule names come from the Rossum org, so no slug may be `conftest`.
+    #[test]
+    fn unique_never_returns_conftest() {
+        assert_eq!(slugify_unique("Conftest", &HashSet::new()), "conftest-2");
     }
 
     #[test]

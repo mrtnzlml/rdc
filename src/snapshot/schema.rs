@@ -204,6 +204,13 @@ fn ensure_formula_id(id: &str) -> Result<()> {
              '.' or '..', or contain '/', '\\' or NUL"
         );
     }
+    // `formulas/conftest.py` would run in the project's pytest job.
+    if id == "conftest" {
+        anyhow::bail!(
+            "schema datapoint id 'conftest' cannot name a formula file: pytest would run \
+             formulas/conftest.py. Rename the field in Rossum."
+        );
+    }
     Ok(())
 }
 
@@ -561,6 +568,23 @@ mod tests {
         let s: Schema = serde_json::from_value(v).unwrap();
         let err = format!("{:#}", serialize_schema(&s).unwrap_err());
         assert!(err.contains("../test_x"), "got: {err}");
+    }
+
+    /// A field id `conftest` would be written as `formulas/conftest.py`,
+    /// which pytest runs while collecting. The id is the file name, so it
+    /// cannot be renamed: refuse it.
+    #[test]
+    fn serialize_schema_rejects_a_conftest_formula_id() {
+        let v = json!({
+            "id": 1,
+            "url": "https://x/api/v1/schemas/1",
+            "name": "S",
+            "queues": [],
+            "content": [{ "category": "datapoint", "id": "conftest", "formula": "1" }]
+        });
+        let s: Schema = serde_json::from_value(v).unwrap();
+        let err = format!("{:#}", serialize_schema(&s).unwrap_err());
+        assert!(err.contains("conftest"), "got: {err}");
     }
 
     /// The same id read from a committed `schema.json` must not select a file
