@@ -30,6 +30,7 @@ jobs:
     secrets: inherit
     with:
       version_label: ${{ inputs.version }}
+      ref: ${{ github.ref }}
 
   # Proves the one mechanism release.yaml depends on that a build alone cannot
   # show: artifacts uploaded by a called workflow's jobs are reachable from the

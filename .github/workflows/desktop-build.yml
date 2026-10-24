@@ -42,6 +42,13 @@ on:
           like "v0.7.0" yields rdc-desktop-0.7.0.dmg.
         required: true
         type: string
+      ref:
+        description: >-
+          Git ref to build. The caller passes the ref its own build uses, so the
+          desktop app is built from the same commit as the CLI (a called
+          workflow's default checkout is the caller run's commit instead).
+        required: true
+        type: string
 
 env:
   FLUTTER_VERSION: "3.47.5"
@@ -70,6 +77,8 @@ jobs:
       APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
 
       # Strip a leading "v" once here so every packaging step can just use
       # $VERSION. Needs an explicit bash shell: `run:` defaults to pwsh on the
@@ -100,7 +109,7 @@ jobs:
           key: desktop-cargo-${{ matrix.target }}-${{ hashFiles('desktop/rust/Cargo.lock') }}
 
       - name: Install Flutter
-        uses: subosito/flutter-action@v2
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable

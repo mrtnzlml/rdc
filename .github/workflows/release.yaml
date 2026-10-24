@@ -120,6 +120,7 @@ jobs:
     secrets: inherit
     with:
       version_label: ${{ inputs.tag || github.ref_name }}
+      ref: ${{ inputs.tag || github.ref }}
 
   release:
     name: Publish release
@@ -147,7 +148,7 @@ jobs:
         run: ls -la artifacts/
 
       - name: Create release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           # MUST be explicit. The action otherwise infers the tag from
           # github.ref, which is a tag ref only on the push path -- on the
