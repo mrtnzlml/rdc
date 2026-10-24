@@ -3199,6 +3199,16 @@ pub fn run_at(
     src_paths.ensure_no_symlinks()?;
     tgt_paths.ensure_no_symlinks()?;
 
+    // `envs/<src>/` always exists once `rdc init` scaffolded overlay.toml, so
+    // only the lockfile proves a pull. A mirror from an unpulled source would
+    // prune every target file, and the deploy job turns that into deletes.
+    if mirror && !src_paths.lockfile().exists() {
+        anyhow::bail!(
+            "'{src}' has never been pulled (no {}), and --mirror from it would prune \
+             every object in '{tgt}' — pull '{src}' first (`rdc sync {src}`)",
+            src_paths.lockfile().display()
+        );
+    }
     if !src_root.exists() {
         anyhow::bail!(
             "source snapshot {} does not exist — pull '{src}' first (`rdc sync {src}`)",

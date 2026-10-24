@@ -2025,6 +2025,7 @@ fn write_tgt_lockfile(root: &std::path::Path, env: &str, keys: &[&str]) {
 fn migrate_mirror_skips_second_unique_typed_template_per_queue() {
     let project = init_two_env_project();
     let root = project.path();
+    write_lockfile(root, "test", &[]); // `test` was pulled, so --mirror may run
 
     write_template(root, "test", "default-rejection-template", 100, "rejection_default");
     write_template(root, "test", "default-rejection-template-2", 200, "rejection_default");
@@ -2056,6 +2057,7 @@ fn migrate_mirror_skips_second_unique_typed_template_per_queue() {
 fn migrate_keeps_unique_typed_duplicates_that_exist_on_target() {
     let project = init_two_env_project();
     let root = project.path();
+    write_lockfile(root, "test", &[]); // `test` was pulled, so --mirror may run
 
     write_template(root, "test", "default-rejection-template", 100, "rejection_default");
     write_template(root, "test", "default-rejection-template-2", 200, "rejection_default");
@@ -2090,6 +2092,7 @@ fn migrate_keeps_unique_typed_duplicates_that_exist_on_target() {
 fn migrate_keeps_lowest_id_unique_typed_duplicate_on_fresh_target() {
     let project = init_two_env_project();
     let root = project.path();
+    write_lockfile(root, "test", &[]); // `test` was pulled, so --mirror may run
 
     // The `-2` slug carries the LOWER id: the keep-rule is id-based, not
     // slug-suffix-based.
@@ -2119,6 +2122,7 @@ fn migrate_keeps_lowest_id_unique_typed_duplicate_on_fresh_target() {
 fn migrate_leaves_custom_type_duplicates_alone() {
     let project = init_two_env_project();
     let root = project.path();
+    write_lockfile(root, "test", &[]); // `test` was pulled, so --mirror may run
 
     write_template(root, "test", "status-change", 100, "custom");
     write_template(root, "test", "status-change-2", 200, "custom");
@@ -2477,6 +2481,7 @@ fn migrate_dry_run_forecasts_the_same_counts_as_the_real_run() {
 fn migrate_mirror_prune_removes_the_directory_it_emptied() {
     let project = init_two_env_project();
     let root = project.path();
+    write_lockfile(root, "test", &[]); // `test` was pulled, so --mirror may run
     write(
         &root.join("envs/test/mdh/vendors/indexes.json"),
         &serde_json::json!([{ "name": "by_id", "key": { "id": 1 } }]),
@@ -2519,6 +2524,7 @@ fn migrate_mirror_prune_removes_the_directory_it_emptied() {
 fn migrate_mirror_keeps_a_pruned_directory_that_still_holds_a_foreign_file() {
     let project = init_two_env_project();
     let root = project.path();
+    write_lockfile(root, "test", &[]); // `test` was pulled, so --mirror may run
     write(
         &root.join("envs/test/mdh/vendors/indexes.json"),
         &serde_json::json!([]),
@@ -2552,6 +2558,7 @@ fn migrate_mirror_keeps_a_pruned_directory_that_still_holds_a_foreign_file() {
 fn migrate_mirror_dry_run_plans_the_directory_removal() {
     let project = init_two_env_project();
     let root = project.path();
+    write_lockfile(root, "test", &[]); // `test` was pulled, so --mirror may run
     write(
         &root.join("envs/test/mdh/vendors/indexes.json"),
         &serde_json::json!([]),
@@ -2712,12 +2719,33 @@ fn migrate_skips_the_organization_when_the_source_has_no_settings() {
     );
 }
 
+/// A `--mirror` from a source that was never pulled (no lockfile; `rdc init`
+/// still scaffolds `envs/<src>/overlay.toml`) would prune every target file,
+/// which the deploy job's `sync --allow-deletes --yes` turns into remote
+/// deletes. It must refuse and leave the target alone.
+#[test]
+fn migrate_mirror_refuses_a_never_pulled_source() {
+    let project = init_two_env_project();
+    let root = project.path();
+    write(&root.join("envs/prod/hooks/h.json"), &serde_json::json!({ "id": 7, "name": "H" }));
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(root)
+        .args(["migrate", "test", "prod", "--mirror", "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("pull 'test' first"));
+    assert!(root.join("envs/prod/hooks/h.json").exists());
+}
+
 /// `--mirror` must never prune the target's org file, even when the source env
-/// has never been pulled.
+/// was pulled but holds no objects.
 #[test]
 fn migrate_mirror_never_prunes_the_organization() {
     let project = init_two_env_project();
     let root = project.path();
+    write_lockfile(root, "test", &[]); // `test` was pulled, so --mirror may run
     write(
         &root.join("envs/prod/organization.json"),
         &serde_json::json!({ "id": 2, "name": "Acme Prod", "settings": {} }),
@@ -2755,6 +2783,7 @@ fn migrate_mirror_never_prunes_the_organization() {
 fn migrate_mirror_accepts_a_saved_view_ref_to_a_queue_whose_workspace_moved() {
     let project = init_two_env_project();
     let root = project.path();
+    write_lockfile(root, "test", &[]); // `test` was pulled, so --mirror may run
 
     std::fs::create_dir_all(root.join(".rdc")).unwrap();
     std::fs::write(
@@ -2975,6 +3004,7 @@ fn run_migrate(root: &std::path::Path, mirror: MirrorMode, dry_run: bool) -> any
 fn mirror_refuses_to_delete_a_live_target_object_while_creating_one() {
     let project = renamed_queue_project();
     let root = project.path();
+    write_lockfile(root, "test", &[]); // `test` was pulled, so --mirror may run
 
     let err = run_migrate(root, MirrorMode::Mirror { allow_recreate: false }, false)
         .expect_err("the prune would destroy a live queue");
@@ -3028,6 +3058,7 @@ If they are unrelated, run it again with --allow-recreate."
 fn dry_run_forecasts_the_recreate_refusal() {
     let project = renamed_queue_project();
     let root = project.path();
+    write_lockfile(root, "test", &[]); // `test` was pulled, so --mirror may run
 
     let err = run_migrate(root, MirrorMode::Mirror { allow_recreate: false }, true)
         .expect_err("--dry-run must forecast the refusal");
@@ -3044,6 +3075,7 @@ fn dry_run_forecasts_the_recreate_refusal() {
 fn allow_recreate_lets_the_prune_through() {
     let project = renamed_queue_project();
     let root = project.path();
+    write_lockfile(root, "test", &[]); // `test` was pulled, so --mirror may run
 
     run_migrate(root, MirrorMode::Mirror { allow_recreate: true }, false)
         .expect("--allow-recreate authorises the prune");
@@ -3097,6 +3129,7 @@ fn migrate_converts_legacy_files_into_the_scaffolded_stub() {
 fn a_recorded_mapping_row_turns_the_recreate_into_a_rename() {
     let project = renamed_queue_project();
     let root = project.path();
+    write_lockfile(root, "test", &[]); // `test` was pulled, so --mirror may run
     std::fs::create_dir_all(root.join(".rdc")).unwrap();
     std::fs::write(
         root.join(".rdc/mapping.toml"),
@@ -3124,6 +3157,7 @@ fn a_recorded_mapping_row_turns_the_recreate_into_a_rename() {
 fn mirror_allows_a_deletion_with_no_create_in_that_kind() {
     let project = init_two_env_project();
     let root = project.path();
+    write_lockfile(root, "test", &[]); // `test` was pulled, so --mirror may run
     write_queue_at(root, "test", "main", "invoices", "Invoices");
     write_queue_at(root, "prod", "main", "invoices", "Invoices");
     // prod additionally holds a queue the source no longer has.
@@ -3155,6 +3189,7 @@ fn mirror_allows_a_deletion_with_no_create_in_that_kind() {
 fn mirror_allows_an_unrelated_queue_delete_and_create() {
     let project = init_two_env_project();
     let root = project.path();
+    write_lockfile(root, "test", &[]); // `test` was pulled, so --mirror may run
     write_queue_at(root, "test", "main", "orders", "Orders");
     write_queue_at(root, "prod", "main", "invoices", "Invoices");
     write(
@@ -3193,6 +3228,7 @@ fn mirror_allows_an_unrelated_queue_delete_and_create() {
 fn mirror_allows_a_hook_delete_and_create() {
     let project = init_two_env_project();
     let root = project.path();
+    write_lockfile(root, "test", &[]); // `test` was pulled, so --mirror may run
     let hook = serde_json::json!({ "name": "Export", "type": "function", "events": [] });
     write(&root.join("envs/test/hooks/sftp-export.json"), &hook);
     write(&root.join("envs/prod/hooks/export.json"), &hook);
@@ -3209,6 +3245,7 @@ fn mirror_allows_a_hook_delete_and_create() {
 fn mirror_allows_a_create_with_no_prune() {
     let project = init_two_env_project();
     let root = project.path();
+    write_lockfile(root, "test", &[]); // `test` was pulled, so --mirror may run
     write_queue_at(root, "test", "main", "invoices", "Invoices");
     write_queue_at(root, "test", "main", "orders", "Orders");
     write_queue_at(root, "prod", "main", "invoices", "Invoices");
@@ -3236,6 +3273,7 @@ fn mirror_allows_a_create_with_no_prune() {
 fn mirror_allows_pruning_an_object_the_target_never_pushed() {
     let project = renamed_queue_project();
     let root = project.path();
+    write_lockfile(root, "test", &[]); // `test` was pulled, so --mirror may run
     // Same fixture, but prod's lockfile knows only the workspace.
     write_lockfile(root, "prod", &[("workspaces", "main", 501)]);
 
@@ -3261,6 +3299,7 @@ fn mirror_allows_pruning_an_object_the_target_never_pushed() {
 fn a_queue_moving_between_workspaces_is_not_a_recreate() {
     let project = init_two_env_project();
     let root = project.path();
+    write_lockfile(root, "test", &[]); // `test` was pulled, so --mirror may run
     // Source: the queue now lives under `second`; both workspaces exist.
     write_queue_at(root, "test", "second", "invoices", "Invoices");
     write_queue_at(root, "test", "main", "orders", "Orders");

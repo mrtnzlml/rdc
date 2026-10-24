@@ -391,7 +391,7 @@ pub(crate) async fn run_cycle(
         // deltas (new/create/drift/orphan) from the already-listed catalog +
         // lockfile + local files with no extra network.
         let mut mdh_plan =
-            crate::cli::pull::mdh::plan_mdh(&catalog.mdh, &lockfile, &paths, no_push);
+            crate::cli::pull::mdh::plan_mdh(&catalog.mdh, &lockfile, &paths, no_push)?;
         // Structural scan can't see a remote index-BODY edit (e.g. an index
         // rename) or a remote ROW edit on a manual dataset — both need the
         // env's index defs / rows fetched. Fetch them per local collection

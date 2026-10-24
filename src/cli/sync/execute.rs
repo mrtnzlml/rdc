@@ -4276,10 +4276,15 @@ pub async fn run(
                 // Stage 2: create collections absent on this env yet.
                 let remote_slugs: BTreeSet<String> =
                     slug_to_collection.keys().cloned().collect();
+                let remote_names: BTreeMap<String, String> = slug_to_collection
+                    .iter()
+                    .map(|(slug, c)| (c.name.clone(), slug.clone()))
+                    .collect();
                 for slug in crate::cli::pull::mdh::local_only_dataset_slugs(
                     &ctx.paths.mdh_dir(),
                     &remote_slugs,
-                ) {
+                    &remote_names,
+                )? {
                     // A local-only dataset that was synced before (has a
                     // lockfile entry) is an orphan, not a new dataset — leave
                     // it to stage 4's prune.

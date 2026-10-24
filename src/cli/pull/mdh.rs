@@ -110,13 +110,19 @@ pub(crate) fn read_collection_name(dataset_dir: &std::path::Path) -> Option<Stri
 /// the datasets a deploy may need to create. Slugs present in `remote_slugs`
 /// are handled by the remote-driven path and deliberately excluded here, so
 /// this never touches an existing collection. Sorted for deterministic order.
+///
+/// `remote_names` maps each env collection's name to its local slug. A
+/// local-only folder whose manifest names one of them is an error, not a new
+/// dataset: every write would go to the existing collection (a copied folder
+/// would delete its rows) while the plan shows a create.
 pub(crate) fn local_only_dataset_slugs(
     mdh_dir: &std::path::Path,
     remote_slugs: &BTreeSet<String>,
-) -> Vec<String> {
+    remote_names: &BTreeMap<String, String>,
+) -> Result<Vec<String>> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(mdh_dir) else {
-        return out; // no local mdh dir → nothing to create
+        return Ok(out); // no local mdh dir → nothing to create
     };
     for entry in entries.flatten() {
         if !entry.path().is_dir() {
@@ -128,15 +134,25 @@ pub(crate) fn local_only_dataset_slugs(
         if remote_slugs.contains(&slug) {
             continue; // handled by the remote-driven path; never touched here
         }
-        if read_collection_name(&entry.path()).is_some_and(|n| is_internal_collection(&n)) {
+        let name = read_collection_name(&entry.path());
+        if name.as_deref().is_some_and(is_internal_collection) {
             continue; // Rossum's own, left over from an older pull
         }
-        if entry.path().join("indexes.json").is_file() {
-            out.push(slug);
+        if !entry.path().join("indexes.json").is_file() {
+            continue;
         }
+        if let Some(existing) = name.as_ref().and_then(|n| remote_names.get(n)) {
+            anyhow::bail!(
+                "mdh/{slug}/{COLLECTION_MANIFEST} names collection '{}', which already exists \
+                 on this env (as mdh/{existing}/). Give the new dataset its own name, or \
+                 remove the folder.",
+                name.unwrap_or_default()
+            );
+        }
+        out.push(slug);
     }
     out.sort();
-    out
+    Ok(out)
 }
 
 /// Direction of a predicted MDH op, so the dry-run planner can file it under
@@ -204,17 +220,19 @@ pub(crate) fn plan_mdh(
     lockfile: &crate::state::Lockfile,
     paths: &crate::paths::Paths,
     no_push: bool,
-) -> Vec<MdhPlanItem> {
+) -> Result<Vec<MdhPlanItem>> {
     let mut items = Vec::new();
     if !listed.available {
-        return items;
+        return Ok(items);
     }
 
     // Slug every env collection exactly as the executor does (listing order,
     // unique dedup) so predicted slugs match the real run byte-for-byte.
     let mut remote_slugs: BTreeSet<String> = BTreeSet::new();
-    for (slug, _c) in listed.datasets() {
+    let mut remote_names: BTreeMap<String, String> = BTreeMap::new();
+    for (slug, c) in listed.datasets() {
         remote_slugs.insert(slug.to_string());
+        remote_names.insert(c.name.clone(), slug.to_string());
     }
 
     let mdh_base = lockfile.objects.get("mdh_indexes");
@@ -283,7 +301,7 @@ pub(crate) fn plan_mdh(
         // Stage 2: a local-only dataset absent on the env and never synced
         // (no lockfile entry) → POST (create the collection). A local-only
         // dataset that WAS synced is an orphan, left to stage 4's prune.
-        for slug in local_only_dataset_slugs(&paths.mdh_dir(), &remote_slugs) {
+        for slug in local_only_dataset_slugs(&paths.mdh_dir(), &remote_slugs, &remote_names)? {
             if base_hash(&slug).is_some() {
                 continue;
             }
@@ -350,7 +368,7 @@ pub(crate) fn plan_mdh(
         }
     }
 
-    items
+    Ok(items)
 }
 
 /// Forecast whether a real sync would PULL (overwrite) a collection's local
@@ -1285,7 +1303,24 @@ mod tests {
         std::fs::write(mdh.path().join("b/indexes.json"), b"{}").unwrap();
 
         let remote: BTreeSet<String> = ["b".to_string()].into_iter().collect();
-        assert_eq!(local_only_dataset_slugs(mdh.path(), &remote), vec!["a".to_string()]);
+        assert_eq!(local_only_dataset_slugs(mdh.path(), &remote, &BTreeMap::new()).unwrap(), vec!["a".to_string()]);
+    }
+
+    /// A copied dataset folder whose manifest still names an existing
+    /// collection must not be treated as new: stage 2 would write to (and
+    /// delete rows of) the existing collection while the plan shows a create.
+    #[test]
+    fn local_only_dataset_slugs_rejects_a_manifest_naming_an_existing_collection() {
+        let mdh = tempfile::TempDir::new().unwrap();
+        let dir = mdh.path().join("vendors-copy");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("indexes.json"), "{}").unwrap();
+        std::fs::write(dir.join(COLLECTION_MANIFEST), r#"{"name": "vendors"}"#).unwrap();
+        let remote: BTreeSet<String> = ["vendors".to_string()].into_iter().collect();
+        let names: BTreeMap<String, String> =
+            [("vendors".to_string(), "vendors".to_string())].into_iter().collect();
+        let err = format!("{:#}", local_only_dataset_slugs(mdh.path(), &remote, &names).unwrap_err());
+        assert!(err.contains("mdh/vendors-copy") && err.contains("'vendors'"), "got: {err}");
     }
 
     #[test]
@@ -1298,7 +1333,7 @@ mod tests {
             std::fs::write(dir.join(COLLECTION_MANIFEST), format!("{{\"name\": \"{name}\"}}")).unwrap();
         }
         let remote = BTreeSet::new();
-        assert_eq!(local_only_dataset_slugs(mdh.path(), &remote), vec!["vendors".to_string()]);
+        assert_eq!(local_only_dataset_slugs(mdh.path(), &remote, &BTreeMap::new()).unwrap(), vec!["vendors".to_string()]);
     }
 
     #[test]
@@ -1306,7 +1341,7 @@ mod tests {
         // No mdh dir at all (env never had MDH) → nothing to create.
         let tmp = tempfile::tempdir().unwrap();
         let remote = BTreeSet::new();
-        assert!(local_only_dataset_slugs(&tmp.path().join("nope"), &remote).is_empty());
+        assert!(local_only_dataset_slugs(&tmp.path().join("nope"), &remote, &BTreeMap::new()).unwrap().is_empty());
     }
 
     /// `plan_mdh` must predict every STRUCTURAL MDH delta a real sync would
@@ -1372,6 +1407,7 @@ mod tests {
         );
 
         let mut got: Vec<(MdhPlanDir, String)> = plan_mdh(&listed, &lf, &paths, false)
+            .unwrap()
             .into_iter()
             .map(|i| (i.dir, i.describe()))
             .collect();
@@ -1392,6 +1428,7 @@ mod tests {
 
         // `--no-push` drops the push-side ops; the pulls survive.
         let np: Vec<String> = plan_mdh(&listed, &lf, &paths, true)
+            .unwrap()
             .into_iter()
             .map(|i| i.describe())
             .collect();
@@ -1461,7 +1498,7 @@ mod tests {
         );
 
         let lines: Vec<String> =
-            plan_mdh(&listed, &lf, &paths, false).into_iter().map(|i| i.describe()).collect();
+            plan_mdh(&listed, &lf, &paths, false).unwrap().into_iter().map(|i| i.describe()).collect();
         assert!(
             lines.contains(&"patch mdh/drifted data".to_string()),
             "drifted rows must be forecast as a push: {lines:?}"
@@ -1477,7 +1514,7 @@ mod tests {
 
         // --no-push keeps the pull-side forecast, drops the push-side one.
         let np: Vec<String> =
-            plan_mdh(&listed, &lf, &paths, true).into_iter().map(|i| i.describe()).collect();
+            plan_mdh(&listed, &lf, &paths, true).unwrap().into_iter().map(|i| i.describe()).collect();
         assert!(np.contains(&"pull mdh/fresh data (new)".to_string()));
         assert!(!np.iter().any(|l| l.contains("data PATCH")));
     }
@@ -1496,7 +1533,7 @@ mod tests {
             }],
             false,
         );
-        assert!(plan_mdh(&listed, &crate::state::Lockfile::default(), &paths, false).is_empty());
+        assert!(plan_mdh(&listed, &crate::state::Lockfile::default(), &paths, false).unwrap().is_empty());
     }
 
     #[test]
