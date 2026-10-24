@@ -141,4 +141,22 @@ void main() {
     await t.pump();
     expect(added, isTrue);
   });
+
+  testWidgets('Project view shows the load error of a project whose rdc.toml is invalid', (t) async {
+    final s = AppState(Settings(parentFolder: '/tmp'));
+    s.projects = [
+      ProjectItem(ProjectSummary(id: 'bad', name: 'bad', folder: '/tmp/bad', envs: const [],
+          error: "env '../x' is invalid."), false),
+    ];
+    s.selectProject('/tmp/bad');
+
+    await t.pumpWidget(MaterialApp(
+      theme: mdhTheme(Brightness.light),
+      home: Scaffold(body: MdhScaffold(state: s, view: NavView.connection)),
+    ));
+    await t.pumpAndSettle();
+
+    expect(find.text("env '../x' is invalid."), findsOneWidget);
+    expect(find.text('Environments'), findsNothing);
+  });
 }

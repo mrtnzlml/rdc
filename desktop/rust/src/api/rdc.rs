@@ -65,6 +65,8 @@ pub struct ProjectSummary {
     pub name: String,
     pub folder: String,
     pub envs: Vec<EnvSummary>,
+    /// Set when `rdc.toml` could not be loaded; `envs` is then empty.
+    pub error: Option<String>,
 }
 
 impl From<&Project> for ProjectSummary {
@@ -74,6 +76,7 @@ impl From<&Project> for ProjectSummary {
             name: p.name().to_string(),
             folder: p.folder.display().to_string(),
             envs: p.envs.iter().map(EnvSummary::from).collect(),
+            error: p.error.clone(),
         }
     }
 }
@@ -178,9 +181,12 @@ pub fn add_project(parent: String, project_name: String, first_env: AddEnvInput)
     // credentials first (validates + writes secrets) so a bad credential never leaves a config behind
     write_credentials(&folder, &env_name, first_env.auth_kind,
         first_env.token.as_deref(), first_env.username.as_deref(), first_env.password.as_deref())?;
-    let api_base = first_env.api_base.trim_end_matches('/').to_string();
-    let rdc_toml = format!("[envs.{env_name}]\napi_base = \"{api_base}\"\norg_id = {}\n", first_env.org_id);
-    std::fs::write(folder.join("rdc.toml"), rdc_toml).map_err(|e| anyhow!("writing rdc.toml: {e}"))?;
+    let mut cfg = rdc::config::ProjectConfig::default();
+    cfg.envs.insert(env_name, rdc::config::EnvConfig {
+        api_base: first_env.api_base.trim_end_matches('/').to_string(),
+        org_id: first_env.org_id,
+    });
+    cfg.save(&folder.join("rdc.toml")).map_err(|e| anyhow!("{e:#}"))?;
     discover::find(&parent, &slug).as_ref().map(ProjectSummary::from)
         .ok_or_else(|| anyhow!("Project not found after add"))
 }
@@ -199,10 +205,12 @@ pub fn validate_existing_project(path: String) -> Result<ProjectSummary> {
             "{path} doesn't look like an rdc project (no rdc.toml). Run `rdc init` there first."
         ));
     }
-    discover::inspect(&source)
-        .as_ref()
-        .map(ProjectSummary::from)
-        .ok_or_else(|| anyhow!("{path} has no environments defined in rdc.toml."))
+    let project = discover::inspect(&source)
+        .ok_or_else(|| anyhow!("{path} has no environments defined in rdc.toml."))?;
+    if let Some(e) = &project.error {
+        return Err(anyhow!("{e}"));
+    }
+    Ok(ProjectSummary::from(&project))
 }
 
 // ---------------------------------------------------------------- edit
@@ -261,7 +269,7 @@ pub fn edit_project(
         }
     };
     if has_new_credentials {
-        let _ = std::fs::remove_file(folder.join(format!("secrets/{env}.secrets.json")));
+        let _ = std::fs::remove_file(rdc::paths::Paths::for_env(&folder, env.as_str()).secrets_file());
         write_credentials(
             &folder,
             &env,
@@ -472,7 +480,7 @@ pub fn sync_env(
             .await
         })
         .await?;
-        Ok(discover::count_files(&folder_path.join(format!("envs/{env}"))))
+        Ok(discover::count_files(&rdc::paths::Paths::for_env(&folder_path, env.as_str()).env_root()))
     });
 
     crate::watch_registry::remove_if(&folder, &env, generation);
@@ -1084,6 +1092,19 @@ mod tests {
     }
 
     #[test]
+    fn add_project_writes_an_api_base_with_a_quote_verbatim() {
+        // The value must be TOML-escaped, not pasted into a template.
+        let tmp = tempfile::tempdir().unwrap();
+        let api_base = "https://p.test/api/v1?q=\"x\"";
+        let p = add_project(tmp.path().display().to_string(), "Acme".into(),
+            AddEnvInput { name: "prod".into(), api_base: api_base.into(), org_id: 7,
+                auth_kind: AuthKind::Token, token: Some("t".into()), username: None, password: None }).unwrap();
+        let cfg = rdc::config::ProjectConfig::load(&tmp.path().join(&p.id).join("rdc.toml")).unwrap();
+        assert_eq!(cfg.envs["prod"].api_base, api_base);
+        assert_eq!(cfg.envs["prod"].org_id, 7);
+    }
+
+    #[test]
     fn add_project_rejects_invalid_first_env_name() {
         let tmp = tempfile::tempdir().unwrap();
         let err = add_project(tmp.path().display().to_string(), "Acme".into(),
@@ -1179,6 +1200,18 @@ mod tests {
         // original env, untouched on disk.
         let cfg = rdc::config::ProjectConfig::load(&folder.join("rdc.toml")).unwrap();
         assert_eq!(cfg.envs.keys().collect::<Vec<_>>(), vec!["main"]);
+    }
+
+    #[test]
+    fn edit_project_replaces_the_saved_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = seed_project(tmp.path(), "acme");
+        edit_project(folder.display().to_string(), "main".into(), EditConnectionInput {
+            name: "acme".into(), api_base: "https://m.test/api/v1".into(), org_id: 1,
+            auth_kind: AuthKind::Token, token: Some("tok2".into()), username: None, password: None,
+        }).unwrap();
+        let saved = rdc::secrets::read_secrets_file(&folder, "main").unwrap();
+        assert_eq!(saved.api_token.as_deref(), Some("tok2"));
     }
 
     #[test]

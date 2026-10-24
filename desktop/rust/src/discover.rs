@@ -3,7 +3,6 @@
 //! at least one `[envs.<name>]` section. Each env is surfaced independently.
 //! All state is derived from on-disk artifacts — there is no registry.
 
-use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -19,7 +18,10 @@ pub(crate) struct EnvInfo {
 #[derive(Debug, Clone)]
 pub(crate) struct Project {
     pub folder: PathBuf,
-    pub envs: Vec<EnvInfo>, // non-empty, sorted by name
+    pub envs: Vec<EnvInfo>, // sorted by name; empty only when `error` is set
+    /// Why `rdc.toml` failed to load. The project is still listed so the
+    /// user sees what to fix instead of the folder silently disappearing.
+    pub error: Option<String>,
 }
 
 impl Project {
@@ -36,17 +38,6 @@ impl Project {
 pub(crate) enum AuthKindRaw {
     Token,
     Password,
-}
-
-#[derive(Deserialize)]
-struct RdcToml {
-    envs: std::collections::BTreeMap<String, RdcEnvConfig>,
-}
-
-#[derive(Deserialize)]
-struct RdcEnvConfig {
-    api_base: String,
-    org_id: u64,
 }
 
 pub(crate) fn scan(parent: &Path) -> Vec<Project> {
@@ -71,29 +62,43 @@ pub(crate) fn inspect(folder: &Path) -> Option<Project> {
     if !folder.is_dir() {
         return None;
     }
-    let content = std::fs::read_to_string(folder.join("rdc.toml")).ok()?;
-    let parsed: RdcToml = toml::from_str(&content).ok()?;
-    if parsed.envs.is_empty() {
+    let toml_path = folder.join("rdc.toml");
+    if !toml_path.is_file() {
+        return None;
+    }
+    // rdc's own loader, so the listing applies the same env-name check as
+    // every other command and never reads a path a bad key would select.
+    let cfg = match rdc::config::ProjectConfig::load(&toml_path) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            return Some(Project {
+                folder: folder.to_path_buf(),
+                envs: Vec::new(),
+                error: Some(format!("{e:#}")),
+            });
+        }
+    };
+    if cfg.envs.is_empty() {
         return None;
     }
     // BTreeMap iterates in sorted key order → envs come out sorted by name.
-    let envs: Vec<EnvInfo> = parsed
+    let envs: Vec<EnvInfo> = cfg
         .envs
         .into_iter()
         .map(|(name, cfg)| {
+            let paths = rdc::paths::Paths::for_env(folder, name.as_str());
             let secrets = rdc::secrets::read_secrets_file(folder, &name).unwrap_or_default();
             let auth_kind = if secrets.username.is_some() {
                 AuthKindRaw::Password
             } else {
                 AuthKindRaw::Token
             };
-            let last_sync_unix =
-                std::fs::metadata(folder.join(format!(".rdc/state/{name}.lock.json")))
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .and_then(|d| i64::try_from(d.as_secs()).ok());
-            let file_count = count_files(&folder.join(format!("envs/{name}")));
+            let last_sync_unix = std::fs::metadata(paths.lockfile())
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|d| i64::try_from(d.as_secs()).ok());
+            let file_count = count_files(&paths.env_root());
             EnvInfo {
                 name,
                 api_base: cfg.api_base,
@@ -107,6 +112,7 @@ pub(crate) fn inspect(folder: &Path) -> Option<Project> {
     Some(Project {
         folder: folder.to_path_buf(),
         envs,
+        error: None,
     })
 }
 
@@ -169,6 +175,20 @@ mod tests {
         std::fs::write(tmp.path().join("empty/rdc.toml"), "").unwrap();
         assert!(inspect(&tmp.path().join("empty")).is_none());
         assert!(inspect(&tmp.path().join("missing")).is_none());
+    }
+
+    #[test]
+    fn inspect_reports_invalid_env_key_without_reading_outside_files() {
+        // A committed `../..` key must not make the listing read another
+        // project's secrets; the project is shown with the load error instead.
+        let tmp = tempfile::tempdir().unwrap();
+        let other = tmp.path().join("other");
+        rdc::secrets::save_password_credentials(&other, "prod", "u", "pw").unwrap();
+        seed_env(tmp.path(), "acme", "\"../../other/secrets/prod\"", "https://x.test/api/v1", 1);
+        let p = inspect(&tmp.path().join("acme")).unwrap();
+        assert!(p.envs.is_empty());
+        let err = p.error.expect("load error is reported");
+        assert!(err.contains("../../other/secrets/prod"), "got: {err}");
     }
 
     #[test]

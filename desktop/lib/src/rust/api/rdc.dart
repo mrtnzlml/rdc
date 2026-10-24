@@ -305,16 +305,24 @@ class ProjectSummary {
   final String folder;
   final List<EnvSummary> envs;
 
+  /// Set when `rdc.toml` could not be loaded; `envs` is then empty.
+  final String? error;
+
   const ProjectSummary({
     required this.id,
     required this.name,
     required this.folder,
     required this.envs,
+    this.error,
   });
 
   @override
   int get hashCode =>
-      id.hashCode ^ name.hashCode ^ folder.hashCode ^ envs.hashCode;
+      id.hashCode ^
+      name.hashCode ^
+      folder.hashCode ^
+      envs.hashCode ^
+      error.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -324,7 +332,8 @@ class ProjectSummary {
           id == other.id &&
           name == other.name &&
           folder == other.folder &&
-          envs == other.envs;
+          envs == other.envs &&
+          error == other.error;
 }
 
 /// One answerable choice, as offered to the UI. `key` is a String rather

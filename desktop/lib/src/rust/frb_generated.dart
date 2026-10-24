@@ -861,13 +861,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   ProjectSummary dco_decode_project_summary(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 4)
-      throw Exception('unexpected arr length: expect 4 but see ${arr.length}');
+    if (arr.length != 5)
+      throw Exception('unexpected arr length: expect 5 but see ${arr.length}');
     return ProjectSummary(
       id: dco_decode_String(arr[0]),
       name: dco_decode_String(arr[1]),
       folder: dco_decode_String(arr[2]),
       envs: dco_decode_list_env_summary(arr[3]),
+      error: dco_decode_opt_String(arr[4]),
     );
   }
 
@@ -1216,11 +1217,13 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_name = sse_decode_String(deserializer);
     var var_folder = sse_decode_String(deserializer);
     var var_envs = sse_decode_list_env_summary(deserializer);
+    var var_error = sse_decode_opt_String(deserializer);
     return ProjectSummary(
       id: var_id,
       name: var_name,
       folder: var_folder,
       envs: var_envs,
+      error: var_error,
     );
   }
 
@@ -1566,6 +1569,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_String(self.name, serializer);
     sse_encode_String(self.folder, serializer);
     sse_encode_list_env_summary(self.envs, serializer);
+    sse_encode_opt_String(self.error, serializer);
   }
 
   @protected

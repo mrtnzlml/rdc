@@ -1683,10 +1683,8 @@ dependencies = [
  "anyhow",
  "flutter_rust_bridge",
  "rdc",
- "serde",
  "tempfile",
  "tokio",
- "toml",
  "trash",
 ]
 

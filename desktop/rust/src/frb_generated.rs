@@ -853,11 +853,13 @@ impl SseDecode for crate::api::rdc::ProjectSummary {
         let mut var_name = <String>::sse_decode(deserializer);
         let mut var_folder = <String>::sse_decode(deserializer);
         let mut var_envs = <Vec<crate::api::rdc::EnvSummary>>::sse_decode(deserializer);
+        let mut var_error = <Option<String>>::sse_decode(deserializer);
         return crate::api::rdc::ProjectSummary {
             id: var_id,
             name: var_name,
             folder: var_folder,
             envs: var_envs,
+            error: var_error,
         };
     }
 }
@@ -1120,6 +1122,7 @@ impl flutter_rust_bridge::IntoDart for crate::api::rdc::ProjectSummary {
             self.name.into_into_dart().into_dart(),
             self.folder.into_into_dart().into_dart(),
             self.envs.into_into_dart().into_dart(),
+            self.error.into_into_dart().into_dart(),
         ]
         .into_dart()
     }
@@ -1444,6 +1447,7 @@ impl SseEncode for crate::api::rdc::ProjectSummary {
         <String>::sse_encode(self.name, serializer);
         <String>::sse_encode(self.folder, serializer);
         <Vec<crate::api::rdc::EnvSummary>>::sse_encode(self.envs, serializer);
+        <Option<String>>::sse_encode(self.error, serializer);
     }
 }
 

@@ -1167,16 +1167,21 @@ class _ProjectView extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                _SectionTitle('Environments'),
-                _EnvTable(
-                  state: state,
-                  item: item,
-                  envs: envs,
-                  onSync: onSync,
-                  onEdit: onEditEnv,
-                  onRemove: onRemoveEnv,
-                  onSelectEnv: onSelectEnv,
-                ),
+                // rdc.toml failed to load: show why instead of an empty table.
+                if (item.summary.error case final error?)
+                  Text(error, style: TextStyle(color: c.danger))
+                else ...[
+                  _SectionTitle('Environments'),
+                  _EnvTable(
+                    state: state,
+                    item: item,
+                    envs: envs,
+                    onSync: onSync,
+                    onEdit: onEditEnv,
+                    onRemove: onRemoveEnv,
+                    onSelectEnv: onSelectEnv,
+                  ),
+                ],
               ],
             ),
           ),

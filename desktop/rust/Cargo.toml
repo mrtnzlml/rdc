@@ -15,8 +15,6 @@ crate-type = ["cdylib", "staticlib"]
 flutter_rust_bridge = "=2.13.0"
 rdc = { path = "../.." }
 anyhow = "1"
-serde = { version = "1", features = ["derive"] }
-toml = "1"
 tokio = { version = "1", features = ["rt"] }
 trash = "5"
 
