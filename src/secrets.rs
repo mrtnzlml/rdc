@@ -39,16 +39,32 @@ pub fn read_secrets_file(project_root: &Path, env: &str) -> Result<SecretsFile> 
     Ok(parsed)
 }
 
+/// The project's `secrets/` directory, created if absent. Refuses anything
+/// but a real directory: `/secrets` is gitignored, yet a force-added
+/// `secrets` symlink into a tracked directory would route every credential
+/// write into the repo. `symlink_metadata` checks the entry itself.
+fn ensure_secrets_dir(project_root: &Path) -> Result<PathBuf> {
+    let dir = project_root.join("secrets");
+    match std::fs::symlink_metadata(&dir) {
+        Ok(meta) if meta.file_type().is_dir() => {}
+        Ok(_) => anyhow::bail!(
+            "{} is a symlink or not a directory; refusing to write credentials into it",
+            dir.display()
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        Err(e) => return Err(anyhow::Error::new(e).context(format!("inspecting {}", dir.display()))),
+    }
+    Ok(dir)
+}
+
 fn write_secrets_file_full(
     project_root: &Path,
     env: &str,
     file: &SecretsFile,
 ) -> Result<PathBuf> {
-    let path = project_root.join("secrets").join(format!("{env}.secrets.json"));
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
+    let path = ensure_secrets_dir(project_root)?.join(format!("{env}.secrets.json"));
     let mut bytes = serde_json::to_vec_pretty(file).context("serializing secrets JSON")?;
     bytes.push(b'\n');
     crate::snapshot::writer::write_atomic(&path, &bytes)
@@ -510,6 +526,7 @@ pub fn write_hook_secrets_stub(project_root: &Path, env: &str) -> Result<bool> {
     if path.exists() {
         return Ok(false);
     }
+    ensure_secrets_dir(project_root)?;
     crate::snapshot::writer::write_atomic(&path, HOOK_SECRETS_STUB.as_bytes())
         .with_context(|| format!("writing {}", path.display()))?;
 
@@ -552,6 +569,7 @@ pub fn rename_hook_secret(project_root: &Path, env: &str, old: &str, new: &str) 
     hooks.insert(new.to_string(), entry);
     let mut bytes = serde_json::to_vec_pretty(&file)?;
     bytes.push(b'\n');
+    ensure_secrets_dir(project_root)?;
     crate::snapshot::writer::write_atomic(&path, &bytes)
         .with_context(|| format!("writing {}", path.display()))?;
     #[cfg(unix)]
@@ -566,6 +584,22 @@ pub fn rename_hook_secret(project_root: &Path, env: &str, old: &str, new: &str) 
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// `/secrets` is gitignored, but a force-added `secrets` symlink into a
+    /// tracked directory would put the cached token where a commit picks it up.
+    #[cfg(unix)]
+    #[test]
+    fn refuses_to_write_credentials_through_a_secrets_symlink() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".rdc/map")).unwrap();
+        std::os::unix::fs::symlink(".rdc/map", root.join("secrets")).unwrap();
+        let err = format!("{:#}", write_login_token(root, "dev", "dummy-token").unwrap_err());
+        assert!(err.contains("symlink"), "got: {err}");
+        assert!(!root.join(".rdc/map/dev.secrets.json").exists());
+        assert!(write_hook_secrets_stub(root, "dev").is_err());
+        assert!(!root.join(".rdc/map/dev.hook-secrets.json").exists());
+    }
 
     #[test]
     fn env_var_wins() {

@@ -330,6 +330,34 @@ async fn sync_restores_the_per_env_scaffolds_but_not_on_a_dry_run() {
     assert!(stub["hooks"].as_object().unwrap().is_empty(), "{stub}");
 }
 
+/// A committed symlink in the env tree stops the sync before any request:
+/// otherwise push would upload the link's target as hook code.
+#[cfg(unix)]
+#[tokio::test]
+async fn sync_refuses_an_env_tree_with_a_symlink() {
+    let server = MockServer::start().await;
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(project.path().join("secrets/dev.secrets.json"), r#"{"api_token":"TEST_TOKEN"}"#).unwrap();
+    std::fs::write(project.path().join("outside.txt"), "not hook code").unwrap();
+    std::fs::create_dir_all(project.path().join("envs/dev/hooks")).unwrap();
+    std::os::unix::fs::symlink(project.path().join("outside.txt"), project.path().join("envs/dev/hooks/x.py")).unwrap();
+    let before = server.received_requests().await.unwrap().len();
+
+    let _cwd_guard = cwd_lock();
+    std::env::set_current_dir(project.path()).unwrap();
+    let err = rdc::cli::sync::run("dev", false, false, false, false, false, None)
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("envs/dev/hooks/x.py"), "got: {err:#}");
+    assert_eq!(server.received_requests().await.unwrap().len(), before, "no request may be sent");
+}
+
 /// Pull-side RemoteCreate: env exposes a label that doesn't exist locally
 /// and isn't in the lockfile. `sync` must classify it `RemoteCreate` and
 /// write the JSON to disk. No API mutations are issued.

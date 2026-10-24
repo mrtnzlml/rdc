@@ -608,6 +608,28 @@ fn migrate_binary_subcommand_transforms_snapshot() {
     assert_eq!(migrated["type"], "function");
 }
 
+/// A symlinked sidecar in the source env must not be read through and
+/// copied into the target as a regular file.
+#[cfg(unix)]
+#[test]
+fn migrate_refuses_a_symlinked_source_sidecar() {
+    let project = init_two_env_project();
+    let root = project.path();
+    write(&root.join("envs/test/hooks/extractor.json"), &serde_json::json!({ "name": "Extractor" }));
+    std::fs::write(root.join("outside.txt"), "DUMMY_SECRET=abc").unwrap();
+    std::os::unix::fs::symlink(root.join("outside.txt"), root.join("envs/test/hooks/extractor.py")).unwrap();
+
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(root)
+        .args(["migrate", "test", "prod"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("envs/test/hooks/extractor.py"));
+    assert!(!root.join("envs/prod/hooks/extractor.py").exists());
+    assert!(!root.join("envs/prod/hooks/extractor.json").exists());
+}
+
 /// A4 — `--dry-run` via the binary writes nothing.
 #[test]
 fn migrate_binary_dry_run_writes_nothing() {

@@ -18,26 +18,35 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating parent dir {}", parent.display()))?;
     }
-    // Sibling temp file: append ".tmp" to the full file name (not the
-    // extension). Works for "foo.json" → "foo.json.tmp" and for an
-    // extensionless "foo" → "foo.tmp".
+    // Sibling temp file with a random suffix, opened with `create_new`: a
+    // fixed name could be pre-planted in the repo as a symlink, and
+    // `create_new` refuses any existing entry, a symlink included.
     let file_name = path
         .file_name()
         .ok_or_else(|| anyhow!("path {} has no file name", path.display()))?;
+    let mut rand = [0u8; 8];
+    getrandom::fill(&mut rand).map_err(|e| anyhow!("reading OS randomness: {e}"))?;
     let mut tmp_name = file_name.to_owned();
-    tmp_name.push(".tmp");
+    tmp_name.push(format!(".{}.tmp", rand.iter().map(|b| format!("{b:02x}")).collect::<String>()));
     let tmp = path.with_file_name(tmp_name);
-    {
-        let mut f = fs::File::create(&tmp)
+    let result = (|| -> Result<()> {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
             .with_context(|| format!("creating temp file {}", tmp.display()))?;
         f.write_all(bytes)
             .with_context(|| format!("writing temp file {}", tmp.display()))?;
         f.sync_all()
             .with_context(|| format!("syncing temp file {}", tmp.display()))?;
+        fs::rename(&tmp, path)
+            .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))
+    })();
+    if result.is_err() {
+        // The random name is never reused, so a failed write cleans up after itself.
+        let _ = fs::remove_file(&tmp);
     }
-    fs::rename(&tmp, path)
-        .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
-    Ok(())
+    result
 }
 
 #[cfg(test)]
@@ -60,6 +69,20 @@ mod tests {
         write_atomic(&path, b"v1").unwrap();
         write_atomic(&path, b"v2").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"v2");
+    }
+
+    /// A repo can carry a committed `<file>.tmp` symlink; writing the file
+    /// must not write through it into the link's target.
+    #[cfg(unix)]
+    #[test]
+    fn does_not_write_through_a_planted_temp_symlink() {
+        let dir = TempDir::new().unwrap();
+        let outside = dir.path().join("outside");
+        fs::write(&outside, b"orig").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.path().join("f.json.tmp")).unwrap();
+        write_atomic(&dir.path().join("f.json"), b"new").unwrap();
+        assert_eq!(fs::read(&outside).unwrap(), b"orig");
+        assert_eq!(fs::read(dir.path().join("f.json")).unwrap(), b"new");
     }
 
     #[test]

@@ -3194,6 +3194,10 @@ pub fn run_at(
     let tgt_paths = crate::paths::Paths::for_env(cwd, tgt);
     let src_root = src_paths.env_root();
     let tgt_root = tgt_paths.env_root();
+    // Migrate reads the source tree and the target's overlay/, and writes the
+    // target tree; none of that may go through a committed symlink.
+    src_paths.ensure_no_symlinks()?;
+    tgt_paths.ensure_no_symlinks()?;
 
     if !src_root.exists() {
         anyhow::bail!(

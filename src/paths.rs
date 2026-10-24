@@ -4,6 +4,7 @@
 //! layout is documented in one place and refactors don't drift across call
 //! sites.
 
+use anyhow::Context;
 use std::path::{Path, PathBuf};
 
 /// Name of the per-env shadow-override directory (`envs/<env>/overlay/`),
@@ -97,6 +98,20 @@ impl Paths {
             .join("conflicts")
             .join(&self.env)
             .join(relpath)
+    }
+
+    /// Refuse a symlink anywhere in this env's trees: `envs/<env>/`, its base
+    /// cache and its conflict shadows, including the directories leading to
+    /// them. The trees come from a repo, and rdc reads and writes inside them
+    /// with the operator's file access; a committed link would point those
+    /// reads and writes elsewhere (for example a sidecar linked to a secrets
+    /// file, uploaded as hook code). rdc never creates a symlink itself.
+    pub fn ensure_no_symlinks(&self) -> anyhow::Result<()> {
+        let conflicts = self.root.join(".rdc").join("conflicts").join(&self.env);
+        for dir in [self.env_root(), self.base_cache_root(), conflicts] {
+            ensure_no_symlinks_under(&self.root, &dir)?;
+        }
+        Ok(())
     }
 
     /// `<root>/envs/<env>/organization.json`
@@ -252,6 +267,45 @@ impl Paths {
     }
 }
 
+/// Error on the first symlink among the components of `dir` below `root`, or
+/// anywhere inside `dir`. Never follows a link. A missing `dir` is fine.
+pub fn ensure_no_symlinks_under(root: &Path, dir: &Path) -> anyhow::Result<()> {
+    fn refuse(root: &Path, p: &Path) -> anyhow::Error {
+        anyhow::anyhow!(
+            "{} is a symlink; rdc does not follow symlinks in an env tree. \
+             Replace it with the file or directory itself.",
+            p.strip_prefix(root).unwrap_or(p).display()
+        )
+    }
+    let mut cur = root.to_path_buf();
+    for comp in dir.strip_prefix(root).unwrap_or(dir).components() {
+        cur.push(comp);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(m) if m.file_type().is_symlink() => return Err(refuse(root, &cur)),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(anyhow::Error::new(e).context(format!("inspecting {}", cur.display()))),
+        }
+    }
+    fn walk(root: &Path, dir: &Path) -> anyhow::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let ft = entry.file_type()?; // does not follow links
+            if ft.is_symlink() {
+                return Err(refuse(root, &entry.path()));
+            }
+            if ft.is_dir() {
+                walk(root, &entry.path())?;
+            }
+        }
+        Ok(())
+    }
+    if std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
+        walk(root, dir).with_context(|| format!("checking {} for symlinks", dir.display()))?;
+    }
+    Ok(())
+}
+
 /// Returns true if this filename is a LEGACY sibling shadow artifact for
 /// the given env: the conflict-skip shadow (`<file>.<env>`) or the
 /// remote-delete marker (`<file>.<env>-deleted`). Newer runs write both
@@ -273,6 +327,31 @@ pub fn is_shadow_artifact(name: &str, env: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_no_symlinks_reports_a_nested_symlinked_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = Paths::for_env(tmp.path(), "dev");
+        std::fs::create_dir_all(paths.env_root().join("hooks")).unwrap();
+        std::fs::write(paths.env_root().join("hooks/a.json"), "{}").unwrap();
+        paths.ensure_no_symlinks().unwrap();
+        std::fs::create_dir_all(tmp.path().join("elsewhere")).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("elsewhere"), paths.env_root().join("rules")).unwrap();
+        let err = format!("{:#}", paths.ensure_no_symlinks().unwrap_err());
+        assert!(err.contains("envs/dev/rules"), "got: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_no_symlinks_reports_a_symlinked_env_root() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("envs")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("elsewhere")).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("elsewhere"), tmp.path().join("envs/dev")).unwrap();
+        let err = format!("{:#}", Paths::for_env(tmp.path(), "dev").ensure_no_symlinks().unwrap_err());
+        assert!(err.contains("envs/dev"), "got: {err}");
+    }
 
     fn p() -> Paths {
         Paths::for_env("/proj", "dev")

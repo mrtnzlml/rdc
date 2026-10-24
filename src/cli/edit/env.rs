@@ -486,33 +486,50 @@ mod tests {
         assert_eq!(tree(root), before);
     }
 
+    /// Make `root` itself read-only. The moves (under `envs/`, `.rdc/`,
+    /// `secrets/`) and the mapping write still succeed, but any write of a
+    /// file directly in `root` fails: the "fails after the moves" case.
+    #[cfg(unix)]
+    fn read_only_root(root: &Path, read_only: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if read_only { 0o555 } else { 0o755 };
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
     #[test]
     fn a_failed_write_undoes_every_move_and_write() {
         let dir = project(&["dev", "prod"]);
         let root = dir.path();
         seed_dev(root);
         write(root, "README.md", "# Project\n<!-- >>> rdc:envs -->\nstale\n<!-- <<< rdc:envs -->\n");
-        // `write_atomic` writes `README.md.tmp` first; a directory there makes
-        // the README write fail after the moves and the mapping write.
-        std::fs::create_dir_all(root.join("README.md.tmp")).unwrap();
+        // README is the first file rewritten in the root; a read-only root
+        // makes it fail after the moves and the mapping write.
+        read_only_root(root, true);
         let before = tree(root);
         let err = rename_env(root, "dev", "sandbox", false).unwrap_err();
+        read_only_root(root, false);
         assert!(format!("{err:#}").contains("every change was undone"), "{err:#}");
+        assert!(format!("{err:#}").contains("README.md"), "{err:#}");
         assert_eq!(tree(root), before);
         assert!(!root.join("envs/sandbox").exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_failed_rdc_toml_write_undoes_every_move_and_write() {
         let dir = project(&["dev", "prod"]);
         let root = dir.path();
         seed_dev(root);
-        // `rdc.toml` is written last; a directory at its temp path fails it
-        // after every move and the mapping write.
-        std::fs::create_dir_all(root.join("rdc.toml.tmp")).unwrap();
+        // With no README, `rdc.toml` is the only root file rewritten, and it
+        // is written last: a read-only root fails it after every move and the
+        // mapping write.
+        read_only_root(root, true);
         let before = tree(root);
         let err = rename_env(root, "dev", "sandbox", false).unwrap_err();
+        read_only_root(root, false);
         assert!(format!("{err:#}").contains("every change was undone"), "{err:#}");
+        assert!(format!("{err:#}").contains("rdc.toml"), "{err:#}");
         assert_eq!(tree(root), before);
     }
 

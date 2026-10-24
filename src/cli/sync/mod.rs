@@ -224,6 +224,8 @@ pub(crate) async fn run_cycle(
 
     let cfg = ProjectConfig::load(&paths.project_config())?;
     let env_cfg = cfg.env_or_err(env)?;
+    // Before any read or write: every later step trusts the tree has no links.
+    paths.ensure_no_symlinks()?;
 
     let mut lockfile = Lockfile::load(&paths.lockfile())?;
     // Set the env's api_base so the lockfile can DERIVE object URLs from
