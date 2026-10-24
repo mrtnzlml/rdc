@@ -179,6 +179,15 @@ impl Lockfile {
                 );
             }
         }
+        for (kind, entries) in &lf.objects {
+            if let Some(bad) = entries.keys().find(|s| !crate::slug::is_safe_relative_key(s)) {
+                anyhow::bail!(
+                    "lockfile {} has an unsafe {kind} slug '{bad}': a slug must not be empty, \
+                     absolute, or contain '.', '..' or '\\' segments.",
+                    path.display()
+                );
+            }
+        }
         Ok(lf)
     }
 
@@ -459,6 +468,36 @@ mod tests {
         lf.save(&path).unwrap();
         let loaded = Lockfile::load(&path).unwrap();
         assert_eq!(loaded, lf);
+    }
+
+    /// Slugs are joined into paths under `envs/<env>/`, and the lockfile is
+    /// committed, so a key that leaves its directory must not load.
+    #[test]
+    fn load_rejects_slug_that_escapes_its_directory() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("dev.lock.json");
+        for slug in ["../../x", "/abs/x", "a//b", "a/./b", "a\\b", ""] {
+            let json = serde_json::json!({
+                "version": LOCKFILE_VERSION,
+                "objects": { "hooks": { slug: { "id": 1 } } }
+            });
+            std::fs::write(&path, json.to_string()).unwrap();
+            let err = format!("{:#}", Lockfile::load(&path).unwrap_err());
+            assert!(err.contains("hooks"), "{slug:?}: {err}");
+        }
+    }
+
+    /// Compound keys (`<workflow>/<step>`) and `_unnamed` are legitimate.
+    #[test]
+    fn load_accepts_compound_and_unnamed_slugs() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("dev.lock.json");
+        let json = serde_json::json!({
+            "version": LOCKFILE_VERSION,
+            "objects": { "workflow_steps": { "wf/step-2": { "id": 1 }, "_unnamed": { "id": 2 } } }
+        });
+        std::fs::write(&path, json.to_string()).unwrap();
+        Lockfile::load(&path).unwrap();
     }
 
     #[test]

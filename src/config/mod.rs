@@ -92,6 +92,9 @@ impl ProjectConfig {
         };
         let cfg: ProjectConfig = toml::from_str(&raw)
             .with_context(|| format!("parsing {}", path.display()))?;
+        if let Some(bad) = cfg.envs.keys().find(|k| !valid_env_name(k)) {
+            anyhow::bail!("{}: env '{bad}' is invalid. {INVALID_ENV_NAME_MSG}", path.display());
+        }
         Ok(cfg)
     }
 
@@ -171,6 +174,22 @@ org_id = 285704
         example().save(&path).unwrap();
         let loaded = ProjectConfig::load(&path).unwrap();
         assert_eq!(loaded, example());
+    }
+
+    /// An env key becomes a path segment (`envs/<env>/`, `secrets/<env>.*`),
+    /// and `rdc.toml` comes from the repo, so a committed `..` must not load.
+    #[test]
+    fn load_rejects_env_key_that_is_not_a_valid_env_name() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("rdc.toml");
+        std::fs::write(
+            &path,
+            "[envs.\"../leak\"]\napi_base = \"https://example.rossum.app/api/v1\"\norg_id = 1\n",
+        )
+        .unwrap();
+        let msg = format!("{:#}", ProjectConfig::load(&path).unwrap_err());
+        assert!(msg.contains("../leak"), "error should name the key: {msg}");
+        assert!(msg.contains(INVALID_ENV_NAME_MSG), "got: {msg}");
     }
 
     #[test]

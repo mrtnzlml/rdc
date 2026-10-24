@@ -1181,6 +1181,24 @@ mod tests {
         assert_eq!(cfg.envs.keys().collect::<Vec<_>>(), vec!["main"]);
     }
 
+    #[test]
+    fn edit_project_rejects_invalid_env_key() {
+        // A hand-edited `rdc.toml` can carry any env key; Edit Connection must
+        // not write the typed credentials to a path that key selects.
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("proj");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("rdc.toml"),
+            "[envs.\"../leak\"]\napi_base = \"https://m.test/api/v1\"\norg_id = 1\n").unwrap();
+        let err = edit_project(folder.display().to_string(), "../leak".into(), EditConnectionInput {
+            name: "proj".into(), api_base: "https://m.test/api/v1".into(), org_id: 1,
+            auth_kind: AuthKind::Token, token: Some("dummy-token-marker".into()),
+            username: None, password: None,
+        }).unwrap_err();
+        assert!(format!("{err:#}").contains("letters, digits"), "got: {err:#}");
+        assert!(!folder.join("leak.secrets.json").exists());
+    }
+
     // ---------------------------------------------------------------- SinkPromptRoute
 
     /// A `PromptSink` a test can inspect and "close", standing in for

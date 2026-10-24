@@ -126,6 +126,9 @@ pub fn serialize_schema(schema: &Schema) -> Result<SchemaJsonAndFormulas> {
         .context("serializing schema to value")?;
 
     let formulas = split_schema_formulas(&mut value);
+    for (id, _) in &formulas {
+        ensure_formula_id(id)?;
+    }
 
     crate::snapshot::key_order::strip_hidden_fields(&mut value);
 
@@ -191,6 +194,19 @@ fn extract_formulas(node: &mut Value, out: &mut Vec<(String, String)>) {
     }
 }
 
+/// A datapoint id names its sidecar `formulas/<id>.py`, so it must be a single
+/// safe path segment. Ids come from the API on pull and from the committed
+/// `schema.json` on push; neither is trusted to stay inside `formulas/`.
+fn ensure_formula_id(id: &str) -> Result<()> {
+    if id.contains('/') || !crate::slug::is_safe_relative_key(id) {
+        anyhow::bail!(
+            "schema datapoint id '{id}' cannot name a formula file: it must not be empty, \
+             '.' or '..', or contain '/', '\\' or NUL"
+        );
+    }
+    Ok(())
+}
+
 /// Reverse of `extract_formulas`: for any datapoint without a `formula`
 /// property, look up `<formulas_dir>/<id>.py` and insert its contents.
 fn merge_formulas(node: &mut Value, formulas_dir: &Path) -> Result<()> {
@@ -200,6 +216,7 @@ fn merge_formulas(node: &mut Value, formulas_dir: &Path) -> Result<()> {
     if is_datapoint && !obj.contains_key("formula") {
         let id = obj.get("id").and_then(|i| i.as_str()).map(|s| s.to_string());
         if let Some(id) = id {
+            ensure_formula_id(&id)?;
             let py_path = formulas_dir.join(format!("{id}.py"));
             if py_path.exists() {
                 let formula = std::fs::read_to_string(&py_path)
@@ -528,6 +545,33 @@ mod tests {
         let s: Schema = serde_json::from_value(v).unwrap();
         let (_, formulas) = serialize_schema(&s).unwrap();
         assert!(formulas.is_empty());
+    }
+
+    /// A datapoint id becomes `formulas/<id>.py`, and the id comes from the
+    /// API, so one that leaves `formulas/` must not serialize.
+    #[test]
+    fn serialize_schema_rejects_formula_id_that_escapes_formulas_dir() {
+        let v = json!({
+            "id": 1,
+            "url": "https://x/api/v1/schemas/1",
+            "name": "S",
+            "queues": [],
+            "content": [{ "category": "datapoint", "id": "../test_x", "formula": "1" }]
+        });
+        let s: Schema = serde_json::from_value(v).unwrap();
+        let err = format!("{:#}", serialize_schema(&s).unwrap_err());
+        assert!(err.contains("../test_x"), "got: {err}");
+    }
+
+    /// The same id read from a committed `schema.json` must not select a file
+    /// outside `formulas/` on push.
+    #[test]
+    fn splice_schema_formulas_rejects_formula_id_that_escapes_formulas_dir() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("formulas")).unwrap();
+        let mut value = json!({"content": [{"category": "datapoint", "id": "../outside"}]});
+        let err = format!("{:#}", splice_schema_formulas(&mut value, tmp.path()).unwrap_err());
+        assert!(err.contains("../outside"), "got: {err}");
     }
 
     #[test]

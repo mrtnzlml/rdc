@@ -946,6 +946,11 @@ pub fn write_scaffold_files(
     api_base: &str,
     org_id: u64,
 ) -> Result<()> {
+    // Embedders pass the env straight from a repo's `rdc.toml`, and the name
+    // is joined into `envs/<env>/` and `secrets/<env>.*` below.
+    if !crate::config::valid_env_name(env_name) {
+        anyhow::bail!("env '{env_name}' is invalid. {}", crate::config::INVALID_ENV_NAME_MSG);
+    }
     write_gitignore(cwd)?;
     write_gitattributes(cwd)?;
     let cfg_path = cwd.join("rdc.toml");
@@ -1305,6 +1310,20 @@ mod tests {
             std::fs::read_to_string(dir.path().join(".gitlab-ci.yml")).unwrap(),
             GITLAB_CI_TEMPLATE
         );
+    }
+
+    /// The desktop app passes an env key straight from a repo's `rdc.toml`;
+    /// a traversing one must fail before any file is created outside the project.
+    #[test]
+    fn write_scaffold_files_rejects_invalid_env_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project = tmp.path().join("p");
+        std::fs::create_dir(&project).unwrap();
+        let err = write_scaffold_files(&project, "../../x", "https://example.rossum.app/api/v1", 1)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains(crate::config::INVALID_ENV_NAME_MSG), "got: {err:#}");
+        assert!(!tmp.path().join("x").exists());
+        assert!(std::fs::read_dir(&project).unwrap().next().is_none(), "nothing written");
     }
 
     /// Embedders call this on every sync, so it must stay non-destructive.

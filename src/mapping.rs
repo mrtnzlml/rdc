@@ -301,6 +301,12 @@ impl GenericMapping {
                 std::collections::BTreeSet::new();
             for row in rows {
                 for (env, slug) in row {
+                    if !crate::slug::is_safe_relative_key(slug) {
+                        anyhow::bail!(
+                            ".rdc/mapping.toml: {kind} maps env '{env}' to unsafe slug '{slug}': \
+                             a slug must not be empty, absolute, or contain '.', '..' or '\\' segments"
+                        );
+                    }
                     if !known_envs.contains(env) {
                         warnings.push(format!(
                             ".rdc/mapping.toml: {kind} row references unknown env \
@@ -808,6 +814,20 @@ version = 1
         let envs = BTreeSet::from(["dev".to_string(), "prod".to_string()]);
         let err = g.validate(&envs).unwrap_err();
         assert!(format!("{err}").contains("invoices"));
+    }
+
+    /// A mapped slug becomes a path under `envs/<tgt>/`, and the mapping is
+    /// committed, so one that leaves its directory must not validate.
+    #[test]
+    fn validate_rejects_slug_that_escapes_its_directory() {
+        let mut g = GenericMapping::default();
+        g.hooks.push(BTreeMap::from([
+            ("dev".to_string(), "h".to_string()),
+            ("prod".to_string(), "../../../outside/x".to_string()),
+        ]));
+        let envs = BTreeSet::from(["dev".to_string(), "prod".to_string()]);
+        let err = format!("{}", g.validate(&envs).unwrap_err());
+        assert!(err.contains("../../../outside/x"), "got: {err}");
     }
 
     #[test]

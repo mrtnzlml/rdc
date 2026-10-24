@@ -32,6 +32,17 @@ pub fn slugify(input: &str) -> String {
     }
 }
 
+/// Whether a slug read from a repo file is safe to join under its directory.
+///
+/// `slugify` never produces anything else, but the lockfile and mapping are
+/// committed, so their keys are checked on load. Compound keys
+/// (`<workflow>/<step>`) are allowed; each `/`-separated segment must be
+/// non-empty, not `.` or `..`, and free of `\` and NUL.
+pub fn is_safe_relative_key(key: &str) -> bool {
+    key.split('/')
+        .all(|seg| !seg.is_empty() && seg != "." && seg != ".." && !seg.contains(['\\', '\0']))
+}
+
 /// Given a base slug and a set of slugs already in use, return a slug that does
 /// not collide. Adds `-2`, `-3`, ... as needed.
 pub fn slugify_unique(input: &str, used: &std::collections::HashSet<String>) -> String {
