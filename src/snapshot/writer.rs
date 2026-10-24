@@ -10,6 +10,17 @@ use std::path::Path;
 /// so a no-op pull doesn't bump mtimes on every file (otherwise every
 /// re-pull would look like "everything changed" to mtime-aware tools).
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_atomic_with_mode(path, bytes, None)
+}
+
+/// [`write_atomic`] for secrets: on Unix the temp file is created with mode
+/// `0600`, so the bytes are never readable by others, not even before the
+/// rename (which keeps the mode).
+pub fn write_atomic_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_atomic_with_mode(path, bytes, Some(0o600))
+}
+
+fn write_atomic_with_mode(path: &Path, bytes: &[u8], mode: Option<u32>) -> Result<()> {
     if let Ok(existing) = fs::read(path)
         && existing == bytes {
             return Ok(());
@@ -30,9 +41,15 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     tmp_name.push(format!(".{}.tmp", rand.iter().map(|b| format!("{b:02x}")).collect::<String>()));
     let tmp = path.with_file_name(tmp_name);
     let result = (|| -> Result<()> {
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            std::os::unix::fs::OpenOptionsExt::mode(&mut opts, mode);
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        let mut f = opts
             .open(&tmp)
             .with_context(|| format!("creating temp file {}", tmp.display()))?;
         f.write_all(bytes)
@@ -83,6 +100,19 @@ mod tests {
         write_atomic(&dir.path().join("f.json"), b"new").unwrap();
         assert_eq!(fs::read(&outside).unwrap(), b"orig");
         assert_eq!(fs::read(dir.path().join("f.json")).unwrap(), b"new");
+    }
+
+    /// A secret must never sit in a file others can read, not even the temp
+    /// file before the rename.
+    #[cfg(unix)]
+    #[test]
+    fn private_write_creates_an_owner_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("s.json");
+        write_atomic_private(&path, b"secret").unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(fs::read(&path).unwrap(), b"secret");
     }
 
     #[test]

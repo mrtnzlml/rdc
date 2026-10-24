@@ -52,7 +52,11 @@ fn ensure_secrets_dir(project_root: &Path) -> Result<PathBuf> {
             dir.display()
         ),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            builder.create(&dir).with_context(|| format!("creating {}", dir.display()))?;
         }
         Err(e) => return Err(anyhow::Error::new(e).context(format!("inspecting {}", dir.display()))),
     }
@@ -67,13 +71,8 @@ fn write_secrets_file_full(
     let path = ensure_secrets_dir(project_root)?.join(format!("{env}.secrets.json"));
     let mut bytes = serde_json::to_vec_pretty(file).context("serializing secrets JSON")?;
     bytes.push(b'\n');
-    crate::snapshot::writer::write_atomic(&path, &bytes)
+    crate::snapshot::writer::write_atomic_private(&path, &bytes)
         .with_context(|| format!("writing {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
     Ok(path)
 }
 
@@ -527,14 +526,8 @@ pub fn write_hook_secrets_stub(project_root: &Path, env: &str) -> Result<bool> {
         return Ok(false);
     }
     ensure_secrets_dir(project_root)?;
-    crate::snapshot::writer::write_atomic(&path, HOOK_SECRETS_STUB.as_bytes())
+    crate::snapshot::writer::write_atomic_private(&path, HOOK_SECRETS_STUB.as_bytes())
         .with_context(|| format!("writing {}", path.display()))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
 
     Ok(true)
 }
@@ -570,13 +563,8 @@ pub fn rename_hook_secret(project_root: &Path, env: &str, old: &str, new: &str) 
     let mut bytes = serde_json::to_vec_pretty(&file)?;
     bytes.push(b'\n');
     ensure_secrets_dir(project_root)?;
-    crate::snapshot::writer::write_atomic(&path, &bytes)
+    crate::snapshot::writer::write_atomic_private(&path, &bytes)
         .with_context(|| format!("writing {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
     Ok(true)
 }
 
@@ -584,6 +572,16 @@ pub fn rename_hook_secret(project_root: &Path, env: &str, old: &str, new: &str) 
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_secrets_dir_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        write_secrets_file(dir.path(), "dev", "tok", None).unwrap();
+        let mode = std::fs::metadata(dir.path().join("secrets")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
 
     /// `/secrets` is gitignored, but a force-added `secrets` symlink into a
     /// tracked directory would put the cached token where a commit picks it up.
