@@ -533,7 +533,7 @@ mod tests {
     /// on a fresh project; a project that wants the release decided by a commit
     /// sets `RDC_RELEASE` to `vX.Y.Z` itself. And with no literal
     /// anywhere, `.github/scripts/bump-version.sh` has nothing to rewrite in
-    /// this file -- it edits three files, none of them this one -- so no
+    /// this file -- it edits four files, none of them this one -- so no
     /// comment here can be silently falsified by a release.
     #[test]
     fn the_committed_template_floats_and_names_no_version() {
