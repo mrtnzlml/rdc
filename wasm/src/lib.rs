@@ -413,6 +413,14 @@ impl WatchControl {
     }
 }
 
+impl Drop for WatchControl {
+    /// A handle freed from JS without `stop()` must not keep polling or keep
+    /// the env claimed.
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
 /// One project held in memory. Cheap to clone: clones share the tree.
 #[derive(Clone)]
 pub struct ProjectCore {
@@ -687,6 +695,16 @@ mod tests {
             username: None,
             password: None,
         }
+    }
+
+    #[test]
+    fn dropping_a_watch_control_cancels_its_token() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let cancel = rdc::cli::sync::watch::CancelToken::new();
+        let control = WatchControl { triggers: tx, cancel: cancel.clone() };
+        assert!(!cancel.is_cancelled());
+        drop(control);
+        assert!(cancel.is_cancelled());
     }
 
     #[test]
