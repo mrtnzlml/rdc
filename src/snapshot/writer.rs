@@ -28,6 +28,11 @@ fn write_atomic_with_mode(path: &Path, bytes: &[u8], mode: Option<u32>) -> Resul
         fs::create_dir_all(parent)
             .with_context(|| format!("creating parent dir {}", parent.display()))?;
     }
+    // No crash to survive and no other process to hide a half-written file
+    // from, and the temp file and rename would each reach the host as a change.
+    if !fs::is_native() {
+        return fs::write(path, bytes).with_context(|| format!("writing {}", path.display()));
+    }
     // Sibling temp file with a random suffix, opened with `create_new`: a
     // fixed name could be pre-planted in the repo as a symlink, and
     // `create_new` refuses any existing entry, a symlink included.
@@ -40,8 +45,12 @@ fn write_atomic_with_mode(path: &Path, bytes: &[u8], mode: Option<u32>) -> Resul
     tmp_name.push(format!(".{}.tmp", rand.iter().map(|b| format!("{b:02x}")).collect::<String>()));
     let tmp = path.with_file_name(tmp_name);
     let result = (|| -> Result<()> {
-        fs::write_new(&tmp, bytes, mode)
-            .with_context(|| format!("writing temp file {}", tmp.display()))?;
+        // `write_new` creates and fills in one call; the file's presence after
+        // a failure says which half failed.
+        fs::write_new(&tmp, bytes, mode).with_context(|| {
+            let verb = if fs::exists(&tmp) { "writing" } else { "creating" };
+            format!("{verb} temp file {}", tmp.display())
+        })?;
         fs::rename(&tmp, path)
             .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))
     })();
@@ -100,6 +109,42 @@ mod tests {
         write_atomic_private(&path, b"secret").unwrap();
         assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(fs::read(&path).unwrap(), b"secret");
+    }
+
+    /// A non-native store has no crash to survive, and the temp file and the
+    /// rename would each be a change event for the host.
+    #[test]
+    fn non_native_store_gets_one_event_per_write() {
+        use crate::vfs::{MemStore, Store};
+        use std::sync::{Arc, Mutex};
+        let mem = Arc::new(MemStore::new("/rdc-mem".into()));
+        let log = Arc::new(Mutex::new(Vec::<(String, bool)>::new()));
+        let sink = log.clone();
+        mem.set_on_change(Box::new(move |k, v| sink.lock().unwrap().push((k.to_string(), v.is_some()))));
+        let store: Arc<dyn Store> = mem.clone();
+        crate::vfs::scope_sync(store, || {
+            write_atomic(Path::new("/rdc-mem/a/b.txt"), b"hi").unwrap();
+        });
+        assert_eq!(*log.lock().unwrap(), [("a/b.txt".to_string(), true)]);
+        assert_eq!(mem.files().len(), 1);
+    }
+
+    /// Failing to create the temp file and failing to fill it are different
+    /// problems, and the message says which.
+    #[cfg(unix)]
+    #[test]
+    fn creation_failure_says_creating() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o500)).unwrap();
+        let probe = fs::write(dir.path().join("probe"), b"");
+        let r = write_atomic(&dir.path().join("f"), b"x");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        if probe.is_ok() {
+            return; // running as root: permissions are not enforced
+        }
+        let msg = format!("{:#}", r.unwrap_err());
+        assert!(msg.contains("creating temp file"), "{msg}");
     }
 
     #[test]
