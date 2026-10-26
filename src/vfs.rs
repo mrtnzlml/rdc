@@ -162,7 +162,8 @@ impl Store for NativeStore {
     }
 }
 
-type OnChange = Box<dyn Fn(&str, Option<&[u8]>) + Send + Sync>;
+type OnChangeFn = dyn Fn(&str, Option<&[u8]>) + Send + Sync;
+type OnChange = Box<OnChangeFn>;
 
 #[derive(Default)]
 struct Tree {
@@ -198,7 +199,8 @@ impl Tree {
 pub struct MemStore {
     root: PathBuf,
     tree: Mutex<Tree>,
-    on_change: Mutex<Option<OnChange>>,
+    /// An `Arc` so `notify` can call it with the lock released.
+    on_change: Mutex<Option<Arc<OnChangeFn>>>,
 }
 
 fn err(kind: io::ErrorKind, msg: &str) -> io::Error {
@@ -240,7 +242,7 @@ impl MemStore {
     /// Called after each write, rename (once per side) and delete, with the
     /// root-relative key and the new bytes (`None` for a removal).
     pub fn set_on_change(&self, f: OnChange) {
-        *self.on_change.lock().unwrap() = Some(f);
+        *self.on_change.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::from(f));
     }
 
     fn key(&self, p: &Path) -> String {
@@ -270,10 +272,13 @@ impl MemStore {
         }
     }
 
-    /// Fire the callback for each event. Always called with the tree unlocked,
-    /// so the callback may read the store.
+    /// Fire the callback for each event. Called with the tree unlocked, and
+    /// the callback itself is cloned out of its lock first, so the callback
+    /// may read, write or re-register on this store. A callback that panics
+    /// leaves no poisoned state behind.
     fn notify(&self, events: Vec<(String, Option<Vec<u8>>)>) {
-        if let Some(f) = self.on_change.lock().unwrap().as_ref() {
+        let f = self.on_change.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(f) = f {
             for (k, v) in &events {
                 f(k, v.as_deref());
             }
@@ -868,6 +873,47 @@ mod tests {
         let want = [("a", true), ("a", false), ("b", true), ("b", false)]
             .map(|(k, v)| (k.to_string(), v));
         assert_eq!(*log.lock().unwrap(), want);
+    }
+
+    #[test]
+    fn mem_on_change_may_write_to_the_same_store() {
+        // The callback is host code; a host that answers a change with an
+        // edit must not deadlock the store. Run on a thread so a deadlock
+        // fails the test instead of hanging it.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let m = Arc::new(MemStore::new(PathBuf::from("/rdc-mem")));
+            let log = Arc::new(Mutex::new(Vec::<String>::new()));
+            let (sink, weak) = (log.clone(), Arc::downgrade(&m));
+            m.set_on_change(Box::new(move |k, _| {
+                sink.lock().unwrap().push(k.to_string());
+                if k == "a" {
+                    let m = weak.upgrade().unwrap();
+                    m.write(Path::new("/rdc-mem/b"), b"2").unwrap();
+                    m.set_on_change(Box::new(|_, _| {}));
+                }
+            }));
+            m.write(Path::new("/rdc-mem/a"), b"1").unwrap();
+            let _ = tx.send((log.lock().unwrap().clone(), m.files().contains_key("b")));
+        });
+        let (log, has_b) = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("deadlocked");
+        assert_eq!(log, ["a", "b"], "the nested write's event is delivered");
+        assert!(has_b);
+    }
+
+    #[test]
+    fn mem_on_change_survives_a_panicking_callback() {
+        let m = MemStore::new(PathBuf::from("/rdc-mem"));
+        m.set_on_change(Box::new(|k, _| assert_ne!(k, "boom")));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            m.write(Path::new("/rdc-mem/boom"), b"1")
+        }));
+        assert!(r.is_err());
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = log.clone();
+        m.set_on_change(Box::new(move |k, _| sink.lock().unwrap().push(k.to_string())));
+        m.write(Path::new("/rdc-mem/ok"), b"1").unwrap();
+        assert_eq!(*log.lock().unwrap(), ["ok"]);
     }
 
     #[tokio::test]
