@@ -52,7 +52,7 @@ chrono = { version = "0.4", default-features = false, features = ["wasmbind"] }
 getrandom = { version = "0.4", features = ["wasm_js"] }
 # Natively `rt-multi-thread` and hyper turn on `rt` and `sync`; name them here.
 tokio = { version = "1", features = ["rt", "sync"] }
-gloo-timers = { version = "0.3.0", features = ["futures"] }
+gloo-timers = { version = "0.4.0", features = ["futures"] }
 wasm-bindgen-futures = "0.4.79"
 
 [dev-dependencies]
