@@ -665,7 +665,29 @@ fn is_transient_network_error(e: &anyhow::Error) -> bool {
             || s.contains("connection reset")
             || s.contains("5xx")
             || s.contains("Connection")
-    })
+    }) || is_fetch_failure_on_wasm(e)
+}
+
+/// The browser's `fetch` reports every network failure the same way, as a
+/// request error whose text matches none of the strings above. Without this,
+/// one network blip would end an unattended browser watch.
+#[cfg(target_arch = "wasm32")]
+fn is_fetch_failure_on_wasm(e: &anyhow::Error) -> bool {
+    is_fetch_failure(e)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn is_fetch_failure_on_wasm(_e: &anyhow::Error) -> bool {
+    false
+}
+
+/// A request that got no HTTP response: reqwest's request or timeout kind.
+/// Built natively only for its tests.
+#[cfg(any(target_arch = "wasm32", test))]
+fn is_fetch_failure(e: &anyhow::Error) -> bool {
+    e.chain()
+        .filter_map(|c| c.downcast_ref::<reqwest::Error>())
+        .any(|r| r.is_request() || r.is_timeout())
 }
 
 /// Heuristic: does this error look like a local-file parse failure?
@@ -1278,6 +1300,27 @@ mod tests {
     fn transient_network_error_recognizes_timeout() {
         let e = anyhow::anyhow!("listing labels for env 'test': connection timed out");
         assert!(is_transient_network_error(&e));
+    }
+
+    #[tokio::test]
+    async fn fetch_failure_is_a_request_without_a_response() {
+        // Port 1 on loopback refuses the connection: a request-kind error.
+        let err = reqwest::Client::new()
+            .get("http://127.0.0.1:1/")
+            .send()
+            .await
+            .unwrap_err();
+        let e = anyhow::Error::new(err).context("listing labels for env 'test'");
+        assert!(is_fetch_failure(&e));
+
+        // An HTTP error status is a response, not a fetch failure.
+        let resp = reqwest::Response::from(
+            http::Response::builder().status(404).body("").unwrap(),
+        );
+        let e = anyhow::Error::new(resp.error_for_status().unwrap_err());
+        assert!(!is_fetch_failure(&e));
+
+        assert!(!is_fetch_failure(&anyhow::anyhow!("something totally else")));
     }
 
     #[test]
