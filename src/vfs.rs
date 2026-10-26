@@ -3,11 +3,15 @@
 //! [`Store`] installed by [`scope`], or to [`NativeStore`] (plain `std::fs`)
 //! when none is. The browser build scopes a [`MemStore`] so the same code
 //! runs on an in-memory project tree.
+//!
+//! A [`MemStore`] reports changes through `set_on_change`; see there for the
+//! delivery order.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::future::Future;
 use std::io;
+use std::ops::Bound;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -172,11 +176,24 @@ struct Tree {
     dirs: BTreeSet<PathBuf>,
 }
 
+/// The range `p..` over unsized `Path` keys.
+fn from(p: &Path) -> (Bound<&Path>, Bound<&Path>) {
+    (Bound::Included(p), Bound::Unbounded)
+}
+
 impl Tree {
+    /// Paths sort component by component, so everything under `p` is a
+    /// contiguous run starting at `p`: a range scan, not a scan of every key.
+    fn files_under<'a>(&'a self, p: &'a Path) -> impl Iterator<Item = &'a PathBuf> {
+        self.files.range::<Path, _>(from(p)).map(|(k, _)| k).take_while(move |k| k.starts_with(p))
+    }
+
+    fn dirs_under<'a>(&'a self, p: &'a Path) -> impl Iterator<Item = &'a PathBuf> {
+        self.dirs.range::<Path, _>(from(p)).take_while(move |d| d.starts_with(p))
+    }
+
     fn is_dir(&self, root: &Path, p: &Path) -> bool {
-        p == root
-            || self.dirs.contains(p)
-            || self.files.keys().any(|k| k != p && k.starts_with(p))
+        p == root || self.dirs.contains(p) || self.files_under(p).any(|k| k != p)
     }
 
     /// Record every ancestor of `p` below `root` as an explicit directory, so
@@ -207,8 +224,24 @@ fn err(kind: io::ErrorKind, msg: &str) -> io::Error {
     io::Error::new(kind, msg.to_string())
 }
 
+/// Drop `.` and resolve `..` without touching any filesystem.
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 impl MemStore {
     pub fn new(root: PathBuf) -> Self {
+        let root = lexical(&root);
         Self { root, tree: Mutex::new(Tree::default()), on_change: Mutex::new(None) }
     }
 
@@ -241,6 +274,13 @@ impl MemStore {
 
     /// Called after each write, rename (once per side) and delete, with the
     /// root-relative key and the new bytes (`None` for a removal).
+    ///
+    /// Events are delivered in call order, with the tree unlocked. A write made
+    /// from inside the callback is therefore delivered immediately, before the
+    /// remaining events of the outer operation (a rename's removal and creation
+    /// are two events). A host that persists by replaying events should not
+    /// write to the store from the callback during a rename: its replay would
+    /// see the nested write between the two halves.
     pub fn set_on_change(&self, f: OnChange) {
         *self.on_change.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::from(f));
     }
@@ -255,16 +295,7 @@ impl MemStore {
 
     fn norm(&self, path: &Path) -> io::Result<PathBuf> {
         let joined = if path.is_relative() { self.root.join(path) } else { path.to_path_buf() };
-        let mut out = PathBuf::new();
-        for c in joined.components() {
-            match c {
-                Component::CurDir => {}
-                Component::ParentDir => {
-                    out.pop();
-                }
-                c => out.push(c),
-            }
-        }
+        let out = lexical(&joined);
         if out.starts_with(&self.root) {
             Ok(out)
         } else {
@@ -286,6 +317,10 @@ impl MemStore {
     }
 
     fn parent_must_be_dir(&self, tree: &Tree, p: &Path) -> io::Result<()> {
+        // A file anywhere on the way up is `NotADirectory`, as on disk.
+        if p.ancestors().skip(1).take_while(|a| *a != self.root).any(|a| tree.files.contains_key(a)) {
+            return Err(err(io::ErrorKind::NotADirectory, "a parent is a file"));
+        }
         match p.parent() {
             Some(parent) if tree.is_dir(&self.root, parent) => Ok(()),
             _ => Err(err(io::ErrorKind::NotFound, "parent directory does not exist")),
@@ -296,11 +331,11 @@ impl MemStore {
         let p = self.norm(path)?;
         {
             let mut tree = self.tree.lock().unwrap();
+            if must_be_new && (tree.files.contains_key(&p) || tree.is_dir(&self.root, &p)) {
+                return Err(err(io::ErrorKind::AlreadyExists, "file exists"));
+            }
             if tree.is_dir(&self.root, &p) {
                 return Err(err(io::ErrorKind::IsADirectory, "is a directory"));
-            }
-            if must_be_new && tree.files.contains_key(&p) {
-                return Err(err(io::ErrorKind::AlreadyExists, "file exists"));
             }
             self.parent_must_be_dir(&tree, &p)?;
             tree.mark_parents(&self.root, &p);
@@ -354,11 +389,16 @@ impl Store for MemStore {
     fn remove_dir(&self, path: &Path) -> io::Result<()> {
         let p = self.norm(path)?;
         let mut tree = self.tree.lock().unwrap();
+        if p == self.root {
+            return Err(err(io::ErrorKind::InvalidInput, "cannot remove the root"));
+        }
+        if tree.files.contains_key(&p) {
+            return Err(err(io::ErrorKind::NotADirectory, "not a directory"));
+        }
         if !tree.is_dir(&self.root, &p) {
             return Err(err(io::ErrorKind::NotFound, "no such directory"));
         }
-        let occupied = tree.files.keys().any(|k| k.starts_with(&p))
-            || tree.dirs.iter().any(|d| d != &p && d.starts_with(&p));
+        let occupied = tree.files_under(&p).next().is_some() || tree.dirs_under(&p).any(|d| d != &p);
         if occupied {
             return Err(err(io::ErrorKind::DirectoryNotEmpty, "directory not empty"));
         }
@@ -370,14 +410,20 @@ impl Store for MemStore {
         let gone: Vec<PathBuf>;
         {
             let mut tree = self.tree.lock().unwrap();
+            if tree.files.contains_key(&p) {
+                return Err(err(io::ErrorKind::NotADirectory, "not a directory"));
+            }
             if !tree.is_dir(&self.root, &p) {
                 return Err(err(io::ErrorKind::NotFound, "no such directory"));
             }
-            gone = tree.files.keys().filter(|k| k.starts_with(&p)).cloned().collect();
+            gone = tree.files_under(&p).cloned().collect();
             for k in &gone {
                 tree.files.remove(k);
             }
-            tree.dirs.retain(|d| !d.starts_with(&p));
+            let dirs: Vec<PathBuf> = tree.dirs_under(&p).cloned().collect();
+            for d in dirs {
+                tree.dirs.remove(&d);
+            }
         }
         self.notify(gone.iter().map(|k| (self.key(k), None)).collect());
         Ok(())
@@ -407,13 +453,12 @@ impl Store for MemStore {
                 if dst.starts_with(&src) {
                     return Err(err(io::ErrorKind::InvalidInput, "cannot move a directory into itself"));
                 }
-                let occupied = tree.files.keys().any(|k| k.starts_with(&dst))
-                    || tree.dirs.iter().any(|d| d != &dst && d.starts_with(&dst));
+                let occupied = tree.files_under(&dst).next().is_some()
+                    || tree.dirs_under(&dst).any(|d| d != &dst);
                 if occupied {
                     return Err(err(io::ErrorKind::DirectoryNotEmpty, "target directory not empty"));
                 }
-                let moved: Vec<PathBuf> =
-                    tree.files.keys().filter(|k| k.starts_with(&src)).cloned().collect();
+                let moved: Vec<PathBuf> = tree.files_under(&src).cloned().collect();
                 for k in moved {
                     let bytes = tree.files.remove(&k).unwrap();
                     let new = dst.join(k.strip_prefix(&src).unwrap());
@@ -422,8 +467,7 @@ impl Store for MemStore {
                     tree.mark_parents(&self.root, &new);
                     tree.files.insert(new, bytes);
                 }
-                let dirs: Vec<PathBuf> =
-                    tree.dirs.iter().filter(|d| d.starts_with(&src)).cloned().collect();
+                let dirs: Vec<PathBuf> = tree.dirs_under(&src).cloned().collect();
                 for d in dirs {
                     tree.dirs.remove(&d);
                     tree.dirs.insert(dst.join(d.strip_prefix(&src).unwrap()));
@@ -437,6 +481,9 @@ impl Store for MemStore {
         Ok(())
     }
     fn copy(&self, from: &Path, to: &Path) -> io::Result<u64> {
+        if self.metadata(from)?.is_dir() {
+            return Err(err(io::ErrorKind::InvalidInput, "the source is a directory"));
+        }
         let bytes = self.read(from)?;
         self.put(to, &bytes, false)?;
         Ok(bytes.len() as u64)
@@ -451,7 +498,7 @@ impl Store for MemStore {
             return Err(err(io::ErrorKind::NotFound, "no such directory"));
         }
         let mut found: BTreeMap<OsString, FileType> = BTreeMap::new();
-        let below = tree.files.keys().map(|k| (k, true)).chain(tree.dirs.iter().map(|d| (d, false)));
+        let below = tree.files_under(&p).map(|k| (k, true)).chain(tree.dirs_under(&p).map(|d| (d, false)));
         for (k, is_file) in below {
             let Ok(rel) = k.strip_prefix(&p) else { continue };
             let mut parts = rel.components();
@@ -811,6 +858,57 @@ mod tests {
             assert!(s.write(&root.join("d"), b"x").is_err());
             assert!(s.read(&root.join("d")).is_err());
         });
+    }
+
+    /// Error kinds follow std on Unix, on both stores.
+    #[cfg(unix)]
+    #[test]
+    fn error_kinds_contract() {
+        both(|s, root| {
+            s.write(&root.join("f"), b"x").unwrap();
+            s.create_dir_all(&root.join("d")).unwrap();
+            let kind = |r: io::Result<()>| r.unwrap_err().kind();
+            assert_eq!(kind(s.remove_dir(&root.join("f"))), ErrorKind::NotADirectory);
+            assert_eq!(kind(s.remove_dir_all(&root.join("f"))), ErrorKind::NotADirectory);
+            assert_eq!(kind(s.write(&root.join("f/x"), b"")), ErrorKind::NotADirectory);
+            assert_eq!(kind(s.write_new(&root.join("d"), b"", None)), ErrorKind::AlreadyExists);
+            assert_eq!(s.copy(&root.join("d"), &root.join("c")).unwrap_err().kind(), ErrorKind::InvalidInput);
+        });
+    }
+
+    #[test]
+    fn mem_remove_dir_refuses_the_root() {
+        let m = MemStore::new(PathBuf::from("/rdc-mem"));
+        assert!(m.remove_dir(Path::new("/rdc-mem")).is_err());
+        assert!(m.metadata(Path::new("/rdc-mem")).unwrap().is_dir());
+    }
+
+    #[test]
+    fn mem_normalizes_its_root() {
+        let m = MemStore::new(PathBuf::from("/a/./b/../c"));
+        m.write(Path::new("/a/c/x"), b"1").unwrap();
+        assert_eq!(m.read(Path::new("x")).unwrap(), b"1");
+        assert_eq!(m.files().keys().collect::<Vec<_>>(), ["x"]);
+        assert_eq!(m.read(Path::new("/a/b/x")).unwrap_err().kind(), ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn mem_handles_a_large_tree() {
+        let files = (0..10_000).map(|i| (format!("d{}/f{i}", i % 100), vec![1u8]));
+        let m = MemStore::from_files(PathBuf::from("/rdc-mem"), files).unwrap();
+        m.write(Path::new("/rdc-mem/d7/new"), b"n").unwrap();
+        let names: Vec<_> = m
+            .read_dir(Path::new("/rdc-mem/d7"))
+            .unwrap()
+            .iter()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 101);
+        assert!(names.contains(&"new".to_string()) && names.contains(&"f107".to_string()));
+        assert_eq!(m.read_dir(Path::new("/rdc-mem")).unwrap().len(), 100);
+        assert!(m.remove_dir(Path::new("/rdc-mem/d7")).is_err());
+        // `d1` must not be mistaken for a prefix of `d10`.
+        assert!(!m.metadata(Path::new("/rdc-mem/d")).is_ok());
     }
 
     #[test]
