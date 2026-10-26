@@ -9,8 +9,17 @@ use std::time::Duration;
 /// (non-`Send`) form because reqwest futures are `!Send` there.
 pub type BoxFuture<'a, T> = futures::future::BoxFuture<'a, T>;
 
-/// Run `f` detached on the runtime.
+/// Run `f` detached on the runtime. Task-locals do not follow a spawn, so
+/// the caller's current store and prompt route, when set, are re-scoped
+/// around `f`.
 pub fn spawn<F: Future<Output = ()> + Send + 'static>(f: F) {
+    let mut f: BoxFuture<'static, ()> = Box::pin(f);
+    if let Some(route) = crate::cli::stdin_coord::current_route() {
+        f = Box::pin(crate::cli::stdin_coord::with_route(route, f));
+    }
+    if let Some(store) = crate::vfs::current() {
+        f = Box::pin(crate::vfs::scope(store, f));
+    }
     tokio::spawn(f);
 }
 

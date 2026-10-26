@@ -500,6 +500,12 @@ pub async fn scope<F: Future>(store: Arc<dyn Store>, f: F) -> F::Output {
     STORE.scope(store, f).await
 }
 
+/// The store this task is scoped to, if any. `rt::spawn` uses it to carry the
+/// scope into the task it starts.
+pub(crate) fn current() -> Option<Arc<dyn Store>> {
+    STORE.try_with(Arc::clone).ok()
+}
+
 fn with_store<R>(f: impl FnOnce(&dyn Store) -> R) -> R {
     match STORE.try_with(Arc::clone) {
         Ok(s) => f(s.as_ref()),

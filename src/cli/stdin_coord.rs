@@ -152,6 +152,12 @@ pub async fn with_route<F: Future>(route: Arc<dyn PromptRoute>, f: F) -> F::Outp
         .await
 }
 
+/// The route this task is scoped to, if any. `rt::spawn` uses it to carry the
+/// scope into the task it starts.
+pub(crate) fn current_route() -> Option<Arc<dyn PromptRoute>> {
+    ROUTE.try_with(Arc::clone).ok()
+}
+
 /// Declare what the next coordinated read is asking. Call immediately
 /// before writing the question. A no-op when no route is installed, which
 /// is every CLI invocation — `PENDING` is only in scope while `ROUTE` is

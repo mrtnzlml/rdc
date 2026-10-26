@@ -13,6 +13,7 @@
 
 use crate::cli::resolve::ConflictStrategy;
 use crate::cli::sync::CycleOutcome;
+use crate::vfs::Store;
 use crate::log::Log;
 use anyhow::Result;
 use std::path::Path;
@@ -27,6 +28,7 @@ use std::time::Duration;
 /// terminal-stdin machinery and is deliberately NOT part of this surface;
 /// only these five names are re-exported.
 pub use crate::cli::change_view::menu_one_line;
+pub use crate::cli::sync::watch::CycleTrigger;
 pub use crate::cli::stdin_coord::{Prompt, PromptKey, PromptKind, PromptRoute, with_route};
 
 /// How an embedder wants one reconciliation cycle run.
@@ -94,6 +96,43 @@ pub async fn sync_logged(
     .await
 }
 
+/// [`sync_logged`] on an in-memory (or any other) project: every file access
+/// inside goes through `store`, never the real disk.
+pub async fn sync_logged_in(
+    store: Arc<dyn Store>,
+    root: &Path,
+    env: &str,
+    token: &str,
+    opts: EmbedSyncOptions,
+    log_sink: Box<dyn std::io::Write + Send>,
+) -> Result<CycleOutcome> {
+    crate::vfs::scope(store, sync_logged(root, env, token, opts, log_sink)).await
+}
+
+/// [`watch_logged`] on a project held by `store`. `triggers` is the host's
+/// stand-in for file events: each message runs a cycle as a local change
+/// would. A non-native store has no OS watcher, so without `triggers` only
+/// polling (and the initial reconcile) runs.
+pub async fn watch_logged_in(
+    store: Arc<dyn Store>,
+    root: &Path,
+    env: &str,
+    api_base: &str,
+    token: String,
+    poll: Option<Duration>,
+    log_sink: Box<dyn std::io::Write + Send>,
+    route: Arc<dyn PromptRoute>,
+    cancel: crate::cli::sync::watch::CancelToken,
+    on_idle: Option<Arc<dyn Fn(Option<u64>) + Send + Sync>>,
+    triggers: Option<tokio::sync::mpsc::Receiver<CycleTrigger>>,
+) -> Result<()> {
+    crate::vfs::scope(
+        store,
+        watch_inner(root, env, api_base, token, poll, log_sink, route, cancel, on_idle, triggers),
+    )
+    .await
+}
+
 /// Run a watch loop against `cwd`/`env` until `cancel` fires, streaming the
 /// log into `log_sink` and routing every blocking prompt to `route`.
 ///
@@ -119,6 +158,21 @@ pub async fn watch_logged(
     route: Arc<dyn PromptRoute>,
     cancel: crate::cli::sync::watch::CancelToken,
     on_idle: Option<Arc<dyn Fn(Option<u64>) + Send + Sync>>,
+) -> Result<()> {
+    watch_inner(cwd, env, api_base, token, poll, log_sink, route, cancel, on_idle, None).await
+}
+
+async fn watch_inner(
+    cwd: &Path,
+    env: &str,
+    api_base: &str,
+    token: String,
+    poll: Option<Duration>,
+    log_sink: Box<dyn std::io::Write + Send>,
+    route: Arc<dyn PromptRoute>,
+    cancel: crate::cli::sync::watch::CancelToken,
+    on_idle: Option<Arc<dyn Fn(Option<u64>) + Send + Sync>>,
+    triggers: Option<tokio::sync::mpsc::Receiver<CycleTrigger>>,
 ) -> Result<()> {
     let renderer = Log::for_sink(crate::cli::resolve::ColorMode::Color, log_sink);
 
@@ -148,6 +202,7 @@ pub async fn watch_logged(
             refresher,
             None, // post_reconcile_hook: no signal handling to install
             None, // stdin_hook: prompts arrive through `route`, not stdin
+            triggers,
         ),
     )
     .await

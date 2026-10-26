@@ -96,7 +96,7 @@ fn paint_polling_status(renderer: &crate::log::Log, interval_secs: u64, elapsed:
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CycleTrigger {
+pub enum CycleTrigger {
     /// A local file changed (after debounce).
     FileEvent,
     /// The poll timer fired.
@@ -188,7 +188,7 @@ pub async fn run_watch(
     // (unlike the stdin hook below) so the piped/CI case can still be
     // killed.
     let post_reconcile_hook: Option<PostReconcileHook> = Some(Box::new(|cancel: CancelToken| {
-        tokio::spawn(async move {
+        crate::rt::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
             cancel.cancel();
         });
@@ -223,7 +223,7 @@ pub async fn run_watch(
             // Activate synchronously, before the first event-loop cycle can
             // run a prompt, so the coordinator is live when a prompt registers.
             let coord = crate::cli::stdin_coord::activate();
-            tokio::spawn(async move {
+            crate::rt::spawn(async move {
                 use tokio::io::{AsyncBufReadExt, BufReader};
                 let mut lines = BufReader::new(tokio::io::stdin()).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
@@ -272,6 +272,7 @@ pub async fn run_watch(
         refresher,
         post_reconcile_hook,
         stdin_hook,
+        None,
     )
     .await?;
 
@@ -310,6 +311,7 @@ pub(crate) async fn run_watch_with(
     refresher: TokenRefresher,
     post_reconcile_hook: Option<PostReconcileHook>,
     stdin_hook: Option<StdinHook>,
+    triggers: Option<tokio::sync::mpsc::Receiver<CycleTrigger>>,
 ) -> Result<()> {
     let cwd = match cfg.cwd {
         Some(p) => p.to_path_buf(),
@@ -392,7 +394,7 @@ pub(crate) async fn run_watch_with(
         let sync_running_ticker = sync_running.clone();
         let reset_ticker = timer_reset.clone();
         let interval_secs = interval_duration.as_secs().max(1);
-        tokio::spawn(async move {
+        crate::rt::spawn(async move {
             // Tick every second so the status line counts down and the
             // ten-segment bar advances; emit a Poll trigger every
             // `interval_secs` ticks. `reset_ticker.notified()` from
@@ -427,7 +429,23 @@ pub(crate) async fn run_watch_with(
     }
 
     let env_root = paths.env_root();
-    let watcher = spawn_file_watcher(cfg.env.to_string(), env_root.clone(), events_tx.clone())?;
+    // Natively, `notify` watches the tree. A non-native store has no OS
+    // events: the host reports changes through `triggers` instead.
+    let watcher = if crate::vfs::is_native() {
+        Some(spawn_file_watcher(cfg.env.to_string(), env_root.clone(), events_tx.clone())?)
+    } else {
+        None
+    };
+    if let Some(mut triggers) = triggers {
+        let tx = events_tx.clone();
+        crate::rt::spawn(async move {
+            while triggers.recv().await.is_some() {
+                if tx.send(CycleTrigger::FileEvent).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
 
     if let Some(hook) = stdin_hook {
         hook(events_tx.clone(), sync_running.clone());
@@ -437,7 +455,7 @@ pub(crate) async fn run_watch_with(
         &cfg,
         events_rx,
         cancel,
-        Some(watcher),
+        watcher,
         env_root,
         Some(renderer.clone()),
         sync_running.clone(),
