@@ -128,7 +128,9 @@ fn mask(src: &str) -> String {
         } else if c[i] == '\'' {
             // A char literal, as opposed to a lifetime or a label.
             let end = if c.get(i + 1) == Some(&'\\') {
-                c[i + 2..].iter().position(|&x| x == '\'').map(|p| i + 2 + p + 1)
+                // `'\''`, `'\n'`, `'\x41'`, `'\u{1F600}'`: the closing quote comes after
+                // the escaped character, which may itself be a quote.
+                c[i + 3..].iter().position(|&x| x == '\'').map(|p| i + 3 + p + 1)
             } else if c.get(i + 2) == Some(&'\'') {
                 Some(i + 3)
             } else {
@@ -281,11 +283,17 @@ mod tests {
     const D: char = '}';
     // }
     /* } /* nested } */ } */
-    fn t() { let _ = '\'; }
+    fn t() { let _ = '\''; }
 }
 fn production() { p.exists(); }
 "##;
     assert_eq!(flagged(src), ["fn production() { p.exists(); }"]);
+}
+
+#[test]
+fn a_needle_after_an_escaped_quote_char_is_still_flagged() {
+    let src = "fn f() { let _ = ('\\'','\"','\\u{1F600}'); p.exists(); }\n";
+    assert_eq!(flagged(src).len(), 1, "{:?}", flagged(src));
 }
 
 #[test]

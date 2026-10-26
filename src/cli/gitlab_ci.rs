@@ -514,15 +514,6 @@ mod tests {
         );
     }
 
-    /// The committed pipeline floats on `latest`, and carries no version
-    /// literal at all.
-    ///
-    /// Both halves are deliberate. A scaffold's job is to install a working rdc
-    /// on a fresh project; a project that wants the release decided by a commit
-    /// sets `RDC_RELEASE` to `vX.Y.Z` itself. And with no literal
-    /// anywhere, `.github/scripts/bump-version.sh` has nothing to rewrite in
-    /// this file -- it edits four files, none of them this one -- so no comment here can be
-    /// silently falsified by a release.
     #[test]
     fn the_archive_job_prepares_its_env_so_credentials_can_be_scoped() {
         // GitLab hands an environment-scoped variable only to a job that
@@ -535,6 +526,15 @@ mod tests {
         assert!(archive.contains("\n    name: \"$RDC_ENV\"\n    action: prepare\n"), "{archive}");
     }
 
+    /// The committed pipeline floats on `latest`, and carries no version
+    /// literal at all.
+    ///
+    /// Both halves are deliberate. A scaffold's job is to install a working rdc
+    /// on a fresh project; a project that wants the release decided by a commit
+    /// sets `RDC_RELEASE` to `vX.Y.Z` itself. And with no literal
+    /// anywhere, `.github/scripts/bump-version.sh` has nothing to rewrite in
+    /// this file -- it edits three files, none of them this one -- so no
+    /// comment here can be silently falsified by a release.
     #[test]
     fn the_committed_template_floats_and_names_no_version() {
         let template = crate::cli::init::GITLAB_CI_TEMPLATE;

@@ -907,7 +907,7 @@ mod tests {
         assert!(names.contains(&"new".to_string()) && names.contains(&"f107".to_string()));
         assert_eq!(m.read_dir(Path::new("/rdc-mem")).unwrap().len(), 100);
         assert!(m.remove_dir(Path::new("/rdc-mem/d7")).is_err());
-        // `d1` must not be mistaken for a prefix of `d10`.
+        // A path that merely prefixes real names (`/d` vs `d0`..`d99`) is not a directory.
         assert!(!m.metadata(Path::new("/rdc-mem/d")).is_ok());
     }
 
