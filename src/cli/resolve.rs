@@ -28,7 +28,8 @@ use anyhow::{Context, Result};
 use crate::cli::change_view::{ChangeRow, RowWidths, count_changes, menu_one_line, render_connector, render_diff_body, render_menu, render_prompt_header, render_reask, render_row};
 use crate::cli::stdin_coord::{Prompt, PromptKey, PromptKind};
 use similar::{Algorithm, TextDiff};
-use std::io::{BufRead, IsTerminal, Write};
+use crate::cli::stdin_coord::LineSource;
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
@@ -192,7 +193,7 @@ fn read_local(path: &Path) -> Result<Vec<u8>> {
 /// Top-level entry point. Auto-detects color mode from environment and TTY.
 /// Production callers use this; tests use `prompt_resolve_with_color` to
 /// pin the mode.
-pub fn prompt_resolve<R: BufRead, W: Write>(
+pub async fn prompt_resolve<R: LineSource, W: Write>(
     input: R,
     output: W,
     index: usize,
@@ -213,12 +214,12 @@ pub fn prompt_resolve<R: BufRead, W: Write>(
         remote_bytes,
         env,
         mode,
-    )
+    ).await
 }
 
 /// Color-aware core. Tests pin the mode here; production goes through
 /// `prompt_resolve` which auto-detects.
-pub fn prompt_resolve_with_color<R: BufRead, W: Write>(
+pub async fn prompt_resolve_with_color<R: LineSource, W: Write>(
     input: R,
     output: W,
     index: usize,
@@ -243,14 +244,14 @@ pub fn prompt_resolve_with_color<R: BufRead, W: Write>(
         mode,
         None,
         false,
-    )
+    ).await
 }
 
 /// Render `summary` then a `Continue? [y/N]` confirmation for a bulk
 /// "apply to all" choice. Returns `Some(chosen)` on `y`, `None` to re-prompt
 /// the main menu on any other answer, and `Some(Resolution::Skip)` on EOF
 /// (matching the prompts' top-level EOF handling).
-fn confirm_bulk<R: BufRead, W: Write>(
+async fn confirm_bulk<R: LineSource, W: Write>(
     input: &mut R,
     output: &mut W,
     summary: &str,
@@ -269,10 +270,9 @@ fn confirm_bulk<R: BufRead, W: Write>(
     });
     write!(output, "{}", render_menu(&keys, mode))?;
     output.flush().ok();
-    let mut c = String::new();
-    if input.read_line(&mut c)? == 0 {
+    let Some(c) = input.read_line().await? else {
         return Ok(Some(Resolution::Skip));
-    }
+    };
     if matches!(c.trim().chars().next(), Some('y') | Some('Y')) {
         Ok(Some(chosen))
     } else {
@@ -284,7 +284,7 @@ fn confirm_bulk<R: BufRead, W: Write>(
 /// `[e]dit`/`[h]` plumbing with [`prompt_resolve_with_color`]; the
 /// only difference is that local bytes come from the caller, not
 /// from `local_path`.
-pub fn prompt_resolve_with_bytes_and_color<R: BufRead, W: Write>(
+pub async fn prompt_resolve_with_bytes_and_color<R: LineSource, W: Write>(
     mut input: R,
     mut output: W,
     index: usize,
@@ -392,21 +392,20 @@ pub fn prompt_resolve_with_bytes_and_color<R: BufRead, W: Write>(
         });
         write!(output, "{}", render_menu(&keys, mode))?;
         output.flush().ok();
-        let mut line = String::new();
-        if input.read_line(&mut line)? == 0 {
+        let Some(line) = input.read_line().await? else {
             return Ok(Resolution::Skip);
-        }
+        };
         match line.trim().chars().next() {
             Some('K') if bulk.is_some() => {
                 let b = bulk.expect("checked is_some");
-                match confirm_bulk(&mut input, &mut output, &b.keep_local_summary, Resolution::KeepLocalAll, mode)? {
+                match confirm_bulk(&mut input, &mut output, &b.keep_local_summary, Resolution::KeepLocalAll, mode).await? {
                     Some(r) => return Ok(r),
                     None => continue,
                 }
             }
             Some('R') if bulk.is_some() => {
                 let b = bulk.expect("checked is_some");
-                match confirm_bulk(&mut input, &mut output, &b.use_remote_summary, Resolution::KeepRemoteAll, mode)? {
+                match confirm_bulk(&mut input, &mut output, &b.use_remote_summary, Resolution::KeepRemoteAll, mode).await? {
                     Some(r) => return Ok(r),
                     None => continue,
                 }
@@ -424,7 +423,7 @@ pub fn prompt_resolve_with_bytes_and_color<R: BufRead, W: Write>(
                     local_path,
                     env,
                     mode,
-                )? {
+                ).await? {
                     EditOutcome::Edited(edited) => return Ok(Resolution::Edit(edited)),
                     EditOutcome::EditedWithMarkers(edited) => {
                         return Ok(Resolution::EditWithMarkers(edited));
@@ -441,7 +440,7 @@ pub fn prompt_resolve_with_bytes_and_color<R: BufRead, W: Write>(
                     local_path,
                     env,
                     mode,
-                )? {
+                ).await? {
                     EditOutcome::Edited(edited) => return Ok(Resolution::Edit(edited)),
                     EditOutcome::EditedWithMarkers(edited) => {
                         return Ok(Resolution::EditWithMarkers(edited));
@@ -481,7 +480,7 @@ fn count_conflict_hunks(local: &[u8], remote: &[u8]) -> usize {
 /// - `Resolution::Abort` — caller bails (e.g. via `PullAborted`).
 ///
 /// `Resolution::Edit` is unreachable from this prompt (no `[e]` option offered).
-pub fn prompt_remote_delete<R: BufRead, W: Write>(
+pub async fn prompt_remote_delete<R: LineSource, W: Write>(
     input: R,
     output: W,
     index: usize,
@@ -491,12 +490,12 @@ pub fn prompt_remote_delete<R: BufRead, W: Write>(
     env: &str,
 ) -> Result<Resolution> {
     let mode = detect_color_mode();
-    prompt_remote_delete_with_color(input, output, index, total, obj, local_path, env, mode, None, false)
+    prompt_remote_delete_with_color(input, output, index, total, obj, local_path, env, mode, None, false).await
 }
 
 /// Color-aware variant. Tests pin the mode; production goes through
 /// `prompt_remote_delete`.
-pub fn prompt_remote_delete_with_color<R: BufRead, W: Write>(
+pub async fn prompt_remote_delete_with_color<R: LineSource, W: Write>(
     input: R,
     output: W,
     index: usize,
@@ -508,7 +507,7 @@ pub fn prompt_remote_delete_with_color<R: BufRead, W: Write>(
     bulk: Option<&BulkPrompt>,
     push_deferred: bool,
 ) -> Result<Resolution> {
-    prompt_one_sided_delete(input, output, index, total, obj, local_path, env, mode, bulk, DeletedOn::Env, push_deferred)
+    prompt_one_sided_delete(input, output, index, total, obj, local_path, env, mode, bulk, DeletedOn::Env, push_deferred).await
 }
 
 /// The prompt for an object deleted locally and edited on the env: the mirror
@@ -516,7 +515,7 @@ pub fn prompt_remote_delete_with_color<R: BufRead, W: Write>(
 /// same [`Resolution`]s. `[k]` keeps the local deletion, so the env's copy is
 /// to go; `[r]` takes the env's copy back. `local_path` holds the env's bytes,
 /// which the caller restored there for review.
-pub fn prompt_local_delete_remote_edit_with_color<R: BufRead, W: Write>(
+pub async fn prompt_local_delete_remote_edit_with_color<R: LineSource, W: Write>(
     input: R,
     output: W,
     index: usize,
@@ -528,7 +527,7 @@ pub fn prompt_local_delete_remote_edit_with_color<R: BufRead, W: Write>(
     bulk: Option<&BulkPrompt>,
     push_deferred: bool,
 ) -> Result<Resolution> {
-    prompt_one_sided_delete(input, output, index, total, obj, local_path, env, mode, bulk, DeletedOn::Local, push_deferred)
+    prompt_one_sided_delete(input, output, index, total, obj, local_path, env, mode, bulk, DeletedOn::Local, push_deferred).await
 }
 
 /// The suffix a `[k]` label takes when `--no-push` defers its env write, so
@@ -545,7 +544,7 @@ enum DeletedOn {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn prompt_one_sided_delete<R: BufRead, W: Write>(
+async fn prompt_one_sided_delete<R: LineSource, W: Write>(
     mut input: R,
     mut output: W,
     index: usize,
@@ -655,21 +654,20 @@ fn prompt_one_sided_delete<R: BufRead, W: Write>(
         });
         write!(output, "{}", render_menu(&keys, mode))?;
         output.flush().ok();
-        let mut line = String::new();
-        if input.read_line(&mut line)? == 0 {
+        let Some(line) = input.read_line().await? else {
             return Ok(Resolution::Skip);
-        }
+        };
         match line.trim().chars().next() {
             Some('K') if bulk.is_some() => {
                 let b = bulk.expect("checked is_some");
-                match confirm_bulk(&mut input, &mut output, &b.keep_local_summary, Resolution::KeepLocalAll, mode)? {
+                match confirm_bulk(&mut input, &mut output, &b.keep_local_summary, Resolution::KeepLocalAll, mode).await? {
                     Some(r) => return Ok(r),
                     None => continue,
                 }
             }
             Some('R') if bulk.is_some() => {
                 let b = bulk.expect("checked is_some");
-                match confirm_bulk(&mut input, &mut output, &b.use_remote_summary, Resolution::KeepRemoteAll, mode)? {
+                match confirm_bulk(&mut input, &mut output, &b.use_remote_summary, Resolution::KeepRemoteAll, mode).await? {
                     Some(r) => return Ok(r),
                     None => continue,
                 }
@@ -772,7 +770,7 @@ fn build_conflict_buffer(local: &[u8], remote: &[u8], env: &str) -> Vec<u8> {
 ///   `[e]dit again / [a]bort` — the user's previous edits are preserved
 ///   across re-tries.
 /// - Otherwise, return the bytes.
-fn run_editor_loop<R: BufRead, W: Write>(
+async fn run_editor_loop<R: LineSource, W: Write>(
     input: &mut R,
     output: &mut W,
     local: &[u8],
@@ -802,7 +800,7 @@ fn run_editor_loop<R: BufRead, W: Write>(
     std::fs::write(&path, &buf)
         .with_context(|| format!("writing temp conflict file {}", path.display()))?;
 
-    let result = (|| -> Result<EditOutcome> {
+    let result = (async || -> Result<EditOutcome> {
         loop {
             let status = Command::new(&editor)
                 .arg(&path)
@@ -824,10 +822,9 @@ fn run_editor_loop<R: BufRead, W: Write>(
                         colorize_prompt("  [e]dit again  [a]bort edit > ", mode)
                     )?;
                     output.flush().ok();
-                    let mut line = String::new();
-                    if input.read_line(&mut line)? == 0 {
+                    let Some(line) = input.read_line().await? else {
                         return Ok(EditOutcome::Aborted);
-                    }
+                    };
                     match line.trim().chars().next() {
                         Some('e') | Some('E') => continue,
                         _ => return Ok(EditOutcome::Aborted),
@@ -835,7 +832,7 @@ fn run_editor_loop<R: BufRead, W: Write>(
                 }
             }
         }
-    })();
+    })().await;
     let _ = std::fs::remove_file(&path);
     result
 }
@@ -884,7 +881,7 @@ fn validate_edited(bytes: &[u8], local_path: &Path) -> std::result::Result<(), S
 ///   skip the marker-leakage check when writing.
 /// - `EditOutcome::Aborted` — user picked `[a]` at some hunk; caller
 ///   falls back to the main prompt.
-fn prompt_hunk_by_hunk<R: BufRead, W: Write>(
+async fn prompt_hunk_by_hunk<R: LineSource, W: Write>(
     input: &mut R,
     output: &mut W,
     local: &[u8],
@@ -944,7 +941,7 @@ fn prompt_hunk_by_hunk<R: BufRead, W: Write>(
                     local_path,
                     env,
                     mode,
-                )?;
+                ).await?;
 
                 match outcome {
                     HunkOutcome::Keep => append_lines(&mut merged, local_slice),
@@ -1018,7 +1015,7 @@ fn append_lines(out: &mut String, lines: &[&str]) {
 /// file. Equal lines are taken from `local_lines` and follow the
 /// unified-diff convention (leading space); the hunk's removed / added
 /// lines use `-` / `+`.
-fn prompt_single_hunk<R: BufRead, W: Write>(
+async fn prompt_single_hunk<R: LineSource, W: Write>(
     input: &mut R,
     output: &mut W,
     hunk_idx: usize,
@@ -1130,13 +1127,12 @@ fn prompt_single_hunk<R: BufRead, W: Write>(
         });
         write!(output, "{}", render_menu(&keys, mode))?;
         output.flush().ok();
-        let mut line = String::new();
-        if input.read_line(&mut line)? == 0 {
+        let Some(line) = input.read_line().await? else {
             // EOF mid-walk → treat like skip so the partial result is
             // still preserved with markers; safer than silently keeping
             // local on a half-typed answer.
             return Ok(HunkOutcome::Skip);
-        }
+        };
         match line.trim().chars().next() {
             Some('k') | Some('K') => return Ok(HunkOutcome::Keep),
             Some('r') | Some('R') => return Ok(HunkOutcome::Remote),
@@ -1152,7 +1148,7 @@ fn prompt_single_hunk<R: BufRead, W: Write>(
                     local_path,
                     env,
                     mode,
-                )? {
+                ).await? {
                     Some(bytes) => return Ok(HunkOutcome::Edit(bytes)),
                     None => continue,
                 }
@@ -1174,7 +1170,7 @@ fn prompt_single_hunk<R: BufRead, W: Write>(
 /// Returns `Some(bytes)` on a successful edit, or `None` if the user
 /// aborted the editor sub-loop (in which case the walker re-prompts for
 /// this hunk).
-fn run_single_hunk_editor<R: BufRead, W: Write>(
+async fn run_single_hunk_editor<R: LineSource, W: Write>(
     input: &mut R,
     output: &mut W,
     local_slice: &[&str],
@@ -1207,7 +1203,7 @@ fn run_single_hunk_editor<R: BufRead, W: Write>(
     std::fs::write(&path, buf.as_bytes())
         .with_context(|| format!("writing temp hunk file {}", path.display()))?;
 
-    let result = (|| -> Result<Option<Vec<u8>>> {
+    let result = (async || -> Result<Option<Vec<u8>>> {
         loop {
             let status = Command::new(&editor)
                 .arg(&path)
@@ -1229,10 +1225,9 @@ fn run_single_hunk_editor<R: BufRead, W: Write>(
                         colorize_prompt("  [e]dit again  [a]bort edit > ", mode)
                     )?;
                     output.flush().ok();
-                    let mut line = String::new();
-                    if input.read_line(&mut line)? == 0 {
+                    let Some(line) = input.read_line().await? else {
                         return Ok(None);
-                    }
+                    };
                     match line.trim().chars().next() {
                         Some('e') | Some('E') => continue,
                         _ => return Ok(None),
@@ -1240,7 +1235,7 @@ fn run_single_hunk_editor<R: BufRead, W: Write>(
                 }
             }
         }
-    })();
+    })().await;
     let _ = std::fs::remove_file(&path);
     result
 }
@@ -1316,7 +1311,7 @@ impl CombinedFileOutcome {
 /// The returned bytes are what now sits on disk for `local_path` (so the
 /// caller can include them when computing the entity's combined hash if
 /// it chooses to advance the lockfile).
-pub fn resolve_combined_file(
+pub async fn resolve_combined_file(
     label_index: usize,
     label_total: usize,
     obj: ObjectRef<'_>,
@@ -1360,7 +1355,7 @@ pub fn resolve_combined_file(
         local_path,
         remote_bytes,
         paths.env(),
-    )?;
+    ).await?;
     match resolution {
         Resolution::KeepLocal => Ok(CombinedFileOutcome::Resolved(local_bytes.to_vec())),
         Resolution::KeepRemote => {
@@ -1463,7 +1458,7 @@ pub enum PushDriftOutcome {
 /// Some(edited_bytes) }`.
 /// On `[s]kip`: returns `Skip`.
 /// On `[a]bort`: returns a `PullAborted` error.
-pub fn resolve_push_drift(
+pub async fn resolve_push_drift(
     interactive: bool,
     obj: ObjectRef<'_>,
     local_path: &Path,
@@ -1488,7 +1483,7 @@ pub fn resolve_push_drift(
         local_path,
         remote_bytes,
         env,
-    )?;
+    ).await?;
     match resolution {
         Resolution::KeepLocal => Ok(PushDriftOutcome::Patch {
             payload_override: None,
@@ -1762,53 +1757,53 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prompt_keep_local_returns_keep_local() {
+    #[tokio::test]
+    async fn prompt_keep_local_returns_keep_local() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.json");
         std::fs::write(&path, b"local\n").unwrap();
 
         let input = Cursor::new(b"k\n");
         let mut output: Vec<u8> = Vec::new();
-        let r = prompt_resolve(input, &mut output, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path, b"remote\n", "test").unwrap();
+        let r = prompt_resolve(input, &mut output, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path, b"remote\n", "test").await.unwrap();
         assert!(matches!(r, Resolution::KeepLocal));
         let s = String::from_utf8(output).unwrap();
         assert!(s.contains("[1/1]"), "output: {s}");
     }
 
-    #[test]
-    fn prompt_keep_remote_returns_keep_remote() {
+    #[tokio::test]
+    async fn prompt_keep_remote_returns_keep_remote() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.json");
         std::fs::write(&path, b"local\n").unwrap();
 
         let input = Cursor::new(b"r\n");
         let mut output: Vec<u8> = Vec::new();
-        let r = prompt_resolve(input, &mut output, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path, b"remote\n", "test").unwrap();
+        let r = prompt_resolve(input, &mut output, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path, b"remote\n", "test").await.unwrap();
         assert!(matches!(r, Resolution::KeepRemote));
     }
 
-    #[test]
-    fn prompt_skip_returns_skip() {
+    #[tokio::test]
+    async fn prompt_skip_returns_skip() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.json");
         std::fs::write(&path, b"local\n").unwrap();
 
         let input = Cursor::new(b"s\n");
         let mut output: Vec<u8> = Vec::new();
-        let r = prompt_resolve(input, &mut output, 2, 5, ObjectRef { kind: "queues", slug: "invoices" }, &path, b"remote\n", "test").unwrap();
+        let r = prompt_resolve(input, &mut output, 2, 5, ObjectRef { kind: "queues", slug: "invoices" }, &path, b"remote\n", "test").await.unwrap();
         assert!(matches!(r, Resolution::Skip));
     }
 
-    #[test]
-    fn prompt_abort_returns_abort() {
+    #[tokio::test]
+    async fn prompt_abort_returns_abort() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.json");
         std::fs::write(&path, b"local\n").unwrap();
 
         let input = Cursor::new(b"a\n");
         let mut output: Vec<u8> = Vec::new();
-        let r = prompt_resolve(input, &mut output, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path, b"remote\n", "test").unwrap();
+        let r = prompt_resolve(input, &mut output, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path, b"remote\n", "test").await.unwrap();
         assert!(matches!(r, Resolution::Abort));
     }
 
@@ -1818,22 +1813,22 @@ mod tests {
         assert!(matches!(BulkChoice::AllRemote.resolution(), Resolution::KeepRemote));
     }
 
-    #[test]
-    fn prompt_unrecognized_re_prompts_then_accepts() {
+    #[tokio::test]
+    async fn prompt_unrecognized_re_prompts_then_accepts() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.json");
         std::fs::write(&path, b"local\n").unwrap();
 
         let input = Cursor::new(b"q\nx\n\nk\n");
         let mut output: Vec<u8> = Vec::new();
-        let r = prompt_resolve(input, &mut output, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path, b"remote\n", "test").unwrap();
+        let r = prompt_resolve(input, &mut output, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path, b"remote\n", "test").await.unwrap();
         assert!(matches!(r, Resolution::KeepLocal));
         let s = String::from_utf8(output).unwrap();
         assert!(s.contains("unrecognized"), "output: {s}");
     }
 
-    #[test]
-    fn prompt_eof_falls_back_to_skip() {
+    #[tokio::test]
+    async fn prompt_eof_falls_back_to_skip() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.json");
         std::fs::write(&path, b"local\n").unwrap();
@@ -1841,12 +1836,12 @@ mod tests {
         // Empty input — first read_line returns 0 (EOF).
         let input = Cursor::new(b"");
         let mut output: Vec<u8> = Vec::new();
-        let r = prompt_resolve(input, &mut output, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path, b"remote\n", "test").unwrap();
+        let r = prompt_resolve(input, &mut output, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path, b"remote\n", "test").await.unwrap();
         assert!(matches!(r, Resolution::Skip));
     }
 
-    #[test]
-    fn prompt_skips_when_local_equals_remote() {
+    #[tokio::test]
+    async fn prompt_skips_when_local_equals_remote() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.json");
         std::fs::write(&path, b"same\n").unwrap();
@@ -1854,7 +1849,7 @@ mod tests {
         // No input read — function short-circuits because local == remote.
         let input = Cursor::new(b"");
         let mut output: Vec<u8> = Vec::new();
-        let r = prompt_resolve(input, &mut output, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path, b"same\n", "test").unwrap();
+        let r = prompt_resolve(input, &mut output, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path, b"same\n", "test").await.unwrap();
         assert!(matches!(r, Resolution::KeepLocal));
     }
 
@@ -1866,15 +1861,15 @@ mod tests {
         assert!(!is_interactive(true));
     }
 
-    #[test]
-    fn resolve_combined_file_noop_when_equal() {
+    #[tokio::test]
+    async fn resolve_combined_file_noop_when_equal() {
         let dir = tempfile::TempDir::new().unwrap();
         let paths = crate::paths::Paths::for_env(dir.path(), "test");
         std::fs::create_dir_all(paths.env_root()).unwrap();
         let path = paths.env_root().join("a.py");
         std::fs::write(&path, b"same\n").unwrap();
         let progress = crate::log::Log::new(ColorMode::Plain);
-        let out = resolve_combined_file(1, 2, ObjectRef { kind: "queues", slug: "invoices" }, &path, b"same\n", b"same\n", true, &paths, &progress).unwrap();
+        let out = resolve_combined_file(1, 2, ObjectRef { kind: "queues", slug: "invoices" }, &path, b"same\n", b"same\n", true, &paths, &progress).await.unwrap();
         // Bytes-equal sides are a "Resolved" outcome — caller may advance.
         assert!(
             !out.is_preserve_base(),
@@ -1885,8 +1880,8 @@ mod tests {
         assert!(!paths.conflict_shadow_path(&path).exists());
     }
 
-    #[test]
-    fn resolve_combined_file_writes_shadow_when_non_interactive() {
+    #[tokio::test]
+    async fn resolve_combined_file_writes_shadow_when_non_interactive() {
         let dir = tempfile::TempDir::new().unwrap();
         let paths = crate::paths::Paths::for_env(dir.path(), "test");
         std::fs::create_dir_all(paths.env_root()).unwrap();
@@ -1894,7 +1889,7 @@ mod tests {
         std::fs::write(&path, b"local\n").unwrap();
         let progress = crate::log::Log::new(ColorMode::Plain);
         let out =
-            resolve_combined_file(1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path, b"local\n", b"remote\n", false, &paths, &progress).unwrap();
+            resolve_combined_file(1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path, b"local\n", b"remote\n", false, &paths, &progress).await.unwrap();
         // Non-interactive shadow-skip MUST signal preserve-base so the
         // caller does not advance the entity's combined hash.
         assert!(
@@ -1910,8 +1905,8 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"local\n");
     }
 
-    #[test]
-    fn resolve_push_drift_non_interactive_returns_skip() {
+    #[tokio::test]
+    async fn resolve_push_drift_non_interactive_returns_skip() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.json");
         std::fs::write(&path, b"local\n").unwrap();
@@ -1924,12 +1919,13 @@ mod tests {
             "test",
             &progress,
         )
+        .await
         .unwrap();
         assert!(matches!(r, PushDriftOutcome::Skip));
     }
 
-    #[test]
-    fn prompt_short_circuits_when_only_noise_differs() {
+    #[tokio::test]
+    async fn prompt_short_circuits_when_only_noise_differs() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.json");
         std::fs::write(&path, b"{\"name\":\"x\",\"modified_at\":\"t1\"}").unwrap();
@@ -1946,7 +1942,7 @@ mod tests {
             &path,
             b"{\"name\":\"x\",\"modified_at\":\"t2\"}",
             "test",
-        )
+        ).await
         .unwrap();
         assert!(matches!(r, Resolution::KeepLocal));
         // No prompt was rendered (short-circuit).
@@ -1983,8 +1979,8 @@ mod tests {
         assert_eq!(s, "[k]eep local");
     }
 
-    #[test]
-    fn prompt_emits_color_codes_when_color_mode() {
+    #[tokio::test]
+    async fn prompt_emits_color_codes_when_color_mode() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.json");
         std::fs::write(&path, b"{\"name\":\"old\"}").unwrap();
@@ -2001,7 +1997,7 @@ mod tests {
             b"{\"name\":\"new\"}",
             "test",
             ColorMode::Color,
-        )
+        ).await
         .unwrap();
         let s = String::from_utf8(output).unwrap();
         // Conflict header + action letters in bold amber; the styled diff
@@ -2014,8 +2010,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prompt_plain_mode_emits_no_color_codes() {
+    #[tokio::test]
+    async fn prompt_plain_mode_emits_no_color_codes() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.json");
         std::fs::write(&path, b"{\"name\":\"old\"}").unwrap();
@@ -2032,7 +2028,7 @@ mod tests {
             b"{\"name\":\"new\"}",
             "test",
             ColorMode::Plain,
-        )
+        ).await
         .unwrap();
         let s = String::from_utf8(output).unwrap();
         assert!(!s.contains("\x1b["), "expected no SGR codes: {s:?}");
@@ -2042,8 +2038,8 @@ mod tests {
 
 
 
-    #[test]
-    fn prompt_resolve_uses_env_name_in_labels() {
+    #[tokio::test]
+    async fn prompt_resolve_uses_env_name_in_labels() {
         use std::io::Cursor;
         let dir = tempfile::tempdir().unwrap();
         let local = dir.path().join("x.json");
@@ -2062,7 +2058,7 @@ mod tests {
             remote,
             "production",
             ColorMode::Plain,
-        )
+        ).await
         .unwrap();
 
         let s = String::from_utf8_lossy(&out);
@@ -2086,8 +2082,8 @@ mod tests {
 
 
 
-    #[test]
-    fn prompt_remote_delete_offers_restore_and_mirror_labels() {
+    #[tokio::test]
+    async fn prompt_remote_delete_offers_restore_and_mirror_labels() {
         use std::io::Cursor;
         let dir = tempfile::tempdir().unwrap();
         let local = dir.path().join("labels/audit-hold.json");
@@ -2107,7 +2103,7 @@ mod tests {
             ColorMode::Plain,
             None,
             false,
-        )
+        ).await
         .unwrap();
         assert!(matches!(res, Resolution::Skip));
 
@@ -2124,8 +2120,8 @@ mod tests {
         assert!(!s.contains("[e]"), "no edit option in delete prompt: {s}");
     }
 
-    #[test]
-    fn prompt_remote_delete_returns_keep_local_on_k() {
+    #[tokio::test]
+    async fn prompt_remote_delete_returns_keep_local_on_k() {
         use std::io::Cursor;
         let dir = tempfile::tempdir().unwrap();
         let local = dir.path().join("x.json");
@@ -2133,13 +2129,13 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let input = Cursor::new(b"k\n");
         let res =
-            prompt_remote_delete_with_color(input, &mut out, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &local, "test", ColorMode::Plain, None, false)
+            prompt_remote_delete_with_color(input, &mut out, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &local, "test", ColorMode::Plain, None, false).await
                 .unwrap();
         assert!(matches!(res, Resolution::KeepLocal));
     }
 
-    #[test]
-    fn prompt_remote_delete_returns_keep_remote_on_r() {
+    #[tokio::test]
+    async fn prompt_remote_delete_returns_keep_remote_on_r() {
         use std::io::Cursor;
         let dir = tempfile::tempdir().unwrap();
         let local = dir.path().join("x.json");
@@ -2147,13 +2143,13 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let input = Cursor::new(b"r\n");
         let res =
-            prompt_remote_delete_with_color(input, &mut out, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &local, "test", ColorMode::Plain, None, false)
+            prompt_remote_delete_with_color(input, &mut out, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &local, "test", ColorMode::Plain, None, false).await
                 .unwrap();
         assert!(matches!(res, Resolution::KeepRemote));
     }
 
-    #[test]
-    fn prompt_remote_delete_returns_abort_on_a() {
+    #[tokio::test]
+    async fn prompt_remote_delete_returns_abort_on_a() {
         use std::io::Cursor;
         let dir = tempfile::tempdir().unwrap();
         let local = dir.path().join("x.json");
@@ -2161,21 +2157,26 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let input = Cursor::new(b"a\n");
         let res =
-            prompt_remote_delete_with_color(input, &mut out, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &local, "test", ColorMode::Plain, None, false)
+            prompt_remote_delete_with_color(input, &mut out, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &local, "test", ColorMode::Plain, None, false).await
                 .unwrap();
         assert!(matches!(res, Resolution::Abort));
     }
 
     /// Three differing hunks separated by equal context. Caller-friendly
     /// fixture used by all `prompt_hunk_by_hunk_*` tests.
+    /// Drives an async resolver from a synchronous `proptest!` body.
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(f)
+    }
+
     fn three_hunk_fixture() -> (Vec<u8>, Vec<u8>) {
         let local = b"a\nFOO\nb\nBAR\nc\nBAZ\nd\n".to_vec();
         let remote = b"a\nfoo\nb\nbar\nc\nbaz\nd\n".to_vec();
         (local, remote)
     }
 
-    #[test]
-    fn prompt_hunk_by_hunk_keep_all_local_yields_local_bytes() {
+    #[tokio::test]
+    async fn prompt_hunk_by_hunk_keep_all_local_yields_local_bytes() {
         let (local, remote) = three_hunk_fixture();
         let mut output: Vec<u8> = Vec::new();
         let mut input = Cursor::new(b"k\nk\nk\n".to_vec());
@@ -2188,7 +2189,7 @@ mod tests {
             path,
             "production",
             ColorMode::Plain,
-        )
+        ).await
         .unwrap();
         match outcome {
             EditOutcome::Edited(bytes) => assert_eq!(bytes, local),
@@ -2196,8 +2197,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn prompt_hunk_by_hunk_use_all_remote_yields_remote_bytes() {
+    #[tokio::test]
+    async fn prompt_hunk_by_hunk_use_all_remote_yields_remote_bytes() {
         let (local, remote) = three_hunk_fixture();
         let mut output: Vec<u8> = Vec::new();
         let mut input = Cursor::new(b"r\nr\nr\n".to_vec());
@@ -2210,7 +2211,7 @@ mod tests {
             path,
             "production",
             ColorMode::Plain,
-        )
+        ).await
         .unwrap();
         match outcome {
             EditOutcome::Edited(bytes) => assert_eq!(bytes, remote),
@@ -2218,8 +2219,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn prompt_hunk_by_hunk_mixed_decisions_yields_correct_merge() {
+    #[tokio::test]
+    async fn prompt_hunk_by_hunk_mixed_decisions_yields_correct_merge() {
         let (local, remote) = three_hunk_fixture();
         let mut output: Vec<u8> = Vec::new();
         // keep, remote, keep
@@ -2233,7 +2234,7 @@ mod tests {
             path,
             "production",
             ColorMode::Plain,
-        )
+        ).await
         .unwrap();
         let bytes = match outcome {
             EditOutcome::Edited(b) => b,
@@ -2245,8 +2246,8 @@ mod tests {
         assert_eq!(bytes, expected, "got {:?}", String::from_utf8_lossy(&bytes));
     }
 
-    #[test]
-    fn prompt_hunk_by_hunk_both_emits_local_then_remote() {
+    #[tokio::test]
+    async fn prompt_hunk_by_hunk_both_emits_local_then_remote() {
         // Single-hunk fixture so the only decision needed is one `b`.
         let local = b"a\nLOCAL\nb\n".to_vec();
         let remote = b"a\nREMOTE\nb\n".to_vec();
@@ -2261,7 +2262,7 @@ mod tests {
             path,
             "production",
             ColorMode::Plain,
-        )
+        ).await
         .unwrap();
         let bytes = match outcome {
             EditOutcome::Edited(b) => b,
@@ -2274,8 +2275,8 @@ mod tests {
         assert!(!s.contains("<<<<<<<"), "no markers on `[b]oth`: {s}");
     }
 
-    #[test]
-    fn prompt_hunk_by_hunk_skip_preserves_markers() {
+    #[tokio::test]
+    async fn prompt_hunk_by_hunk_skip_preserves_markers() {
         let local = b"a\nLOCAL\nb\n".to_vec();
         let remote = b"a\nREMOTE\nb\n".to_vec();
         let mut output: Vec<u8> = Vec::new();
@@ -2289,7 +2290,7 @@ mod tests {
             path,
             "production",
             ColorMode::Plain,
-        )
+        ).await
         .unwrap();
         let bytes = match outcome {
             EditOutcome::EditedWithMarkers(b) => b,
@@ -2302,8 +2303,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prompt_hunk_by_hunk_abort_returns_aborted() {
+    #[tokio::test]
+    async fn prompt_hunk_by_hunk_abort_returns_aborted() {
         let (local, remote) = three_hunk_fixture();
         let mut output: Vec<u8> = Vec::new();
         let mut input = Cursor::new(b"a\n".to_vec());
@@ -2316,13 +2317,13 @@ mod tests {
             path,
             "production",
             ColorMode::Plain,
-        )
+        ).await
         .unwrap();
         assert!(matches!(outcome, EditOutcome::Aborted), "got {outcome:?}");
     }
 
-    #[test]
-    fn prompt_single_hunk_displays_surrounding_context() {
+    #[tokio::test]
+    async fn prompt_single_hunk_displays_surrounding_context() {
         // Local has 10 lines, hunk at line 4 (one line changed). The
         // hunk view goes through `render_styled_diff` (same renderer
         // every other diff surface uses), so we assert on its plain
@@ -2347,7 +2348,7 @@ mod tests {
             &path,
             "test",
             ColorMode::Plain,
-        )
+        ).await
         .unwrap();
 
         let s = String::from_utf8_lossy(&output);
@@ -2376,8 +2377,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prompt_resolve_shows_h_only_for_multi_hunk() {
+    #[tokio::test]
+    async fn prompt_resolve_shows_h_only_for_multi_hunk() {
         // Single-hunk case — `[h]` must not appear, header must not say "(N hunks)".
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.py");
@@ -2394,7 +2395,7 @@ mod tests {
             b"a\nREMOTE\nb\n",
             "production",
             ColorMode::Plain,
-        )
+        ).await
         .unwrap();
         let s = String::from_utf8(output).unwrap();
         assert!(
@@ -2421,7 +2422,7 @@ mod tests {
             b"a\nfoo\nb\nbar\nc\nbaz\nd\n",
             "production",
             ColorMode::Plain,
-        )
+        ).await
         .unwrap();
         let s3 = String::from_utf8(output3).unwrap();
         assert!(
@@ -2542,7 +2543,7 @@ mod tests {
             let input_str: String = "k\n".repeat(k);
             let input = std::io::Cursor::new(input_str);
             let mut output: Vec<u8> = Vec::new();
-            let outcome = prompt_hunk_by_hunk(
+            let outcome = block_on(prompt_hunk_by_hunk(
                 &mut std::io::BufReader::new(input),
                 &mut output,
                 local.as_bytes(),
@@ -2550,7 +2551,7 @@ mod tests {
                 std::path::Path::new("x.py"),
                 "test",
                 ColorMode::Plain,
-            ).unwrap();
+            )).unwrap();
             match outcome {
                 EditOutcome::Edited(bytes) => {
                     let result = String::from_utf8(bytes).unwrap();
@@ -2577,7 +2578,7 @@ mod tests {
             let input_str: String = "r\n".repeat(k);
             let input = std::io::Cursor::new(input_str);
             let mut output: Vec<u8> = Vec::new();
-            let outcome = prompt_hunk_by_hunk(
+            let outcome = block_on(prompt_hunk_by_hunk(
                 &mut std::io::BufReader::new(input),
                 &mut output,
                 local.as_bytes(),
@@ -2585,7 +2586,7 @@ mod tests {
                 std::path::Path::new("x.py"),
                 "test",
                 ColorMode::Plain,
-            ).unwrap();
+            )).unwrap();
             match outcome {
                 EditOutcome::Edited(bytes) => {
                     let result = String::from_utf8(bytes).unwrap();
@@ -2792,8 +2793,8 @@ mod tests {
     // Group B — prompt_hunk_by_hunk adversarial examples.
     // ============================================================
 
-    #[test]
-    fn hunk_by_hunk_eof_mid_walk_preserves_partial_work_with_markers() {
+    #[tokio::test]
+    async fn hunk_by_hunk_eof_mid_walk_preserves_partial_work_with_markers() {
         // 3 hunks; only one decision typed. Walker should resolve hunk
         // 1 from stdin, then hit EOF mid-walk and mark hunks 2 and 3
         // as Skip — yielding EditedWithMarkers with both hunks wrapped
@@ -2810,7 +2811,7 @@ mod tests {
             path,
             "production",
             ColorMode::Plain,
-        )
+        ).await
         .unwrap();
         let bytes = match outcome {
             EditOutcome::EditedWithMarkers(b) => b,
@@ -2826,8 +2827,8 @@ mod tests {
         assert!(s.contains("BAZ\n=======\nbaz\n"), "hunk 3 wrap: {s}");
     }
 
-    #[test]
-    fn hunk_by_hunk_unknown_action_reprompts() {
+    #[tokio::test]
+    async fn hunk_by_hunk_unknown_action_reprompts() {
         // 1 hunk; user types `x\n` (unknown), then `k\n`.
         let local = b"a\nLOCAL\nb\n".to_vec();
         let remote = b"a\nREMOTE\nb\n".to_vec();
@@ -2842,7 +2843,7 @@ mod tests {
             path,
             "test",
             ColorMode::Plain,
-        )
+        ).await
         .unwrap();
         match outcome {
             EditOutcome::Edited(bytes) => assert_eq!(bytes, local),
@@ -2852,8 +2853,8 @@ mod tests {
         assert!(s.contains("unrecognized"), "unknown should re-prompt: {s}");
     }
 
-    #[test]
-    fn hunk_by_hunk_immediate_abort_returns_aborted() {
+    #[tokio::test]
+    async fn hunk_by_hunk_immediate_abort_returns_aborted() {
         let (local, remote) = three_hunk_fixture();
         let mut output: Vec<u8> = Vec::new();
         let mut input = Cursor::new(b"a\n".to_vec());
@@ -2866,13 +2867,13 @@ mod tests {
             path,
             "test",
             ColorMode::Plain,
-        )
+        ).await
         .unwrap();
         assert!(matches!(outcome, EditOutcome::Aborted), "got {outcome:?}");
     }
 
-    #[test]
-    fn hunk_by_hunk_mixed_options_handle_in_order() {
+    #[tokio::test]
+    async fn hunk_by_hunk_mixed_options_handle_in_order() {
         // 4-hunk fixture. Decisions: k, r, b, s.
         let local = b"a\nFOO\nb\nBAR\nc\nBAZ\nd\nQUX\ne\n".to_vec();
         let remote = b"a\nfoo\nb\nbar\nc\nbaz\nd\nqux\ne\n".to_vec();
@@ -2887,7 +2888,7 @@ mod tests {
             path,
             "production",
             ColorMode::Plain,
-        )
+        ).await
         .unwrap();
         let bytes = match outcome {
             EditOutcome::EditedWithMarkers(b) => b,
@@ -2902,8 +2903,8 @@ mod tests {
         assert_eq!(bytes, expected, "got {:?}", String::from_utf8_lossy(&bytes));
     }
 
-    #[test]
-    fn hunk_by_hunk_identical_inputs_short_circuits_to_local() {
+    #[tokio::test]
+    async fn hunk_by_hunk_identical_inputs_short_circuits_to_local() {
         // No conflict hunks at all: walker must return Edited(local) without
         // reading from stdin or prompting.
         let local = b"a\nb\nc\n".to_vec();
@@ -2919,7 +2920,7 @@ mod tests {
             path,
             "test",
             ColorMode::Plain,
-        )
+        ).await
         .unwrap();
         match outcome {
             EditOutcome::Edited(bytes) => assert_eq!(bytes, local),
@@ -2987,8 +2988,8 @@ mod tests {
     // Group D — resolver UI / prompt_resolve_with_color.
     // ============================================================
 
-    #[test]
-    fn prompt_resolve_header_includes_hunk_count_for_multi_hunk() {
+    #[tokio::test]
+    async fn prompt_resolve_header_includes_hunk_count_for_multi_hunk() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.py");
         std::fs::write(&path, b"a\nFOO\nb\nBAR\nc\nBAZ\nd\n").unwrap();
@@ -3004,7 +3005,7 @@ mod tests {
             b"a\nfoo\nb\nbar\nc\nbaz\nd\n",
             "test",
             ColorMode::Plain,
-        )
+        ).await
         .unwrap();
         let s = String::from_utf8(output).unwrap();
         assert!(
@@ -3013,8 +3014,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prompt_resolve_header_omits_hunk_count_for_single_hunk() {
+    #[tokio::test]
+    async fn prompt_resolve_header_omits_hunk_count_for_single_hunk() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.py");
         std::fs::write(&path, b"a\nLOCAL\nb\n").unwrap();
@@ -3030,7 +3031,7 @@ mod tests {
             b"a\nREMOTE\nb\n",
             "test",
             ColorMode::Plain,
-        )
+        ).await
         .unwrap();
         let s = String::from_utf8(output).unwrap();
         assert!(
@@ -3039,8 +3040,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prompt_resolve_unknown_key_reprompts_includes_h_for_multi_hunk() {
+    #[tokio::test]
+    async fn prompt_resolve_unknown_key_reprompts_includes_h_for_multi_hunk() {
         // 3-hunk conflict; stdin `z\n` (unrecognized) then `s\n`.
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.py");
@@ -3057,7 +3058,7 @@ mod tests {
             b"a\nfoo\nb\nbar\nc\nbaz\nd\n",
             "test",
             ColorMode::Plain,
-        )
+        ).await
         .unwrap();
         assert!(matches!(r, Resolution::Skip));
         let s = String::from_utf8(output).unwrap();
@@ -3073,8 +3074,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prompt_bulk_use_remote_all_after_confirm() {
+    #[tokio::test]
+    async fn prompt_bulk_use_remote_all_after_confirm() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.json");
         let bulk = BulkPrompt {
@@ -3087,7 +3088,7 @@ mod tests {
             input, &mut out, 1, 3, ObjectRef { kind: "queues", slug: "invoices" }, &path,
             b"{\"a\":1}", b"{\"a\":2}", "prod", ColorMode::Plain, Some(&bulk),
             false,
-        )
+        ).await
         .unwrap();
         assert!(matches!(r, Resolution::KeepRemoteAll));
         let s = String::from_utf8(out).unwrap();
@@ -3095,8 +3096,8 @@ mod tests {
         assert!(s.contains("USE-ALL-SUMMARY"), "summary not shown: {s}");
     }
 
-    #[test]
-    fn prompt_bulk_keep_local_all_after_confirm() {
+    #[tokio::test]
+    async fn prompt_bulk_keep_local_all_after_confirm() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.json");
         let bulk = BulkPrompt {
@@ -3109,13 +3110,13 @@ mod tests {
             input, &mut out, 1, 3, ObjectRef { kind: "queues", slug: "invoices" }, &path,
             b"{\"a\":1}", b"{\"a\":2}", "prod", ColorMode::Plain, Some(&bulk),
             false,
-        )
+        ).await
         .unwrap();
         assert!(matches!(r, Resolution::KeepLocalAll));
     }
 
-    #[test]
-    fn prompt_bulk_declined_falls_back_to_single() {
+    #[tokio::test]
+    async fn prompt_bulk_declined_falls_back_to_single() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.json");
         let bulk = BulkPrompt {
@@ -3129,13 +3130,13 @@ mod tests {
             input, &mut out, 1, 3, ObjectRef { kind: "queues", slug: "invoices" }, &path,
             b"{\"a\":1}", b"{\"a\":2}", "prod", ColorMode::Plain, Some(&bulk),
             false,
-        )
+        ).await
         .unwrap();
         assert!(matches!(r, Resolution::KeepLocal));
     }
 
-    #[test]
-    fn prompt_bulk_none_preserves_uppercase_single_behavior() {
+    #[tokio::test]
+    async fn prompt_bulk_none_preserves_uppercase_single_behavior() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.json");
         let input = Cursor::new(b"R\n");
@@ -3144,15 +3145,15 @@ mod tests {
             input, &mut out, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path,
             b"{\"a\":1}", b"{\"a\":2}", "prod", ColorMode::Plain, None,
             false,
-        )
+        ).await
         .unwrap();
         assert!(matches!(r, Resolution::KeepRemote), "uppercase R must still mean single KeepRemote when bulk is None");
         let s = String::from_utf8(out).unwrap();
         assert!(!s.contains("for ALL"), "bulk options must be hidden when None: {s}");
     }
 
-    #[test]
-    fn prompt_remote_delete_bulk_use_remote_all() {
+    #[tokio::test]
+    async fn prompt_remote_delete_bulk_use_remote_all() {
         use std::io::Cursor;
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.json");
@@ -3163,7 +3164,7 @@ mod tests {
         };
         let input = Cursor::new(b"R\ny\n");
         let mut out: Vec<u8> = Vec::new();
-        let r = prompt_remote_delete_with_color(input, &mut out, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path, "prod", ColorMode::Plain, Some(&bulk), false).unwrap();
+        let r = prompt_remote_delete_with_color(input, &mut out, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path, "prod", ColorMode::Plain, Some(&bulk), false).await.unwrap();
         assert!(matches!(r, Resolution::KeepRemoteAll));
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("[R] use prod for ALL"), "bulk options must be shown: {s}");
@@ -3173,15 +3174,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prompt_remote_delete_bulk_none_preserves_single() {
+    #[tokio::test]
+    async fn prompt_remote_delete_bulk_none_preserves_single() {
         use std::io::Cursor;
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.json");
         std::fs::write(&path, b"{\"a\":1}\n").unwrap();
         let input = Cursor::new(b"r\n");
         let mut out: Vec<u8> = Vec::new();
-        let r = prompt_remote_delete_with_color(input, &mut out, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path, "prod", ColorMode::Plain, None, false).unwrap();
+        let r = prompt_remote_delete_with_color(input, &mut out, 1, 1, ObjectRef { kind: "queues", slug: "invoices" }, &path, "prod", ColorMode::Plain, None, false).await.unwrap();
         assert!(matches!(r, Resolution::KeepRemote));
     }
 
@@ -3197,8 +3198,8 @@ mod tests {
     /// tempdir prefix for a stable placeholder before pinning, so the
     /// committed file records everything the refactor could plausibly move
     /// and nothing that is an artifact of this test run.
-    #[test]
-    fn conflict_prompt_bytes_are_pinned() {
+    #[tokio::test]
+    async fn conflict_prompt_bytes_are_pinned() {
         
         let dir = tempfile::tempdir().unwrap();
         let local = dir.path().join("queues/invoices.json");
@@ -3216,7 +3217,7 @@ mod tests {
             b"{\"name\":\"Invoices EU\"}",
             "dev",
             ColorMode::Plain,
-        )
+        ).await
         .unwrap();
 
         let actual = redact_tempdir(&t.text(), dir.path());
@@ -3224,8 +3225,8 @@ mod tests {
     }
 
     /// Under `--no-push` the `[k]` label names when the push happens.
-    #[test]
-    fn conflict_prompt_under_no_push_bytes_are_pinned() {
+    #[tokio::test]
+    async fn conflict_prompt_under_no_push_bytes_are_pinned() {
         let dir = tempfile::tempdir().unwrap();
         let local = dir.path().join("queues/invoices.json");
         std::fs::create_dir_all(local.parent().unwrap()).unwrap();
@@ -3245,15 +3246,15 @@ mod tests {
             ColorMode::Plain,
             None,
             true,
-        )
+        ).await
         .unwrap();
 
         let actual = redact_tempdir(&t.text(), dir.path());
         pin("conflict_no_push", &actual);
     }
 
-    #[test]
-    fn remote_delete_prompt_bytes_are_pinned() {
+    #[tokio::test]
+    async fn remote_delete_prompt_bytes_are_pinned() {
         
         let dir = tempfile::tempdir().unwrap();
         let local = dir.path().join("labels/audit-hold.json");
@@ -3272,15 +3273,15 @@ mod tests {
             ColorMode::Plain,
             None,
             false,
-        )
+        ).await
         .unwrap();
 
         let actual = redact_tempdir(&t.text(), dir.path());
         pin("remote_delete", &actual);
     }
 
-    #[test]
-    fn local_delete_remote_edit_prompt_bytes_are_pinned() {
+    #[tokio::test]
+    async fn local_delete_remote_edit_prompt_bytes_are_pinned() {
         let dir = tempfile::tempdir().unwrap();
         let local = dir.path().join("labels/audit-hold.json");
         std::fs::create_dir_all(local.parent().unwrap()).unwrap();
@@ -3299,7 +3300,7 @@ mod tests {
             ColorMode::Plain,
             None,
             false,
-        )
+        ).await
         .unwrap();
 
         let actual = redact_tempdir(&t.text(), dir.path());
@@ -3331,8 +3332,8 @@ mod tests {
     /// Single-hunk conflict answered with an unrecognized key: pins the hint
     /// that lists the keys, and the re-prompt after it. The multi-hunk hint
     /// is a different string and is pinned by `conflict_multi_hunk`.
-    #[test]
-    fn conflict_unrecognized_key_bytes_are_pinned() {
+    #[tokio::test]
+    async fn conflict_unrecognized_key_bytes_are_pinned() {
         
         let dir = tempfile::tempdir().unwrap();
         let local = conflict_fixture(dir.path(), b"{\"name\":\"Invoices\"}");
@@ -3348,7 +3349,7 @@ mod tests {
             b"{\"name\":\"Invoices EU\"}",
             "dev",
             ColorMode::Plain,
-        )
+        ).await
         .unwrap();
 
         let actual = redact_tempdir(&t.text(), dir.path());
@@ -3358,8 +3359,8 @@ mod tests {
     /// Multi-hunk conflict: the header carries the hunk count and the menu
     /// gains `[h]`. Answered with an unrecognized key first, so the pin also
     /// records the hint variant that names `h`.
-    #[test]
-    fn conflict_multi_hunk_prompt_bytes_are_pinned() {
+    #[tokio::test]
+    async fn conflict_multi_hunk_prompt_bytes_are_pinned() {
         
         let dir = tempfile::tempdir().unwrap();
         let local = conflict_fixture(dir.path(), TWO_HUNK_LOCAL);
@@ -3375,7 +3376,7 @@ mod tests {
             TWO_HUNK_REMOTE,
             "dev",
             ColorMode::Plain,
-        )
+        ).await
         .unwrap();
 
         let actual = redact_tempdir(&t.text(), dir.path());
@@ -3384,8 +3385,8 @@ mod tests {
 
     /// Conflict with the bulk options offered: the `[K]`/`[R]` line above the
     /// menu, the impact summary, and the `Continue? [y/N] >` confirmation.
-    #[test]
-    fn conflict_bulk_prompt_bytes_are_pinned() {
+    #[tokio::test]
+    async fn conflict_bulk_prompt_bytes_are_pinned() {
         
         let dir = tempfile::tempdir().unwrap();
         let local = conflict_fixture(dir.path(), b"{\"name\":\"Invoices\"}");
@@ -3409,7 +3410,7 @@ mod tests {
             ColorMode::Plain,
             Some(&bulk),
             false,
-        )
+        ).await
         .unwrap();
         assert!(matches!(r, Resolution::KeepLocalAll));
 
@@ -3419,8 +3420,8 @@ mod tests {
 
     /// The per-hunk walker reached through `[h]`: one prompt per hunk, each
     /// with its line range and up to three lines of context.
-    #[test]
-    fn hunk_by_hunk_prompt_bytes_are_pinned() {
+    #[tokio::test]
+    async fn hunk_by_hunk_prompt_bytes_are_pinned() {
         
         let dir = tempfile::tempdir().unwrap();
         let local = conflict_fixture(dir.path(), TWO_HUNK_LOCAL);
@@ -3437,7 +3438,7 @@ mod tests {
             TWO_HUNK_REMOTE,
             "dev",
             ColorMode::Plain,
-        )
+        ).await
         .unwrap();
 
         let actual = redact_tempdir(&t.text(), dir.path());
@@ -3445,8 +3446,8 @@ mod tests {
     }
 
     /// The remote-delete prompt with the bulk options offered.
-    #[test]
-    fn remote_delete_bulk_prompt_bytes_are_pinned() {
+    #[tokio::test]
+    async fn remote_delete_bulk_prompt_bytes_are_pinned() {
         
         let dir = tempfile::tempdir().unwrap();
         let local = dir.path().join("labels/audit-hold.json");
@@ -3468,7 +3469,7 @@ mod tests {
             ColorMode::Plain,
             Some(&bulk),
             false,
-        )
+        ).await
         .unwrap();
         assert!(matches!(r, Resolution::KeepRemoteAll));
 

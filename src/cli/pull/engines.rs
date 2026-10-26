@@ -46,7 +46,7 @@ pub async fn process(
             continue;
         }
 
-        let result: Result<()> = (|| {
+        let result: Result<()> = (async || {
             // Each engine owns a directory: `engines/<slug>/`. The engine's
             // JSON lives at `engine.json` inside it, alongside `fields/`.
             let engine_dir = ctx.paths.engine_dir(&slug);
@@ -81,7 +81,7 @@ pub async fn process(
                 ctx.paths.env(),
                 base_hash.as_deref(),
                 Some(ctx.paths),
-            )?;
+            ).await?;
 
             record_object(
                 ctx.lockfile,
@@ -94,7 +94,7 @@ pub async fn process(
             );
             written += 1;
             Ok(())
-        })();
+        })().await;
         result?;
     }
 

@@ -20,7 +20,7 @@ pub async fn process(
     org: Organization,
     progress: &Arc<Log>,
 ) -> Result<(usize, usize)> {
-    let result: Result<(usize, usize)> = (|| {
+    let result: Result<(usize, usize)> = (async || {
         let path = ctx.paths.organization_file();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -52,7 +52,7 @@ pub async fn process(
             ctx.paths.env(),
             base_hash.as_deref(),
             Some(ctx.paths),
-        )?;
+        ).await?;
 
         record_object(
             ctx.lockfile,
@@ -66,6 +66,6 @@ pub async fn process(
         progress.event(Action::Pull, &format!("organization ({} pulled)", org.name));
 
         Ok((1, conflicts))
-    })();
+    })().await;
     result
 }

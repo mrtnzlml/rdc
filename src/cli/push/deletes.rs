@@ -83,7 +83,7 @@ impl DeleteCounts {
 /// Print the tombstone list to stderr and gate on the destructive
 /// confirmation. Returns `Aborted` if the user declines on TTY; returns
 /// `Err` if running non-TTY without `--allow-deletes`.
-pub fn confirm_or_refuse(
+pub async fn confirm_or_refuse(
     tombstones: &Tombstones,
     interactive: bool,
     allow_deletes: bool,
@@ -167,7 +167,7 @@ pub fn confirm_or_refuse(
     // Route via the stdin coordinator so this prompt cooperates with the
     // `rdc sync --watch` Enter-trigger reader instead of fighting it for
     // the terminal. Outside watch it reads stdin directly.
-    let ans = crate::cli::stdin_coord::read_line_coordinated()?
+    let ans = crate::cli::stdin_coord::read_line_coordinated().await?
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase();
@@ -445,7 +445,7 @@ async fn delete_one(
     };
 
     if drifted {
-        match resolve_delete_drift(progress, interactive, kind, slug)? {
+        match resolve_delete_drift(progress, interactive, kind, slug).await? {
             DeleteDriftChoice::KeepDelete => { /* fall through to DELETE */ }
             DeleteDriftChoice::Skip => {
                 progress.event(Action::Skip, &format!("{kind}/{slug} (drift)"));
@@ -502,7 +502,7 @@ enum DeleteDriftChoice {
     Abort,
 }
 
-fn resolve_delete_drift(
+async fn resolve_delete_drift(
     progress: &Arc<Log>,
     interactive: bool,
     kind: &str,
@@ -555,7 +555,7 @@ fn resolve_delete_drift(
     let mut q = progress.writer();
     write!(q, "{}", crate::cli::change_view::render_menu(&keys, mode)).ok();
     q.flush().ok();
-    let ans = crate::cli::stdin_coord::read_line_coordinated()?
+    let ans = crate::cli::stdin_coord::read_line_coordinated().await?
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase();
@@ -687,8 +687,8 @@ mod tests {
     /// The regression: this gate printed with `eprintln!`, so an embedder
     /// consuming `Log::for_sink` received not one line of the most
     /// destructive list rdc prints.
-    #[test]
-    fn delete_gate_writes_the_object_list_into_the_log_sink() {
+    #[tokio::test]
+    async fn delete_gate_writes_the_object_list_into_the_log_sink() {
         let buf = Buf::default();
         let log = crate::log::Log::for_sink(
             crate::cli::resolve::ColorMode::Plain,
@@ -699,7 +699,7 @@ mod tests {
         t.engines.insert("custom-eu".to_string(), 4410);
 
         // `allow_deletes` returns before the prompt, so this never reads stdin.
-        let out = confirm_or_refuse(&t, false, true, &log).unwrap();
+        let out = confirm_or_refuse(&t, false, true, &log).await.unwrap();
         assert!(matches!(out, ConfirmOutcome::Proceed));
 
         let text = buf.text();
@@ -766,9 +766,12 @@ mod tests {
         seen: std::sync::Mutex<Vec<crate::cli::stdin_coord::Prompt>>,
     }
     impl crate::cli::stdin_coord::PromptRoute for Recorder {
-        fn ask(&self, prompt: &crate::cli::stdin_coord::Prompt) -> Option<String> {
+        fn ask<'a>(
+            &'a self,
+            prompt: &'a crate::cli::stdin_coord::Prompt,
+        ) -> crate::rt::BoxFuture<'a, Option<String>> {
             self.seen.lock().unwrap().push(prompt.clone());
-            Some(self.answer.clone())
+            Box::pin(async move { Some(self.answer.clone()) })
         }
     }
 
@@ -793,7 +796,7 @@ mod tests {
         let mut t = Tombstones::default();
         t.hooks.insert("legacy-export".to_string(), 9137);
         let out = crate::cli::stdin_coord::with_route(route.clone(), async {
-            confirm_or_refuse(&t, true, false, &log)
+            confirm_or_refuse(&t, true, false, &log).await
         })
         .await
         .unwrap();
@@ -834,7 +837,7 @@ mod tests {
         t.hooks.insert("legacy-export".to_string(), 9137);
         t.queues.insert("invoices".to_string(), 4210);
         let out = crate::cli::stdin_coord::with_route(route, async {
-            confirm_or_refuse(&t, true, false, &log)
+            confirm_or_refuse(&t, true, false, &log).await
         })
         .await
         .unwrap();
@@ -851,7 +854,7 @@ mod tests {
         let route = std::sync::Arc::new(crate::cli::prompt_pin::CannedRoute::echoing("k", buf.0.clone()));
 
         let choice = crate::cli::stdin_coord::with_route(route, async {
-            resolve_delete_drift(&log, true, "hooks", "legacy-export")
+            resolve_delete_drift(&log, true, "hooks", "legacy-export").await
         })
         .await
         .unwrap();
@@ -874,7 +877,7 @@ mod tests {
         });
 
         let choice = crate::cli::stdin_coord::with_route(route.clone(), async {
-            resolve_delete_drift(&log, true, "hooks", "legacy-export")
+            resolve_delete_drift(&log, true, "hooks", "legacy-export").await
         })
         .await
         .unwrap();

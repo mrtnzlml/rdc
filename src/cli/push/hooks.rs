@@ -867,7 +867,7 @@ async fn push_one_drifted(
         local_json_path, &remote_json,
         env,
         progress,
-    )? {
+    ).await? {
         PushDriftOutcome::Patch { payload_override } => {
             if let Some(bytes) = payload_override {
                 let mut ov: serde_json::Value = serde_json::from_slice(&bytes)

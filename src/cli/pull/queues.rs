@@ -169,7 +169,7 @@ pub async fn process(
             continue;
         }
 
-        let queue_result: Result<()> = (|| {
+        let queue_result: Result<()> = (async || {
             let queue_dir = ctx.paths.queue_dir(&ws_slug, &q_slug);
             std::fs::create_dir_all(&queue_dir)
                 .with_context(|| format!("creating {}", queue_dir.display()))?;
@@ -221,7 +221,7 @@ pub async fn process(
                 ctx.paths.env(),
                 queue_base.as_deref(),
                 Some(ctx.paths),
-            )?;
+            ).await?;
             record_object(
                 ctx.lockfile,
                 KIND_QUEUES,
@@ -254,7 +254,7 @@ pub async fn process(
                 queue_dir,
             });
             Ok(())
-        })();
+        })().await;
         queue_result?;
     }
 
@@ -277,12 +277,12 @@ pub async fn process(
         if let Some(schema) = schemas_by_queue_id.get(&w.q.id)
             && !schema_pushed
         {
-            write_schema_for_queue(ctx, &mut counts, w, schema, progress)?;
+            write_schema_for_queue(ctx, &mut counts, w, schema, progress).await?;
         }
         if let Some(inbox) = inboxes_by_queue_id.get(&w.q.id)
             && !inbox_pushed
         {
-            write_inbox_for_queue(ctx, &mut counts, w, inbox, progress)?;
+            write_inbox_for_queue(ctx, &mut counts, w, inbox, progress).await?;
         }
     }
 
@@ -299,7 +299,7 @@ pub async fn process(
     Ok(counts)
 }
 
-fn write_schema_for_queue(
+async fn write_schema_for_queue(
     ctx: &mut PullCtx<'_>,
     counts: &mut QueueCounts,
     w: &QueueWork<'_>,
@@ -385,7 +385,7 @@ fn write_schema_for_queue(
                     ctx.interactive,
                     ctx.paths,
                     progress,
-                )?;
+                ).await?;
                 let mut preserve_base = json_outcome.is_preserve_base();
                 let resolved_json = json_outcome.into_bytes();
                 let mut resolved_formulas: Vec<(String, Vec<u8>)> =
@@ -411,7 +411,7 @@ fn write_schema_for_queue(
                         ctx.interactive,
                         ctx.paths,
                         progress,
-                    )?;
+                    ).await?;
                     preserve_base |= outcome.is_preserve_base();
                     resolved_formulas.push((field_id.clone(), outcome.into_bytes()));
                 }
@@ -480,7 +480,7 @@ fn write_schema_for_queue(
     Ok(())
 }
 
-fn write_inbox_for_queue(
+async fn write_inbox_for_queue(
     ctx: &mut PullCtx<'_>,
     counts: &mut QueueCounts,
     w: &QueueWork<'_>,
@@ -516,7 +516,7 @@ fn write_inbox_for_queue(
         ctx.paths.env(),
         inbox_base.as_deref(),
         Some(ctx.paths),
-    )?;
+    ).await?;
     record_object(
         ctx.lockfile,
         KIND_INBOXES,

@@ -205,7 +205,7 @@ pub async fn push_dataset(
                 collection_name,
                 &diff.pending_regular_deletes,
                 &diff.pending_search_deletes,
-            )?;
+            ).await?;
             if proceed {
                 plan.drop_regular.extend(diff.pending_regular_deletes.iter().cloned());
                 plan.drop_search.extend(diff.pending_search_deletes.iter().cloned());
@@ -760,14 +760,14 @@ fn report_pending_index_drops(
 
 /// Interactive [y/N] confirmation for dropping remote MDH indexes that are no
 /// longer present locally. Returns `true` to proceed with the drops.
-fn prompt_confirm_index_drops(
+async fn prompt_confirm_index_drops(
     progress: &Arc<Log>,
     collection_name: &str,
     pending_regular: &[String],
     pending_search: &[String],
 ) -> Result<bool> {
     report_pending_index_drops(progress, collection_name, pending_regular, pending_search);
-    progress.with_prompt(|| -> Result<bool> {
+    progress.with_prompt_async(async {
         use std::io::Write;
         let keys = vec![
             crate::cli::stdin_coord::PromptKey::new(
@@ -789,12 +789,12 @@ fn prompt_confirm_index_drops(
         let mode = crate::cli::resolve::detect_color_mode();
         write!(q, "{}", crate::cli::change_view::render_menu(&keys, mode)).ok();
         q.flush().ok();
-        let ans = crate::cli::stdin_coord::read_line_coordinated()?
+        let ans = crate::cli::stdin_coord::read_line_coordinated().await?
             .unwrap_or_default()
             .trim()
             .to_ascii_lowercase();
         Ok(ans == "y" || ans == "yes")
-    })
+    }).await
 }
 
 /// Result of the base-aware (3-way) within-env index diff. `plan` carries
@@ -962,7 +962,7 @@ mod tests {
                 "vendors",
                 &["idx_vendor_no".to_string()],
                 &["srch_name".to_string()],
-            )
+            ).await
         })
         .await
         .unwrap();
@@ -1618,9 +1618,12 @@ mod tests {
         seen: std::sync::Mutex<Vec<crate::cli::stdin_coord::Prompt>>,
     }
     impl crate::cli::stdin_coord::PromptRoute for Recorder {
-        fn ask(&self, prompt: &crate::cli::stdin_coord::Prompt) -> Option<String> {
+        fn ask<'a>(
+            &'a self,
+            prompt: &'a crate::cli::stdin_coord::Prompt,
+        ) -> crate::rt::BoxFuture<'a, Option<String>> {
             self.seen.lock().unwrap().push(prompt.clone());
-            Some(self.answer.clone())
+            Box::pin(async move { Some(self.answer.clone()) })
         }
     }
 
@@ -1642,7 +1645,7 @@ mod tests {
         });
 
         let proceed = crate::cli::stdin_coord::with_route(route.clone(), async {
-            prompt_confirm_index_drops(&log, "vendors", &["idx_vendor_no".to_string()], &[])
+            prompt_confirm_index_drops(&log, "vendors", &["idx_vendor_no".to_string()], &[]).await
         })
         .await
         .unwrap();

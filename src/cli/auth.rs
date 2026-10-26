@@ -247,7 +247,7 @@ pub async fn refresh_token_for_401(env: &str) -> Result<()> {
     );
 
     loop {
-        let Some(new_token) = read_new_token()? else {
+        let Some(new_token) = read_new_token().await? else {
             return Err(anyhow!("token refresh cancelled"));
         };
         let trimmed = new_token.trim();
@@ -280,11 +280,11 @@ pub async fn refresh_token_for_401(env: &str) -> Result<()> {
 /// the coordinator is active the token is read as a coordinated line, with
 /// terminal echo off. An empty line cancels there, because Ctrl-C does not
 /// interrupt a coordinated read.
-fn read_new_token() -> Result<Option<String>> {
+async fn read_new_token() -> Result<Option<String>> {
     if crate::cli::stdin_coord::is_active() {
         eprint!("? New API token (input hidden; empty line cancels): ");
         let _echo = EchoOff::new();
-        let line = crate::cli::stdin_coord::read_line_coordinated()?;
+        let line = crate::cli::stdin_coord::read_line_coordinated().await?;
         eprintln!();
         return Ok(line.filter(|l| !l.trim().is_empty()));
     }

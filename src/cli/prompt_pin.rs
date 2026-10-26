@@ -102,12 +102,16 @@ impl CannedRoute {
 }
 
 impl crate::cli::stdin_coord::PromptRoute for CannedRoute {
-    fn ask(&self, _prompt: &crate::cli::stdin_coord::Prompt) -> Option<String> {
+    fn ask<'a>(
+        &'a self,
+        _prompt: &'a crate::cli::stdin_coord::Prompt,
+    ) -> crate::rt::BoxFuture<'a, Option<String>> {
         let mut g = self.sink.lock().unwrap();
         g.extend_from_slice(self.answer.as_bytes());
         g.push(b'\n');
         drop(g);
-        Some(self.answer.to_string())
+        let answer = self.answer.to_string();
+        Box::pin(async move { Some(answer) })
     }
 }
 
@@ -117,12 +121,12 @@ impl crate::cli::stdin_coord::PromptRoute for CannedRoute {
 /// buffer as it is read; `output` is what the prompt writes to. `text` is the
 /// two interleaved, which is what gets pinned.
 pub(crate) struct Transcript {
-    buf: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+    buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
 }
 
 impl Transcript {
     pub(crate) fn new() -> Self {
-        Self { buf: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())) }
+        Self { buf: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())) }
     }
 
     /// `keys` is what the user types, newline-separated, e.g. `"z\ns\n"`.
@@ -138,13 +142,13 @@ impl Transcript {
     }
 
     pub(crate) fn text(&self) -> String {
-        String::from_utf8_lossy(&self.buf.borrow()).into_owned()
+        String::from_utf8_lossy(&self.buf.lock().unwrap()).into_owned()
     }
 }
 
 pub(crate) struct TranscriptInput {
     inner: std::io::Cursor<Vec<u8>>,
-    sink: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+    sink: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
 }
 
 impl std::io::Read for TranscriptInput {
@@ -169,7 +173,7 @@ impl std::io::BufRead for TranscriptInput {
         let n = std::io::BufRead::read_line(&mut self.inner, out)?;
         if n > 0 {
             let typed = &out[before..];
-            let mut sink = self.sink.borrow_mut();
+            let mut sink = self.sink.lock().unwrap();
             sink.extend_from_slice(typed.as_bytes());
             if !typed.ends_with('\n') {
                 sink.push(b'\n');
@@ -180,12 +184,12 @@ impl std::io::BufRead for TranscriptInput {
 }
 
 pub(crate) struct TranscriptOutput {
-    sink: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+    sink: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
 }
 
 impl std::io::Write for TranscriptOutput {
     fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-        self.sink.borrow_mut().extend_from_slice(b);
+        self.sink.lock().unwrap().extend_from_slice(b);
         Ok(b.len())
     }
 

@@ -13,6 +13,7 @@ pub mod merge;
 pub mod model;
 pub mod overlay;
 pub mod paths;
+pub mod rt;
 pub mod secrets;
 pub mod slug;
 pub mod snapshot;

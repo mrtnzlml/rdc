@@ -84,7 +84,7 @@ pub async fn process(
             continue;
         }
 
-        let result: Result<()> = (|| {
+        let result: Result<()> = (async || {
             let fields_dir = ctx.paths.engine_fields_dir(&engine_slug);
             std::fs::create_dir_all(&fields_dir)
                 .with_context(|| format!("creating {}", fields_dir.display()))?;
@@ -126,7 +126,7 @@ pub async fn process(
                 ctx.paths.env(),
                 base_hash.as_deref(),
                 Some(ctx.paths),
-            )?;
+            ).await?;
 
             if let Some(old) = legacy_flat_key.as_deref()
                 && old != composite_key
@@ -145,7 +145,7 @@ pub async fn process(
             );
             written += 1;
             Ok(())
-        })();
+        })().await;
         result?;
     }
 

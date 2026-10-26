@@ -459,12 +459,12 @@ pub fn sync_env(
         previous.cancel.cancel();
     }
     let route: std::sync::Arc<dyn rdc::cli::sync::embed::PromptRoute> =
-        std::sync::Arc::new(SinkPromptRoute {
+        std::sync::Arc::new(SharedSinkRoute(std::sync::Arc::new(SinkPromptRoute {
             sink: sink.clone(),
             answers: std::sync::Mutex::new(answer_rx),
             cancel: cancel.clone(),
             log_buf,
-        });
+        })));
 
     let result: Result<u64> = block_on(async {
         rdc::cli::init::write_scaffold_files(&folder_path, &env, &api_base, org_id)?;
@@ -605,8 +605,32 @@ struct SinkPromptRoute<S: PromptSink = StreamSink<SyncPhase>> {
     log_buf: LineBuffer,
 }
 
-impl<S: PromptSink + Send + Sync> rdc::cli::sync::embed::PromptRoute for SinkPromptRoute<S> {
-    fn ask(&self, prompt: &rdc::cli::sync::embed::Prompt) -> Option<String> {
+/// The route the watch installs. `PromptRoute::ask` is async, but the wait
+/// below is a blocking channel poll, so it runs on tokio's blocking pool —
+/// which needs an owned (`'static`) handle, hence the `Arc`.
+struct SharedSinkRoute<S: PromptSink = StreamSink<SyncPhase>>(std::sync::Arc<SinkPromptRoute<S>>);
+
+impl<S: PromptSink + Send + Sync + 'static> rdc::cli::sync::embed::PromptRoute
+    for SharedSinkRoute<S>
+{
+    fn ask<'a>(
+        &'a self,
+        prompt: &'a rdc::cli::sync::embed::Prompt,
+    ) -> rdc::rt::BoxFuture<'a, Option<String>> {
+        let route = self.0.clone();
+        let prompt = prompt.clone();
+        Box::pin(async move {
+            // A panic in the blocking wait degrades to end of input (skip / N),
+            // the same as the Dart stream going away.
+            tokio::task::spawn_blocking(move || route.ask_blocking(&prompt))
+                .await
+                .unwrap_or(None)
+        })
+    }
+}
+
+impl<S: PromptSink + Send + Sync> SinkPromptRoute<S> {
+    fn ask_blocking(&self, prompt: &rdc::cli::sync::embed::Prompt) -> Option<String> {
         use std::sync::mpsc::RecvTimeoutError;
         use std::time::Duration;
 
@@ -750,12 +774,12 @@ pub fn watch_env(
     // see `LineBuffer`'s doc.
     let log_buf = LineBuffer::default();
     let route: std::sync::Arc<dyn rdc::cli::sync::embed::PromptRoute> =
-        std::sync::Arc::new(SinkPromptRoute {
+        std::sync::Arc::new(SharedSinkRoute(std::sync::Arc::new(SinkPromptRoute {
             sink: sink.clone(),
             answers: std::sync::Mutex::new(answer_rx),
             cancel: cancel.clone(),
             log_buf: log_buf.clone(),
-        });
+        })));
 
     let forwarder = LineForwarder {
         sink: sink.clone(),
@@ -1324,7 +1348,7 @@ mod tests {
             });
             // If the stale answer were not drained, this would return "n"
             // immediately instead of blocking for the real "y".
-            assert_eq!(route.ask(&sample_prompt()), Some("y".to_string()));
+            assert_eq!(route.ask_blocking(&sample_prompt()), Some("y".to_string()));
         });
     }
 
@@ -1344,7 +1368,7 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(30));
                 sender.send((id, "n".to_string())).unwrap();
             });
-            assert_eq!(route.ask(&sample_prompt()), Some("n".to_string()));
+            assert_eq!(route.ask_blocking(&sample_prompt()), Some("n".to_string()));
         });
     }
 
@@ -1356,7 +1380,7 @@ mod tests {
                 let id = wait_for_prompt_id(&route);
                 tx.send((id, "y".to_string())).unwrap();
             });
-            let _ = route.ask(&sample_prompt());
+            let _ = route.ask_blocking(&sample_prompt());
         });
         let emitted = route.sink.emitted.lock().unwrap();
         match &emitted[0] {
@@ -1383,8 +1407,23 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(20));
                 sender.send((id, "y".to_string())).unwrap();
             });
-            assert_eq!(route.ask(&sample_prompt()), Some("y".to_string()));
+            assert_eq!(route.ask_blocking(&sample_prompt()), Some("y".to_string()));
         });
+    }
+
+    #[test]
+    fn the_async_trait_route_answers_through_the_blocking_pool() {
+        let (route, tx) = route_with_channel();
+        let route = SharedSinkRoute(std::sync::Arc::new(route));
+        let inner = route.0.clone();
+        let answer = std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let id = wait_for_prompt_id(&inner);
+                tx.send((id, "y".to_string())).unwrap();
+            });
+            block_on(route.ask(&sample_prompt()))
+        });
+        assert_eq!(answer, Some("y".to_string()));
     }
 
     #[test]
@@ -1396,7 +1435,7 @@ mod tests {
         // the only way `ask` returns is the initial `emit` failing and
         // short-circuiting before the wait loop is ever entered. If it
         // didn't, this call would hang.
-        assert_eq!(route.ask(&sample_prompt()), None);
+        assert_eq!(route.ask_blocking(&sample_prompt()), None);
     }
 
     #[test]
@@ -1409,7 +1448,7 @@ mod tests {
         });
         // No answer is ever sent; without the cancellation check this would
         // hang forever rather than returning within one poll interval.
-        assert_eq!(route.ask(&sample_prompt()), None);
+        assert_eq!(route.ask_blocking(&sample_prompt()), None);
     }
 
     #[test]
@@ -1445,7 +1484,7 @@ mod tests {
         // before its wait loop ever checks this, so no second thread is
         // needed to unblock it.
         route.cancel.cancel();
-        assert_eq!(route.ask(&sample_prompt()), None);
+        assert_eq!(route.ask_blocking(&sample_prompt()), None);
 
         // The question text must be gone -- discarded, not forwarded -- so
         // it can never get prepended to the next real line.

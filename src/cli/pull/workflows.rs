@@ -46,7 +46,7 @@ pub async fn process(
             continue;
         }
 
-        let result: Result<()> = (|| {
+        let result: Result<()> = (async || {
             // Each workflow owns a directory: `workflows/<slug>/`. The
             // workflow's JSON lives at `workflow.json` inside it, alongside
             // `steps/`.
@@ -84,7 +84,7 @@ pub async fn process(
                 ctx.paths.env(),
                 base_hash.as_deref(),
                 Some(ctx.paths),
-            )?;
+            ).await?;
 
             record_object(
                 ctx.lockfile,
@@ -97,7 +97,7 @@ pub async fn process(
             );
             written += 1;
             Ok(())
-        })();
+        })().await;
         result?;
     }
 

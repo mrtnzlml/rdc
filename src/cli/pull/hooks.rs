@@ -72,7 +72,7 @@ pub async fn process(
             continue;
         }
 
-        let result: Result<()> = (|| {
+        let result: Result<()> = (async || {
             if !dir_created {
                 std::fs::create_dir_all(ctx.paths.hooks_dir())
                     .with_context(|| format!("creating {}", ctx.paths.hooks_dir().display()))?;
@@ -158,7 +158,7 @@ pub async fn process(
                         ctx.paths.env(),
                         base_hash.as_deref(),
                         Some(ctx.paths),
-                    )?;
+                    ).await?;
                     if let Some(code) = &proposed_code {
                         write_hook_code(&ctx.paths.hooks_dir(), &slug, code, ext)
                             .with_context(|| format!("writing hook code for '{}'", hook.name))?;
@@ -219,7 +219,7 @@ pub async fn process(
                         ctx.interactive && symmetric,
                         ctx.paths,
                         progress,
-                    )?;
+                    ).await?;
 
                     // Track preserve-base intent across both sub-files of the
                     // combined-hash entity — if either side asks for it, the
@@ -242,7 +242,7 @@ pub async fn process(
                                     ctx.interactive,
                                     ctx.paths,
                                     progress,
-                                )?;
+                                ).await?;
                                 preserve_base |= code_outcome.is_preserve_base();
                                 let bytes = code_outcome.into_bytes();
                                 Some(String::from_utf8(bytes).with_context(|| {
@@ -313,7 +313,7 @@ pub async fn process(
             );
             written += 1;
             Ok(())
-        })();
+        })().await;
         result?;
     }
 

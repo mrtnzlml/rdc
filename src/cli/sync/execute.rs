@@ -40,7 +40,7 @@ use crate::cli::resolve::{
     prompt_remote_delete_with_color,
     prompt_resolve_with_bytes_and_color,
 };
-use crate::cli::stdin_coord::CoordinatorStdin;
+use crate::cli::stdin_coord::{Borrowed, CoordinatorStdin, LineSource};
 use crate::cli::sync::classify::{ClassifiedItem, SyncClass};
 use crate::log::{Action, Log};
 use crate::slug::slugify_unique;
@@ -48,7 +48,6 @@ use crate::snapshot::codec::combined_hash;
 use crate::snapshot::writer::write_atomic;
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -150,7 +149,7 @@ pub(crate) fn build_bulk_prompt(
 /// existing behavior (interactive prompt on a TTY, shadow-file skip
 /// otherwise).
 #[cfg(test)]
-pub(crate) async fn resolve_conflicts<R: BufRead>(
+pub(crate) async fn resolve_conflicts<R: LineSource>(
     ctx: &mut PullCtx<'_>,
     catalog: &RemoteCatalog,
     classified: &[ClassifiedItem],
@@ -393,7 +392,7 @@ impl<'a> CatalogIndex<'a> {
 /// on the env since the last sync reads as the `rdc://` ref the pull will
 /// write. A `--no-pull` run passes the plain lockfile: nothing is pulled, so
 /// such an object stays untracked and its ref must stay a URL.
-async fn resolve_conflicts_projected<R: BufRead>(
+async fn resolve_conflicts_projected<R: LineSource>(
     ctx: &mut PullCtx<'_>,
     catalog: &RemoteCatalog,
     classified: &[ClassifiedItem],
@@ -788,7 +787,7 @@ async fn resolve_conflicts_projected<R: BufRead>(
             bulk_sticky,
             bulk.as_ref(),
             no_push,
-        )?;
+        ).await?;
     }
 
     Ok(outcome)
@@ -1263,7 +1262,7 @@ fn try_auto_merge(
 ///   doesn't" cases).
 /// - Records the canonical combined hash on every Resolution arm so
 ///   the lockfile stays consistent with the classifier's view.
-fn resolve_one_conflict<R: BufRead>(
+async fn resolve_one_conflict<R: LineSource>(
     ctx: &mut PullCtx<'_>,
     it: &ClassifiedItem,
     refs: ConflictRefs,
@@ -1619,7 +1618,7 @@ fn resolve_one_conflict<R: BufRead>(
     }
 
     let prompt_outcome: std::cell::RefCell<Option<PromptOutcome>> = std::cell::RefCell::new(None);
-    progress.with_prompt(|| -> anyhow::Result<_> {
+    progress.with_prompt_async(async {
         let computed: PromptOutcome = if json_canonicalize_equal && sidecar_diverges {
             match hash_strategy {
                 HashStrategy::Hook | HashStrategy::Rule => {
@@ -1629,7 +1628,7 @@ fn resolve_one_conflict<R: BufRead>(
                     let r = match sticky_now {
                         Some(b) => b.resolution(),
                         None => prompt_resolve_with_bytes_and_color(
-                            &mut *input,
+                            Borrowed(&mut *input),
                             &mut *prompt_out,
                             idx_one_based,
                             total,
@@ -1641,7 +1640,7 @@ fn resolve_one_conflict<R: BufRead>(
                             detect_color_mode(),
                             bulk,
                             no_push,
-                        )?,
+                        ).await?,
                     };
                     (
                         r,
@@ -1685,7 +1684,7 @@ fn resolve_one_conflict<R: BufRead>(
                     let r = match sticky_now {
                         Some(b) => b.resolution(),
                         None => prompt_resolve_with_bytes_and_color(
-                            &mut *input,
+                            Borrowed(&mut *input),
                             &mut *prompt_out,
                             idx_one_based,
                             total,
@@ -1697,7 +1696,7 @@ fn resolve_one_conflict<R: BufRead>(
                             detect_color_mode(),
                             bulk,
                             no_push,
-                        )?,
+                        ).await?,
                     };
                     // For schemas we don't write the sidecar from the
                     // resolver — the `[r]` path adopts the whole
@@ -1715,7 +1714,7 @@ fn resolve_one_conflict<R: BufRead>(
             let r = match sticky_now {
                 Some(b) => b.resolution(),
                 None => prompt_resolve_with_bytes_and_color(
-                    &mut *input,
+                    Borrowed(&mut *input),
                     &mut *prompt_out,
                     idx_one_based,
                     total,
@@ -1727,7 +1726,7 @@ fn resolve_one_conflict<R: BufRead>(
                     detect_color_mode(),
                     bulk,
                     no_push,
-                )?,
+                ).await?,
             };
             (
                 r,
@@ -1739,7 +1738,7 @@ fn resolve_one_conflict<R: BufRead>(
         };
         *prompt_outcome.borrow_mut() = Some(computed);
         Ok(())
-    })?;
+    }).await?;
     // The prompt's own byte pair / anchor path are informational only: the
     // resolution below applies to the whole object, and the shadow flow
     // parks every divergent half via `divergent_shadow_parts` rather than
@@ -2382,7 +2381,7 @@ fn remove_mdh_dataset(ctx: &mut PullCtx<'_>, slug: &str, indexes_path: &Path) {
 /// entry + base cache are dropped silently, no prompt.
 ///
 /// Returns the number of datasets removed from disk.
-async fn prune_mdh_orphans<R: BufRead>(
+async fn prune_mdh_orphans<R: LineSource>(
     ctx: &mut PullCtx<'_>,
     remote_slugs: &std::collections::BTreeSet<String>,
     mut input: R,
@@ -2465,19 +2464,19 @@ async fn prune_mdh_orphans<R: BufRead>(
         // Interactive prompt — same shape as the classifier kinds.
         let prompt_res: std::cell::RefCell<Option<Resolution>> = std::cell::RefCell::new(None);
         let indexes_for_prompt = indexes_path.clone();
-        progress.with_prompt(|| -> anyhow::Result<()> {
+        progress.with_prompt_async(async {
             let r = prompt_remote_delete(
-                &mut input,
+                Borrowed(&mut input),
                 progress.writer(),
                 orphan_idx + 1,
                 orphan_total,
                 ObjectRef { kind: "mdh", slug: &slug },
                 &indexes_for_prompt,
                 &env,
-            )?;
+            ).await?;
             *prompt_res.borrow_mut() = Some(r);
             Ok(())
-        })?;
+        }).await?;
         let resolution = prompt_res.into_inner().expect("with_prompt must populate");
 
         match resolution {
@@ -2561,7 +2560,7 @@ async fn prune_mdh_orphans<R: BufRead>(
 /// are emitted as warnings and skipped. Subsequent tasks plumb in
 /// hashing for the remaining kinds.
 #[cfg(test)]
-pub(crate) async fn resolve_remote_deletes<R: BufRead>(
+pub(crate) async fn resolve_remote_deletes<R: LineSource>(
     ctx: &mut PullCtx<'_>,
     catalog: &RemoteCatalog,
     classified: &[ClassifiedItem],
@@ -2590,7 +2589,7 @@ pub(crate) async fn resolve_remote_deletes<R: BufRead>(
 /// `resolve_remote_deletes`, restoring the env's side portabilized against
 /// `projection` — see [`resolve_conflicts_projected`].
 #[allow(clippy::too_many_arguments)]
-async fn resolve_remote_deletes_projected<R: BufRead>(
+async fn resolve_remote_deletes_projected<R: LineSource>(
     ctx: &mut PullCtx<'_>,
     catalog: &RemoteCatalog,
     classified: &[ClassifiedItem],
@@ -3240,27 +3239,45 @@ async fn resolve_remote_deletes_projected<R: BufRead>(
                     let prompt_res: std::cell::RefCell<Option<Resolution>> =
                         std::cell::RefCell::new(None);
                     let local_for_prompt = local_path.clone();
-                    let prompt = if it.class == SyncClass::LocalDeleteRemoteEdit {
-                        prompt_local_delete_remote_edit_with_color::<_, _>
-                    } else {
-                        prompt_remote_delete_with_color::<_, _>
-                    };
-                    progress.with_prompt(|| -> anyhow::Result<()> {
-                        let r = prompt(
-                            &mut input,
-                            progress.writer(),
+                    progress.with_prompt_async(async {
+                        let ldre = it.class == SyncClass::LocalDeleteRemoteEdit;
+                        let (index, obj, mode) = (
                             content_total + processed_lerd + processed_ldre + 1,
-                            prompt_total,
                             ObjectRef { kind: &it.kind, slug: &it.slug },
-                            &local_for_prompt,
-                            &env,
                             detect_color_mode(),
-                            bulk.as_ref(),
-                            no_push,
-                        )?;
+                        );
+                        let r = if ldre {
+                            prompt_local_delete_remote_edit_with_color(
+                                Borrowed(&mut input),
+                                progress.writer(),
+                                index,
+                                prompt_total,
+                                obj,
+                                &local_for_prompt,
+                                &env,
+                                mode,
+                                bulk.as_ref(),
+                                no_push,
+                            )
+                            .await?
+                        } else {
+                            prompt_remote_delete_with_color(
+                                Borrowed(&mut input),
+                                progress.writer(),
+                                index,
+                                prompt_total,
+                                obj,
+                                &local_for_prompt,
+                                &env,
+                                mode,
+                                bulk.as_ref(),
+                                no_push,
+                            )
+                            .await?
+                        };
                         *prompt_res.borrow_mut() = Some(r);
                         Ok(())
-                    })?;
+                    }).await?;
                     let raw = prompt_res.into_inner().expect("with_prompt must populate");
                     match raw {
                         Resolution::KeepLocalAll => {
@@ -3676,16 +3693,16 @@ pub async fn run(
         if !tombstones.is_empty() {
             let confirm_out: std::cell::RefCell<Option<crate::cli::push::deletes::ConfirmOutcome>> =
                 std::cell::RefCell::new(None);
-            progress.with_prompt(|| -> anyhow::Result<()> {
+            progress.with_prompt_async(async {
                 let o = crate::cli::push::deletes::confirm_or_refuse(
                     &tombstones,
                     interactive,
                     allow_deletes,
                     progress,
-                )?;
+                ).await?;
                 *confirm_out.borrow_mut() = Some(o);
                 Ok(())
-            })?;
+            }).await?;
             match confirm_out.into_inner().expect("with_prompt must populate") {
                 crate::cli::push::deletes::ConfirmOutcome::Aborted => {
                     progress.event(
@@ -5266,6 +5283,60 @@ mod tests {
             recorded, prior_base,
             "shadow-skip must preserve the prior lockfile base hash"
         );
+    }
+
+    /// A route that answers `None` (the consumer went away: end of input)
+    /// makes a conflict skip, exactly like scripted EOF: the local file is
+    /// untouched, the remote parks in a shadow file, nothing is promoted to
+    /// push and the prior base hash is kept so the conflict resurfaces.
+    #[tokio::test]
+    async fn route_none_skips_conflict() {
+        struct Gone;
+        impl crate::cli::stdin_coord::PromptRoute for Gone {
+            fn ask<'a>(
+                &'a self,
+                _prompt: &'a crate::cli::stdin_coord::Prompt,
+            ) -> crate::rt::BoxFuture<'a, Option<String>> {
+                Box::pin(async { None })
+            }
+        }
+
+        let mut fixture = setup_conflict_fixture();
+        let prior_base = fixture.lockfile.base_hash("labels", "audit-hold")
+            .expect("fixture must seed a prior base hash");
+        let catalog = catalog_with_labels(vec![fixture.remote_label.clone()]);
+        let classified = classified_for(&fixture);
+        let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
+        let local_before = std::fs::read(&fixture.local_path).unwrap();
+
+        let outcome = {
+            let mut ctx = PullCtx {
+                paths: &fixture.paths,
+                client: &fixture.client,
+                lockfile: &mut fixture.lockfile,
+                queue_locations: BTreeMap::new(),
+                interactive: true,
+            };
+            crate::cli::stdin_coord::with_route(
+                std::sync::Arc::new(Gone),
+                resolve_conflicts(
+                    &mut ctx,
+                    &catalog,
+                    &classified,
+                    CoordinatorStdin::new(),
+                    true,
+                    None,
+                    &progress,
+                    &mut None,
+                ),
+            )
+            .await
+            .expect("a route that answers None must skip, not fail")
+        };
+
+        assert!(outcome.promoted_to_push.is_empty(), "skip never promotes to push");
+        assert_eq!(std::fs::read(&fixture.local_path).unwrap(), local_before);
+        assert_eq!(fixture.lockfile.base_hash("labels", "audit-hold").unwrap(), prior_base);
     }
 
     /// Non-interactive (CI / non-TTY) shadow-fallback for a conflict must

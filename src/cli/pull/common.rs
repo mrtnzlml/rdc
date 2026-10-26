@@ -778,7 +778,7 @@ pub(crate) fn classify_combined_pull(
 /// [`crate::cli::resolve::Resolution::EditWithMarkers`] outcome: the
 /// merged bytes contain unresolved markers, so the lockfile must not
 /// advance.
-pub fn apply_pull_action(
+pub async fn apply_pull_action(
     action: PullAction,
     obj: crate::cli::resolve::ObjectRef<'_>,
     local_path: &Path,
@@ -802,7 +802,7 @@ pub fn apply_pull_action(
         base_hash,
         paths,
         HashMode::Canonical,
-    )
+    ).await
 }
 
 /// Same as [`apply_pull_action`], parameterized by [`HashMode`] so a conflict
@@ -814,7 +814,7 @@ pub fn apply_pull_action(
 /// them. See [`HashMode`] for why the two modes must differ for JSONL row
 /// data, and [`decide_pull_action_with`] for the analogous split on the
 /// decision half.
-pub fn apply_pull_action_with(
+pub async fn apply_pull_action_with(
     action: PullAction,
     obj: crate::cli::resolve::ObjectRef<'_>,
     local_path: &Path,
@@ -871,7 +871,7 @@ pub fn apply_pull_action_with(
                     paths,
                     base_hash,
                     mode,
-                )?
+                ).await?
             } else {
                 shadow_file_conflict(local_path, remote_bytes, progress, paths, base_hash, mode)?
             };
@@ -940,7 +940,7 @@ fn shadow_file_conflict(
 /// [`crate::cli::resolve::Resolution::Abort`] this returns a
 /// [`crate::cli::resolve::PullAborted`]-wrapping anyhow error so the
 /// pull runner can downcast and skip lockfile.save().
-fn resolve_conflict_interactive(
+async fn resolve_conflict_interactive(
     obj: crate::cli::resolve::ObjectRef<'_>,
     local_path: &Path,
     remote_bytes: &[u8],
@@ -973,7 +973,7 @@ fn resolve_conflict_interactive(
         local_path,
         remote_bytes,
         env,
-    )?;
+    ).await?;
 
     match resolution {
         Resolution::KeepLocal => {
@@ -1171,8 +1171,8 @@ mod tests {
         assert_eq!(action, PullAction::Conflict);
     }
 
-    #[test]
-    fn apply_write_creates_file() {
+    #[tokio::test]
+    async fn apply_write_creates_file() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.json");
         let p = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
@@ -1187,14 +1187,14 @@ mod tests {
             "test",
             None,
             None,
-        )
+        ).await
         .unwrap();
         assert_eq!(h, "h".repeat(64));
         assert_eq!(std::fs::read(&path).unwrap(), b"hello");
     }
 
-    #[test]
-    fn apply_conflict_non_interactive_writes_remote_shadow() {
+    #[tokio::test]
+    async fn apply_conflict_non_interactive_writes_remote_shadow() {
         let dir = tempfile::TempDir::new().unwrap();
         let paths = Paths::for_env(dir.path(), "test");
         std::fs::create_dir_all(paths.env_root()).unwrap();
@@ -1213,7 +1213,7 @@ mod tests {
             "test",
             None,
             Some(&paths),
-        )
+        ).await
         .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"local");
         assert_eq!(
@@ -1314,8 +1314,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn apply_nochange_does_not_modify_file() {
+    #[tokio::test]
+    async fn apply_nochange_does_not_modify_file() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("x.json");
         std::fs::write(&path, b"original").unwrap();
@@ -1332,7 +1332,7 @@ mod tests {
             "test",
             None,
             None,
-        )
+        ).await
         .unwrap();
         assert_eq!(h, "h".repeat(64));
         // Local file unchanged byte-for-byte.
@@ -1344,8 +1344,8 @@ mod tests {
     /// *prior base hash* so the caller's `record_object` is a no-op. This
     /// ensures the next pull/sync re-classifies the slug as a conflict
     /// instead of silently swallowing it.
-    #[test]
-    fn shadow_file_skip_does_not_advance_lockfile_base() {
+    #[tokio::test]
+    async fn shadow_file_skip_does_not_advance_lockfile_base() {
         let dir = tempfile::TempDir::new().unwrap();
         let paths = Paths::for_env(dir.path(), "test");
         std::fs::create_dir_all(paths.env_root()).unwrap();
@@ -1367,7 +1367,7 @@ mod tests {
             "test",
             Some(&prior_base),
             Some(&paths),
-        )
+        ).await
         .unwrap();
         // Lockfile must NOT advance — recorded hash equals prior base.
         assert_eq!(
@@ -1386,8 +1386,8 @@ mod tests {
     /// if `base_hash` is `None` (paranoia, never seen in practice) we fall
     /// back to the local hash so the lockfile still gets a sensible entry.
     /// Documents the fallback contract.
-    #[test]
-    fn shadow_file_skip_with_no_prior_base_falls_back_to_local_hash() {
+    #[tokio::test]
+    async fn shadow_file_skip_with_no_prior_base_falls_back_to_local_hash() {
         let dir = tempfile::TempDir::new().unwrap();
         let paths = Paths::for_env(dir.path(), "test");
         std::fs::create_dir_all(paths.env_root()).unwrap();
@@ -1407,7 +1407,7 @@ mod tests {
             "test",
             None, // no prior base
             Some(&paths),
-        )
+        ).await
         .unwrap();
         assert_eq!(recorded, content_hash(local, &Lockfile::default()));
     }
@@ -1428,8 +1428,8 @@ mod tests {
     /// with a plain function call. Both call sites were converted together,
     /// so this test covers the underlying defect even though it drives the
     /// non-interactive leg.
-    #[test]
-    fn raw_mode_conflict_resolution_records_raw_hash_not_canonical() {
+    #[tokio::test]
+    async fn raw_mode_conflict_resolution_records_raw_hash_not_canonical() {
         let dir = tempfile::TempDir::new().unwrap();
         let paths = Paths::for_env(dir.path(), "test");
         std::fs::create_dir_all(paths.env_root()).unwrap();
@@ -1466,7 +1466,7 @@ mod tests {
             None, // no prior base → fallback hashes local bytes
             Some(&paths),
             HashMode::Raw,
-        )
+        ).await
         .unwrap();
 
         assert_eq!(
@@ -1483,8 +1483,8 @@ mod tests {
     /// Re-running the same conflict pull twice with shadow-skip must keep
     /// surfacing the conflict — the lockfile entry never advances, so the
     /// classifier sees `(local != base, remote != base)` both times.
-    #[test]
-    fn two_consecutive_pulls_with_shadow_skip_keep_re_prompting() {
+    #[tokio::test]
+    async fn two_consecutive_pulls_with_shadow_skip_keep_re_prompting() {
         let dir = tempfile::TempDir::new().unwrap();
         let paths = Paths::for_env(dir.path(), "test");
         std::fs::create_dir_all(paths.env_root()).unwrap();
@@ -1509,7 +1509,7 @@ mod tests {
             "test",
             Some(&base_hash),
             Some(&paths),
-        )
+        ).await
         .unwrap();
         assert_eq!(recorded1, base_hash, "first pull preserves base");
 

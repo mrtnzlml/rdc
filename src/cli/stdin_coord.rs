@@ -20,7 +20,7 @@
 
 use std::cell::RefCell;
 use std::future::Future;
-use std::io::{self, BufRead, Read};
+use std::io::{self, BufRead};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -113,10 +113,10 @@ impl Prompt {
 /// concurrent watches can't share it — but a route is scoped per-watch, so
 /// task-local is the right granularity, not process-global.
 pub trait PromptRoute: Send + Sync {
-    /// Block until the consumer answers. `None` means end of input; every
+    /// Resolve once the consumer answers. `None` means end of input; every
     /// resolver already degrades safely on that (conflicts skip, gates
     /// read as `N`).
-    fn ask(&self, prompt: &Prompt) -> Option<String>;
+    fn ask<'a>(&'a self, prompt: &'a Prompt) -> crate::rt::BoxFuture<'a, Option<String>>;
 }
 
 tokio::task_local! {
@@ -271,7 +271,7 @@ pub fn maybe_ring_bell() {
 ///
 /// The CLI never installs a route, so its path through steps 2 and 3 is
 /// unchanged.
-pub fn read_line_coordinated() -> io::Result<Option<String>> {
+pub async fn read_line_coordinated() -> io::Result<Option<String>> {
     // Ring the watch attention bell the moment a prompt blocks for input.
     // EVERY coordinated prompt (conflict / remote-delete / destructive-delete
     // / delete-drift / MDH resolvers) funnels through here — directly or via
@@ -287,7 +287,7 @@ pub fn read_line_coordinated() -> io::Result<Option<String>> {
             .ok()
             .flatten()
             .unwrap_or_else(Prompt::unknown);
-        return Ok(route.ask(&prompt));
+        return Ok(route.ask(&prompt).await);
     }
     if let Some(coord) = COORD.get() {
         return Ok(coord.recv_line());
@@ -302,62 +302,54 @@ pub fn read_line_coordinated() -> io::Result<Option<String>> {
     Ok(Some(s))
 }
 
-/// A [`BufRead`] adapter over [`read_line_coordinated`], for the conflict /
-/// remote-delete resolvers (which take a generic `BufRead`). Each delivered
-/// line is re-terminated with `\n` so `BufRead::read_line` sees normal line
-/// semantics. Construction is cheap and acquires nothing — the first read
-/// is what blocks/locks, so a conflict-free cycle that never reads also
-/// never touches stdin.
-pub struct CoordinatorStdin {
-    buf: Vec<u8>,
-    pos: usize,
-    eof: bool,
+/// An async source of answer lines for the resolvers. Any [`BufRead`]
+/// is one (tests pass a `Cursor`); [`CoordinatorStdin`] is the live one.
+/// `Ok(None)` is end of input; the line has no trailing newline.
+pub trait LineSource {
+    fn read_line(&mut self) -> crate::rt::BoxFuture<'_, io::Result<Option<String>>>;
 }
+
+impl<R: BufRead + Send> LineSource for R {
+    fn read_line(&mut self) -> crate::rt::BoxFuture<'_, io::Result<Option<String>>> {
+        Box::pin(async move {
+            let mut s = String::new();
+            if BufRead::read_line(self, &mut s)? == 0 {
+                return Ok(None);
+            }
+            while s.ends_with('\n') || s.ends_with('\r') {
+                s.pop();
+            }
+            Ok(Some(s))
+        })
+    }
+}
+
+/// A borrowed [`LineSource`], for passing `&mut R` to a resolver that takes
+/// its source by value. (`&mut R` is not itself a `LineSource`: the blanket
+/// impl over `BufRead` rules out a second one.)
+pub struct Borrowed<'a, R: ?Sized>(pub &'a mut R);
+
+impl<R: LineSource + ?Sized> LineSource for Borrowed<'_, R> {
+    fn read_line(&mut self) -> crate::rt::BoxFuture<'_, io::Result<Option<String>>> {
+        self.0.read_line()
+    }
+}
+
+/// A [`LineSource`] over [`read_line_coordinated`], for the conflict /
+/// remote-delete resolvers. Construction is cheap and acquires nothing —
+/// the first read is what blocks/locks, so a conflict-free cycle that
+/// never reads also never touches stdin.
+pub struct CoordinatorStdin;
 
 impl CoordinatorStdin {
     pub fn new() -> Self {
-        Self {
-            buf: Vec::new(),
-            pos: 0,
-            eof: false,
-        }
+        Self
     }
 }
 
-impl Read for CoordinatorStdin {
-    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        let n = {
-            let avail = self.fill_buf()?;
-            let n = avail.len().min(out.len());
-            out[..n].copy_from_slice(&avail[..n]);
-            n
-        };
-        self.consume(n);
-        Ok(n)
-    }
-}
-
-impl BufRead for CoordinatorStdin {
-    fn fill_buf(&mut self) -> io::Result<&[u8]> {
-        if self.pos >= self.buf.len() && !self.eof {
-            match read_line_coordinated()? {
-                Some(mut line) => {
-                    line.push('\n');
-                    self.buf = line.into_bytes();
-                    self.pos = 0;
-                }
-                None => {
-                    self.eof = true;
-                    self.buf.clear();
-                    self.pos = 0;
-                }
-            }
-        }
-        Ok(&self.buf[self.pos..])
-    }
-
-    fn consume(&mut self, amt: usize) {
-        self.pos = (self.pos + amt).min(self.buf.len());
+impl LineSource for CoordinatorStdin {
+    fn read_line(&mut self) -> crate::rt::BoxFuture<'_, io::Result<Option<String>>> {
+        Box::pin(read_line_coordinated())
     }
 }
 
@@ -414,31 +406,39 @@ mod tests {
         assert!(!take_bell(true), "unarmed is silent");
     }
 
-    #[test]
-    fn coordinator_stdin_buffers_one_delivered_line_with_newline() {
-        // Drive `CoordinatorStdin` purely through its buffer by pre-seeding
-        // it (the global path is exercised in integration). Verifies the
-        // BufRead line semantics the resolvers rely on.
-        let mut cs = CoordinatorStdin::new();
-        cs.buf = b"k\n".to_vec();
-        let mut line = String::new();
-        let n = cs.read_line(&mut line).unwrap();
-        assert_eq!(n, 2);
-        assert_eq!(line, "k\n");
-        // Buffer exhausted; without a global owner this would read real
-        // stdin, so we don't call read_line again here.
-        assert_eq!(cs.pos, cs.buf.len());
-    }
-
     struct Canned {
         answer: String,
         seen: Mutex<Vec<Prompt>>,
     }
     impl PromptRoute for Canned {
-        fn ask(&self, prompt: &Prompt) -> Option<String> {
+        fn ask<'a>(&'a self, prompt: &'a Prompt) -> crate::rt::BoxFuture<'a, Option<String>> {
             self.seen.lock().unwrap().push(prompt.clone());
-            Some(self.answer.clone())
+            Box::pin(async move { Some(self.answer.clone()) })
         }
+    }
+
+    struct SlowYes;
+    impl PromptRoute for SlowYes {
+        fn ask<'a>(&'a self, _prompt: &'a Prompt) -> crate::rt::BoxFuture<'a, Option<String>> {
+            Box::pin(async {
+                crate::rt::sleep(std::time::Duration::from_millis(1)).await;
+                Some("y".to_string())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn async_route_answers_through_await() {
+        let got = with_route(Arc::new(SlowYes), read_line_coordinated()).await;
+        assert_eq!(got.unwrap(), Some("y".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_buf_read_is_a_line_source() {
+        let mut src = std::io::Cursor::new(b"k\r\nlast".to_vec());
+        assert_eq!(LineSource::read_line(&mut src).await.unwrap(), Some("k".into()));
+        assert_eq!(LineSource::read_line(&mut src).await.unwrap(), Some("last".into()));
+        assert_eq!(LineSource::read_line(&mut src).await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -453,7 +453,7 @@ mod tests {
                 question: "Proceed with deletion? [y/N] ".into(),
                 keys: vec![PromptKey::new('y', "yes"), PromptKey::new('n', "no")],
             });
-            assert_eq!(read_line_coordinated().unwrap(), Some("k".to_string()));
+            assert_eq!(read_line_coordinated().await.unwrap(), Some("k".to_string()));
         })
         .await;
         let seen = route.seen.lock().unwrap();
@@ -474,8 +474,8 @@ mod tests {
                 question: "q".into(),
                 keys: vec![PromptKey::new('s', "skip")],
             });
-            let _ = read_line_coordinated().unwrap();
-            let _ = read_line_coordinated().unwrap();
+            let _ = read_line_coordinated().await.unwrap();
+            let _ = read_line_coordinated().await.unwrap();
         })
         .await;
         let seen = route.seen.lock().unwrap();
@@ -530,7 +530,7 @@ mod tests {
                     for _ in 0..20 {
                         tokio::time::sleep(std::time::Duration::from_micros(50)).await;
                     }
-                    read_line_coordinated().unwrap()
+                    read_line_coordinated().await.unwrap()
                 }))
             })
             .collect();

@@ -19,7 +19,7 @@ use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 /// Answers no prompt: a test that reaches one has gone wrong.
 struct NoPrompts;
 impl PromptRoute for NoPrompts {
-    fn ask(&self, prompt: &Prompt) -> Option<String> {
+    fn ask<'a>(&'a self, prompt: &'a Prompt) -> rdc::rt::BoxFuture<'a, Option<String>> {
         panic!("unexpected prompt: {prompt:?}");
     }
 }

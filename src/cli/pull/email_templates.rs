@@ -81,7 +81,7 @@ pub async fn process(
             continue;
         }
 
-        let result: Result<()> = (|| {
+        let result: Result<()> = (async || {
             let dir = ctx.paths.queue_email_templates_dir(&ws_slug, &q_slug);
             std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
@@ -114,7 +114,7 @@ pub async fn process(
                 ctx.paths.env(),
                 base_hash.as_deref(),
                 Some(ctx.paths),
-            )?;
+            ).await?;
 
             record_object(
                 ctx.lockfile,
@@ -127,7 +127,7 @@ pub async fn process(
             );
             count += 1;
             Ok(())
-        })();
+        })().await;
         result?;
     }
 

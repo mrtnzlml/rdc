@@ -228,7 +228,7 @@ pub async fn push_dataset_data(
             );
         }
         crate::cli::push::mdh::DeleteGate::Prompt => {
-            if !prompt_confirm_row_deletes(progress, collection_name, pending)? {
+            if !prompt_confirm_row_deletes(progress, collection_name, pending).await? {
                 deletes = &[];
                 skipped = true;
                 progress.event(
@@ -311,7 +311,7 @@ pub async fn push_dataset_data(
 /// (`push/mdh.rs:668`): `with_prompt` clears any active status line, and
 /// `read_line_coordinated()` (no arguments, `io::Result<Option<String>>`) is the
 /// single chokepoint that also rings the watch attention bell.
-fn prompt_confirm_row_deletes(
+async fn prompt_confirm_row_deletes(
     progress: &Arc<Log>,
     collection_name: &str,
     pending: usize,
@@ -324,7 +324,7 @@ fn prompt_confirm_row_deletes(
             crate::cli::change_view::count_noun(pending, "row", "rows")
         ),
     );
-    progress.with_prompt(|| -> Result<bool> {
+    progress.with_prompt_async(async {
         use std::io::Write;
         let keys = vec![
             crate::cli::stdin_coord::PromptKey::new(
@@ -342,12 +342,12 @@ fn prompt_confirm_row_deletes(
         let mode = crate::cli::resolve::detect_color_mode();
         write!(q, "{}", crate::cli::change_view::render_menu(&keys, mode)).ok();
         q.flush().ok();
-        let ans = crate::cli::stdin_coord::read_line_coordinated()?
+        let ans = crate::cli::stdin_coord::read_line_coordinated().await?
             .unwrap_or_default()
             .trim()
             .to_ascii_lowercase();
         Ok(ans == "y" || ans == "yes")
-    })
+    }).await
 }
 
 #[cfg(test)]
@@ -809,9 +809,12 @@ mod tests {
         seen: std::sync::Mutex<Vec<crate::cli::stdin_coord::Prompt>>,
     }
     impl crate::cli::stdin_coord::PromptRoute for Recorder {
-        fn ask(&self, prompt: &crate::cli::stdin_coord::Prompt) -> Option<String> {
+        fn ask<'a>(
+            &'a self,
+            prompt: &'a crate::cli::stdin_coord::Prompt,
+        ) -> crate::rt::BoxFuture<'a, Option<String>> {
             self.seen.lock().unwrap().push(prompt.clone());
-            Some(self.answer.clone())
+            Box::pin(async move { Some(self.answer.clone()) })
         }
     }
 
@@ -824,7 +827,7 @@ mod tests {
         let route = std::sync::Arc::new(crate::cli::prompt_pin::CannedRoute::echoing("y", buf.0.clone()));
 
         let proceed = crate::cli::stdin_coord::with_route(route, async {
-            prompt_confirm_row_deletes(&log, "vendors", 12)
+            prompt_confirm_row_deletes(&log, "vendors", 12).await
         })
         .await
         .unwrap();
@@ -851,7 +854,7 @@ mod tests {
         });
 
         let proceed = crate::cli::stdin_coord::with_route(route.clone(), async {
-            prompt_confirm_row_deletes(&log, "gl-codes", 3)
+            prompt_confirm_row_deletes(&log, "gl-codes", 3).await
         })
         .await
         .unwrap();

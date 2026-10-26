@@ -480,14 +480,26 @@ impl Log {
     where
         F: FnOnce() -> T,
     {
+        self.clear_status_for_prompt();
+        f()
+    }
+
+    /// [`Log::with_prompt`] for a prompt that awaits its answer.
+    pub async fn with_prompt_async<T>(
+        &self,
+        f: impl std::future::Future<Output = anyhow::Result<T>>,
+    ) -> anyhow::Result<T> {
+        self.clear_status_for_prompt();
+        f.await
+    }
+
+    fn clear_status_for_prompt(&self) {
         let mut state = self.state.lock().unwrap();
         if state.status_active {
             let _ = state.out.write_all(b"\r\x1b[K");
             state.status_active = false;
         }
         let _ = state.out.flush();
-        drop(state);
-        f()
     }
 
     /// Begin a progress phase. `total == 0` renders as a bare count ("listing 40");
