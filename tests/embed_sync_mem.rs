@@ -3,7 +3,6 @@
 
 use rdc::cli::sync::embed::{sync_logged_in, EmbedSyncOptions};
 use rdc::vfs::{MemStore, Store};
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -35,7 +34,10 @@ async fn embed_sync_no_push_pulls_into_memory() {
             .await;
     }
 
-    let root = PathBuf::from("/rdc-mem/project");
+    // A real tempdir holds the virtual root, so a stray native write would
+    // succeed and be caught below.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("project");
     let store = Arc::new(
         MemStore::from_files(
             root.clone(),
@@ -69,5 +71,6 @@ org_id = 1
     let files = store.files();
     assert!(files.contains_key("envs/main/_index.md"));
     assert!(files.contains_key("envs/main/organization.json"));
-    assert!(!Path::new("/rdc-mem").exists(), "the sync touched the real disk");
+    assert!(!root.exists(), "the sync touched the real disk");
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0, "the sync wrote under the tempdir");
 }

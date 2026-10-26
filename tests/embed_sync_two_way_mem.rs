@@ -9,7 +9,6 @@ use rdc::cli::sync::embed::{
 };
 use rdc::cli::sync::watch::CancelToken;
 use rdc::vfs::{MemStore, Store};
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -95,7 +94,10 @@ async fn embed_sync_logged_in_pushes_a_local_edit_in_memory() {
         .mount(&server)
         .await;
 
-    let root = PathBuf::from("/rdc-mem/project");
+    // A real tempdir holds the virtual root, so a stray native write would
+    // succeed and be caught below.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("project");
     let store = Arc::new(
         MemStore::from_files(
             root.clone(),
@@ -166,7 +168,8 @@ org_id = 1
     .await
     .expect("second sync_logged_in should push the local edit");
 
-    assert!(!Path::new("/rdc-mem").exists(), "the sync touched the real disk");
+    assert!(!root.exists(), "the sync touched the real disk");
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0, "the sync wrote under the tempdir");
 }
 
 #[derive(Clone, Default)]
@@ -242,7 +245,10 @@ async fn watch_in_memory_never_touches_disk() {
         .mount(&server)
         .await;
 
-    let root = PathBuf::from("/rdc-mem/project");
+    // A real tempdir holds the virtual root, so a stray native write would
+    // succeed and be caught below.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("project");
     let store = Arc::new(
         MemStore::from_files(
             root.clone(),
@@ -314,5 +320,6 @@ async fn watch_in_memory_never_touches_disk() {
 
     let (res, ()) = tokio::join!(watch, driver);
     res.expect("watch stops cleanly");
-    assert!(!Path::new("/rdc-mem").exists(), "the watch touched the real disk");
+    assert!(!root.exists(), "the watch touched the real disk");
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0, "the watch wrote under the tempdir");
 }
