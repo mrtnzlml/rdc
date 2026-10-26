@@ -177,6 +177,19 @@ impl Tree {
             || self.dirs.contains(p)
             || self.files.keys().any(|k| k != p && k.starts_with(p))
     }
+
+    /// Record every ancestor of `p` below `root` as an explicit directory, so
+    /// a directory outlives its last file the way it does on disk.
+    fn mark_parents(&mut self, root: &Path, p: &Path) {
+        let mut cur = p.parent();
+        while let Some(d) = cur {
+            if d == root || !d.starts_with(root) {
+                break;
+            }
+            self.dirs.insert(d.to_path_buf());
+            cur = d.parent();
+        }
+    }
 }
 
 /// An in-memory tree under a virtual `root`. Paths are normalized lexically
@@ -197,16 +210,25 @@ impl MemStore {
         Self { root, tree: Mutex::new(Tree::default()), on_change: Mutex::new(None) }
     }
 
-    /// `files` are keyed relative to `root`, with `/` separators.
-    pub fn from_files(root: PathBuf, files: impl IntoIterator<Item = (String, Vec<u8>)>) -> Self {
+    /// `files` are keyed relative to `root`, with `/` separators. A key that
+    /// is absolute or escapes the root is `PermissionDenied`.
+    pub fn from_files(
+        root: PathBuf,
+        files: impl IntoIterator<Item = (String, Vec<u8>)>,
+    ) -> io::Result<Self> {
         let store = Self::new(root);
         {
             let mut tree = store.tree.lock().unwrap();
             for (k, v) in files {
-                tree.files.insert(store.root.join(k), v);
+                if Path::new(&k).has_root() {
+                    return Err(err(io::ErrorKind::PermissionDenied, "key is not relative"));
+                }
+                let p = store.norm(Path::new(&k))?;
+                tree.mark_parents(&store.root, &p);
+                tree.files.insert(p, v);
             }
         }
-        store
+        Ok(store)
     }
 
     /// Every file, keyed relative to the root with `/` separators.
@@ -276,6 +298,7 @@ impl MemStore {
                 return Err(err(io::ErrorKind::AlreadyExists, "file exists"));
             }
             self.parent_must_be_dir(&tree, &p)?;
+            tree.mark_parents(&self.root, &p);
             tree.files.insert(p.clone(), bytes.to_vec());
         }
         self.notify(vec![(self.key(&p), Some(bytes.to_vec()))]);
@@ -299,14 +322,13 @@ impl Store for MemStore {
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
         let p = self.norm(path)?;
         let mut tree = self.tree.lock().unwrap();
-        let mut cur = p.as_path();
-        while cur != self.root {
-            if tree.files.contains_key(cur) {
-                return Err(err(io::ErrorKind::AlreadyExists, "a file is in the way"));
-            }
-            tree.dirs.insert(cur.to_path_buf());
-            cur = cur.parent().unwrap_or(&self.root);
+        // Validate the whole chain before recording any of it.
+        let chain: Vec<&Path> = p.ancestors().take_while(|a| *a != self.root).collect();
+        if chain.iter().any(|a| tree.files.contains_key(*a)) {
+            return Err(err(io::ErrorKind::AlreadyExists, "a file is in the way"));
         }
+        let chain: Vec<PathBuf> = chain.into_iter().map(Path::to_path_buf).collect();
+        tree.dirs.extend(chain);
         Ok(())
     }
     fn remove_file(&self, path: &Path) -> io::Result<()> {
@@ -368,10 +390,22 @@ impl Store for MemStore {
                 }
                 events.push((self.key(&src), None));
                 events.push((self.key(&dst), Some(bytes.clone())));
+                tree.mark_parents(&self.root, &dst);
                 tree.files.insert(dst, bytes);
             } else if tree.is_dir(&self.root, &src) {
+                if src == dst {
+                    return Ok(());
+                }
                 if tree.files.contains_key(&dst) {
                     return Err(err(io::ErrorKind::NotADirectory, "target is a file"));
+                }
+                if dst.starts_with(&src) {
+                    return Err(err(io::ErrorKind::InvalidInput, "cannot move a directory into itself"));
+                }
+                let occupied = tree.files.keys().any(|k| k.starts_with(&dst))
+                    || tree.dirs.iter().any(|d| d != &dst && d.starts_with(&dst));
+                if occupied {
+                    return Err(err(io::ErrorKind::DirectoryNotEmpty, "target directory not empty"));
                 }
                 let moved: Vec<PathBuf> =
                     tree.files.keys().filter(|k| k.starts_with(&src)).cloned().collect();
@@ -380,6 +414,7 @@ impl Store for MemStore {
                     let new = dst.join(k.strip_prefix(&src).unwrap());
                     events.push((self.key(&k), None));
                     events.push((self.key(&new), Some(bytes.clone())));
+                    tree.mark_parents(&self.root, &new);
                     tree.files.insert(new, bytes);
                 }
                 let dirs: Vec<PathBuf> =
@@ -661,9 +696,100 @@ mod tests {
         let m = MemStore::from_files(
             PathBuf::from("/rdc-mem"),
             [("envs/dev/a.json".to_string(), b"1".to_vec())],
-        );
+        )
+        .unwrap();
         assert!(m.metadata(Path::new("/rdc-mem/envs/dev")).unwrap().is_dir());
         assert_eq!(m.files().keys().collect::<Vec<_>>(), ["envs/dev/a.json"]);
+    }
+
+    #[test]
+    fn mem_from_files_rejects_escaping_keys() {
+        for bad in ["../x", "a/../../x", "/etc/x"] {
+            let r = MemStore::from_files(PathBuf::from("/rdc-mem"), [(bad.to_string(), vec![])]);
+            assert_eq!(r.err().unwrap().kind(), ErrorKind::PermissionDenied, "{bad}");
+        }
+        let ok = MemStore::from_files(PathBuf::from("/rdc-mem"), [("./a/../b".to_string(), vec![1])]).unwrap();
+        assert_eq!(ok.files().keys().collect::<Vec<_>>(), ["b"]);
+    }
+
+    #[test]
+    fn dirs_outlive_their_last_file() {
+        both(|s, root| {
+            s.create_dir_all(&root.join("d")).unwrap();
+            s.write(&root.join("d/x"), b"1").unwrap();
+            s.remove_file(&root.join("d/x")).unwrap();
+            s.write(&root.join("d/y"), b"2").unwrap();
+            s.rename(&root.join("d/y"), &root.join("d/z")).unwrap();
+            assert!(s.metadata(&root.join("d")).unwrap().is_dir());
+            s.write(&root.join("d/w"), b"3").unwrap();
+        });
+        let m = MemStore::from_files(PathBuf::from("/rdc-mem"), [("d/x".to_string(), vec![])]).unwrap();
+        m.remove_file(Path::new("/rdc-mem/d/x")).unwrap();
+        m.write(Path::new("/rdc-mem/d/y"), b"").unwrap();
+    }
+
+    #[test]
+    fn create_dir_all_over_a_file_leaves_nothing_behind() {
+        let m = MemStore::new(PathBuf::from("/rdc-mem"));
+        m.write(Path::new("/rdc-mem/f"), b"").unwrap();
+        assert!(m.create_dir_all(Path::new("/rdc-mem/f/a/b")).is_err());
+        assert!(m.metadata(Path::new("/rdc-mem/f/a")).is_err());
+        assert!(m.read_dir(Path::new("/rdc-mem/f")).is_err());
+    }
+
+    #[test]
+    fn write_onto_a_directory_fails() {
+        both(|s, root| {
+            s.create_dir_all(&root.join("d")).unwrap();
+            assert!(s.write(&root.join("d"), b"x").is_err());
+            assert!(s.read(&root.join("d")).is_err());
+        });
+    }
+
+    #[test]
+    fn rename_dir_onto_existing_dir() {
+        both(|s, root| {
+            s.create_dir_all(&root.join("a")).unwrap();
+            s.write(&root.join("a/x"), b"1").unwrap();
+            s.create_dir_all(&root.join("full")).unwrap();
+            s.write(&root.join("full/y"), b"2").unwrap();
+            assert!(s.rename(&root.join("a"), &root.join("full")).is_err());
+            assert_eq!(s.read(&root.join("a/x")).unwrap(), b"1");
+            assert_eq!(s.read(&root.join("full/y")).unwrap(), b"2");
+            assert!(s.rename(&root.join("a"), &root.join("a/sub")).is_err());
+            s.create_dir_all(&root.join("empty")).unwrap();
+            s.rename(&root.join("a"), &root.join("empty")).unwrap();
+            assert_eq!(s.read(&root.join("empty/x")).unwrap(), b"1");
+        });
+    }
+
+    #[test]
+    fn mem_on_change_for_dir_operations() {
+        let m = MemStore::new(PathBuf::from("/rdc-mem"));
+        let log = Arc::new(Mutex::new(Vec::<(String, bool)>::new()));
+        let sink = log.clone();
+        m.set_on_change(Box::new(move |k, v| sink.lock().unwrap().push((k.to_string(), v.is_some()))));
+        m.create_dir_all(Path::new("/rdc-mem/d")).unwrap();
+        m.write(Path::new("/rdc-mem/d/x"), b"1").unwrap();
+        log.lock().unwrap().clear();
+        m.rename(Path::new("/rdc-mem/d"), Path::new("/rdc-mem/e")).unwrap();
+        assert_eq!(
+            *log.lock().unwrap(),
+            [("d/x".to_string(), false), ("e/x".to_string(), true)]
+        );
+        log.lock().unwrap().clear();
+        m.remove_dir_all(Path::new("/rdc-mem/e")).unwrap();
+        assert_eq!(*log.lock().unwrap(), [("e/x".to_string(), false)]);
+    }
+
+    #[test]
+    fn mem_norm_handles_relative_and_trailing_slash() {
+        let m = MemStore::new(PathBuf::from("/rdc-mem"));
+        m.create_dir_all(Path::new("/rdc-mem/d/")).unwrap();
+        m.write(Path::new("d/x"), b"1").unwrap();
+        assert_eq!(m.read(Path::new("/rdc-mem/d/x/")).unwrap(), b"1");
+        assert_eq!(m.read(Path::new("d/../d/x")).unwrap(), b"1");
+        assert_eq!(m.read(Path::new("../x")).unwrap_err().kind(), ErrorKind::PermissionDenied);
     }
 
     #[test]
