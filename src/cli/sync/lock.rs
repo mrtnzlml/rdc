@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 #[cfg(not(target_arch = "wasm32"))]
 use fs4::{FileExt, TryLockError};
 #[cfg(target_arch = "wasm32")]
+// wasm32 stand-in for fs4's `FileExt` / `TryLockError`, not the real crate.
 use crate::vfs::wasm_lock::{FileExt, TryLockError};
 use crate::vfs::LockFile as File;
 use std::path::Path;
@@ -19,7 +20,9 @@ use std::time::Duration;
 // Disambiguate from the inherent `try_lock` / `unlock` methods on
 // `std::fs::File` (stable since Rust 1.89). We call fs4's trait
 // methods explicitly via fully-qualified syntax below so the trait
-// import is genuinely used and the behaviour stays sourced from fs4.
+// import is genuinely used. On native targets the behaviour stays sourced
+// from fs4; on wasm32 it comes from the `vfs::wasm_lock` shim instead,
+// which locks nothing (there is no second process off-disk).
 
 #[derive(Debug)]
 pub struct EnvLock {

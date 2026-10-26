@@ -442,10 +442,16 @@ pub(crate) async fn run_watch_with(
     let watcher = None;
     if let Some(mut triggers) = triggers {
         let tx = events_tx.clone();
+        let cancel = cancel.clone();
         crate::rt::spawn(async move {
-            while triggers.recv().await.is_some() {
-                if tx.send(CycleTrigger::FileEvent).await.is_err() {
-                    break;
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    t = triggers.recv() => {
+                        if t.is_none() || tx.send(CycleTrigger::FileEvent).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         });
@@ -797,6 +803,7 @@ mod wasm_notify {
     }
 }
 #[cfg(target_arch = "wasm32")]
+// wasm32 stand-in for the real `notify` crate (not a dependency there).
 use wasm_notify as notify;
 
 #[cfg(test)]
