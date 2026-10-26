@@ -361,10 +361,10 @@ pub fn count_files(dir: &Path) -> u64 {
     fn walk(p: &Path, acc: &mut u64) {
         if let Ok(entries) = crate::vfs::read_dir(p) {
             for entry in entries {
-                let Ok(t) = entry.file_type() else { continue };
-                if t.is_dir() {
+                let Ok(ft) = entry.file_type() else { continue };
+                if ft.is_dir() {
                     walk(&entry.path(), acc);
-                } else if t.is_file() {
+                } else if ft.is_file() {
                     *acc += 1;
                 }
             }
