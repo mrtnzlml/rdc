@@ -242,6 +242,317 @@ pub(crate) fn watch_logged_config<'a>(
     }
 }
 
+// ------------------------------------------------------------ project and env management
+//
+// The project and env bookkeeping every embedder offers: create a project,
+// validate one, edit, add, remove and rename an env. Each takes the project
+// `root` and does all file access through `vfs`, so the desktop bridge runs
+// it on disk and the browser on an in-memory tree. Folder naming, trashing
+// and the bridge DTOs stay with the embedder.
+
+/// How an env authenticates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthKind {
+    Token,
+    Password,
+}
+
+/// A new env, with its credentials.
+#[derive(Debug, Clone)]
+pub struct EnvInput {
+    pub name: String,
+    pub api_base: String,
+    pub org_id: u64,
+    pub auth_kind: AuthKind,
+    pub token: Option<String>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+/// New settings for an existing env. Credentials are optional: leave all
+/// blank to keep the saved ones.
+#[derive(Debug, Clone)]
+pub struct EditEnvInput {
+    pub api_base: String,
+    pub org_id: u64,
+    pub auth_kind: AuthKind,
+    pub token: Option<String>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+/// One env as an embedder lists it.
+#[derive(Debug, Clone)]
+pub struct EnvInfo {
+    pub name: String,
+    pub api_base: String,
+    pub org_id: u64,
+    pub auth_kind: AuthKind,
+    /// The lockfile's mtime. Always `None` off disk: a non-native store
+    /// keeps no timestamps.
+    pub last_sync_unix: Option<i64>,
+    pub file_count: u64,
+}
+
+/// A project as an embedder lists it.
+#[derive(Debug, Clone)]
+pub struct ProjectInfo {
+    /// Sorted by name; empty only when `error` is set.
+    pub envs: Vec<EnvInfo>,
+    /// Why `rdc.toml` failed to load. The project is still returned so the
+    /// user sees what to fix.
+    pub error: Option<String>,
+}
+
+/// What [`remove_env`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemovedEnv {
+    /// The env and its files are gone; the project remains.
+    Removed,
+    /// It was the project's last env. Nothing was changed: removing it means
+    /// removing the project, which is the embedder's call.
+    LastEnv,
+}
+
+/// `root` as a project, or `None` when it is not one (no directory, no
+/// `rdc.toml`, or no envs in it).
+pub fn inspect_project(root: &Path) -> Option<ProjectInfo> {
+    if !crate::vfs::is_dir(root) {
+        return None;
+    }
+    let toml_path = root.join("rdc.toml");
+    if !crate::vfs::is_file(&toml_path) {
+        return None;
+    }
+    // rdc's own loader, so the listing applies the same env-name check as
+    // every other command and never reads a path a bad key would select.
+    let cfg = match crate::config::ProjectConfig::load(&toml_path) {
+        Ok(cfg) => cfg,
+        Err(e) => return Some(ProjectInfo { envs: Vec::new(), error: Some(format!("{e:#}")) }),
+    };
+    if cfg.envs.is_empty() {
+        return None;
+    }
+    // BTreeMap iterates in sorted key order → envs come out sorted by name.
+    let envs = cfg
+        .envs
+        .into_iter()
+        .map(|(name, cfg)| {
+            let paths = crate::paths::Paths::for_env(root, name.as_str());
+            let secrets = crate::secrets::read_secrets_file(root, &name).unwrap_or_default();
+            let auth_kind =
+                if secrets.username.is_some() { AuthKind::Password } else { AuthKind::Token };
+            EnvInfo {
+                last_sync_unix: crate::vfs::modified_unix(paths.lockfile()),
+                file_count: count_files(&paths.env_root()),
+                name,
+                api_base: cfg.api_base,
+                org_id: cfg.org_id,
+                auth_kind,
+            }
+        })
+        .collect();
+    Some(ProjectInfo { envs, error: None })
+}
+
+/// Regular files below `dir`, recursively. Symlinks are not followed or
+/// counted. 0 when `dir` does not exist.
+pub fn count_files(dir: &Path) -> u64 {
+    fn walk(p: &Path, acc: &mut u64) {
+        if let Ok(entries) = crate::vfs::read_dir(p) {
+            for entry in entries {
+                let Ok(t) = entry.file_type() else { continue };
+                if t.is_dir() {
+                    walk(&entry.path(), acc);
+                } else if t.is_file() {
+                    *acc += 1;
+                }
+            }
+        }
+    }
+    let mut n = 0;
+    walk(dir, &mut n);
+    n
+}
+
+/// Check that `root` is an rdc project (at least one env, any names).
+/// Moves and writes nothing.
+pub fn validate_project(root: &Path) -> Result<ProjectInfo> {
+    let path = root.display();
+    if !crate::vfs::is_dir(root) {
+        anyhow::bail!("Not a folder: {path}");
+    }
+    if !crate::vfs::exists(root.join("rdc.toml")) {
+        anyhow::bail!(
+            "{path} doesn't look like an rdc project (no rdc.toml). Run `rdc init` there first."
+        );
+    }
+    let project = inspect_project(root)
+        .ok_or_else(|| anyhow::anyhow!("{path} has no environments defined in rdc.toml."))?;
+    if let Some(e) = &project.error {
+        anyhow::bail!("{e}");
+    }
+    Ok(project)
+}
+
+/// Create a project at `root` with one env: its credentials, then
+/// `rdc.toml`. The scaffold (`.gitlab-ci.yml`, …) is
+/// `cli::init::write_scaffold_files`'s job, not this one's.
+pub fn add_project(root: &Path, first_env: &EnvInput) -> Result<()> {
+    let env_name = first_env.name.trim().to_string();
+    if !crate::config::valid_env_name(&env_name) {
+        anyhow::bail!(
+            "Environment name may only contain letters, digits, - and _ (and can't be empty)."
+        );
+    }
+    crate::vfs::create_dir_all(root).map_err(|e| anyhow::anyhow!("creating folder: {e}"))?;
+    // Credentials first (validates + writes secrets) so a bad credential
+    // never leaves a config behind.
+    write_credentials(root, &env_name, first_env.auth_kind, first_env.token.as_deref(),
+        first_env.username.as_deref(), first_env.password.as_deref())?;
+    let mut cfg = crate::config::ProjectConfig::default();
+    cfg.envs.insert(env_name, crate::config::EnvConfig {
+        api_base: first_env.api_base.trim_end_matches('/').to_string(),
+        org_id: first_env.org_id,
+    });
+    cfg.save(&root.join("rdc.toml")).map_err(|e| anyhow::anyhow!("{e:#}"))
+}
+
+/// Rewrite `env`'s api_base/org_id through rdc's own config writer, and
+/// replace its credentials only when new ones are supplied.
+pub fn edit_env(root: &Path, env: &str, input: &EditEnvInput) -> Result<()> {
+    let toml_path = root.join("rdc.toml");
+    let mut cfg =
+        crate::config::ProjectConfig::load(&toml_path).map_err(|e| anyhow::anyhow!("{e:#}"))?;
+    let ec = cfg
+        .envs
+        .get_mut(env)
+        .ok_or_else(|| anyhow::anyhow!("This project has no `{env}` environment."))?;
+    ec.api_base = input.api_base.trim_end_matches('/').to_string();
+    ec.org_id = input.org_id;
+    cfg.save(&toml_path).map_err(|e| anyhow::anyhow!("{e:#}"))?;
+
+    let has_new_credentials = match input.auth_kind {
+        AuthKind::Token => input.token.as_deref().is_some_and(|s| !s.is_empty()),
+        AuthKind::Password => {
+            input.username.as_deref().is_some_and(|s| !s.is_empty())
+                || input.password.as_deref().is_some_and(|s| !s.is_empty())
+        }
+    };
+    if has_new_credentials {
+        let _ = crate::vfs::remove_file(crate::paths::Paths::for_env(root, env).secrets_file());
+        write_credentials(root, env, input.auth_kind, input.token.as_deref(),
+            input.username.as_deref(), input.password.as_deref())?;
+    }
+    Ok(())
+}
+
+/// Add an env to an existing project. Errors if it already exists.
+pub fn add_env(root: &Path, input: &EnvInput) -> Result<()> {
+    let name = input.name.trim().to_string();
+    if name.is_empty() {
+        anyhow::bail!("Environment name is required.");
+    }
+    if !crate::config::valid_env_name(&name) {
+        anyhow::bail!(crate::config::INVALID_ENV_NAME_MSG);
+    }
+    let toml_path = root.join("rdc.toml");
+    let mut cfg =
+        crate::config::ProjectConfig::load(&toml_path).map_err(|e| anyhow::anyhow!("{e:#}"))?;
+    if cfg.envs.contains_key(&name) {
+        anyhow::bail!("An environment named \"{name}\" already exists in this project.");
+    }
+    // Validate + write credentials FIRST: if they're invalid, `rdc.toml` must
+    // stay untouched so the caller can fix the input and retry without first
+    // having to remove a half-registered env.
+    write_credentials(root, &name, input.auth_kind, input.token.as_deref(),
+        input.username.as_deref(), input.password.as_deref())?;
+    cfg.envs.insert(name, crate::config::EnvConfig {
+        api_base: input.api_base.trim_end_matches('/').to_string(),
+        org_id: input.org_id,
+    });
+    cfg.save(&toml_path).map_err(|e| anyhow::anyhow!("{e:#}"))
+}
+
+/// Remove an env: its `rdc.toml` section, snapshot, secrets and state. The
+/// last env is left alone and reported as [`RemovedEnv::LastEnv`].
+pub fn remove_env(root: &Path, env: &str) -> Result<RemovedEnv> {
+    // Guard against a malformed `rdc.toml` env key (or any other caller
+    // mistake) before `env` is ever interpolated into a path below — an env
+    // name with `..` or a path separator must never reach a removal.
+    if !crate::config::valid_env_name(env) {
+        anyhow::bail!(crate::config::INVALID_ENV_NAME_MSG);
+    }
+    let toml_path = root.join("rdc.toml");
+    let mut cfg =
+        crate::config::ProjectConfig::load(&toml_path).map_err(|e| anyhow::anyhow!("{e:#}"))?;
+    if !cfg.envs.contains_key(env) {
+        anyhow::bail!("This project has no \"{env}\" environment.");
+    }
+    if cfg.envs.len() == 1 {
+        return Ok(RemovedEnv::LastEnv);
+    }
+    cfg.envs.remove(env);
+    cfg.save(&toml_path).map_err(|e| anyhow::anyhow!("{e:#}"))?;
+    // Best-effort cleanup, all through `Paths` so the layout stays
+    // single-sourced (src/paths.rs).
+    let paths = crate::paths::Paths::for_env(root, env);
+    let _ = crate::vfs::remove_dir_all(paths.env_root());
+    let _ = crate::vfs::remove_file(paths.secrets_file());
+    let _ = crate::vfs::remove_file(crate::secrets::hook_secrets_path(root, env));
+    let _ = crate::vfs::remove_file(paths.lockfile());
+    let _ = crate::vfs::remove_file(paths.env_lock());
+    let _ = crate::vfs::remove_dir_all(paths.base_cache_root());
+    // `Paths` has no bare "conflicts dir" accessor, only the per-file
+    // `conflict_shadow_path`; passing the env root itself as `local_path`
+    // makes it strip to an empty relpath, yielding the env's whole
+    // `.rdc/conflicts/<env>/` shadow directory.
+    let _ = crate::vfs::remove_dir_all(paths.conflict_shadow_path(&paths.env_root()));
+    Ok(RemovedEnv::Removed)
+}
+
+/// Rename an env `old` → `new`, offline. The work is `rdc edit env rename`'s,
+/// so every surface renames the same paths, refuses the same cases and rolls
+/// back the same way. A rename to the same name (an edit dialog submits the
+/// name even when unchanged) is a no-op with an empty report.
+pub fn rename_env(root: &Path, old: &str, new: &str) -> Result<crate::cli::edit::env::RenameReport> {
+    if crate::config::valid_env_name(old) && new.trim() == old {
+        return Ok(crate::cli::edit::env::RenameReport::default());
+    }
+    crate::cli::edit::env::rename_env(root, old, new, false).map_err(|e| anyhow::anyhow!("{e:#}"))
+}
+
+/// Write credentials via rdc's own helpers. Empty strings are rejected.
+fn write_credentials(
+    root: &Path,
+    env: &str,
+    auth: AuthKind,
+    token: Option<&str>,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> Result<()> {
+    match auth {
+        AuthKind::Token => {
+            let t = token
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("Token is required."))?;
+            crate::secrets::write_secrets_file(root, env, t, None)
+                .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+        }
+        AuthKind::Password => {
+            let u = username
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("Username is required."))?;
+            let p = password
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("Password is required."))?;
+            crate::secrets::save_password_credentials(root, env, u, p)
+                .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

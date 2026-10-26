@@ -5,15 +5,11 @@
 
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone)]
-pub(crate) struct EnvInfo {
-    pub name: String,
-    pub api_base: String,
-    pub org_id: u64,
-    pub auth_kind: AuthKindRaw,
-    pub last_sync_unix: Option<i64>,
-    pub file_count: u64,
-}
+/// One env of a project. The core type: the listing logic lives in
+/// `rdc::cli::sync::embed` so every embedder shares it.
+pub(crate) use rdc::cli::sync::embed::EnvInfo;
+/// How an env authenticates (the core type under this module's old name).
+pub(crate) use rdc::cli::sync::embed::AuthKind as AuthKindRaw;
 
 #[derive(Debug, Clone)]
 pub(crate) struct Project {
@@ -32,12 +28,6 @@ impl Project {
     pub fn id(&self) -> &str {
         self.name()
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AuthKindRaw {
-    Token,
-    Password,
 }
 
 pub(crate) fn scan(parent: &Path) -> Vec<Project> {
@@ -59,79 +49,15 @@ pub(crate) fn find(parent: &Path, name: &str) -> Option<Project> {
 }
 
 pub(crate) fn inspect(folder: &Path) -> Option<Project> {
-    if !folder.is_dir() {
-        return None;
-    }
-    let toml_path = folder.join("rdc.toml");
-    if !toml_path.is_file() {
-        return None;
-    }
-    // rdc's own loader, so the listing applies the same env-name check as
-    // every other command and never reads a path a bad key would select.
-    let cfg = match rdc::config::ProjectConfig::load(&toml_path) {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            return Some(Project {
-                folder: folder.to_path_buf(),
-                envs: Vec::new(),
-                error: Some(format!("{e:#}")),
-            });
-        }
-    };
-    if cfg.envs.is_empty() {
-        return None;
-    }
-    // BTreeMap iterates in sorted key order → envs come out sorted by name.
-    let envs: Vec<EnvInfo> = cfg
-        .envs
-        .into_iter()
-        .map(|(name, cfg)| {
-            let paths = rdc::paths::Paths::for_env(folder, name.as_str());
-            let secrets = rdc::secrets::read_secrets_file(folder, &name).unwrap_or_default();
-            let auth_kind = if secrets.username.is_some() {
-                AuthKindRaw::Password
-            } else {
-                AuthKindRaw::Token
-            };
-            let last_sync_unix = std::fs::metadata(paths.lockfile())
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .and_then(|d| i64::try_from(d.as_secs()).ok());
-            let file_count = count_files(&paths.env_root());
-            EnvInfo {
-                name,
-                api_base: cfg.api_base,
-                org_id: cfg.org_id,
-                auth_kind,
-                last_sync_unix,
-                file_count,
-            }
-        })
-        .collect();
-    Some(Project {
+    rdc::cli::sync::embed::inspect_project(folder).map(|info| Project {
         folder: folder.to_path_buf(),
-        envs,
-        error: None,
+        envs: info.envs,
+        error: info.error,
     })
 }
 
 pub(crate) fn count_files(p: &Path) -> u64 {
-    fn walk(p: &Path, acc: &mut u64) {
-        if let Ok(rd) = std::fs::read_dir(p) {
-            for entry in rd.flatten() {
-                let Ok(meta) = entry.metadata() else { continue };
-                if meta.is_dir() {
-                    walk(&entry.path(), acc);
-                } else if meta.is_file() {
-                    *acc += 1;
-                }
-            }
-        }
-    }
-    let mut n = 0;
-    walk(p, &mut n);
-    n
+    rdc::cli::sync::embed::count_files(p)
 }
 
 #[cfg(test)]

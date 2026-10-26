@@ -7,7 +7,7 @@
 
 use crate::discover::{self, AuthKindRaw, Project};
 use anyhow::{anyhow, Result};
-use rdc::config::{valid_env_name, INVALID_ENV_NAME_MSG};
+use rdc::cli::sync::embed;
 use crate::frb_generated::StreamSink;
 use std::collections::HashSet;
 use std::future::Future;
@@ -32,6 +32,15 @@ impl From<AuthKindRaw> for AuthKind {
         match r {
             AuthKindRaw::Token => AuthKind::Token,
             AuthKindRaw::Password => AuthKind::Password,
+        }
+    }
+}
+
+impl From<AuthKind> for AuthKindRaw {
+    fn from(k: AuthKind) -> Self {
+        match k {
+            AuthKind::Token => AuthKindRaw::Token,
+            AuthKind::Password => AuthKindRaw::Password,
         }
     }
 }
@@ -170,23 +179,9 @@ pub fn list_projects(parent: String) -> Vec<ProjectSummary> {
 /// added later via `add_env`.)
 pub fn add_project(parent: String, project_name: String, first_env: AddEnvInput) -> Result<ProjectSummary> {
     let parent = PathBuf::from(parent);
-    let env_name = first_env.name.trim().to_string();
-    if !valid_env_name(&env_name) {
-        return Err(anyhow!("Environment name may only contain letters, digits, - and _ (and can't be empty)."));
-    }
     let used: HashSet<String> = discover::scan(&parent).iter().map(|p| p.name().to_string()).collect();
     let slug = rdc::slug::slugify_unique(&project_name, &used);
-    let folder = parent.join(&slug);
-    std::fs::create_dir_all(&folder).map_err(|e| anyhow!("creating folder: {e}"))?;
-    // credentials first (validates + writes secrets) so a bad credential never leaves a config behind
-    write_credentials(&folder, &env_name, first_env.auth_kind,
-        first_env.token.as_deref(), first_env.username.as_deref(), first_env.password.as_deref())?;
-    let mut cfg = rdc::config::ProjectConfig::default();
-    cfg.envs.insert(env_name, rdc::config::EnvConfig {
-        api_base: first_env.api_base.trim_end_matches('/').to_string(),
-        org_id: first_env.org_id,
-    });
-    cfg.save(&folder.join("rdc.toml")).map_err(|e| anyhow!("{e:#}"))?;
+    embed::add_project(&parent.join(&slug), &first_env.into())?;
     discover::find(&parent, &slug).as_ref().map(ProjectSummary::from)
         .ok_or_else(|| anyhow!("Project not found after add"))
 }
@@ -196,21 +191,9 @@ pub fn add_project(parent: String, project_name: String, first_env: AddEnvInput)
 /// Validate that `path` is an rdc project (≥1 env, any names) and return its
 /// summary. Does not move, copy, or symlink anything.
 pub fn validate_existing_project(path: String) -> Result<ProjectSummary> {
-    let source = PathBuf::from(&path);
-    if !source.is_dir() {
-        return Err(anyhow!("Not a folder: {path}"));
-    }
-    if !source.join("rdc.toml").exists() {
-        return Err(anyhow!(
-            "{path} doesn't look like an rdc project (no rdc.toml). Run `rdc init` there first."
-        ));
-    }
-    let project = discover::inspect(&source)
-        .ok_or_else(|| anyhow!("{path} has no environments defined in rdc.toml."))?;
-    if let Some(e) = &project.error {
-        return Err(anyhow!("{e}"));
-    }
-    Ok(ProjectSummary::from(&project))
+    let folder = PathBuf::from(&path);
+    let info = embed::validate_project(&folder)?;
+    Ok(ProjectSummary::from(&Project { folder, envs: info.envs, error: info.error }))
 }
 
 // ---------------------------------------------------------------- edit
@@ -251,34 +234,14 @@ pub fn edit_project(
         folder = new_folder;
     }
 
-    let toml_path = folder.join("rdc.toml");
-    let mut cfg = rdc::config::ProjectConfig::load(&toml_path).map_err(|e| anyhow!("{e:#}"))?;
-    let ec = cfg
-        .envs
-        .get_mut(&env)
-        .ok_or_else(|| anyhow!("This project has no `{env}` environment."))?;
-    ec.api_base = input.api_base.trim_end_matches('/').to_string();
-    ec.org_id = input.org_id;
-    cfg.save(&toml_path).map_err(|e| anyhow!("{e:#}"))?;
-
-    let has_new_credentials = match input.auth_kind {
-        AuthKind::Token => input.token.as_deref().is_some_and(|s| !s.is_empty()),
-        AuthKind::Password => {
-            input.username.as_deref().is_some_and(|s| !s.is_empty())
-                || input.password.as_deref().is_some_and(|s| !s.is_empty())
-        }
-    };
-    if has_new_credentials {
-        let _ = std::fs::remove_file(rdc::paths::Paths::for_env(&folder, env.as_str()).secrets_file());
-        write_credentials(
-            &folder,
-            &env,
-            input.auth_kind,
-            input.token.as_deref(),
-            input.username.as_deref(),
-            input.password.as_deref(),
-        )?;
-    }
+    embed::edit_env(&folder, &env, &embed::EditEnvInput {
+        api_base: input.api_base,
+        org_id: input.org_id,
+        auth_kind: input.auth_kind.into(),
+        token: input.token,
+        username: input.username,
+        password: input.password,
+    })?;
 
     discover::inspect(&folder)
         .as_ref()
@@ -299,36 +262,24 @@ pub struct AddEnvInput {
     pub password: Option<String>,
 }
 
+impl From<AddEnvInput> for embed::EnvInput {
+    fn from(i: AddEnvInput) -> Self {
+        Self {
+            name: i.name,
+            api_base: i.api_base,
+            org_id: i.org_id,
+            auth_kind: i.auth_kind.into(),
+            token: i.token,
+            username: i.username,
+            password: i.password,
+        }
+    }
+}
+
 /// Add a new environment to an existing project. Errors if the env already exists.
 pub fn add_env(folder: String, input: AddEnvInput) -> Result<ProjectSummary> {
     let folder = PathBuf::from(&folder);
-    let name = input.name.trim().to_string();
-    if name.is_empty() {
-        return Err(anyhow!("Environment name is required."));
-    }
-    if !valid_env_name(&name) {
-        return Err(anyhow!(INVALID_ENV_NAME_MSG));
-    }
-    let toml_path = folder.join("rdc.toml");
-    let mut cfg = rdc::config::ProjectConfig::load(&toml_path).map_err(|e| anyhow!("{e:#}"))?;
-    if cfg.envs.contains_key(&name) {
-        return Err(anyhow!("An environment named \"{name}\" already exists in this project."));
-    }
-    // Validate + write credentials FIRST: if they're invalid, `rdc.toml` must
-    // stay untouched so the caller can fix the input and retry `add_env`
-    // without first having to remove a half-registered env.
-    write_credentials(
-        &folder, &name,
-        input.auth_kind, input.token.as_deref(), input.username.as_deref(), input.password.as_deref(),
-    )?;
-    cfg.envs.insert(
-        name.clone(),
-        rdc::config::EnvConfig {
-            api_base: input.api_base.trim_end_matches('/').to_string(),
-            org_id: input.org_id,
-        },
-    );
-    cfg.save(&toml_path).map_err(|e| anyhow!("{e:#}"))?;
+    embed::add_env(&folder, &input.into())?;
     discover::inspect(&folder)
         .as_ref()
         .map(ProjectSummary::from)
@@ -338,41 +289,13 @@ pub fn add_env(folder: String, input: AddEnvInput) -> Result<ProjectSummary> {
 /// Remove an environment: its `rdc.toml` section, snapshot, secrets, and state.
 /// If it was the last env, the whole project is trashed and `Ok(None)` returned.
 pub fn remove_env(folder: String, env: String) -> Result<Option<ProjectSummary>> {
-    // Defensive: guard against a malformed `rdc.toml` env key (or any other
-    // caller mistake) before `env` is ever interpolated into a path below —
-    // an env name with `..` or a path separator must never reach
-    // `remove_dir_all`/`remove_file`.
-    if !valid_env_name(&env) {
-        return Err(anyhow!(INVALID_ENV_NAME_MSG));
-    }
-    let folder = PathBuf::from(&folder);
-    let toml_path = folder.join("rdc.toml");
-    let mut cfg = rdc::config::ProjectConfig::load(&toml_path).map_err(|e| anyhow!("{e:#}"))?;
-    if !cfg.envs.contains_key(&env) {
-        return Err(anyhow!("This project has no \"{env}\" environment."));
-    }
-    if cfg.envs.len() == 1 {
+    let folder_path = PathBuf::from(&folder);
+    if embed::remove_env(&folder_path, &env)? == embed::RemovedEnv::LastEnv {
         // Last environment — removing it means removing the project.
-        trash_project(folder.display().to_string())?;
+        trash_project(folder)?;
         return Ok(None);
     }
-    cfg.envs.remove(&env);
-    cfg.save(&toml_path).map_err(|e| anyhow!("{e:#}"))?;
-    // Best-effort cleanup of the env's on-disk artifacts, all routed through
-    // rdc's own `Paths` so the layout stays single-sourced (src/paths.rs).
-    let paths = rdc::paths::Paths::for_env(&folder, &env);
-    let _ = std::fs::remove_dir_all(paths.env_root());
-    let _ = std::fs::remove_file(paths.secrets_file());
-    let _ = std::fs::remove_file(rdc::secrets::hook_secrets_path(&folder, &env));
-    let _ = std::fs::remove_file(paths.lockfile());
-    let _ = std::fs::remove_file(paths.env_lock());
-    let _ = std::fs::remove_dir_all(paths.base_cache_root());
-    // `Paths` has no bare "conflicts dir" accessor, only the per-file
-    // `conflict_shadow_path`; passing the env root itself as `local_path`
-    // makes it strip to an empty relpath, yielding the env's whole
-    // `.rdc/conflicts/<env>/` shadow directory without hand-rolling the path.
-    let _ = std::fs::remove_dir_all(paths.conflict_shadow_path(&paths.env_root()));
-    discover::inspect(&folder)
+    discover::inspect(&folder_path)
         .as_ref()
         .map(ProjectSummary::from)
         .map(Some)
@@ -394,18 +317,12 @@ pub struct RenameEnvResult {
 /// the same way.
 pub fn rename_env(folder: String, old: String, new: String) -> Result<RenameEnvResult> {
     let folder = PathBuf::from(&folder);
-    let summary = |f: &Path| {
-        discover::inspect(f)
-            .as_ref()
-            .map(ProjectSummary::from)
-            .ok_or_else(|| anyhow!("Project not found after rename_env"))
-    };
-    // The edit dialog submits the env name even when it is unchanged.
-    if valid_env_name(&old) && new.trim() == old {
-        return Ok(RenameEnvResult { project: summary(&folder)?, follow_ups: vec![], warnings: vec![] });
-    }
-    let report = rdc::cli::edit::env::rename_env(&folder, &old, &new, false).map_err(|e| anyhow!("{e:#}"))?;
-    Ok(RenameEnvResult { project: summary(&folder)?, follow_ups: report.follow_ups, warnings: report.warnings })
+    let report = embed::rename_env(&folder, &old, &new)?;
+    let project = discover::inspect(&folder)
+        .as_ref()
+        .map(ProjectSummary::from)
+        .ok_or_else(|| anyhow!("Project not found after rename_env"))?;
+    Ok(RenameEnvResult { project, follow_ups: report.follow_ups, warnings: report.warnings })
 }
 
 // ---------------------------------------------------------------- sync
@@ -924,37 +841,6 @@ pub fn reveal_in_file_manager(path: String) -> Result<()> {
 }
 
 // ---------------------------------------------------------------- internal
-
-/// Write credentials via rdc's own helpers. Empty strings are rejected the
-/// same way the original bridge did.
-fn write_credentials(
-    folder: &Path,
-    env: &str,
-    auth: AuthKind,
-    token: Option<&str>,
-    username: Option<&str>,
-    password: Option<&str>,
-) -> Result<()> {
-    match auth {
-        AuthKind::Token => {
-            let t = token
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| anyhow!("Token is required."))?;
-            rdc::secrets::write_secrets_file(folder, env, t, None).map_err(|e| anyhow!("{e:#}"))?;
-        }
-        AuthKind::Password => {
-            let u = username
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| anyhow!("Username is required."))?;
-            let p = password
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| anyhow!("Password is required."))?;
-            rdc::secrets::save_password_credentials(folder, env, u, p)
-                .map_err(|e| anyhow!("{e:#}"))?;
-        }
-    }
-    Ok(())
-}
 
 /// Block the calling thread on `fut` using a current-thread runtime (the sync
 /// engine holds `!Send` types across awaits, so it cannot run multi-threaded).

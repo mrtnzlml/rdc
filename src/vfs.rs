@@ -500,6 +500,13 @@ pub async fn scope<F: Future>(store: Arc<dyn Store>, f: F) -> F::Output {
     STORE.scope(store, f).await
 }
 
+/// [`scope`] for synchronous work: `f` runs with `store` as the filesystem
+/// and the scope ends when it returns. For a caller with no async runtime at
+/// hand, such as a binding's project-management call.
+pub fn scope_sync<R>(store: Arc<dyn Store>, f: impl FnOnce() -> R) -> R {
+    STORE.sync_scope(store, f)
+}
+
 /// The store this task is scoped to, if any. `rt::spawn` uses it to carry the
 /// scope into the task it starts.
 pub(crate) fn current() -> Option<Arc<dyn Store>> {
@@ -567,6 +574,19 @@ pub fn is_file(path: impl AsRef<Path>) -> bool {
 }
 pub fn is_native() -> bool {
     with_store(|s| s.is_native())
+}
+
+/// `path`'s mtime in Unix seconds. Only a native store keeps one; any other
+/// answers `None`.
+pub fn modified_unix(path: impl AsRef<Path>) -> Option<i64> {
+    if !is_native() {
+        return None;
+    }
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
 }
 
 /// An open advisory-lock file. Always a real file: only meaningful when
