@@ -83,6 +83,15 @@ fn a_desktop_only_week_still_ships() {
 }
 
 #[test]
+fn wasm_change_ships() {
+    // The browser build is a release asset. Without `wasm/` in the ship gate a
+    // wasm-only week reads as "nothing to release".
+    let (ok, out) = plan("0.7.0", "wasm/src/lib.rs\n", "fix(wasm): handle an empty store\n");
+    assert!(ok);
+    assert_eq!(out, "release=true\nbump=patch\nversion=0.7.1\ntag=v0.7.1\n");
+}
+
+#[test]
 fn the_desktop_lockfile_ships() {
     let (ok, out) = plan("0.7.0", "desktop/rust/Cargo.lock\n", "chore(deps): bump a crate\n");
     assert!(ok);

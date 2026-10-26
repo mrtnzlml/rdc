@@ -122,13 +122,68 @@ jobs:
       version_label: ${{ inputs.tag || github.ref_name }}
       ref: ${{ inputs.tag || github.ref }}
 
+  # The browser build ships in this same release: the wasm bindings crate run
+  # through wasm-bindgen as an ES module (`--target web`). Blocking, unlike
+  # the desktop app -- see `release`'s `if`. The version in the asset name is
+  # rdc's (the tag), never wasm/Cargo.toml's placeholder 0.0.0.
+  build-wasm:
+    name: Build wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install Rust
+        # Pinned by rust-toolchain.toml; the target goes onto that toolchain.
+        shell: bash
+        run: |
+          rustup show
+          rustup target add wasm32-unknown-unknown
+
+      - name: Cache cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            wasm/target
+          key: cargo-wasm-release-${{ hashFiles('wasm/Cargo.lock', 'rust-toolchain.toml') }}
+
+      - name: Install wasm-bindgen-cli
+        # Must equal the wasm-bindgen version in wasm/Cargo.lock (and the
+        # `=` pin in wasm/Cargo.toml), or the glue does not match the module.
+        run: cargo install wasm-bindgen-cli --version 0.2.129 --locked
+
+      - name: Build
+        working-directory: wasm
+        run: cargo build --release --locked --target wasm32-unknown-unknown
+
+      - name: Package
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          version=${TAG#v}
+          mkdir -p dist
+          wasm-bindgen --target web --out-dir dist/pkg \
+            wasm/target/wasm32-unknown-unknown/release/rdc_wasm.wasm
+          tar czf "dist/rdc-$version-wasm32-unknown-unknown.tar.gz" -C dist/pkg .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: rdc-wasm32-unknown-unknown
+          path: dist/*.tar.gz
+          retention-days: 1
+
   release:
     name: Publish release
-    needs: [build, build-desktop]
-    # Publish as long as the CLI matrix succeeded, whatever the desktop jobs
-    # did. Without `always()` a failed desktop build would skip this job and
-    # withhold the CLI tarballs.
-    if: always() && needs.build.result == 'success'
+    needs: [build, build-wasm, build-desktop]
+    # Publish as long as the CLI matrix and the wasm build succeeded, whatever
+    # the desktop jobs did. Without `always()` a failed desktop build would skip
+    # this job and withhold the CLI tarballs.
+    if: always() && needs.build.result == 'success' && needs.build-wasm.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

@@ -67,14 +67,15 @@ fi
 
 # Ship gate. These are the paths that end up inside a release asset: the CLI
 # source, the template embedded in the binary, the desktop app (which ships its
-# own .dmg/.tar.gz/.zip), and the two files that pin the root dependency graph.
+# own .dmg/.tar.gz/.zip), the wasm bindings (the browser tarball), and the two
+# files that pin the root dependency graph.
 # Docs, tests and CI config deliberately do NOT ship, so a docs-only week costs
 # nothing and releases nothing.
 #
 # Paths answer *whether* the artifact changed and cannot be fooled by a
 # mislabelled commit; the commit types below answer only *how big* the change
 # was. The two questions deliberately use different signals.
-if ! grep -qE '^(src|templates|desktop)/|^Cargo\.(toml|lock)$' "$paths"; then
+if ! grep -qE '^(src|templates|desktop|wasm)/|^Cargo\.(toml|lock)$' "$paths"; then
   printf 'release=false\nreason=nothing-shippable\n'
   exit 0
 fi

@@ -100,7 +100,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-wasm-ci-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+            wasm/target
+          key: cargo-wasm-ci-${{ hashFiles('Cargo.lock', 'wasm/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-wasm-ci-
 
       - name: Check
@@ -108,6 +109,26 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --lib --locked --target wasm32-unknown-unknown -- -D warnings
+
+      # The release's `build-wasm` job, so packaging breaks on a PR and not on
+      # release day. Keep the wasm-bindgen-cli version in step with release.yaml.
+      - name: Test bindings
+        working-directory: wasm
+        run: cargo test --locked
+
+      - name: Build bindings
+        working-directory: wasm
+        run: cargo build --release --locked --target wasm32-unknown-unknown
+
+      - name: Install wasm-bindgen-cli
+        run: cargo install wasm-bindgen-cli --version 0.2.129 --locked
+
+      - name: Package
+        run: |
+          wasm-bindgen --target web --out-dir dist/pkg \
+            wasm/target/wasm32-unknown-unknown/release/rdc_wasm.wasm
+          tar czf dist/rdc-wasm.tar.gz -C dist/pkg .
+          tar tzf dist/rdc-wasm.tar.gz
 
   # The Python testkit that `rdc init` scaffolds. Its self-tests run in every
   # project's pipeline, so a break here turns every project's test job red.

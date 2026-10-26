@@ -93,6 +93,13 @@ or strip the attribute yourself:
 xattr -dr com.apple.quarantine /Applications/rdc.app
 ```
 
+## In the browser
+
+Each release also carries `rdc-<version>-wasm32-unknown-unknown.tar.gz`: rdc
+compiled to WebAssembly, as an ES module with TypeScript declarations. It runs
+on an in-memory project tree and is meant for hosts such as a browser
+extension. See [`wasm/README.md`](wasm/README.md) for the API.
+
 ## Quick start
 
 ```sh

@@ -105,11 +105,27 @@ Project-specific instructions for working in this repo.
   ran. The three gate steps are **duplicated on purpose** in `ci.yaml` and
   `weekly-release.yaml`; whatever CI accepts the release gate must also accept,
   so change one and you must change the other. `cargo fmt` is absent from both
-  — this tree is not fmt-clean and never has been. `ci.yaml` also has two
-  **CI-only** jobs, `testkit` (`pytest` in `templates/`) and `desktop`
-  (`flutter test`, the bridge integration test, `cargo test` in
+  — this tree is not fmt-clean and never has been. `ci.yaml` also has three
+  **CI-only** jobs, `wasm` (the root library for `wasm32`, plus `wasm/`'s tests
+  and the full `build-wasm` packaging), `testkit` (`pytest` in `templates/`)
+  and `desktop` (`flutter test`, the bridge integration test, `cargo test` in
   `desktop/rust`, on macOS because the goldens were rendered there). CI may be
   stricter than the release gate, never looser. The live suite runs nowhere.
+- The browser build is a release asset, `rdc-<version>-wasm32-unknown-unknown.tar.gz`,
+  built by `release.yaml`'s `build-wasm` job from `wasm/` (its own cargo
+  workspace, crate `rdc_wasm`, version `0.0.0`, never published). The
+  `<version>` is rdc's, from the tag, exactly as in the CLI matrix; never
+  `wasm/Cargo.toml`'s. The tarball is `wasm-bindgen --target web` output
+  (`rdc_wasm.js`, `rdc_wasm_bg.wasm`, `.d.ts` files), an ES module. The job
+  installs `wasm-bindgen-cli` at exactly the `wasm-bindgen` version in
+  `wasm/Cargo.lock` (`=`-pinned in `wasm/Cargo.toml`); bump all three together,
+  in `release.yaml` and `ci.yaml`. It is **blocking**: `release` needs
+  `build-wasm` to succeed, unlike the desktop jobs. `wasm/` is in the ship gate
+  of `release-plan.sh` because the tarball is built from it; without that a
+  wasm-only week would release nothing. `tests/vfs_boundary.rs` guards the
+  embedding path: production file access must go through `src/vfs.rs`, or the
+  library stops building for wasm. `asset_name` in `src/upgrade.rs` is the CLI's
+  and is unaffected.
 - **`rust-toolchain.toml` is the only place the Rust version is decided**, and
   no workflow may use `dtolnay/rust-toolchain` again: that action picks its
   toolchain from its own `@rev` and **never reads the file**, so it would
