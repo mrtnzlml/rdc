@@ -81,6 +81,7 @@ bridge's DTOs in camelCase. Differences from the desktop app:
   `choices` — or a rejected promise — counts as `null` (skip / no).
   `WatchHandle.stop()` answers a pending prompt with `null`.
 - **One sync or watch per env**: a second call on a busy env is rejected (the
-  on-disk `EnvLock` does not apply in memory).
+  on-disk `EnvLock` does not apply in memory). `renameEnv` and `removeEnv`
+  of a busy env are rejected too.
 - **Watch** has no file watcher. It polls on `pollSecs`, and `trigger()` runs a
   cycle as a local file change would; call it after `writeFile`.

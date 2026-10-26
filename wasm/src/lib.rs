@@ -543,7 +543,11 @@ impl ProjectCore {
 
     /// `None` when `env` was the last one: the project is gone, and so is
     /// every file in the tree (the desktop app trashes the folder).
+    ///
+    /// Refused while `env` is being synced or watched (on disk, `EnvLock`
+    /// refuses it; in memory nothing else would).
     pub fn remove_env(&self, env: &str) -> Result<Option<ProjectSummary>> {
+        let _claim = self.claim(env)?;
         match self.run(|root| embed::remove_env(root, env))? {
             embed::RemovedEnv::Removed => self.summary().map(Some),
             embed::RemovedEnv::LastEnv => {
@@ -555,7 +559,11 @@ impl ProjectCore {
         }
     }
 
+    /// Refused while `old` is being synced or watched: the running cycle
+    /// would write `envs/<old>/` back. A rename to the same name is the
+    /// edit dialog's no-op and needs no claim.
     pub fn rename_env(&self, old: &str, new: &str) -> Result<RenameEnvResult> {
+        let _claim = if new.trim() == old { None } else { Some(self.claim(old)?) };
         let report = self.run(|root| embed::rename_env(root, old, new))?;
         Ok(RenameEnvResult {
             project: self.summary()?,
@@ -820,5 +828,23 @@ mod tests {
         let e = p.summary().unwrap_err();
         let m = p.message(&e);
         assert!(!m.contains(ROOT), "{m}");
+    }
+
+    #[test]
+    fn rename_or_remove_of_a_busy_env_is_refused() {
+        let p = ProjectCore::create("acme", &dev()).unwrap();
+        let mut prod = dev();
+        prod.name = "prod".into();
+        p.add_env(&prod).unwrap();
+        p.write_file("envs/dev/queues/x.json", b"{}").unwrap();
+        let before = p.files();
+        let claim = p.claim("dev").unwrap();
+        assert!(p.rename_env("dev", "test").is_err());
+        assert!(p.remove_env("dev").is_err());
+        assert_eq!(p.files(), before, "a refused call leaves the tree as it was");
+        drop(claim);
+        // The calls free the env again, so a later sync can claim it.
+        p.rename_env("dev", "test").unwrap();
+        assert!(p.claim("test").is_ok() && p.claim("dev").is_ok());
     }
 }
