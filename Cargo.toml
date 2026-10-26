@@ -22,23 +22,38 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = { version = "4", features = ["unstable-dynamic"] }
 deunicode = "1"
-flate2 = "1"
-fs4 = "1"
 getrandom = "0.4"
 futures = { version = "0.3", default-features = false, features = ["alloc"] }
 indexmap = { version = "2", features = ["serde"] }
-inquire = { version = "0.9", default-features = false, features = ["crossterm"] }
-notify = "8"
 reqwest = { version = "0.13", features = ["json", "rustls"], default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = { version = "0.11", default-features = false }
 similar = { version = "3", features = ["inline"] }
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "parking_lot"] }
+toml = "1"
+web-time = "1.1.0"
+
+# Native only: the terminal, the filesystem watcher, file locks, the
+# self-upgrade archive and the multi-threaded runtime. The browser build
+# (wasm32) never reaches them; see src/rt.rs and src/vfs.rs.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+flate2 = "1"
+fs4 = "1"
+inquire = { version = "0.9", default-features = false, features = ["crossterm"] }
+notify = "8"
 tar = { version = "0.4", default-features = false }
 tempfile = "3"
-thiserror = "2"
-tokio = { version = "1", features = ["io-std", "io-util", "macros", "parking_lot", "rt-multi-thread", "signal"] }
-toml = "1"
+tokio = { version = "1", features = ["io-std", "rt-multi-thread", "signal"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+chrono = { version = "0.4", default-features = false, features = ["wasmbind"] }
+getrandom = { version = "0.4", features = ["wasm_js"] }
+# Natively `rt-multi-thread` and hyper turn on `rt` and `sync`; name them here.
+tokio = { version = "1", features = ["rt", "sync"] }
+gloo-timers = { version = "0.3.0", features = ["futures"] }
+wasm-bindgen-futures = "0.4.79"
 
 [dev-dependencies]
 assert_cmd = "2"

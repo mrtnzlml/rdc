@@ -583,6 +583,28 @@ pub fn open_lock_file(path: impl AsRef<Path>) -> io::Result<LockFile> {
         .open(path)
 }
 
+/// Stands in for `fs4`'s lock calls on wasm32, where `fs4` is not built: std's
+/// own report `Unsupported`, and are never reached, because a browser project
+/// is never [`is_native`].
+#[cfg(target_arch = "wasm32")]
+pub mod wasm_lock {
+    pub use std::fs::TryLockError;
+
+    pub trait FileExt {
+        fn try_lock(&self) -> Result<(), TryLockError>;
+        fn unlock(&self) -> std::io::Result<()>;
+    }
+
+    impl FileExt for super::LockFile {
+        fn try_lock(&self) -> Result<(), TryLockError> {
+            super::LockFile::try_lock(self)
+        }
+        fn unlock(&self) -> std::io::Result<()> {
+            super::LockFile::unlock(self)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

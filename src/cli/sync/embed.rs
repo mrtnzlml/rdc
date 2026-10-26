@@ -179,7 +179,7 @@ async fn watch_inner(
     let root = cwd.to_path_buf();
     let base = api_base.to_string();
     let refresher: crate::cli::sync::watch::TokenRefresher = Arc::new(
-        move |env: String| -> futures::future::BoxFuture<'static, Result<Option<String>>> {
+        move |env: String| -> crate::rt::BoxFuture<'static, Result<Option<String>>> {
             let root = root.clone();
             let base = base.clone();
             Box::pin(async move {

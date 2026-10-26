@@ -15,7 +15,7 @@ name: CI
 # must also accept, or Monday gets surprised again. If you change a gate here,
 # change it there -- and vice versa.
 #
-# The `testkit` and `desktop` jobs are CI-only on purpose. CI may be stricter
+# The `wasm`, `testkit` and `desktop` jobs are CI-only on purpose. CI may be stricter
 # than the release gate; it must never be looser.
 #
 # The live suite (tests/live.rs) is not run here: it needs sandbox credentials
@@ -78,6 +78,36 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps --document-private-items --locked
+
+  # The library must keep building for the browser (wasm32). Native-only code
+  # is cfg-gated; a new native-only call on the embedding path breaks this.
+  wasm:
+    name: Wasm build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        # The target goes onto the pinned toolchain, not a separate one.
+        run: |
+          rustup show
+          rustup target add wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-wasm-ci-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-wasm-ci-
+
+      - name: Check
+        run: cargo check --lib --locked --target wasm32-unknown-unknown
+
+      - name: Clippy
+        run: cargo clippy --lib --locked --target wasm32-unknown-unknown -- -D warnings
 
   # The Python testkit that `rdc init` scaffolds. Its self-tests run in every
   # project's pipeline, so a break here turns every project's test job red.

@@ -300,7 +300,7 @@ pub(crate) fn write_login_token(project_root: &Path, env: &str, token: &str) -> 
 }
 
 pub(crate) fn now_unix_secs() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use web_time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())

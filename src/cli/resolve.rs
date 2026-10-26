@@ -785,8 +785,8 @@ async fn run_editor_loop<R: LineSource, W: Write>(
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("tmp");
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let stamp = web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let path = std::env::temp_dir().join(format!("rdc-conflict-{stamp}.{ext}"));
@@ -1185,8 +1185,8 @@ async fn run_single_hunk_editor<R: LineSource, W: Write>(
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("tmp");
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let stamp = web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let path = std::env::temp_dir().join(format!("rdc-hunk-{stamp}.{ext}"));

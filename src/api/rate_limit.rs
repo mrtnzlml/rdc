@@ -40,7 +40,7 @@
 
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tokio::time::Instant;
+use crate::rt::Instant;
 
 /// Bounded token bucket. Refills continuously at `refill_per_sec`,
 /// capped at `capacity`. `acquire()` consumes one token, sleeping
@@ -143,7 +143,7 @@ impl RateLimiter {
             };
             // Sleep OUTSIDE the lock so other tasks aren't blocked from
             // computing their own wait or fast-pathing a fresh token.
-            tokio::time::sleep(wait).await;
+            crate::rt::sleep(wait).await;
         }
     }
 }

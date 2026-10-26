@@ -154,7 +154,7 @@ mod action_tests {
 /// Local-time HH:MM:SS for the event-log prefix. Mirrors the helper that
 /// previously lived in `cli::sync::watch`.
 pub(crate) fn now_hhmmss() -> String {
-    format_hhmmss_with_offset(std::time::SystemTime::now(), local_offset_secs())
+    format_hhmmss_with_offset(web_time::SystemTime::now(), local_offset_secs())
 }
 
 /// Seconds east of UTC for the system's current local time (e.g. CEST = +7200,
@@ -176,9 +176,9 @@ fn format_hhmmss(t: std::time::SystemTime) -> String {
 
 /// Format `t` as `HH:MM:SS` after shifting by `offset_east_secs` (seconds
 /// east of UTC). Wraps within the day; `offset_east_secs == 0` yields UTC.
-fn format_hhmmss_with_offset(t: std::time::SystemTime, offset_east_secs: i64) -> String {
+fn format_hhmmss_with_offset(t: web_time::SystemTime, offset_east_secs: i64) -> String {
     let secs = t
-        .duration_since(std::time::UNIX_EPOCH)
+        .duration_since(web_time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
     // `rem_euclid` keeps the result in 0..86400 even when the offset pushes

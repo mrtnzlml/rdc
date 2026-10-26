@@ -76,8 +76,8 @@ mod trace {
 
     pub fn record(limiter_wait_ms: f64, duration_ms: f64, status: &str, desc: &str) {
         let Some(sink) = sink() else { return };
-        let epoch_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let epoch_ms = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64() * 1000.0)
             .unwrap_or(0.0);
         // A poisoned lock or a failed write must never take down a sync —
@@ -161,8 +161,8 @@ mod body_trace {
 
     pub fn record(status: &str, desc: &str, body: &[u8]) {
         let Some(sink) = sink() else { return };
-        let epoch_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let epoch_ms = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64() * 1000.0)
             .unwrap_or(0.0);
         // Diagnostics, not state: a failed write never fails the request.
@@ -210,13 +210,13 @@ pub async fn send_with_retry(
                 // `build().send()` call below. No user-facing retry chatter.
                 let _ = (reason, &progress);
                 let wait = retry_after(&resp).unwrap_or_else(|| backoff(attempt));
-                tokio::time::sleep(wait).await;
+                crate::rt::sleep(wait).await;
             }
             // A connect-class failure never reached the server, so it is
             // retriable for any method — including POST. Everything else is
             // returned as-is.
             Err(e) if is_retriable_transport(&e) => {
-                tokio::time::sleep(backoff(attempt)).await;
+                crate::rt::sleep(backoff(attempt)).await;
             }
             Err(e) => return Err(e),
         }
@@ -233,12 +233,12 @@ async fn send_once(
     limiter: Option<&Arc<RateLimiter>>,
     attempt: u32,
 ) -> Result<Response> {
-    let gate = std::time::Instant::now();
+    let gate = web_time::Instant::now();
     if let Some(l) = limiter {
         l.acquire().await;
     }
     let limiter_wait_ms = gate.elapsed().as_secs_f64() * 1000.0;
-    let sent = std::time::Instant::now();
+    let sent = web_time::Instant::now();
     let out = if body_trace::enabled() {
         // Build the request first so its body can be read; sending it through
         // the builder's own client keeps every other behaviour identical.
@@ -319,10 +319,18 @@ fn retry_after(resp: &Response) -> Option<Duration> {
 /// bucket makes it the most resolver-intensive thing rdc talks to — and it is
 /// the unattended CI deploy (`rdc sync --allow-deletes --yes`) that pays for
 /// it, since nobody is there to re-run.
+#[cfg(not(target_arch = "wasm32"))]
 fn is_retriable_transport(err: &anyhow::Error) -> bool {
     err.chain()
         .filter_map(|c| c.downcast_ref::<reqwest::Error>())
         .any(|e| e.is_connect())
+}
+
+/// The browser's `fetch` does not say whether a failure happened before the
+/// request left, so no transport failure is known to be safe to re-send.
+#[cfg(target_arch = "wasm32")]
+fn is_retriable_transport(_err: &anyhow::Error) -> bool {
+    false
 }
 
 fn backoff(attempt: u32) -> Duration {

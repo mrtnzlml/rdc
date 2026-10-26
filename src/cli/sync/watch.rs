@@ -3,7 +3,7 @@
 //! Spec: docs/superpowers/specs/2026-05-14-watch-mode-design.md
 
 use anyhow::Result;
-use futures::future::BoxFuture;
+use crate::rt::BoxFuture;
 use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::Arc;
@@ -164,6 +164,7 @@ pub(crate) type StdinHook =
 /// `CancelToken::cancel` from its own stop button) passes `None`.
 pub(crate) type PostReconcileHook = Box<dyn FnOnce(CancelToken) + Send>;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn run_watch(
     env: &str,
     interactive: bool,
@@ -410,7 +411,7 @@ pub(crate) async fn run_watch_with(
                             paint_polling_status(&renderer_ticker, interval_secs, elapsed);
                         }
                     }
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                    _ = crate::rt::sleep(Duration::from_secs(1)) => {
                         elapsed += 1;
                         if elapsed >= interval_secs {
                             elapsed = 0;
@@ -431,11 +432,14 @@ pub(crate) async fn run_watch_with(
     let env_root = paths.env_root();
     // Natively, `notify` watches the tree. A non-native store has no OS
     // events: the host reports changes through `triggers` instead.
+    #[cfg(not(target_arch = "wasm32"))]
     let watcher = if crate::vfs::is_native() {
         Some(spawn_file_watcher(cfg.env.to_string(), env_root.clone(), events_tx.clone())?)
     } else {
         None
     };
+    #[cfg(target_arch = "wasm32")]
+    let watcher = None;
     if let Some(mut triggers) = triggers {
         let tx = events_tx.clone();
         crate::rt::spawn(async move {
@@ -506,7 +510,7 @@ pub(crate) async fn event_loop(
                 let Some(trigger) = evt else { break };
                 // Debounce only file events. Poll events run immediately.
                 if matches!(trigger, CycleTrigger::FileEvent) {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    crate::rt::sleep(std::time::Duration::from_millis(500)).await;
                 }
                 // Coalesce any pending events that arrived during the debounce window
                 // (or during a previous cycle execution).
@@ -548,7 +552,7 @@ pub(crate) async fn event_loop(
                     poll_secs: cfg.poll.map(|d| d.as_secs().max(1)),
                 };
 
-                let _cycle_started = std::time::Instant::now();
+                let _cycle_started = web_time::Instant::now();
                 let _lock = crate::cli::sync::lock::EnvLock::acquire(
                     &paths.env_lock(),
                     std::time::Duration::from_secs(30),
@@ -699,6 +703,7 @@ fn is_fixable_by_editing(e: &anyhow::Error) -> bool {
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn spawn_file_watcher(
     env: String,
     env_root: std::path::PathBuf,
@@ -727,6 +732,7 @@ fn spawn_file_watcher(
     Ok(watcher)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn path_should_be_ignored(path: &std::path::Path, env: &str) -> bool {
     // Ignore .rdc/ subtree — daemon-managed.
     if path.components().any(|c| c.as_os_str() == ".rdc") {
@@ -745,6 +751,31 @@ fn path_should_be_ignored(path: &std::path::Path, env: &str) -> bool {
     // Ignore shadow artifacts.
     crate::paths::is_shadow_artifact(name, env)
 }
+
+/// Stands in for the `notify` crate on wasm32, where a project is never on
+/// the native store and so never has an OS watcher. The watcher type is
+/// uninhabited: `event_loop`'s `Option` of it is always `None`.
+#[cfg(target_arch = "wasm32")]
+mod wasm_notify {
+    pub enum RecommendedWatcher {}
+    pub enum RecursiveMode {
+        Recursive,
+    }
+    pub trait Watcher {
+        fn watch(&mut self, path: &std::path::Path, mode: RecursiveMode) -> Result<(), ()>;
+        fn unwatch(&mut self, path: &std::path::Path) -> Result<(), ()>;
+    }
+    impl Watcher for RecommendedWatcher {
+        fn watch(&mut self, _: &std::path::Path, _: RecursiveMode) -> Result<(), ()> {
+            match *self {}
+        }
+        fn unwatch(&mut self, _: &std::path::Path) -> Result<(), ()> {
+            match *self {}
+        }
+    }
+}
+#[cfg(target_arch = "wasm32")]
+use wasm_notify as notify;
 
 #[cfg(test)]
 mod tests {

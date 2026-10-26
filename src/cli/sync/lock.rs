@@ -8,7 +8,10 @@
 //! lock file is left behind; subsequent runs reuse it.
 
 use anyhow::{Context, Result};
+#[cfg(not(target_arch = "wasm32"))]
 use fs4::{FileExt, TryLockError};
+#[cfg(target_arch = "wasm32")]
+use crate::vfs::wasm_lock::{FileExt, TryLockError};
 use crate::vfs::LockFile as File;
 use std::path::Path;
 use std::time::Duration;
@@ -34,12 +37,12 @@ impl EnvLock {
             return Ok(EnvLock { file: None });
         }
         let file = open_lock_file(lock_path)?;
-        let deadline = std::time::Instant::now() + timeout;
+        let deadline = web_time::Instant::now() + timeout;
         loop {
             match <File as FileExt>::try_lock(&file) {
                 Ok(()) => return Ok(EnvLock { file: Some(file) }),
                 Err(TryLockError::WouldBlock) => {
-                    if std::time::Instant::now() >= deadline {
+                    if web_time::Instant::now() >= deadline {
                         // Name the holder and the remedy. The bare timeout
                         // reads as an rdc fault, when it is almost always a
                         // second rdc — often a `--watch` left running — partway

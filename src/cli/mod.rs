@@ -488,6 +488,7 @@ pub enum Command {
     },
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // Once-daily passive nudge. Skipped for the upgrade command since
     // it computes the same answer fresh. Refresh runs first (tight 2s
@@ -613,6 +614,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 ///
 /// Non-TTY contexts (CI, piped) skip the prompt and surface the
 /// original error annotated with a hint to run `rdc auth <env>`.
+#[cfg(not(target_arch = "wasm32"))]
 async fn with_401_retry<T, F, Fut>(env: &str, op: F) -> anyhow::Result<T>
 where
     F: Fn() -> Fut,
@@ -631,6 +633,7 @@ where
 /// Parse a human-friendly duration string (`30s`, `2m`, `5m`, `1h`) into
 /// a [`std::time::Duration`]. Plain integers are treated as seconds.
 /// Used to validate `--poll-interval` after clap accepts it as a string.
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_duration(s: &str) -> anyhow::Result<std::time::Duration> {
     let s = s.trim();
     let (num, unit) = s.split_at(
@@ -654,12 +657,15 @@ fn parse_duration(s: &str) -> anyhow::Result<std::time::Duration> {
     Ok(d)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub mod auth;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod auth_browser;
 pub mod change_view;
 pub mod deploy;
 pub mod gitlab_ci;
 pub mod regions;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod env_picker;
 pub mod index;
 pub mod init;

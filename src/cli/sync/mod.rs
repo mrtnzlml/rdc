@@ -249,7 +249,7 @@ pub(crate) async fn run_cycle(
     let renderer_was_supplied = renderer.is_some();
     let progress: Arc<Log> =
         renderer.unwrap_or_else(|| Log::new(crate::cli::resolve::detect_color_mode()));
-    let started = std::time::Instant::now();
+    let started = web_time::Instant::now();
 
     // The two per-env files nobody finds on their own: `envs/<env>/overlay.toml`
     // and `secrets/<env>.hook-secrets.json`. Both are created-if-absent and

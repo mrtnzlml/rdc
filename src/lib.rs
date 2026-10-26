@@ -18,6 +18,7 @@ pub mod secrets;
 pub mod slug;
 pub mod snapshot;
 pub mod state;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod upgrade;
 pub mod vfs;
 

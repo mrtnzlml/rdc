@@ -181,6 +181,7 @@ static COORD: OnceLock<StdinCoordinator> = OnceLock::new();
 /// Activate coordination and return the global coordinator. Called once by
 /// the watch reader on startup, before any cycle can run a prompt.
 /// Idempotent.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn activate() -> &'static StdinCoordinator {
     COORD.get_or_init(StdinCoordinator::new)
 }
@@ -188,11 +189,13 @@ pub fn activate() -> &'static StdinCoordinator {
 /// Whether the watch reader owns stdin. A prompt that would read the
 /// terminal itself (inquire) must go through [`read_line_coordinated`]
 /// instead while this is true, or it races the reader for the input.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn is_active() -> bool {
     COORD.get().is_some()
 }
 
 impl StdinCoordinator {
+    #[cfg(not(target_arch = "wasm32"))]
     fn new() -> Self {
         Self {
             waiting: Mutex::new(None),
@@ -202,6 +205,7 @@ impl StdinCoordinator {
     /// Hand `line` to a prompt that is currently waiting for input.
     /// Returns `Err(line)` (the line back) if no prompt is waiting, so the
     /// owner can route it elsewhere (Enter-trigger / drop).
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn try_deliver(&self, line: String) -> Result<(), String> {
         let guard = self.waiting.lock().unwrap();
         match guard.as_ref() {

@@ -1,15 +1,22 @@
-use crate::config::{EnvConfig, ProjectConfig};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::config::EnvConfig;
+use crate::config::ProjectConfig;
 use crate::paths::Paths;
 use crate::snapshot::writer::write_atomic;
 use anyhow::{anyhow, Context, Result};
+#[cfg(not(target_arch = "wasm32"))]
 use inquire::error::InquireError;
+#[cfg(not(target_arch = "wasm32"))]
 use inquire::validator::Validation;
+#[cfg(not(target_arch = "wasm32"))]
 use inquire::{Confirm, CustomType, Text};
+#[cfg(not(target_arch = "wasm32"))]
 use std::io::IsTerminal;
 use std::path::Path;
 
 /// Whether `rdc init` is bootstrapping a new project or extending an
 /// existing one by adding new env(s).
+#[cfg(not(target_arch = "wasm32"))]
 enum InitMode {
     New,
     Extend,
@@ -28,6 +35,7 @@ pub(crate) enum Scaffolded {
 }
 
 impl Scaffolded {
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn label(self) -> &'static str {
         match self {
             Scaffolded::Created => "created",
@@ -38,6 +46,7 @@ impl Scaffolded {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn run(env_specs: Vec<String>, force: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let cfg_path = cwd.join("rdc.toml");
@@ -289,6 +298,7 @@ pub async fn run(env_specs: Vec<String>, force: bool) -> Result<()> {
 /// "don't auth right now; fall back to the next-steps message and let
 /// `rdc auth` handle it later". Hard errors (real I/O failures from the
 /// prompt library) propagate.
+#[cfg(not(target_arch = "wasm32"))]
 fn prompt_token_for_env(env: &str) -> Result<Option<String>> {
     use inquire::error::InquireError;
     use inquire::{Password, PasswordDisplayMode};
@@ -316,6 +326,7 @@ fn prompt_token_for_env(env: &str) -> Result<Option<String>> {
 /// Resolve the list of env specs to use. When `env_specs` is empty,
 /// prompts interactively (TTY-only). Invalid input re-prompts inline
 /// rather than aborting; Esc or Ctrl+C cancels.
+#[cfg(not(target_arch = "wasm32"))]
 fn resolve_env_specs(
     env_specs: Vec<String>,
     cfg: &ProjectConfig,
@@ -409,11 +420,13 @@ fn resolve_env_specs(
     Ok(specs)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 enum PromptOutcome {
     Cancelled,
     Failed(anyhow::Error),
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn finish_or_cancel(specs: Vec<String>) -> Result<Vec<String>> {
     if specs.is_empty() {
         Err(anyhow!("init cancelled; no environments defined"))
@@ -422,6 +435,7 @@ fn finish_or_cancel(specs: Vec<String>) -> Result<Vec<String>> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn map_prompt_err(e: InquireError) -> PromptOutcome {
     match e {
         InquireError::OperationCanceled | InquireError::OperationInterrupted => {
@@ -431,6 +445,7 @@ fn map_prompt_err(e: InquireError) -> PromptOutcome {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn prompt_env_name(taken: &[String]) -> std::result::Result<String, PromptOutcome> {
     let taken_owned: Vec<String> = taken.to_vec();
     let value = Text::new("Env name")
@@ -457,6 +472,7 @@ fn prompt_env_name(taken: &[String]) -> std::result::Result<String, PromptOutcom
     Ok(value.trim().to_string())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn prompt_api_base() -> std::result::Result<String, PromptOutcome> {
     let value = Text::new("API base URL")
         .with_help_message("e.g. https://api.elis.rossum.ai/v1")
@@ -477,6 +493,7 @@ fn prompt_api_base() -> std::result::Result<String, PromptOutcome> {
     Ok(value.trim().to_string())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn prompt_org_id() -> std::result::Result<u64, PromptOutcome> {
     CustomType::<u64>::new("Organization ID")
         .with_help_message("Rossum organization ID (positive integer)")
@@ -485,6 +502,7 @@ fn prompt_org_id() -> std::result::Result<u64, PromptOutcome> {
         .map_err(map_prompt_err)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_env_spec(spec: &str) -> Result<(String, EnvConfig)> {
     let (env_name, rest) = spec
         .split_once('=')

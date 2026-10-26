@@ -118,8 +118,11 @@ pub(crate) fn is_loopback_base(base_url: &str) -> bool {
 /// Nagle adds compounds noticeably across hundreds of round-trips
 /// during a full sync.
 pub(crate) fn build_http_client() -> Result<Client> {
-    Client::builder()
-        .tcp_nodelay(true)
+    let builder = Client::builder();
+    // The browser's `fetch` owns the socket.
+    #[cfg(not(target_arch = "wasm32"))]
+    let builder = builder.tcp_nodelay(true);
+    builder
         .build()
         .map_err(|e| anyhow::anyhow!("building reqwest client: {e}"))
 }

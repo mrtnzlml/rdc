@@ -28,7 +28,8 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 /// Poll cadence for index-drop wait loops.
 const DROP_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -462,7 +463,7 @@ pub(crate) async fn verify_creates_materialized(
             }
             return Ok(missing_regular.len() + missing_search.len());
         }
-        tokio::time::sleep(scaled(client, DROP_POLL_INTERVAL)).await;
+        crate::rt::sleep(scaled(client, DROP_POLL_INTERVAL)).await;
     }
 }
 
@@ -611,7 +612,7 @@ async fn wait_for_regular_drop(
                 collection
             ));
         }
-        tokio::time::sleep(scaled(client, DROP_POLL_INTERVAL)).await;
+        crate::rt::sleep(scaled(client, DROP_POLL_INTERVAL)).await;
     }
 }
 
@@ -647,7 +648,7 @@ async fn wait_for_search_drop(
                 collection
             ));
         }
-        tokio::time::sleep(scaled(client, DROP_POLL_INTERVAL)).await;
+        crate::rt::sleep(scaled(client, DROP_POLL_INTERVAL)).await;
     }
 }
 
