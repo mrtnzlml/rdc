@@ -77,7 +77,7 @@ pub fn rename_env(root: &Path, old: &str, new: &str, dry_run: bool) -> Result<Re
     }
     let pairs = move_pairs(root, &cfg, old, new);
     for (_, to) in &pairs {
-        if to.symlink_metadata().is_ok() {
+        if crate::vfs::symlink_metadata(to).is_ok() {
             bail!(
                 "{} already exists. Move or delete it, then retry the rename.",
                 rel(root, to).display()
@@ -85,7 +85,7 @@ pub fn rename_env(root: &Path, old: &str, new: &str, dry_run: bool) -> Result<Re
         }
     }
     let mut moves: Vec<(PathBuf, PathBuf)> =
-        pairs.into_iter().filter(|(from, _)| from.symlink_metadata().is_ok()).collect();
+        pairs.into_iter().filter(|(from, _)| crate::vfs::symlink_metadata(from).is_ok()).collect();
     // These run after `envs/<old>/` itself has moved, which is the first move.
     moves.extend(shadow_moves(root, old, new)?);
 

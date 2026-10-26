@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 /// active in the browser.
 const ALLOWED: &[&str] = &["src/vfs.rs", "src/upgrade.rs", "src/main.rs", "src/api/retry.rs"];
 
-const NEEDLES: &[&str] = &[".exists()", ".is_dir()", ".is_file()", "OpenOptions", "DirBuilder"];
+const NEEDLES: &[&str] = &[".exists()", ".is_dir()", ".is_file()", "OpenOptions", "DirBuilder",
+    ".symlink_metadata()", ".metadata()", ".canonicalize()", ".read_dir(",
+];
 
 /// `vfs::FileType` has `is_dir()` / `is_file()` methods, like `std::fs::FileType`.
 /// Text cannot tell them from `Path::is_dir()`, so a receiver that is plainly a
