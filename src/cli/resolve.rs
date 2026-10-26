@@ -30,7 +30,7 @@ use crate::cli::stdin_coord::{Prompt, PromptKey, PromptKind};
 use similar::{Algorithm, TextDiff};
 use crate::cli::stdin_coord::LineSource;
 use std::io::{IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
@@ -280,6 +280,16 @@ async fn confirm_bulk<R: LineSource, W: Write>(
     }
 }
 
+/// The project root `local_path` lives under: the nearest ancestor `a` with
+/// `local_path` inside `a/envs/<env>/`. `None` when it is not under one.
+fn project_root_of(local_path: &Path, env: &str) -> Option<PathBuf> {
+    local_path
+        .ancestors()
+        .skip(1)
+        .find(|a| local_path.starts_with(a.join("envs").join(env)))
+        .map(Path::to_path_buf)
+}
+
 /// Color-aware bytes-driven core. Shares the prompt + diff +
 /// `[e]dit`/`[h]` plumbing with [`prompt_resolve_with_color`]; the
 /// only difference is that local bytes come from the caller, not
@@ -310,8 +320,11 @@ pub async fn prompt_resolve_with_bytes_and_color<R: LineSource, W: Write>(
     // conflicts) and the diff shows only the genuine change. Deriving it from
     // cwd + `env` keeps this self-contained; an unloadable lockfile falls back
     // to empty (prior behavior).
+    // Where there is no working directory (wasm32 errs on `current_dir`),
+    // the project root is read off `local_path` instead.
     let lockfile = std::env::current_dir()
         .ok()
+        .or_else(|| project_root_of(local_path, env))
         .map(|cwd| crate::paths::Paths::for_env(&cwd, env))
         .and_then(|p| crate::state::Lockfile::load(&p.lockfile()).ok())
         .unwrap_or_default();
@@ -1638,6 +1651,15 @@ mod tests {
     use super::*;
     use crate::cli::prompt_pin::{Transcript, pin, redact_tempdir};
     use std::io::Cursor;
+
+    #[test]
+    fn project_root_of_reads_the_root_off_a_local_path() {
+        let p = Path::new("/project/envs/dev/queues/x.json");
+        assert_eq!(project_root_of(p, "dev"), Some(PathBuf::from("/project")));
+        assert_eq!(project_root_of(p, "test"), None);
+        // A relative path resolves to the empty root, i.e. the working dir.
+        assert_eq!(project_root_of(Path::new("envs/dev/a.json"), "dev"), Some(PathBuf::new()));
+    }
 
 
 
