@@ -297,7 +297,14 @@ pub async fn read_line_coordinated() -> io::Result<Option<String>> {
             .ok()
             .flatten()
             .unwrap_or_else(Prompt::unknown);
-        return Ok(route.ask(&prompt).await);
+        // The contract is "no trailing newline"; a route that delivers a raw
+        // terminal line (`"y\n"`, `"y\r\n"`) is held to it too.
+        return Ok(route.ask(&prompt).await.map(|mut line| {
+            while line.ends_with('\n') || line.ends_with('\r') {
+                line.pop();
+            }
+            line
+        }));
     }
     if let Some(coord) = COORD.get() {
         return Ok(coord.recv_line());
@@ -473,6 +480,22 @@ mod tests {
         })
         .await;
         assert_eq!(route.0.load(Ordering::SeqCst), 1, "route asked again after EOF");
+    }
+
+    #[tokio::test]
+    async fn coordinator_stdin_yields_one_delivered_line_without_newline() {
+        for delivered in ["y\n", "y\r\n"] {
+            let route = Arc::new(Canned {
+                answer: delivered.into(),
+                seen: Mutex::new(Vec::new()),
+            });
+            let got = with_route(route, async {
+                let mut src = CoordinatorStdin::new();
+                LineSource::read_line(&mut src).await.unwrap()
+            })
+            .await;
+            assert_eq!(got, Some("y".to_string()), "delivered {delivered:?}");
+        }
     }
 
     #[tokio::test]

@@ -5291,12 +5291,13 @@ mod tests {
     /// push and the prior base hash is kept so the conflict resurfaces.
     #[tokio::test]
     async fn route_none_skips_conflict() {
-        struct Gone;
+        struct Gone(std::sync::atomic::AtomicUsize);
         impl crate::cli::stdin_coord::PromptRoute for Gone {
             fn ask<'a>(
                 &'a self,
                 _prompt: &'a crate::cli::stdin_coord::Prompt,
             ) -> crate::rt::BoxFuture<'a, Option<String>> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Box::pin(async { None })
             }
         }
@@ -5309,6 +5310,7 @@ mod tests {
         let progress = Log::new(crate::cli::resolve::ColorMode::Plain);
         let local_before = std::fs::read(&fixture.local_path).unwrap();
 
+        let gone = std::sync::Arc::new(Gone(std::sync::atomic::AtomicUsize::new(0)));
         let outcome = {
             let mut ctx = PullCtx {
                 paths: &fixture.paths,
@@ -5318,7 +5320,7 @@ mod tests {
                 interactive: true,
             };
             crate::cli::stdin_coord::with_route(
-                std::sync::Arc::new(Gone),
+                gone.clone(),
                 resolve_conflicts(
                     &mut ctx,
                     &catalog,
@@ -5334,6 +5336,10 @@ mod tests {
             .expect("a route that answers None must skip, not fail")
         };
 
+        assert!(
+            gone.0.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the route must have been asked at least once"
+        );
         assert!(outcome.promoted_to_push.is_empty(), "skip never promotes to push");
         assert_eq!(std::fs::read(&fixture.local_path).unwrap(), local_before);
         assert_eq!(fixture.lockfile.base_hash("labels", "audit-hold").unwrap(), prior_base);
