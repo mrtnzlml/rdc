@@ -230,7 +230,7 @@ pub(crate) fn list_slugs(paths: &Paths, kind: &str) -> Result<Vec<String>> {
 /// The organization's one slug (`"self"`, matching the codec's and the
 /// lockfile's convention), or none when the env has no `organization.json`.
 fn list_organization_slug(paths: &Paths) -> Result<Vec<String>> {
-    Ok(if paths.organization_file().exists() {
+    Ok(if crate::vfs::exists(paths.organization_file()) {
         vec!["self".to_string()]
     } else {
         Vec::new()
@@ -240,16 +240,15 @@ fn list_organization_slug(paths: &Paths) -> Result<Vec<String>> {
 /// Sorted names of the subdirectories of `dir` that hold a `file`; empty when
 /// `dir` does not exist.
 fn subdirs_holding(dir: &Path, file: &str) -> Result<Vec<String>> {
-    if !dir.exists() {
+    if !crate::vfs::exists(dir) {
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
+    for entry in crate::vfs::read_dir(dir)? {
         if !entry.file_type()?.is_dir() {
             continue;
         }
-        if entry.path().join(file).exists() {
+        if crate::vfs::exists(entry.path().join(file)) {
             out.push(entry.file_name().to_string_lossy().into_owned());
         }
     }
@@ -261,8 +260,7 @@ fn subdirs_holding(dir: &Path, file: &str) -> Result<Vec<String>> {
 /// artifacts, in directory order.
 fn json_stems(dir: &Path, env: &str) -> Result<Vec<String>> {
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
+    for entry in crate::vfs::read_dir(dir)? {
         let name = entry.file_name().to_string_lossy().into_owned();
         if crate::paths::is_shadow_artifact(&name, env) {
             continue;
@@ -287,7 +285,7 @@ fn list_workspace_slugs(paths: &Paths) -> Result<Vec<String>> {
 
 fn list_queue_nested(paths: &Paths, kind: &str) -> Result<Vec<String>> {
     let ws_dir = paths.workspaces_dir();
-    if !ws_dir.exists() {
+    if !crate::vfs::exists(&ws_dir) {
         return Ok(Vec::new());
     }
     let file_name = match kind {
@@ -297,21 +295,19 @@ fn list_queue_nested(paths: &Paths, kind: &str) -> Result<Vec<String>> {
         _ => return Ok(Vec::new()),
     };
     let mut out = Vec::new();
-    for ws_entry in std::fs::read_dir(&ws_dir)? {
-        let ws_entry = ws_entry?;
+    for ws_entry in crate::vfs::read_dir(&ws_dir)? {
         if !ws_entry.file_type()?.is_dir() {
             continue;
         }
         let queues_dir = ws_entry.path().join("queues");
-        if !queues_dir.exists() {
+        if !crate::vfs::exists(&queues_dir) {
             continue;
         }
-        for q_entry in std::fs::read_dir(&queues_dir)? {
-            let q_entry = q_entry?;
+        for q_entry in crate::vfs::read_dir(&queues_dir)? {
             if !q_entry.file_type()?.is_dir() {
                 continue;
             }
-            if q_entry.path().join(file_name).exists() {
+            if crate::vfs::exists(q_entry.path().join(file_name)) {
                 out.push(q_entry.file_name().to_string_lossy().into_owned());
             }
         }
@@ -322,28 +318,26 @@ fn list_queue_nested(paths: &Paths, kind: &str) -> Result<Vec<String>> {
 
 fn list_email_template_keys(paths: &Paths) -> Result<Vec<String>> {
     let ws_dir = paths.workspaces_dir();
-    if !ws_dir.exists() {
+    if !crate::vfs::exists(&ws_dir) {
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
-    for ws_entry in std::fs::read_dir(&ws_dir)? {
-        let ws_entry = ws_entry?;
+    for ws_entry in crate::vfs::read_dir(&ws_dir)? {
         if !ws_entry.file_type()?.is_dir() {
             continue;
         }
         let ws_slug = ws_entry.file_name().to_string_lossy().into_owned();
         let queues_dir = ws_entry.path().join("queues");
-        if !queues_dir.exists() {
+        if !crate::vfs::exists(&queues_dir) {
             continue;
         }
-        for q_entry in std::fs::read_dir(&queues_dir)? {
-            let q_entry = q_entry?;
+        for q_entry in crate::vfs::read_dir(&queues_dir)? {
             if !q_entry.file_type()?.is_dir() {
                 continue;
             }
             let q_slug = q_entry.file_name().to_string_lossy().into_owned();
             let et_dir = q_entry.path().join("email-templates");
-            if !et_dir.exists() {
+            if !crate::vfs::exists(&et_dir) {
                 continue;
             }
             for stem in json_stems(&et_dir, paths.env())? {
@@ -365,7 +359,7 @@ fn list_flat_kind(paths: &Paths, kind: &str) -> Result<Vec<String>> {
         "saved_views" => paths.saved_views_dir(),
         _ => return Ok(Vec::new()),
     };
-    if !dir.exists() {
+    if !crate::vfs::exists(&dir) {
         return Ok(Vec::new());
     }
     let mut out = json_stems(&dir, paths.env())?;
@@ -379,18 +373,17 @@ fn list_engine_slugs(paths: &Paths) -> Result<Vec<String>> {
 
 fn list_engine_field_slugs(paths: &Paths) -> Result<Vec<String>> {
     let dir = paths.engines_dir();
-    if !dir.exists() {
+    if !crate::vfs::exists(&dir) {
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
-    for e_entry in std::fs::read_dir(&dir)? {
-        let e_entry = e_entry?;
+    for e_entry in crate::vfs::read_dir(&dir)? {
         if !e_entry.file_type()?.is_dir() {
             continue;
         }
         let e_slug = e_entry.file_name().to_string_lossy().into_owned();
         let fields_dir = paths.engine_fields_dir(&e_slug);
-        if !fields_dir.exists() {
+        if !crate::vfs::exists(&fields_dir) {
             continue;
         }
         for stem in json_stems(&fields_dir, paths.env())? {

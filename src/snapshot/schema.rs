@@ -37,7 +37,7 @@ pub fn write_schema_bytes_with_cache(
     }
     let formulas_dir = queue_dir.join("formulas");
     if !formulas.is_empty() {
-        std::fs::create_dir_all(&formulas_dir)
+        crate::vfs::create_dir_all(&formulas_dir)
             .with_context(|| format!("creating {}", formulas_dir.display()))?;
         for (field_id, code) in formulas {
             let py_path = formulas_dir.join(format!("{field_id}.py"));
@@ -54,19 +54,19 @@ pub fn write_schema_bytes_with_cache(
     // from a fresh pull, the next push would try to send a
     // `combined_hash` that doesn't match the lockfile, and the user
     // sees stale `.py` files in their git tree forever.
-    if formulas_dir.exists() {
+    if crate::vfs::exists(&formulas_dir) {
         let kept: std::collections::BTreeSet<&str> =
             formulas.iter().map(|(id, _)| id.as_str()).collect();
-        let entries = std::fs::read_dir(&formulas_dir)
+        let entries = crate::vfs::read_dir(&formulas_dir)
             .with_context(|| format!("reading {}", formulas_dir.display()))?;
-        for entry in entries.flatten() {
+        for entry in entries {
             let name = entry.file_name().to_string_lossy().into_owned();
             let Some(id) = name.strip_suffix(".py") else { continue };
             if kept.contains(id) {
                 continue;
             }
             let path = entry.path();
-            std::fs::remove_file(&path)
+            crate::vfs::remove_file(&path)
                 .with_context(|| format!("removing orphan formula {}", path.display()))?;
             if let Some(p) = paths {
                 crate::state::base_cache::forget(p, &path)?;
@@ -82,7 +82,7 @@ pub fn write_schema_bytes_with_cache(
 /// to type into `Schema`.
 pub fn read_schema_value(queue_dir: &Path) -> Result<Value> {
     let json_path = queue_dir.join("schema.json");
-    let raw = std::fs::read_to_string(&json_path)
+    let raw = crate::vfs::read_to_string(&json_path)
         .with_context(|| format!("reading {}", json_path.display()))?;
     let mut value: Value = serde_json::from_str(&raw)
         .with_context(|| format!("parsing {}", json_path.display()))?;
@@ -95,7 +95,7 @@ pub fn read_schema_value(queue_dir: &Path) -> Result<Value> {
 /// a schema edited at the push drift prompt, which carries only the JSON half.
 pub fn splice_schema_formulas(value: &mut Value, queue_dir: &Path) -> Result<()> {
     let formulas_dir = queue_dir.join("formulas");
-    if formulas_dir.is_dir()
+    if crate::vfs::is_dir(&formulas_dir)
         && let Some(content) = value.get_mut("content").and_then(|c| c.as_array_mut()) {
             for node in content.iter_mut() {
                 merge_formulas(node, &formulas_dir)?;
@@ -144,18 +144,16 @@ pub fn serialize_schema(schema: &Schema) -> Result<SchemaJsonAndFormulas> {
 /// directory does not exist. Used to compute the LOCAL combined hash.
 pub fn read_local_formulas(queue_dir: &Path) -> Result<Vec<(String, Vec<u8>)>> {
     let formulas_dir = queue_dir.join("formulas");
-    if !formulas_dir.exists() {
+    if !crate::vfs::exists(&formulas_dir) {
         return Ok(Vec::new());
     }
     let mut out: Vec<(String, Vec<u8>)> = Vec::new();
-    for entry in std::fs::read_dir(&formulas_dir)
+    for entry in crate::vfs::read_dir(&formulas_dir)
         .with_context(|| format!("reading {}", formulas_dir.display()))?
     {
-        let entry = entry
-            .with_context(|| format!("listing {}", formulas_dir.display()))?;
         let name = entry.file_name().to_string_lossy().to_string();
         if let Some(field_id) = name.strip_suffix(".py") {
-            let bytes = std::fs::read(entry.path())
+            let bytes = crate::vfs::read(entry.path())
                 .with_context(|| format!("reading {}", entry.path().display()))?;
             out.push((field_id.to_string(), bytes));
         }
@@ -225,8 +223,8 @@ fn merge_formulas(node: &mut Value, formulas_dir: &Path) -> Result<()> {
         if let Some(id) = id {
             ensure_formula_id(&id)?;
             let py_path = formulas_dir.join(format!("{id}.py"));
-            if py_path.exists() {
-                let formula = std::fs::read_to_string(&py_path)
+            if crate::vfs::exists(&py_path) {
+                let formula = crate::vfs::read_to_string(&py_path)
                     .with_context(|| format!("reading {}", py_path.display()))?;
                 obj.insert("formula".to_string(), Value::String(formula));
             }

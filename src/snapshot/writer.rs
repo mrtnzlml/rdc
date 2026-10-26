@@ -1,6 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use std::fs;
-use std::io::Write;
+use crate::vfs as fs;
 use std::path::Path;
 
 /// Write `bytes` to `path` atomically: write to a sibling temp file, then rename.
@@ -41,21 +40,8 @@ fn write_atomic_with_mode(path: &Path, bytes: &[u8], mode: Option<u32>) -> Resul
     tmp_name.push(format!(".{}.tmp", rand.iter().map(|b| format!("{b:02x}")).collect::<String>()));
     let tmp = path.with_file_name(tmp_name);
     let result = (|| -> Result<()> {
-        let mut opts = fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        if let Some(mode) = mode {
-            std::os::unix::fs::OpenOptionsExt::mode(&mut opts, mode);
-        }
-        #[cfg(not(unix))]
-        let _ = mode;
-        let mut f = opts
-            .open(&tmp)
-            .with_context(|| format!("creating temp file {}", tmp.display()))?;
-        f.write_all(bytes)
+        fs::write_new(&tmp, bytes, mode)
             .with_context(|| format!("writing temp file {}", tmp.display()))?;
-        f.sync_all()
-            .with_context(|| format!("syncing temp file {}", tmp.display()))?;
         fs::rename(&tmp, path)
             .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))
     })();
@@ -69,6 +55,7 @@ fn write_atomic_with_mode(path: &Path, bytes: &[u8], mode: Option<u32>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use tempfile::TempDir;
 
     #[test]

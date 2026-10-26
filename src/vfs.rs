@@ -563,6 +563,20 @@ pub fn is_native() -> bool {
     with_store(|s| s.is_native())
 }
 
+/// An open advisory-lock file. Always a real file: only meaningful when
+/// [`is_native`], and callers skip locking otherwise.
+pub type LockFile = std::fs::File;
+
+/// Open (creating if needed) the file an OS-level lock is taken on. Native only.
+pub fn open_lock_file(path: impl AsRef<Path>) -> io::Result<LockFile> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1055,7 +1055,7 @@ pub fn from_catalog_scan_lockfile(
     // flagged. The scanner skipped Clean items, so anything in
     // `changes.labels` is by definition a local edit/create candidate.
     for (slug, path) in &changes.labels {
-        let bytes = match std::fs::read(path) {
+        let bytes = match crate::vfs::read(path) {
             Ok(b) => b,
             Err(_) => continue,
         };
@@ -1094,7 +1094,7 @@ pub fn from_catalog_scan_lockfile(
     }
 
     for (slug, path) in &changes.saved_views {
-        let bytes = match std::fs::read(path) {
+        let bytes = match crate::vfs::read(path) {
             Ok(b) => b,
             Err(_) => continue,
         };
@@ -1130,7 +1130,7 @@ pub fn from_catalog_scan_lockfile(
         // delete an organization, so a missing file means nothing to push, not
         // a delete request; the pull half of the same sync restores it.
         if let Some(path) = &changes.organization
-            && let Ok(bytes) = std::fs::read(path)
+            && let Ok(bytes) = crate::vfs::read(path)
         {
             let hash = crate::state::content_hash(&bytes, &crate::state::Lockfile::default());
             scan_changes.insert(("organization".to_string(), "self".to_string()), hash);
@@ -1264,7 +1264,7 @@ pub fn from_catalog_scan_lockfile(
         remote_hashes.insert(("workspaces".to_string(), slug), hash);
     }
     for (slug, path) in &changes.workspaces {
-        if let Ok(bytes) = std::fs::read(path) {
+        if let Ok(bytes) = crate::vfs::read(path) {
             scan_changes.insert(
                 ("workspaces".to_string(), slug.clone()),
                 crate::state::content_hash(&bytes, &crate::state::Lockfile::default()),
@@ -1311,7 +1311,7 @@ pub fn from_catalog_scan_lockfile(
         remote_hashes.insert(("engines".to_string(), slug), hash);
     }
     for (slug, path) in &changes.engines {
-        if let Ok(bytes) = std::fs::read(path) {
+        if let Ok(bytes) = crate::vfs::read(path) {
             scan_changes.insert(
                 ("engines".to_string(), slug.clone()),
                 crate::state::content_hash(&bytes, &crate::state::Lockfile::default()),
@@ -1365,7 +1365,7 @@ pub fn from_catalog_scan_lockfile(
         remote_hashes.insert(("engine_fields".to_string(), composite_key), hash);
     }
     for (slug, path) in &changes.engine_fields {
-        if let Ok(bytes) = std::fs::read(path) {
+        if let Ok(bytes) = crate::vfs::read(path) {
             scan_changes.insert(
                 ("engine_fields".to_string(), slug.clone()),
                 crate::state::content_hash(&bytes, &crate::state::Lockfile::default()),
@@ -1415,7 +1415,7 @@ pub fn from_catalog_scan_lockfile(
         remote_hashes.insert(("hooks".to_string(), slug), hash);
     }
     for (slug, json_path) in &changes.hooks {
-        let json_bytes = match std::fs::read(json_path) {
+        let json_bytes = match crate::vfs::read(json_path) {
             Ok(b) => b,
             Err(_) => continue,
         };
@@ -1427,10 +1427,10 @@ pub fn from_catalog_scan_lockfile(
         let ext = crate::snapshot::hook::hook_code_extension_from_value(&value);
         let primary = json_path.with_extension(ext);
         let fallback = json_path.with_extension(if ext == "py" { "js" } else { "py" });
-        let code = if primary.exists() {
-            std::fs::read_to_string(&primary).ok()
-        } else if fallback.exists() {
-            std::fs::read_to_string(&fallback).ok()
+        let code = if crate::vfs::exists(&primary) {
+            crate::vfs::read_to_string(&primary).ok()
+        } else if crate::vfs::exists(&fallback) {
+            crate::vfs::read_to_string(&fallback).ok()
         } else {
             None
         };
@@ -1472,13 +1472,13 @@ pub fn from_catalog_scan_lockfile(
         remote_hashes.insert(("rules".to_string(), slug), hash);
     }
     for (slug, json_path) in &changes.rules {
-        let json_bytes = match std::fs::read(json_path) {
+        let json_bytes = match crate::vfs::read(json_path) {
             Ok(b) => b,
             Err(_) => continue,
         };
         let py_path = json_path.with_extension("py");
-        let code = if py_path.exists() {
-            std::fs::read_to_string(&py_path).ok()
+        let code = if crate::vfs::exists(&py_path) {
+            crate::vfs::read_to_string(&py_path).ok()
         } else {
             None
         };
@@ -1588,7 +1588,7 @@ pub fn from_catalog_scan_lockfile(
 
     // Scan-side hashes for queues / inboxes (flat) and schemas (combined).
     for (slug, path) in &changes.queues {
-        if let Ok(bytes) = std::fs::read(path) {
+        if let Ok(bytes) = crate::vfs::read(path) {
             scan_changes.insert(
                 ("queues".to_string(), slug.clone()),
                 crate::state::content_hash(&bytes, &crate::state::Lockfile::default()),
@@ -1596,7 +1596,7 @@ pub fn from_catalog_scan_lockfile(
         }
     }
     for (slug, path) in &changes.inboxes {
-        if let Ok(bytes) = std::fs::read(path) {
+        if let Ok(bytes) = crate::vfs::read(path) {
             scan_changes.insert(
                 ("inboxes".to_string(), slug.clone()),
                 crate::state::content_hash(&bytes, &crate::state::Lockfile::default()),
@@ -1606,7 +1606,7 @@ pub fn from_catalog_scan_lockfile(
     for (slug, schema_path) in &changes.schemas {
         // The push scanner stores the path to `schema.json`; the formulas
         // sit in a sibling `formulas/` dir. Mirror `scan_schemas`.
-        let Ok(json_bytes) = std::fs::read(schema_path) else {
+        let Ok(json_bytes) = crate::vfs::read(schema_path) else {
             continue;
         };
         let queue_dir = match schema_path.parent() {
@@ -1682,7 +1682,7 @@ pub fn from_catalog_scan_lockfile(
         remote_hashes.insert(("email_templates".to_string(), compound), hash);
     }
     for (slug, path) in &changes.email_templates {
-        if let Ok(bytes) = std::fs::read(path) {
+        if let Ok(bytes) = crate::vfs::read(path) {
             scan_changes.insert(
                 ("email_templates".to_string(), slug.clone()),
                 crate::state::content_hash(&bytes, &crate::state::Lockfile::default()),

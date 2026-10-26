@@ -1113,8 +1113,8 @@ fn try_auto_merge(
             if let Some(c) = &final_code {
                 crate::snapshot::writer::write_atomic(code_path, c.as_bytes())?;
                 crate::state::base_cache::write(ctx.paths, code_path, c.as_bytes())?;
-            } else if code_path.exists() {
-                std::fs::remove_file(code_path).with_context(|| {
+            } else if crate::vfs::exists(code_path) {
+                crate::vfs::remove_file(code_path).with_context(|| {
                     format!("removing merged-empty sidecar {}", code_path.display())
                 })?;
                 crate::state::base_cache::forget(ctx.paths, code_path)?;
@@ -1142,13 +1142,13 @@ fn try_auto_merge(
                 crate::state::base_cache::cache_mirror(ctx.paths, &queue_dir.join("formulas"))
                     .unwrap_or_else(|| ctx.paths.base_cache_root().join("__missing__"));
             let mut base_formulas: Vec<(String, Vec<u8>)> = Vec::new();
-            if cache_formulas_dir.exists()
-                && let Ok(entries) = std::fs::read_dir(&cache_formulas_dir)
+            if crate::vfs::exists(&cache_formulas_dir)
+                && let Ok(entries) = crate::vfs::read_dir(&cache_formulas_dir)
             {
-                for e in entries.flatten() {
+                for e in entries {
                     let name = e.file_name().to_string_lossy().to_string();
                     if let Some(id) = name.strip_suffix(".py")
-                        && let Ok(b) = std::fs::read(e.path())
+                        && let Ok(b) = crate::vfs::read(e.path())
                     {
                         base_formulas.push((id.to_string(), b));
                     }
@@ -1307,8 +1307,8 @@ async fn resolve_one_conflict<R: LineSource>(
     let (local_code, local_formulas): (Option<String>, Vec<(String, Vec<u8>)>) = match hash_strategy
     {
         HashStrategy::Hook | HashStrategy::Rule => {
-            let code = if code_path.exists() {
-                std::fs::read_to_string(&code_path).ok()
+            let code = if crate::vfs::exists(&code_path) {
+                crate::vfs::read_to_string(&code_path).ok()
             } else {
                 None
             };
@@ -1336,7 +1336,7 @@ async fn resolve_one_conflict<R: LineSource>(
     // asymmetric cases, the resolver hands `prompt_resolve` a
     // canonicalize-equal JSON pair which short-circuits to
     // `KeepLocal` — silently routing the item to push.
-    let local_json_bytes = std::fs::read(&local_path).unwrap_or_default();
+    let local_json_bytes = crate::vfs::read(&local_path).unwrap_or_default();
     // Use the env lockfile (not an empty one) so reference normalization stays
     // symmetric and robust. `remote_bytes` was already portabilized to rdc://
     // form above, but canonicalizing both sides through `ctx.lockfile` still
@@ -1397,7 +1397,7 @@ async fn resolve_one_conflict<R: LineSource>(
         // Without this, a subsequent BothDiverged would fail the
         // `cache_matches_base` guard and silently skip auto-merge.
         if matches!(hash_strategy, HashStrategy::Flat)
-            && let Ok(on_disk) = std::fs::read(&local_path)
+            && let Ok(on_disk) = crate::vfs::read(&local_path)
         {
             crate::state::base_cache::write(ctx.paths, &local_path, &on_disk)?;
         }
@@ -1801,7 +1801,7 @@ async fn resolve_one_conflict<R: LineSource>(
             // Ensure parent dirs exist (workspaces / engines / engine_fields
             // live in nested directories that may not have been created).
             if let Some(parent) = local_path.parent() {
-                std::fs::create_dir_all(parent).ok();
+                crate::vfs::create_dir_all(parent).ok();
             }
             write_atomic(&local_path, &remote_bytes)?;
             // Adopt the remote sidecar(s) too. Hooks/rules write a
@@ -1815,15 +1815,15 @@ async fn resolve_one_conflict<R: LineSource>(
                 };
                 if let Some(code) = &remote_code {
                     write_atomic(&canonical_code_path, code.as_bytes())?;
-                } else if canonical_code_path.exists() {
-                    std::fs::remove_file(&canonical_code_path).with_context(|| {
+                } else if crate::vfs::exists(&canonical_code_path) {
+                    crate::vfs::remove_file(&canonical_code_path).with_context(|| {
                         format!("removing stale {}", canonical_code_path.display())
                     })?;
                 }
                 // If the previous-runtime sidecar still sits on disk
                 // (hook just flipped runtimes), drop it.
-                if canonical_code_path != code_path && code_path.exists() {
-                    std::fs::remove_file(&code_path)
+                if canonical_code_path != code_path && crate::vfs::exists(&code_path) {
+                    crate::vfs::remove_file(&code_path)
                         .with_context(|| format!("removing stale {}", code_path.display()))?;
                 }
             } else if matches!(hash_strategy, HashStrategy::Schema) {
@@ -1833,7 +1833,7 @@ async fn resolve_one_conflict<R: LineSource>(
                 let queue_dir = local_path.parent().unwrap_or(&local_path);
                 let formulas_dir = queue_dir.join("formulas");
                 if !remote_formulas.is_empty() {
-                    std::fs::create_dir_all(&formulas_dir)
+                    crate::vfs::create_dir_all(&formulas_dir)
                         .with_context(|| format!("creating {}", formulas_dir.display()))?;
                 }
                 for (fid, bytes) in &remote_formulas {
@@ -1843,8 +1843,8 @@ async fn resolve_one_conflict<R: LineSource>(
                 for (lid, _) in &local_formulas {
                     if !remote_formulas.iter().any(|(rid, _)| rid == lid) {
                         let stale = formulas_dir.join(format!("{lid}.py"));
-                        if stale.exists() {
-                            std::fs::remove_file(&stale)
+                        if crate::vfs::exists(&stale) {
+                            crate::vfs::remove_file(&stale)
                                 .with_context(|| format!("removing stale {}", stale.display()))?;
                         }
                     }
@@ -1878,7 +1878,7 @@ async fn resolve_one_conflict<R: LineSource>(
                 &local_path
             };
             if let Some(parent) = edit_target.parent() {
-                std::fs::create_dir_all(parent).ok();
+                crate::vfs::create_dir_all(parent).ok();
             }
             write_atomic(edit_target, &edited)?;
             crate::cli::pull::common::record_object(
@@ -1913,7 +1913,7 @@ async fn resolve_one_conflict<R: LineSource>(
                 &local_path
             };
             if let Some(parent) = edit_target.parent() {
-                std::fs::create_dir_all(parent).ok();
+                crate::vfs::create_dir_all(parent).ok();
             }
             write_atomic(edit_target, &edited)?;
             progress.event(Action::Warn, &format!(
@@ -2001,7 +2001,7 @@ async fn resolve_one_conflict<R: LineSource>(
 fn sidecar_path_for_conflict(local_path: &Path, strategy: HashStrategy) -> PathBuf {
     match strategy {
         HashStrategy::Hook => {
-            if let Ok(bytes) = std::fs::read(local_path)
+            if let Ok(bytes) = crate::vfs::read(local_path)
                 && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes)
             {
                 let ext = crate::snapshot::hook::hook_code_extension_from_value(&v);
@@ -2107,11 +2107,11 @@ fn remote_delete_detail(kind: &str, slug: &str, env: &str) -> String {
 /// scanner uses, so the result is comparable to lockfile base hashes.
 /// `None` when the JSON file is unreadable.
 fn local_disk_hash(refs: &RemoteDeleteRefs) -> Option<String> {
-    let bytes = std::fs::read(&refs.local_path).ok()?;
+    let bytes = crate::vfs::read(&refs.local_path).ok()?;
     let lf = crate::state::Lockfile::default();
     Some(match refs.hash_strategy {
         HashStrategy::Hook => {
-            let code = std::fs::read_to_string(sidecar_path_for_conflict(
+            let code = crate::vfs::read_to_string(sidecar_path_for_conflict(
                 &refs.local_path,
                 refs.hash_strategy,
             ))
@@ -2119,7 +2119,7 @@ fn local_disk_hash(refs: &RemoteDeleteRefs) -> Option<String> {
             crate::state::hook_combined_hash(&bytes, &code, &lf)
         }
         HashStrategy::Rule => {
-            let code = std::fs::read_to_string(sidecar_path_for_conflict(
+            let code = crate::vfs::read_to_string(sidecar_path_for_conflict(
                 &refs.local_path,
                 refs.hash_strategy,
             ))
@@ -2156,14 +2156,14 @@ fn delete_local_object(
     } else {
         local_path.with_extension("js")
     };
-    std::fs::remove_file(local_path)
+    crate::vfs::remove_file(local_path)
         .with_context(|| format!("removing {}", local_path.display()))?;
-    if matches!(refs.hash_strategy, HashStrategy::Hook | HashStrategy::Rule) && sidecar.exists() {
-        std::fs::remove_file(&sidecar)
+    if matches!(refs.hash_strategy, HashStrategy::Hook | HashStrategy::Rule) && crate::vfs::exists(&sidecar) {
+        crate::vfs::remove_file(&sidecar)
             .with_context(|| format!("removing {}", sidecar.display()))?;
     }
-    if matches!(refs.hash_strategy, HashStrategy::Hook) && other_sidecar.exists() {
-        std::fs::remove_file(&other_sidecar)
+    if matches!(refs.hash_strategy, HashStrategy::Hook) && crate::vfs::exists(&other_sidecar) {
+        crate::vfs::remove_file(&other_sidecar)
             .with_context(|| format!("removing {}", other_sidecar.display()))?;
     }
     // For schemas, also sweep the formulas/ directory so deleted schemas
@@ -2171,11 +2171,11 @@ fn delete_local_object(
     if matches!(refs.hash_strategy, HashStrategy::Schema) {
         let queue_dir = local_path.parent().unwrap_or(local_path);
         let formulas_dir = queue_dir.join("formulas");
-        if formulas_dir.exists() {
-            std::fs::remove_dir_all(&formulas_dir).ok();
+        if crate::vfs::exists(&formulas_dir) {
+            crate::vfs::remove_dir_all(&formulas_dir).ok();
         }
     }
-    let _ = std::fs::remove_file(deleted_marker_path(ctx.paths, local_path));
+    let _ = crate::vfs::remove_file(deleted_marker_path(ctx.paths, local_path));
     // Remove the dirs this left empty (a deleted queue's `email-templates/`,
     // then the queue dir). Git never tracks them, and an empty queue dir
     // shadows a namesake queue in another workspace (`locate_queue_dir`).
@@ -2185,7 +2185,7 @@ fn delete_local_object(
     while let Some(d) = dir
         && d.starts_with(&env_root)
         && d != env_root
-        && std::fs::remove_dir(d).is_ok()
+        && crate::vfs::remove_dir(d).is_ok()
     {
         dir = d.parent();
     }
@@ -2196,8 +2196,8 @@ fn delete_local_object(
 }
 
 fn sweep_conflict_artifacts(paths: &crate::paths::Paths, local_path: &Path) {
-    let _ = std::fs::remove_file(paths.conflict_shadow_path(local_path));
-    let _ = std::fs::remove_file(deleted_marker_path(paths, local_path));
+    let _ = crate::vfs::remove_file(paths.conflict_shadow_path(local_path));
+    let _ = crate::vfs::remove_file(deleted_marker_path(paths, local_path));
 }
 
 /// Every half of a split-file object whose remote side diverges from the
@@ -2331,8 +2331,8 @@ async fn push_new_mdh_rows(
 /// re-flagged on the next sync.
 fn remove_mdh_dataset(ctx: &mut PullCtx<'_>, slug: &str, indexes_path: &Path) {
     let dataset_dir = ctx.paths.dataset_dir(slug);
-    if dataset_dir.exists() {
-        std::fs::remove_dir_all(&dataset_dir).ok();
+    if crate::vfs::exists(&dataset_dir) {
+        crate::vfs::remove_dir_all(&dataset_dir).ok();
     }
     crate::state::base_cache::forget(ctx.paths, indexes_path).ok();
     // Row data (manual datasets): the file itself went with the dir removal
@@ -2346,7 +2346,7 @@ fn remove_mdh_dataset(ctx: &mut PullCtx<'_>, slug: &str, indexes_path: &Path) {
     if let Some(mirror) = crate::state::base_cache::cache_mirror(ctx.paths, indexes_path)
         && let Some(mirror_dir) = mirror.parent()
     {
-        std::fs::remove_dir(mirror_dir).ok();
+        crate::vfs::remove_dir(mirror_dir).ok();
     }
     drop_lockfile_entry(ctx, "mdh_indexes", slug);
     drop_lockfile_entry(ctx, "mdh_data", slug);
@@ -2413,7 +2413,7 @@ async fn prune_mdh_orphans<R: LineSource>(
         let indexes_path = ctx.paths.dataset_dir(&slug).join("indexes.json");
 
         // Both-sides-agree deletion: lockfile entry but no local file.
-        if !indexes_path.exists() {
+        if !crate::vfs::exists(&indexes_path) {
             remove_mdh_dataset(ctx, &slug, &indexes_path);
             progress.event(
                 Action::Delete,
@@ -2428,7 +2428,7 @@ async fn prune_mdh_orphans<R: LineSource>(
         // makes) auto-prunes: same rule as clean `RemoteDelete`, in
         // interactive and non-TTY runs alike. Locally modified orphans
         // fall through to the prompt / marker flow below.
-        let unchanged = std::fs::read(&indexes_path)
+        let unchanged = crate::vfs::read(&indexes_path)
             .ok()
             .map(|bytes| crate::state::content_hash(&bytes, &crate::state::Lockfile::default()))
             .is_some_and(|h| {
@@ -2440,7 +2440,7 @@ async fn prune_mdh_orphans<R: LineSource>(
                     == Some(h.as_str())
             });
         if unchanged {
-            let _ = std::fs::remove_file(deleted_marker_path(ctx.paths, &indexes_path));
+            let _ = crate::vfs::remove_file(deleted_marker_path(ctx.paths, &indexes_path));
             remove_mdh_dataset(ctx, &slug, &indexes_path);
             progress.event(Action::Delete, &format!("mdh/{slug} (deleted on {env})"));
             pruned += 1;
@@ -3090,7 +3090,7 @@ async fn resolve_remote_deletes_projected<R: LineSource>(
                     match refs.restore_bytes.as_ref() {
                         Some(bytes) => {
                             if let Some(parent) = local_path.parent() {
-                                std::fs::create_dir_all(parent).ok();
+                                crate::vfs::create_dir_all(parent).ok();
                             }
                             write_atomic(&local_path, bytes)?;
                             restored.push(local_path.clone());
@@ -3116,7 +3116,7 @@ async fn resolve_remote_deletes_projected<R: LineSource>(
                             {
                                 let queue_dir = local_path.parent().unwrap_or(&local_path);
                                 let formulas_dir = queue_dir.join("formulas");
-                                std::fs::create_dir_all(&formulas_dir).ok();
+                                crate::vfs::create_dir_all(&formulas_dir).ok();
                                 for (fid, fbytes) in &refs.restore_formulas {
                                     let path = formulas_dir.join(format!("{fid}.py"));
                                     write_atomic(&path, fbytes)?;
@@ -3146,7 +3146,7 @@ async fn resolve_remote_deletes_projected<R: LineSource>(
                 // LocalDeleteRemoteEdit) keep prompting below. See
                 // docs/superpowers/specs/2026-06-10-sync-auto-remote-delete-design.md.
                 if matches!(it.class, SyncClass::RemoteDelete) {
-                    if !local_path.exists() {
+                    if !crate::vfs::exists(&local_path) {
                         // Vanished mid-run — both sides agree; converge by
                         // dropping the entry (same semantics as BothDeleted).
                         ctx.lockfile.depart(&it.kind, &it.slug);
@@ -3179,7 +3179,7 @@ async fn resolve_remote_deletes_projected<R: LineSource>(
                     // local file already has bytes; for
                     // LocalDeleteRemoteEdit it was restored above, unless
                     // --no-pull kept it deleted.
-                    if local_path.exists() || it.class == SyncClass::LocalDeleteRemoteEdit {
+                    if crate::vfs::exists(&local_path) || it.class == SyncClass::LocalDeleteRemoteEdit {
                         let marker = deleted_marker_path(ctx.paths, &local_path);
                         write_atomic(&marker, b"")?;
                         progress.event(
@@ -3195,7 +3195,7 @@ async fn resolve_remote_deletes_projected<R: LineSource>(
                     continue;
                 }
 
-                if forced.is_none() && !local_path.exists() {
+                if forced.is_none() && !crate::vfs::exists(&local_path) {
                     // RemoteDelete / LocalEditRemoteDelete with no local
                     // file: the classifier saw a tombstone-flavored
                     // state but the file isn't there. Defensive — emit
@@ -3320,7 +3320,7 @@ async fn resolve_remote_deletes_projected<R: LineSource>(
                             // base; otherwise that phase's drift check would
                             // ask the same question a second time.
                             for path in &restored {
-                                let _ = std::fs::remove_file(path);
+                                let _ = crate::vfs::remove_file(path);
                             }
                             // The base becomes the env's copy, so from here
                             // on this is a plain local delete: if the gate is
@@ -3359,7 +3359,7 @@ async fn resolve_remote_deletes_projected<R: LineSource>(
                     Resolution::Skip => {
                         if no_pull {
                             for path in &restored {
-                                let _ = std::fs::remove_file(path);
+                                let _ = crate::vfs::remove_file(path);
                             }
                         }
                         let marker = deleted_marker_path(ctx.paths, &local_path);
@@ -3432,11 +3432,11 @@ struct RemoteDeleteRefs {
 /// already dropped the field (no catalog body → no `engine` URL).
 fn find_engine_field_engine_slug(paths: &crate::paths::Paths, field_slug: &str) -> Option<String> {
     let engines_dir = paths.engines_dir();
-    if !engines_dir.exists() {
+    if !crate::vfs::exists(&engines_dir) {
         return None;
     }
-    let entries = std::fs::read_dir(&engines_dir).ok()?;
-    for entry in entries.flatten() {
+    let entries = crate::vfs::read_dir(&engines_dir).ok()?;
+    for entry in entries {
         if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
@@ -3444,7 +3444,7 @@ fn find_engine_field_engine_slug(paths: &crate::paths::Paths, field_slug: &str) 
             .path()
             .join("fields")
             .join(format!("{field_slug}.json"));
-        if candidate.exists() {
+        if crate::vfs::exists(&candidate) {
             return Some(entry.file_name().to_string_lossy().to_string());
         }
     }
@@ -4212,10 +4212,10 @@ pub async fn run(
                 for (slug, collection) in &slug_to_collection {
                     'index: {
                         let indexes_path = ctx.paths.dataset_dir(slug).join("indexes.json");
-                        if !indexes_path.exists() {
+                        if !crate::vfs::exists(&indexes_path) {
                             break 'index;
                         }
-                        let local_bytes = match std::fs::read(&indexes_path) {
+                        let local_bytes = match crate::vfs::read(&indexes_path) {
                             Ok(b) => b,
                             Err(_) => break 'index,
                         };
@@ -4263,7 +4263,7 @@ pub async fn run(
                         == crate::cli::pull::mdh::DataMode::Manual
                     {
                         let data_path = ctx.paths.dataset_data(slug);
-                        let local = std::fs::read(&data_path).ok();
+                        let local = crate::vfs::read(&data_path).ok();
                         let base = ctx
                             .lockfile
                             .objects
@@ -4331,7 +4331,7 @@ pub async fn run(
                         );
                         continue;
                     };
-                    let local_bytes = match std::fs::read(&indexes_path) {
+                    let local_bytes = match crate::vfs::read(&indexes_path) {
                         Ok(b) => b,
                         Err(_) => continue,
                     };

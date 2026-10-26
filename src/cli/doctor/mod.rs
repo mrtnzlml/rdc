@@ -33,7 +33,7 @@ pub async fn run(env: &str, dry_run: bool) -> Result<()> {
 
     // 0. Files renamed by hand (same `id`, new slug). Followed first, so the
     //    unpushed count below does not read each one as a delete plus a create.
-    if paths.lockfile().exists() {
+    if crate::vfs::exists(paths.lockfile()) {
         let mut lockfile = Lockfile::load(&paths.lockfile())?;
         lockfile.api_base = api_base.clone();
         let (renamed, warnings) =
@@ -156,7 +156,7 @@ pub async fn run(env: &str, dry_run: bool) -> Result<()> {
 
     // Slug-realign reads the lockfile, so it can't run without one. Skip it
     // when the lockfile is missing — run `rdc sync` first to create one.
-    if paths.lockfile().exists() {
+    if crate::vfs::exists(paths.lockfile()) {
         // 2. Slug renames — mechanical, applied automatically.
         log.event(Action::Doctor, "checking slug alignment");
         rename_slugs::run(
@@ -204,7 +204,7 @@ pub async fn run(env: &str, dry_run: bool) -> Result<()> {
 /// nothing is tracked, so nothing is "unpushed".
 fn scan_unpushed(paths: &Paths, api_base: &str) -> Result<Unpushed> {
     let lockfile_path = paths.lockfile();
-    if !lockfile_path.exists() {
+    if !crate::vfs::exists(&lockfile_path) {
         return Ok(Unpushed::default());
     }
     let mut lockfile = Lockfile::load(&lockfile_path)?;

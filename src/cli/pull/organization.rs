@@ -23,7 +23,7 @@ pub async fn process(
     let result: Result<(usize, usize)> = (async || {
         let path = ctx.paths.organization_file();
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
+            crate::vfs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
 

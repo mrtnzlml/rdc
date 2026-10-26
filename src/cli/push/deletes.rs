@@ -359,9 +359,9 @@ pub fn detach_departed(
     ];
     let mut rewritten = Vec::new();
     for (kind, dir) in holders {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let Ok(entries) = crate::vfs::read_dir(&dir) else { continue };
         let mut files: Vec<std::path::PathBuf> = entries
-            .flatten()
+            .into_iter()
             .map(|e| e.path())
             .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
             .collect();
@@ -373,7 +373,7 @@ pub fn detach_departed(
             if skip.contains(&(kind.to_string(), slug.clone())) {
                 continue;
             }
-            let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+            let bytes = crate::vfs::read(&path).with_context(|| format!("reading {}", path.display()))?;
             let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
                 continue;
             };

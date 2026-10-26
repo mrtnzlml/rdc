@@ -666,12 +666,12 @@ pub fn decide_pull_action_with(
         return Ok((PullAction::Write, remote_hash));
     };
 
-    if !local_path.exists() {
+    if !crate::vfs::exists(local_path) {
         return Ok((PullAction::Write, remote_hash));
     }
 
     let local_bytes =
-        std::fs::read(local_path).with_context(|| format!("reading {}", local_path.display()))?;
+        crate::vfs::read(local_path).with_context(|| format!("reading {}", local_path.display()))?;
     let local_hash = hash(&local_bytes);
 
     // Short-circuit: canonicalized local == canonicalized remote means
@@ -839,7 +839,7 @@ pub async fn apply_pull_action_with(
             Ok(remote_hash)
         }
         PullAction::KeepLocal => {
-            let local_bytes = std::fs::read(local_path)
+            let local_bytes = crate::vfs::read(local_path)
                 .with_context(|| format!("reading {}", local_path.display()))?;
             // Local won the merge → it's the new base.
             if let Some(p) = paths {
@@ -853,7 +853,7 @@ pub async fn apply_pull_action_with(
             // the disk bytes (whatever flavour the canonical form took)
             // so the next merge has them.
             if let Some(p) = paths
-                && let Ok(on_disk) = std::fs::read(local_path)
+                && let Ok(on_disk) = crate::vfs::read(local_path)
             {
                 crate::state::base_cache::write(p, local_path, &on_disk)?;
             }
@@ -881,7 +881,7 @@ pub async fn apply_pull_action_with(
             // crucial, because the disk still holds LOCAL, not base.
             if let Some(p) = paths
                 && base_hash != Some(resolved_hash.as_str())
-                && let Ok(on_disk) = std::fs::read(local_path)
+                && let Ok(on_disk) = crate::vfs::read(local_path)
             {
                 crate::state::base_cache::write(p, local_path, &on_disk)?;
             }
@@ -932,7 +932,7 @@ fn shadow_file_conflict(
     // sensible entry — `mode == Raw` for MDH row data, never the canonical
     // hash that a one-row `data.jsonl` would misclassify.
     let local_bytes =
-        std::fs::read(local_path).with_context(|| format!("reading {}", local_path.display()))?;
+        crate::vfs::read(local_path).with_context(|| format!("reading {}", local_path.display()))?;
     Ok(hash_for_mode(&local_bytes, mode))
 }
 
@@ -977,7 +977,7 @@ async fn resolve_conflict_interactive(
 
     match resolution {
         Resolution::KeepLocal => {
-            let local_bytes = std::fs::read(local_path)
+            let local_bytes = crate::vfs::read(local_path)
                 .with_context(|| format!("reading {}", local_path.display()))?;
             Ok(hash_for_mode(&local_bytes, mode))
         }

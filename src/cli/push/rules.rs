@@ -391,8 +391,8 @@ fn write_back(
     } else {
         // Server dropped the trigger_condition; remove the stale .py from
         // disk AND the base cache so the snapshot stays canonical.
-        if local_py_path.exists() {
-            std::fs::remove_file(&local_py_path)
+        if crate::vfs::exists(&local_py_path) {
+            crate::vfs::remove_file(&local_py_path)
                 .with_context(|| format!("removing stale {}", local_py_path.display()))?;
         }
         crate::state::base_cache::forget(paths, &local_py_path)?;
@@ -487,8 +487,8 @@ async fn push_one_drifted(
                 crate::state::base_cache::write(paths, &local_py_path, code.as_bytes())
                     .with_context(|| format!("caching base rule code for '{slug}'"))?;
             } else {
-                if local_py_path.exists() {
-                    std::fs::remove_file(&local_py_path)
+                if crate::vfs::exists(&local_py_path) {
+                    crate::vfs::remove_file(&local_py_path)
                         .with_context(|| format!("removing stale {}", local_py_path.display()))?;
                 }
                 crate::state::base_cache::forget(paths, &local_py_path)?;

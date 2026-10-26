@@ -54,14 +54,14 @@ pub fn portabilize_refs(
             Some(p) => p,
             None => continue,
         };
-        if !path.exists() {
+        if !crate::vfs::exists(&path) {
             continue;
         }
         // Conflict-shadow handling. A shadow parked under `.rdc/conflicts/<env>/`
         // marks an object whose local side was kept verbatim for the user to
         // resolve against the remote.
         let shadow_path = paths.conflict_shadow_path(&path);
-        if shadow_path.exists() {
+        if crate::vfs::exists(&shadow_path) {
             if active_conflicts.contains(&(kind.clone(), slug.clone())) {
                 // Still an open conflict THIS run: leave the local file
                 // byte-untouched so the diff against the remote shadow stays
@@ -74,16 +74,16 @@ pub fn portabilize_refs(
             // forever, so its refs never portabilize and it re-syncs on every
             // run (observed as a perpetual migrate+sync churn). Prune the stale
             // shadow (and any `-deleted` marker) so the object can converge.
-            let _ = std::fs::remove_file(&shadow_path);
+            let _ = crate::vfs::remove_file(&shadow_path);
             let mut marker = shadow_path.clone().into_os_string();
             marker.push("-deleted");
-            let _ = std::fs::remove_file(std::path::PathBuf::from(marker));
+            let _ = crate::vfs::remove_file(std::path::PathBuf::from(marker));
         }
 
         // Read and parse. A read error on a file we just confirmed exists is a
         // real I/O problem (permissions, races) and should surface, not be
         // silently skipped — consistent with how the sidecar reads below fail.
-        let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        let bytes = crate::vfs::read(&path).with_context(|| format!("reading {}", path.display()))?;
         let mut value: serde_json::Value = match serde_json::from_slice(&bytes) {
             Ok(v) => v,
             Err(_) => continue, // defensive: skip unparseable files
@@ -204,14 +204,14 @@ fn compute_hash_for_kind(
             // Also check the other extension (stale sidecar, runtime changed).
             let stale_ext = if ext == "py" { "js" } else { "py" };
             let stale_code_path = paths.hooks_dir().join(format!("{slug}.{stale_ext}"));
-            let code: Option<String> = if code_path.exists() {
+            let code: Option<String> = if crate::vfs::exists(&code_path) {
                 Some(
-                    std::fs::read_to_string(&code_path)
+                    crate::vfs::read_to_string(&code_path)
                         .with_context(|| format!("reading hook code {}", code_path.display()))?,
                 )
-            } else if stale_code_path.exists() {
+            } else if crate::vfs::exists(&stale_code_path) {
                 Some(
-                    std::fs::read_to_string(&stale_code_path).with_context(|| {
+                    crate::vfs::read_to_string(&stale_code_path).with_context(|| {
                         format!("reading hook code {}", stale_code_path.display())
                     })?,
                 )
@@ -226,9 +226,9 @@ fn compute_hash_for_kind(
         }
         "rules" => {
             let py_path = paths.rules_dir().join(format!("{slug}.py"));
-            let code: Option<String> = if py_path.exists() {
+            let code: Option<String> = if crate::vfs::exists(&py_path) {
                 Some(
-                    std::fs::read_to_string(&py_path)
+                    crate::vfs::read_to_string(&py_path)
                         .with_context(|| format!("reading rule code {}", py_path.display()))?,
                 )
             } else {

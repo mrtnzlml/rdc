@@ -104,7 +104,7 @@ pub async fn push_dataset(
     interactive: bool,
     progress: &Arc<Log>,
 ) -> Result<usize> {
-    let local_raw = std::fs::read(indexes_path)
+    let local_raw = crate::vfs::read(indexes_path)
         .with_context(|| format!("reading {}", indexes_path.display()))?;
     let local_set: IndexSet = serde_json::from_slice(&local_raw)
         .with_context(|| format!("parsing {}", indexes_path.display()))?;

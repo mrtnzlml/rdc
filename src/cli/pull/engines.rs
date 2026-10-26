@@ -50,7 +50,7 @@ pub async fn process(
             // Each engine owns a directory: `engines/<slug>/`. The engine's
             // JSON lives at `engine.json` inside it, alongside `fields/`.
             let engine_dir = ctx.paths.engine_dir(&slug);
-            std::fs::create_dir_all(&engine_dir)
+            crate::vfs::create_dir_all(&engine_dir)
                 .with_context(|| format!("creating {}", engine_dir.display()))?;
 
             // Canonical on-disk bytes via KindCodec: redacts server-set

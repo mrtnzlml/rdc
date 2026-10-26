@@ -42,7 +42,7 @@ pub(crate) enum DataMode {
 /// the user's opt-in.
 pub(crate) fn read_data_mode(dataset_dir: &std::path::Path) -> Result<DataMode> {
     let path = dataset_dir.join(COLLECTION_MANIFEST);
-    let Ok(bytes) = std::fs::read(&path) else {
+    let Ok(bytes) = crate::vfs::read(&path) else {
         return Ok(DataMode::None);
     };
     let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
@@ -100,7 +100,7 @@ pub(crate) fn is_internal_collection(name: &str) -> bool {
 /// the manifest is absent (a legacy dataset predating the manifest) or
 /// unparseable — never panics; the caller warns and skips.
 pub(crate) fn read_collection_name(dataset_dir: &std::path::Path) -> Option<String> {
-    let bytes = std::fs::read(dataset_dir.join(COLLECTION_MANIFEST)).ok()?;
+    let bytes = crate::vfs::read(dataset_dir.join(COLLECTION_MANIFEST)).ok()?;
     let value: Value = serde_json::from_slice(&bytes).ok()?;
     value.get("name")?.as_str().map(str::to_owned)
 }
@@ -121,11 +121,11 @@ pub(crate) fn local_only_dataset_slugs(
     remote_names: &BTreeMap<String, String>,
 ) -> Result<Vec<String>> {
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(mdh_dir) else {
+    let Ok(entries) = crate::vfs::read_dir(mdh_dir) else {
         return Ok(out); // no local mdh dir → nothing to create
     };
-    for entry in entries.flatten() {
-        if !entry.path().is_dir() {
+    for entry in entries {
+        if !crate::vfs::is_dir(entry.path()) {
             continue;
         }
         let Some(slug) = entry.file_name().to_str().map(str::to_owned) else {
@@ -138,7 +138,7 @@ pub(crate) fn local_only_dataset_slugs(
         if name.as_deref().is_some_and(is_internal_collection) {
             continue; // Rossum's own, left over from an older pull
         }
-        if !entry.path().join("indexes.json").is_file() {
+        if !crate::vfs::is_file(entry.path().join("indexes.json")) {
             continue;
         }
         if let Some(existing) = name.as_ref().and_then(|n| remote_names.get(n)) {
@@ -247,7 +247,7 @@ pub(crate) fn plan_mdh(
         // `indexes.json` hash differs from the lockfile baseline → PATCH.
         for slug in &remote_slugs {
             let indexes_path = paths.dataset_dir(slug).join("indexes.json");
-            let Ok(bytes) = std::fs::read(&indexes_path) else {
+            let Ok(bytes) = crate::vfs::read(&indexes_path) else {
                 continue;
             };
             let local_hash =
@@ -283,7 +283,7 @@ pub(crate) fn plan_mdh(
             {
                 continue;
             }
-            let Ok(bytes) = std::fs::read(paths.dataset_data(slug)) else {
+            let Ok(bytes) = crate::vfs::read(paths.dataset_data(slug)) else {
                 continue;
             };
             let local_hash = crate::state::raw_content_hash(&bytes);
@@ -317,7 +317,7 @@ pub(crate) fn plan_mdh(
     // Stage 3 (structural pull): an env collection with no local
     // `indexes.json` → the pull would create the dataset dir locally.
     for slug in &remote_slugs {
-        if !paths.dataset_dir(slug).join("indexes.json").is_file() {
+        if !crate::vfs::is_file(paths.dataset_dir(slug).join("indexes.json")) {
             items.push(MdhPlanItem {
                 dir: MdhPlanDir::Pull,
                 slug: slug.to_string(),
@@ -339,7 +339,7 @@ pub(crate) fn plan_mdh(
     // fallible companion surfaces errors).
     for slug in &remote_slugs {
         if read_data_mode(&paths.dataset_dir(slug)).unwrap_or(DataMode::None) == DataMode::Manual
-            && !paths.dataset_data(slug).is_file()
+            && !crate::vfs::is_file(paths.dataset_data(slug))
         {
             items.push(MdhPlanItem {
                 dir: MdhPlanDir::Pull,
@@ -387,7 +387,7 @@ fn index_edit_item(
 ) -> Result<Option<MdhPlanItem>> {
     // A missing local file is a create, not an index-body edit — leave it to
     // `plan_mdh` stage 3 so it is not forecast twice.
-    if !ix_path.is_file() {
+    if !crate::vfs::is_file(ix_path) {
         return Ok(None);
     }
     let (action, _remote_hash) = decide_pull_action(ix_path, base_hash, proposed)?;
@@ -442,7 +442,7 @@ pub(crate) async fn plan_mdh_index_edits(
     // version; only the scheduling below changes.
     let wanted: Vec<(String, String)> = listed
         .datasets()
-        .filter(|(slug, _)| paths.dataset_dir(slug).join("indexes.json").is_file())
+        .filter(|(slug, _)| crate::vfs::is_file(paths.dataset_dir(slug).join("indexes.json")))
         .map(|(slug, c)| (slug.to_string(), c.name.clone()))
         .collect();
 
@@ -483,7 +483,7 @@ pub(crate) async fn plan_mdh_index_edits(
             // forecasts "(new)"; don't fetch (nothing to compare against)
             // or double-report. This is also what keeps an unflagged
             // dataset's cost unchanged: no manual opt-in, no fetch, ever.
-            if data_path.is_file() {
+            if crate::vfs::is_file(&data_path) {
                 let rows = listed.client.find_all(name, Some(progress.clone())).await?;
                 let proposed = crate::snapshot::mdh_data::to_jsonl(&rows)?;
                 let base = lockfile.base_hash("mdh_data", slug);
@@ -921,7 +921,7 @@ pub async fn list(
     if let Some(paths) = prefetch_for {
         let wanted: Vec<(String, String)> = listed
             .datasets()
-            .filter(|(slug, _)| paths.dataset_dir(slug).join("indexes.json").is_file())
+            .filter(|(slug, _)| crate::vfs::is_file(paths.dataset_dir(slug).join("indexes.json")))
             .map(|(slug, c)| (slug.to_string(), c.name.clone()))
             .collect();
         listed.index_sets = fetch_index_sets(&listed.client, &wanted, progress).await?;
@@ -979,13 +979,13 @@ pub async fn process(
         }
 
         if !dir_created {
-            std::fs::create_dir_all(ctx.paths.mdh_dir())
+            crate::vfs::create_dir_all(ctx.paths.mdh_dir())
                 .with_context(|| format!("creating {}", ctx.paths.mdh_dir().display()))?;
             dir_created = true;
         }
 
         let dataset_dir = ctx.paths.dataset_dir(&slug);
-        std::fs::create_dir_all(&dataset_dir)
+        crate::vfs::create_dir_all(&dataset_dir)
             .with_context(|| format!("creating {}", dataset_dir.display()))?;
 
         // Persist the collection's server `name` to a minimal manifest.
@@ -998,11 +998,11 @@ pub async fn process(
         // `idIndex`) is NOT cleaned up here: those keys survive every pull
         // indefinitely and travel through `migrate` into other envs.
         let manifest_path = dataset_dir.join(COLLECTION_MANIFEST);
-        let existing = std::fs::read(&manifest_path).ok();
+        let existing = crate::vfs::read(&manifest_path).ok();
         let manifest_bytes = manifest_bytes_merged(existing.as_deref(), &c.name)?;
         let needs_write = existing.as_deref() != Some(manifest_bytes.as_slice());
         if needs_write {
-            std::fs::write(&manifest_path, &manifest_bytes)
+            crate::vfs::write(&manifest_path, &manifest_bytes)
                 .with_context(|| format!("writing {}", manifest_path.display()))?;
             changed.insert(slug.clone());
         }

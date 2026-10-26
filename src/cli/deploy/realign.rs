@@ -354,7 +354,7 @@ fn is_stable_slug(slug: &str, base: &str) -> bool {
 /// Read a JSON file and return its top-level `name` field as a String.
 /// Returns None for any IO/parse failure or a non-string `name`.
 fn read_name(path: &std::path::Path) -> Option<String> {
-    let raw = std::fs::read_to_string(path).ok()?;
+    let raw = crate::vfs::read_to_string(path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
     v.get("name")
         .and_then(|n| n.as_str())
@@ -444,19 +444,19 @@ fn locate_engine_field_file(paths: &Paths, key: &str) -> Option<std::path::PathB
         let candidate = paths
             .engine_fields_dir(e_slug)
             .join(format!("{f_slug}.json"));
-        if candidate.exists() {
+        if crate::vfs::exists(&candidate) {
             return Some(candidate);
         }
     }
     let engines_dir = paths.engines_dir();
-    let entries = std::fs::read_dir(&engines_dir).ok()?;
-    for e_entry in entries.flatten() {
+    let entries = crate::vfs::read_dir(&engines_dir).ok()?;
+    for e_entry in entries {
         if !e_entry.file_type().ok()?.is_dir() {
             continue;
         }
         let e_slug = e_entry.file_name().to_string_lossy().to_string();
         let p = paths.engine_fields_dir(&e_slug).join(format!("{key}.json"));
-        if p.exists() {
+        if crate::vfs::exists(&p) {
             return Some(p);
         }
     }
@@ -471,13 +471,13 @@ fn locate_workflow_step_file(paths: &Paths, key: &str) -> Option<std::path::Path
         let candidate = paths
             .workflow_steps_dir(w_slug)
             .join(format!("{s_slug}.json"));
-        if candidate.exists() {
+        if crate::vfs::exists(&candidate) {
             return Some(candidate);
         }
     }
     let workflows_dir = paths.workflows_dir();
-    let entries = std::fs::read_dir(&workflows_dir).ok()?;
-    for w_entry in entries.flatten() {
+    let entries = crate::vfs::read_dir(&workflows_dir).ok()?;
+    for w_entry in entries {
         if !w_entry.file_type().ok()?.is_dir() {
             continue;
         }
@@ -485,7 +485,7 @@ fn locate_workflow_step_file(paths: &Paths, key: &str) -> Option<std::path::Path
         let p = paths
             .workflow_steps_dir(&w_slug)
             .join(format!("{key}.json"));
-        if p.exists() {
+        if crate::vfs::exists(&p) {
             return Some(p);
         }
     }
@@ -500,11 +500,11 @@ fn locate_queue_dir(
     q_slug: &str,
 ) -> Option<(String, std::path::PathBuf)> {
     let ws_root = paths.workspaces_dir();
-    let entries = std::fs::read_dir(&ws_root).ok()?;
-    for entry in entries.flatten() {
+    let entries = crate::vfs::read_dir(&ws_root).ok()?;
+    for entry in entries {
         let ws_slug = entry.file_name().to_string_lossy().to_string();
         let candidate = entry.path().join("queues").join(q_slug);
-        if candidate.is_dir() {
+        if crate::vfs::is_dir(&candidate) {
             // Sanity: parent ws_slug should exist in lockfile.
             if lockfile
                 .objects
@@ -714,7 +714,7 @@ fn refresh_lockfile_hashes(paths: &Paths, lockfile: &mut Lockfile) -> Result<()>
         let Some((kind, slug)) = crate::cli::migrate::classify(rel) else {
             continue;
         };
-        let Ok(json) = std::fs::read(&base_path) else {
+        let Ok(json) = crate::vfs::read(&base_path) else {
             continue;
         };
         let sidecars = base_sidecars(kind, &base_path);
@@ -742,13 +742,13 @@ fn base_sidecars(kind: &str, base_json_path: &std::path::Path) -> Vec<(String, V
     match (kind, stem, dir) {
         ("hooks", Some(stem), Some(dir)) => {
             for ext in ["py", "js"] {
-                if let Ok(bytes) = std::fs::read(dir.join(format!("{stem}.{ext}"))) {
+                if let Ok(bytes) = crate::vfs::read(dir.join(format!("{stem}.{ext}"))) {
                     return vec![("code".to_string(), bytes)];
                 }
             }
             Vec::new()
         }
-        ("rules", Some(stem), Some(dir)) => match std::fs::read(dir.join(format!("{stem}.py"))) {
+        ("rules", Some(stem), Some(dir)) => match crate::vfs::read(dir.join(format!("{stem}.py"))) {
             Ok(bytes) => vec![("trigger_condition".to_string(), bytes)],
             Err(_) => Vec::new(),
         },
@@ -838,7 +838,7 @@ fn rewrite_refs_in_tree(
         .collect();
     for root in [paths.env_root(), paths.base_cache_root()] {
         for path in json_files_under(&root) {
-            let Ok(raw) = std::fs::read_to_string(&path) else {
+            let Ok(raw) = crate::vfs::read_to_string(&path) else {
                 continue;
             };
             let mut updated = raw.clone();
@@ -858,12 +858,12 @@ fn json_files_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+        let Ok(entries) = crate::vfs::read_dir(&dir) else {
             continue;
         };
-        for entry in entries.flatten() {
+        for entry in entries {
             let path = entry.path();
-            if path.is_dir() {
+            if crate::vfs::is_dir(&path) {
                 stack.push(path);
             } else if path.extension().and_then(|e| e.to_str()) == Some("json") {
                 out.push(path);
@@ -1137,7 +1137,7 @@ pub fn follow_hand_renames(
         let mut pending = Vec::new();
         for (p, moves) in found {
             for (at_new, at_old) in &moves {
-                std::fs::rename(at_new, at_old).with_context(|| {
+                crate::vfs::rename(at_new, at_old).with_context(|| {
                     format!("moving {} back to {}", at_new.display(), at_old.display())
                 })?;
             }
@@ -1181,7 +1181,7 @@ fn lockfile_key_change(p: &PendingRename) -> (&'static str, String, String) {
 
 /// The `id` a local JSON file carries, if any.
 fn file_id(path: &std::path::Path) -> Option<u64> {
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = crate::vfs::read(path).ok()?;
     serde_json::from_slice::<serde_json::Value>(&bytes).ok()?.get("id")?.as_u64()
 }
 
@@ -1216,14 +1216,14 @@ fn pair_by_id(
 
 /// Immediate subdirectories of `dir` that contain `file`, as `(name, path to file)`.
 fn subdirs_with(dir: &std::path::Path, file: &str) -> Vec<(String, std::path::PathBuf)> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let Ok(entries) = crate::vfs::read_dir(dir) else {
         return Vec::new();
     };
     let mut out: Vec<(String, std::path::PathBuf)> = entries
-        .flatten()
+        .into_iter()
         .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
         .map(|e| (e.file_name().to_string_lossy().to_string(), e.path().join(file)))
-        .filter(|(_, p)| p.exists())
+        .filter(|(_, p)| crate::vfs::exists(p))
         .collect();
     out.sort();
     out
@@ -1231,11 +1231,11 @@ fn subdirs_with(dir: &std::path::Path, file: &str) -> Vec<(String, std::path::Pa
 
 /// `<stem>.json` files directly in `dir`, as `(stem, path)`.
 fn json_files_in(dir: &std::path::Path) -> Vec<(String, std::path::PathBuf)> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let Ok(entries) = crate::vfs::read_dir(dir) else {
         return Vec::new();
     };
     let mut out: Vec<(String, std::path::PathBuf)> = entries
-        .flatten()
+        .into_iter()
         .map(|e| e.path())
         .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
         .filter_map(|p| Some((p.file_stem()?.to_str()?.to_string(), p)))
@@ -1255,14 +1255,14 @@ fn detect_hand_renames(
     let workspaces = subdirs_with(&paths.workspaces_dir(), "workspace.json");
     if round == HandRenameRound::Structural {
         for (old, new) in pair_by_id(lockfile, "workspaces", &workspaces, |s| {
-            paths.workspace_dir(s).join("workspace.json").exists()
+            crate::vfs::exists(paths.workspace_dir(s).join("workspace.json"))
         }) {
             let moves = vec![(paths.workspace_dir(&new), paths.workspace_dir(&old))];
             out.push((PendingRename::Workspace { old, new }, moves));
         }
         let engines = subdirs_with(&paths.engines_dir(), "engine.json");
         for (old, new) in pair_by_id(lockfile, "engines", &engines, |s| {
-            paths.engine_dir(s).join("engine.json").exists()
+            crate::vfs::exists(paths.engine_dir(s).join("engine.json"))
         }) {
             let moves = vec![(paths.engine_dir(&new), paths.engine_dir(&old))];
             out.push((PendingRename::Engine { old, new }, moves));
@@ -1274,7 +1274,7 @@ fn detect_hand_renames(
             let queue_anywhere = |slug: &str| {
                 subdirs_with(&paths.workspaces_dir(), "workspace.json")
                     .iter()
-                    .any(|(w, _)| paths.queue_dir(w, slug).join("queue.json").exists())
+                    .any(|(w, _)| crate::vfs::exists(paths.queue_dir(w, slug).join("queue.json")))
             };
             for (old, new) in pair_by_id(lockfile, "queues", &queues, queue_anywhere) {
                 let moves = vec![(paths.queue_dir(ws, &new), paths.queue_dir(ws, &old))];
@@ -1292,11 +1292,11 @@ fn detect_hand_renames(
     ];
     for (kind, dir, sidecars) in flat {
         let files = json_files_in(&dir);
-        for (old, new) in pair_by_id(lockfile, kind, &files, |s| dir.join(format!("{s}.json")).exists()) {
+        for (old, new) in pair_by_id(lockfile, kind, &files, |s| crate::vfs::exists(dir.join(format!("{s}.json")))) {
             let mut moves = vec![(dir.join(format!("{new}.json")), dir.join(format!("{old}.json")))];
             for ext in sidecars {
                 let at_new = dir.join(format!("{new}.{ext}"));
-                if at_new.exists() {
+                if crate::vfs::exists(&at_new) {
                     moves.push((at_new, dir.join(format!("{old}.{ext}"))));
                 }
             }
@@ -1342,7 +1342,7 @@ fn detect_hand_renames(
         };
         for (old_key, new_key) in pair_by_id(&scoped, "email_templates", &files, |k| {
             let t = k.rsplit('/').next().unwrap_or(k);
-            dir.join(format!("{t}.json")).exists()
+            crate::vfs::exists(dir.join(format!("{t}.json")))
         }) {
             let old = old_key.rsplit('/').next().unwrap_or_default().to_string();
             let new = new_key.rsplit('/').next().unwrap_or_default().to_string();
@@ -1354,30 +1354,30 @@ fn detect_hand_renames(
 }
 
 fn move_file(paths: &Paths, from: &std::path::Path, to: &std::path::Path) -> Result<()> {
-    if to.exists() {
+    if crate::vfs::exists(to) {
         anyhow::bail!("destination {} already exists", to.display());
     }
     if let Some(parent) = to.parent() {
-        std::fs::create_dir_all(parent)
+        crate::vfs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    std::fs::rename(from, to)
+    crate::vfs::rename(from, to)
         .with_context(|| format!("moving {} -> {}", from.display(), to.display()))?;
     move_base_mirror(paths, from, to)
 }
 
 fn move_optional(paths: &Paths, from: &std::path::Path, to: &std::path::Path) -> Result<()> {
-    if !from.exists() {
+    if !crate::vfs::exists(from) {
         return Ok(());
     }
     move_file(paths, from, to)
 }
 
 fn move_dir(paths: &Paths, from: &std::path::Path, to: &std::path::Path) -> Result<()> {
-    if to.exists() {
+    if crate::vfs::exists(to) {
         anyhow::bail!("destination {} already exists", to.display());
     }
-    std::fs::rename(from, to)
+    crate::vfs::rename(from, to)
         .with_context(|| format!("moving {} -> {}", from.display(), to.display()))?;
     move_base_mirror(paths, from, to)
 }
@@ -1396,14 +1396,14 @@ fn move_base_mirror(paths: &Paths, from: &std::path::Path, to: &std::path::Path)
     ) else {
         return Ok(());
     };
-    if !base_from.exists() {
+    if !crate::vfs::exists(&base_from) {
         return Ok(());
     }
     if let Some(parent) = base_to.parent() {
-        std::fs::create_dir_all(parent)
+        crate::vfs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    std::fs::rename(&base_from, &base_to).with_context(|| {
+    crate::vfs::rename(&base_from, &base_to).with_context(|| {
         format!(
             "moving base cache {} -> {}",
             base_from.display(),
@@ -1651,11 +1651,11 @@ fn apply_overlay_rewrites(
     applied: &[PendingRename],
 ) -> Result<(Vec<String>, Vec<String>)> {
     let path = paths.overlay_file();
-    if !path.exists() {
+    if !crate::vfs::exists(&path) {
         return Ok((Vec::new(), Vec::new()));
     }
     let original =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        crate::vfs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let mut text = original.clone();
     let mut updated = Vec::new();
     let mut missed = Vec::new();
@@ -1700,10 +1700,10 @@ fn collect_orphans(paths: &Paths, kind: &str, old: &str, out: &mut Vec<String>) 
     let dotted = format!(".{old}]");
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for path in paths.legacy_mapping_files() {
-        if !path.exists() {
+        if !crate::vfs::exists(&path) {
             continue;
         }
-        let Ok(raw) = std::fs::read_to_string(&path) else {
+        let Ok(raw) = crate::vfs::read_to_string(&path) else {
             continue;
         };
         if raw.contains(&needle) || raw.contains(&dotted) {
@@ -1905,8 +1905,8 @@ fn record_mapping_rows(
     }
 
     let path = paths.mapping_file();
-    let original = if path.exists() {
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?
+    let original = if crate::vfs::exists(&path) {
+        crate::vfs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?
     } else {
         String::new()
     };

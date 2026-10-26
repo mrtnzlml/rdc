@@ -162,7 +162,7 @@ pub async fn push_dataset_data(
     progress: &Arc<Log>,
 ) -> Result<usize> {
     let data_path = paths.dataset_data(slug);
-    let Ok(local_raw) = std::fs::read(&data_path) else {
+    let Ok(local_raw) = crate::vfs::read(&data_path) else {
         return Ok(0); // not pulled yet — never authoritative
     };
 

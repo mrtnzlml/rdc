@@ -74,7 +74,7 @@ pub async fn process(
 
         let result: Result<()> = (async || {
             if !dir_created {
-                std::fs::create_dir_all(ctx.paths.hooks_dir())
+                crate::vfs::create_dir_all(ctx.paths.hooks_dir())
                     .with_context(|| format!("creating {}", ctx.paths.hooks_dir().display()))?;
                 dir_created = true;
             }
@@ -94,9 +94,9 @@ pub async fn process(
                 .paths
                 .hooks_dir()
                 .join(format!("{slug}.{}", if ext == "py" { "js" } else { "py" }));
-            let pre_local_json = if local_path.exists() {
+            let pre_local_json = if crate::vfs::exists(&local_path) {
                 Some(
-                    std::fs::read(&local_path)
+                    crate::vfs::read(&local_path)
                         .with_context(|| format!("reading {}", local_path.display()))?,
                 )
             } else {
@@ -106,14 +106,14 @@ pub async fn process(
             // hash. The runtime-derived one wins if present; otherwise the
             // other extension still contributes — same defensive fallback as
             // `read_hook_value`.
-            let pre_local_code = if code_path.exists() {
+            let pre_local_code = if crate::vfs::exists(&code_path) {
                 Some(
-                    std::fs::read_to_string(&code_path)
+                    crate::vfs::read_to_string(&code_path)
                         .with_context(|| format!("reading {}", code_path.display()))?,
                 )
-            } else if stale_code_path.exists() {
+            } else if crate::vfs::exists(&stale_code_path) {
                 Some(
-                    std::fs::read_to_string(&stale_code_path)
+                    crate::vfs::read_to_string(&stale_code_path)
                         .with_context(|| format!("reading {}", stale_code_path.display()))?,
                 )
             } else {
@@ -170,15 +170,15 @@ pub async fn process(
                             &code_disk_path,
                             code.as_bytes(),
                         )?;
-                    } else if code_path.exists() {
-                        std::fs::remove_file(&code_path)
+                    } else if crate::vfs::exists(&code_path) {
+                        crate::vfs::remove_file(&code_path)
                             .with_context(|| format!("removing stale {}", code_path.display()))?;
                         crate::state::base_cache::forget(ctx.paths, &code_path)?;
                     }
                     // Always sweep a sidecar with the other extension —
                     // runtime may have just changed, leaving a stale file.
-                    if stale_code_path.exists() {
-                        std::fs::remove_file(&stale_code_path).with_context(|| {
+                    if crate::vfs::exists(&stale_code_path) {
+                        crate::vfs::remove_file(&stale_code_path).with_context(|| {
                             format!("removing stale {}", stale_code_path.display())
                         })?;
                         crate::state::base_cache::forget(ctx.paths, &stale_code_path)?;

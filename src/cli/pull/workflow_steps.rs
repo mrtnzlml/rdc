@@ -80,7 +80,7 @@ pub async fn process(
 
         let result: Result<()> = (async || {
             let steps_dir = ctx.paths.workflow_steps_dir(&workflow_slug);
-            std::fs::create_dir_all(&steps_dir)
+            crate::vfs::create_dir_all(&steps_dir)
                 .with_context(|| format!("creating {}", steps_dir.display()))?;
 
             // Canonical on-disk bytes via KindCodec: strips `modified_at`.

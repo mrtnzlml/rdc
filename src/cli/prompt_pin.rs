@@ -70,15 +70,15 @@ pub(crate) fn pin(name: &str, actual: &str) {
         .join("testdata/prompt_pins")
         .join(format!("{name}.txt"));
     let updating = std::env::var_os(UPDATE).is_some();
-    if updating || !path.exists() {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, actual).unwrap();
+    if updating || !crate::vfs::exists(&path) {
+        crate::vfs::create_dir_all(path.parent().unwrap()).unwrap();
+        crate::vfs::write(&path, actual).unwrap();
         if updating {
             return;
         }
         panic!("wrote a new pin at {}; re-run to verify it", path.display());
     }
-    let expected = std::fs::read_to_string(&path).unwrap();
+    let expected = crate::vfs::read_to_string(&path).unwrap();
     pretty_assertions::assert_eq!(expected, actual, "prompt bytes moved: {}", name);
 }
 

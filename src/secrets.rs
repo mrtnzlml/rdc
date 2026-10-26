@@ -29,10 +29,10 @@ pub struct SecretsFile {
 /// malformed JSON or unreadable files.
 pub fn read_secrets_file(project_root: &Path, env: &str) -> Result<SecretsFile> {
     let path = project_root.join("secrets").join(format!("{env}.secrets.json"));
-    if !path.exists() {
+    if !crate::vfs::exists(&path) {
         return Ok(SecretsFile::default());
     }
-    let raw = std::fs::read_to_string(&path)
+    let raw = crate::vfs::read_to_string(&path)
         .with_context(|| format!("reading {}", path.display()))?;
     let parsed: SecretsFile = serde_json::from_str(&raw)
         .with_context(|| format!("parsing {}", path.display()))?;
@@ -45,18 +45,15 @@ pub fn read_secrets_file(project_root: &Path, env: &str) -> Result<SecretsFile> 
 /// write into the repo. `symlink_metadata` checks the entry itself.
 fn ensure_secrets_dir(project_root: &Path) -> Result<PathBuf> {
     let dir = project_root.join("secrets");
-    match std::fs::symlink_metadata(&dir) {
-        Ok(meta) if meta.file_type().is_dir() => {}
+    match crate::vfs::symlink_metadata(&dir) {
+        Ok(meta) if meta.is_dir() => {}
         Ok(_) => anyhow::bail!(
             "{} is a symlink or not a directory; refusing to write credentials into it",
             dir.display()
         ),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let mut builder = std::fs::DirBuilder::new();
-            builder.recursive(true);
-            #[cfg(unix)]
-            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-            builder.create(&dir).with_context(|| format!("creating {}", dir.display()))?;
+            crate::vfs::create_dir_all_private(&dir)
+                .with_context(|| format!("creating {}", dir.display()))?;
         }
         Err(e) => return Err(anyhow::Error::new(e).context(format!("inspecting {}", dir.display()))),
     }
@@ -479,10 +476,10 @@ pub fn hook_secrets_path(project_root: &Path, env: &str) -> PathBuf {
 /// typos surface loudly instead of silently dropping secrets on push.
 pub fn load_hook_secrets(project_root: &Path, env: &str) -> Result<HookSecrets> {
     let path = hook_secrets_path(project_root, env);
-    if !path.exists() {
+    if !crate::vfs::exists(&path) {
         return Ok(HookSecrets::default());
     }
-    let raw = std::fs::read_to_string(&path)
+    let raw = crate::vfs::read_to_string(&path)
         .with_context(|| format!("reading {}", path.display()))?;
     if raw.trim().is_empty() {
         return Ok(HookSecrets::default());
@@ -522,7 +519,7 @@ pub const HOOK_SECRETS_STUB: &str = r#"{
 /// data loss. Mode 0600 on Unix, matching `secrets/<env>.secrets.json`.
 pub fn write_hook_secrets_stub(project_root: &Path, env: &str) -> Result<bool> {
     let path = hook_secrets_path(project_root, env);
-    if path.exists() {
+    if crate::vfs::exists(&path) {
         return Ok(false);
     }
     ensure_secrets_dir(project_root)?;
@@ -539,7 +536,7 @@ pub fn write_hook_secrets_stub(project_root: &Path, env: &str) -> Result<bool> {
 /// file, `"//"` included, is kept as it was.
 pub fn rename_hook_secret(project_root: &Path, env: &str, old: &str, new: &str) -> Result<bool> {
     let path = hook_secrets_path(project_root, env);
-    let Ok(raw) = std::fs::read_to_string(&path) else {
+    let Ok(raw) = crate::vfs::read_to_string(&path) else {
         return Ok(false);
     };
     if raw.trim().is_empty() {

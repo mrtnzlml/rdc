@@ -138,7 +138,7 @@ pub fn write_hook_code(dir: &Path, slug: &str, code: &str, ext: &str) -> Result<
 /// The next pull or push write-back normalizes the layout.
 pub fn read_hook_value(dir: &Path, slug: &str) -> Result<Value> {
     let json_path = dir.join(format!("{slug}.json"));
-    let raw = std::fs::read_to_string(&json_path)
+    let raw = crate::vfs::read_to_string(&json_path)
         .with_context(|| format!("reading {}", json_path.display()))?;
     let mut value: Value =
         serde_json::from_str(&raw).with_context(|| format!("parsing {}", json_path.display()))?;
@@ -152,7 +152,7 @@ pub fn read_hook_value(dir: &Path, slug: &str) -> Result<Value> {
 pub fn splice_hook_code(value: &mut Value, dir: &Path, slug: &str) -> Result<()> {
     let ext = hook_code_extension_from_value(value);
     let primary = dir.join(format!("{slug}.{ext}"));
-    let code_path = if primary.exists() {
+    let code_path = if crate::vfs::exists(&primary) {
         Some(primary)
     } else {
         // Defensive fallback: check the other extension. This handles
@@ -160,11 +160,11 @@ pub fn splice_hook_code(value: &mut Value, dir: &Path, slug: &str) -> Result<()>
         // sidecar wasn't renamed yet. Push/sync callers will normalize
         // on next write.
         let alt = dir.join(format!("{slug}.{}", other_extension(ext)));
-        if alt.exists() { Some(alt) } else { None }
+        if crate::vfs::exists(&alt) { Some(alt) } else { None }
     };
     if let Some(p) = code_path {
         let code =
-            std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
+            crate::vfs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
         // The sidecar file is the byte-exact canonical form (every writer
         // preserves bytes). No trailing-newline normalization on read either.
         if let Some(config) = value.get_mut("config").and_then(|c| c.as_object_mut()) {

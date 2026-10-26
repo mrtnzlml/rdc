@@ -171,7 +171,7 @@ pub async fn process(
 
         let queue_result: Result<()> = (async || {
             let queue_dir = ctx.paths.queue_dir(&ws_slug, &q_slug);
-            std::fs::create_dir_all(&queue_dir)
+            crate::vfs::create_dir_all(&queue_dir)
                 .with_context(|| format!("creating {}", queue_dir.display()))?;
 
             // The queue's slug is GLOBAL id-pinned (see the `used_q_slugs`
@@ -308,9 +308,9 @@ async fn write_schema_for_queue(
 ) -> Result<()> {
     let queue_dir = &w.queue_dir;
     let schema_path = queue_dir.join("schema.json");
-    let pre_local_json = if schema_path.exists() {
+    let pre_local_json = if crate::vfs::exists(&schema_path) {
         Some(
-            std::fs::read(&schema_path)
+            crate::vfs::read(&schema_path)
                 .with_context(|| format!("reading {}", schema_path.display()))?,
         )
     } else {
@@ -443,7 +443,7 @@ async fn write_schema_for_queue(
                     ctx.paths.conflict_shadow_path(&queue_dir.join("formulas"));
                 crate::snapshot::writer::write_atomic(&remote_path, &remote_json_bytes)?;
                 if !remote_formulas.is_empty() {
-                    std::fs::create_dir_all(&remote_formulas_dir)
+                    crate::vfs::create_dir_all(&remote_formulas_dir)
                         .with_context(|| format!("creating {}", remote_formulas_dir.display()))?;
                     for (field_id, bytes) in &remote_formulas {
                         let p = remote_formulas_dir.join(format!("{field_id}.py"));
@@ -547,9 +547,9 @@ fn find_stale_queue_dir(
     q_slug: &str,
     q_id: u64,
 ) -> Option<std::path::PathBuf> {
-    let entries = std::fs::read_dir(paths.workspaces_dir()).ok()?;
-    for entry in entries.flatten() {
-        if !entry.path().is_dir() {
+    let entries = crate::vfs::read_dir(paths.workspaces_dir()).ok()?;
+    for entry in entries {
+        if !crate::vfs::is_dir(entry.path()) {
             continue;
         }
         let ws_slug = entry.file_name().to_string_lossy().into_owned();
@@ -557,7 +557,7 @@ fn find_stale_queue_dir(
             continue;
         }
         let candidate = paths.queue_dir(&ws_slug, q_slug);
-        let Ok(bytes) = std::fs::read(candidate.join("queue.json")) else {
+        let Ok(bytes) = crate::vfs::read(candidate.join("queue.json")) else {
             continue;
         };
         let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
@@ -599,22 +599,21 @@ fn reconcile_moved_queue(
         // Deleting them here instead left the next sync reading a tombstone
         // for each, i.e. a DELETE of every template of the moved queue.
         let from = stale_dir.join("email-templates");
-        if from.is_dir() {
+        if crate::vfs::is_dir(&from) {
             let to = ctx.paths.queue_email_templates_dir(new_ws_slug, q_slug);
-            std::fs::create_dir_all(&to).with_context(|| format!("creating {}", to.display()))?;
-            for entry in std::fs::read_dir(&from)
+            crate::vfs::create_dir_all(&to).with_context(|| format!("creating {}", to.display()))?;
+            for entry in crate::vfs::read_dir(&from)
                 .with_context(|| format!("listing {}", from.display()))?
-                .flatten()
             {
                 let target = to.join(entry.file_name());
-                if !target.exists() {
-                    std::fs::rename(entry.path(), &target).with_context(|| {
+                if !crate::vfs::exists(&target) {
+                    crate::vfs::rename(entry.path(), &target).with_context(|| {
                         format!("moving {} -> {}", entry.path().display(), target.display())
                     })?;
                 }
             }
         }
-        std::fs::remove_dir_all(stale_dir)
+        crate::vfs::remove_dir_all(stale_dir)
             .with_context(|| format!("removing stale queue dir {}", stale_dir.display()))?;
         progress.event(
             Action::Info,
@@ -667,14 +666,14 @@ fn is_stale_queue_dir_clean(ctx: &PullCtx<'_>, q_slug: &str, dir: &std::path::Pa
     else {
         return Ok(false);
     };
-    let queue_bytes = std::fs::read(&queue_path)
+    let queue_bytes = crate::vfs::read(&queue_path)
         .with_context(|| format!("reading {}", queue_path.display()))?;
     if crate::state::content_hash(&queue_bytes, &crate::state::Lockfile::default()) != queue_base {
         return Ok(false);
     }
 
     let schema_path = dir.join("schema.json");
-    if schema_path.exists() {
+    if crate::vfs::exists(&schema_path) {
         let Some(schema_base) = ctx
             .lockfile
             .objects
@@ -684,7 +683,7 @@ fn is_stale_queue_dir_clean(ctx: &PullCtx<'_>, q_slug: &str, dir: &std::path::Pa
         else {
             return Ok(false);
         };
-        let schema_bytes = std::fs::read(&schema_path)
+        let schema_bytes = crate::vfs::read(&schema_path)
             .with_context(|| format!("reading {}", schema_path.display()))?;
         let formulas = crate::snapshot::schema::read_local_formulas(dir)?;
         let combined = crate::state::schema_combined_hash(&schema_bytes, &formulas, ctx.lockfile);
@@ -694,7 +693,7 @@ fn is_stale_queue_dir_clean(ctx: &PullCtx<'_>, q_slug: &str, dir: &std::path::Pa
     }
 
     let inbox_path = dir.join("inbox.json");
-    if inbox_path.exists() {
+    if crate::vfs::exists(&inbox_path) {
         let Some(inbox_base) = ctx
             .lockfile
             .objects
@@ -704,7 +703,7 @@ fn is_stale_queue_dir_clean(ctx: &PullCtx<'_>, q_slug: &str, dir: &std::path::Pa
         else {
             return Ok(false);
         };
-        let inbox_bytes = std::fs::read(&inbox_path)
+        let inbox_bytes = crate::vfs::read(&inbox_path)
             .with_context(|| format!("reading {}", inbox_path.display()))?;
         if crate::state::content_hash(&inbox_bytes, &crate::state::Lockfile::default())
             != inbox_base

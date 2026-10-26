@@ -65,7 +65,7 @@ pub fn write_rule_code(dir: &Path, slug: &str, code: &str) -> Result<()> {
 /// this directly, then `serde_json::from_value(value)?`.
 pub fn read_rule_value(dir: &Path, slug: &str) -> Result<Value> {
     let json_path = dir.join(format!("{slug}.json"));
-    let raw = std::fs::read_to_string(&json_path)
+    let raw = crate::vfs::read_to_string(&json_path)
         .with_context(|| format!("reading {}", json_path.display()))?;
     let mut value: Value = serde_json::from_str(&raw)
         .with_context(|| format!("parsing {}", json_path.display()))?;
@@ -78,8 +78,8 @@ pub fn read_rule_value(dir: &Path, slug: &str) -> Result<Value> {
 /// drift prompt, which carries only the JSON half.
 pub fn splice_rule_code(value: &mut Value, dir: &Path, slug: &str) -> Result<()> {
     let py_path = dir.join(format!("{slug}.py"));
-    if py_path.exists() {
-        let code = std::fs::read_to_string(&py_path)
+    if crate::vfs::exists(&py_path) {
+        let code = crate::vfs::read_to_string(&py_path)
             .with_context(|| format!("reading {}", py_path.display()))?;
         if let Some(obj) = value.as_object_mut() {
             obj.insert("trigger_condition".to_string(), Value::String(code));

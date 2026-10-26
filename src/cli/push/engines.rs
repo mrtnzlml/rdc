@@ -75,7 +75,7 @@ pub async fn push(
             }
 
             let disk_bytes =
-                std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+                crate::vfs::read(path).with_context(|| format!("reading {}", path.display()))?;
             let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
                 .with_context(|| format!("parsing {}", path.display()))?;
             let deferred = crate::snapshot::refs::resolve_value_deferring(&mut payload, lockfile);
@@ -273,7 +273,7 @@ async fn push_update_batch(
             // sequential loop did: an unreadable file is an error even for an
             // entry that would otherwise be skipped.
             let disk_bytes =
-                std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+                crate::vfs::read(path).with_context(|| format!("reading {}", path.display()))?;
             let entry = lf
                 .objects
                 .get("engines")
@@ -527,7 +527,7 @@ async fn push_one_drifted(
         .expect("only reached for an item that was batched as an update");
     let id = entry.id;
 
-    let disk_bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let disk_bytes = crate::vfs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
         .with_context(|| format!("parsing {}", path.display()))?;
     let mut deferred = crate::snapshot::refs::resolve_value_deferring(&mut payload, lockfile);

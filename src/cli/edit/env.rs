@@ -90,12 +90,12 @@ pub fn rename_env(root: &Path, old: &str, new: &str, dry_run: bool) -> Result<Re
     moves.extend(shadow_moves(root, old, new)?);
 
     let lock_path = Paths::for_env(root, old).env_lock();
-    let lock_existed = lock_path.exists();
+    let lock_existed = crate::vfs::exists(&lock_path);
     // Taking the lock creates `.rdc/state/` (and `.rdc/`) in a project that
     // never synced; neither should outlive the run.
     let rdc_dir = root.join(".rdc");
     let created_dirs: Vec<PathBuf> =
-        [rdc_dir.join("state"), rdc_dir].into_iter().filter(|d| !d.exists()).collect();
+        [rdc_dir.join("state"), rdc_dir].into_iter().filter(|d| !crate::vfs::exists(d)).collect();
     let result = if dry_run {
         plan_and_apply(root, &cfg, old, new, dry_run, &moves)
     } else {
@@ -114,10 +114,10 @@ pub fn rename_env(root: &Path, old: &str, new: &str, dry_run: bool) -> Result<Re
     // The old env's lock file has no env left to guard after a rename, and
     // one this run created should not outlive a failed run either.
     if !dry_run && (result.is_ok() || !lock_existed) {
-        let _ = std::fs::remove_file(&lock_path);
+        let _ = crate::vfs::remove_file(&lock_path);
         for dir in &created_dirs {
             // Succeeds only while the directory is empty.
-            let _ = std::fs::remove_dir(dir);
+            let _ = crate::vfs::remove_dir(dir);
         }
     }
     result
@@ -129,10 +129,10 @@ pub fn rename_env(root: &Path, old: &str, new: &str, dry_run: bool) -> Result<Re
 /// `(from, to)` pairs under `envs/<new>/`, to run after the env tree moved.
 fn shadow_moves(root: &Path, old: &str, new: &str) -> Result<Vec<(PathBuf, PathBuf)>> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-        let Ok(entries) = std::fs::read_dir(dir) else { return Ok(()) };
+        let Ok(entries) = crate::vfs::read_dir(dir) else { return Ok(()) };
         for entry in entries {
-            let path = entry.with_context(|| format!("reading {}", dir.display()))?.path();
-            if path.is_dir() {
+            let path = entry.path();
+            if crate::vfs::is_dir(&path) {
                 walk(&path, out)?;
             } else {
                 out.push(path);
@@ -155,7 +155,7 @@ fn shadow_moves(root: &Path, old: &str, new: &str) -> Result<Vec<(PathBuf, PathB
             None => format!("{}.{new}", &name[..name.len() - old.len() - 1]),
         };
         let collision = path.with_file_name(&renamed);
-        if collision.exists() {
+        if crate::vfs::exists(&collision) {
             bail!(
                 "{} already exists. Move or delete it, then retry the rename.",
                 rel(root, &collision).display()
@@ -185,7 +185,7 @@ fn plan_and_apply(
 
     let mut rewrites: Vec<Rewrite> = Vec::new();
     let mapping_path = Paths::for_env(root, old).mapping_file();
-    if mapping_path.exists() {
+    if crate::vfs::exists(&mapping_path) {
         let original = read(&mapping_path)?;
         let mut mapping = GenericMapping::load(&mapping_path)?;
         let before = toml::to_string_pretty(&mapping).context("serializing mapping")?;
@@ -201,7 +201,7 @@ fn plan_and_apply(
     let doc_regions = crate::cli::scaffold_docs::render_doc_regions(&new_cfg.envs);
     for doc in ["README.md", "CLAUDE.md"] {
         let path = root.join(doc);
-        if !path.exists() {
+        if !crate::vfs::exists(&path) {
             continue;
         }
         let original = read(&path)?;
@@ -212,7 +212,7 @@ fn plan_and_apply(
         }
     }
     let ci_path = root.join(".gitlab-ci.yml");
-    if ci_path.exists() {
+    if crate::vfs::exists(&ci_path) {
         let original = read(&ci_path)?;
         let pipeline = ci::rename_in_pipeline(&original, old, new, &new_cfg.envs)
             .context("planning the .gitlab-ci.yml rename")?;
@@ -251,7 +251,7 @@ fn apply(moves: &[(PathBuf, PathBuf)], rewrites: &[Rewrite]) -> Result<()> {
         }
     }
     for (from, to) in moved.iter().rev().map(|m| (&m.0, &m.1)) {
-        if let Err(e) = std::fs::rename(to, from) {
+        if let Err(e) = crate::vfs::rename(to, from) {
             failures.push(format!("moving {} back: {e}", to.display()));
         }
     }
@@ -272,9 +272,9 @@ fn apply_forward<'a>(
 ) -> Result<()> {
     for m in moves {
         if let Some(parent) = m.1.parent() {
-            std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+            crate::vfs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
-        std::fs::rename(&m.0, &m.1)
+        crate::vfs::rename(&m.0, &m.1)
             .with_context(|| format!("moving {} to {}", m.0.display(), m.1.display()))?;
         moved.push(m);
     }
@@ -333,7 +333,7 @@ fn push_rewrite(rewrites: &mut Vec<Rewrite>, path: PathBuf, original: String, ne
 }
 
 fn read(path: &Path) -> Result<String> {
-    std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))
+    crate::vfs::read_to_string(path).with_context(|| format!("reading {}", path.display()))
 }
 
 fn rel(root: &Path, path: &Path) -> PathBuf {

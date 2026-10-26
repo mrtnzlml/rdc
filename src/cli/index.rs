@@ -38,7 +38,7 @@ use std::path::Path;
 /// Generate `<env_root>/_index.md` from the lockfile + on-disk JSONs.
 pub fn generate(paths: &Paths, lockfile: &Lockfile) -> Result<()> {
     let env_root = paths.env_root();
-    if !env_root.exists() {
+    if !crate::vfs::exists(&env_root) {
         return Ok(());
     }
 
@@ -582,7 +582,7 @@ fn entry_line(slug: &str, id: u64, v: Option<&Value>) -> String {
 }
 
 fn read_json(path: &Path) -> Option<Value> {
-    let raw = std::fs::read_to_string(path).ok()?;
+    let raw = crate::vfs::read_to_string(path).ok()?;
     serde_json::from_str(&raw).ok()
 }
 
@@ -613,11 +613,11 @@ fn join_slugs(slugs: &[&str]) -> String {
 
 /// Names of the subdirectories of `dir`, unsorted. Empty if `dir` is absent.
 fn subdirs(dir: &Path) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let Ok(entries) = crate::vfs::read_dir(dir) else {
         return Vec::new();
     };
     entries
-        .flatten()
+        .into_iter()
         .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
         .map(|e| e.file_name().to_string_lossy().to_string())
         .collect()

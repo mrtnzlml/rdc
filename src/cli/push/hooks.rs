@@ -304,8 +304,8 @@ pub async fn push(
             // cache mirror.
             let other_created_ext = if created_ext == "py" { "js" } else { "py" };
             let stale_created = hooks_dir.join(format!("{slug}.{other_created_ext}"));
-            if stale_created.exists() {
-                std::fs::remove_file(&stale_created)
+            if crate::vfs::exists(&stale_created) {
+                crate::vfs::remove_file(&stale_created)
                     .with_context(|| format!("removing stale {}", stale_created.display()))?;
             }
             crate::state::base_cache::forget(paths, &stale_created)?;
@@ -773,8 +773,8 @@ fn write_back(
         // Post-PATCH the hook has no code (e.g. a function→webhook change):
         // drop the primary sidecar from disk and the base cache so the
         // snapshot stays canonical.
-        if code_path.exists() {
-            std::fs::remove_file(&code_path)
+        if crate::vfs::exists(&code_path) {
+            crate::vfs::remove_file(&code_path)
                 .with_context(|| format!("removing stale {}", code_path.display()))?;
         }
         crate::state::base_cache::forget(paths, &code_path)?;
@@ -783,8 +783,8 @@ fn write_back(
     // local disk still carries — from disk AND the base cache mirror.
     let other_updated_ext = if updated_ext == "py" { "js" } else { "py" };
     let stale_updated = hooks_dir.join(format!("{slug}.{other_updated_ext}"));
-    if stale_updated.exists() {
-        std::fs::remove_file(&stale_updated)
+    if crate::vfs::exists(&stale_updated) {
+        crate::vfs::remove_file(&stale_updated)
             .with_context(|| format!("removing stale {}", stale_updated.display()))?;
     }
     crate::state::base_cache::forget(paths, &stale_updated)?;
@@ -901,8 +901,8 @@ async fn push_one_drifted(
                 crate::state::base_cache::write(paths, &remote_code_path, code.as_bytes())
                     .with_context(|| format!("caching base hook code for '{slug}'"))?;
             } else {
-                if remote_code_path.exists() {
-                    std::fs::remove_file(&remote_code_path).with_context(|| {
+                if crate::vfs::exists(&remote_code_path) {
+                    crate::vfs::remove_file(&remote_code_path).with_context(|| {
                         format!("removing stale {}", remote_code_path.display())
                     })?;
                 }
@@ -910,8 +910,8 @@ async fn push_one_drifted(
             }
             let other_remote_ext = if remote_ext == "py" { "js" } else { "py" };
             let stale = hooks_dir.join(format!("{slug}.{other_remote_ext}"));
-            if stale.exists() {
-                std::fs::remove_file(&stale)
+            if crate::vfs::exists(&stale) {
+                crate::vfs::remove_file(&stale)
                     .with_context(|| format!("removing stale {}", stale.display()))?;
             }
             // Adopt is a content-side reconciliation (remote → local).

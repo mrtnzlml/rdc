@@ -76,7 +76,7 @@ pub async fn push(
             pushed += batched_pushed;
             skipped += batched_skipped;
 
-            let disk_bytes = std::fs::read(queue_path)
+            let disk_bytes = crate::vfs::read(queue_path)
                 .with_context(|| format!("reading {}", queue_path.display()))?;
             let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
                 .with_context(|| format!("parsing {}", queue_path.display()))?;
@@ -251,7 +251,7 @@ async fn push_update_batch(
             // Read BEFORE the `content_hash` guard, exactly as the old
             // sequential loop did: an unreadable file is an error even for an
             // entry that would otherwise be skipped.
-            let disk_bytes = std::fs::read(queue_path)
+            let disk_bytes = crate::vfs::read(queue_path)
                 .with_context(|| format!("reading {}", queue_path.display()))?;
             let entry = lf
                 .objects
@@ -507,7 +507,7 @@ async fn push_one_drifted(
         .expect("only reached for an item that was batched as an update");
     let id = entry.id;
 
-    let disk_bytes = std::fs::read(queue_path)
+    let disk_bytes = crate::vfs::read(queue_path)
         .with_context(|| format!("reading {}", queue_path.display()))?;
     let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
         .with_context(|| format!("parsing {}", queue_path.display()))?;

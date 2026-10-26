@@ -55,17 +55,17 @@ fn load_or_migrate_mapping(
     let generic_path = src_paths.mapping_file();
     // A file with no rows — the stub `rdc init` scaffolds — records nothing, so
     // legacy files beside it are still converted, into it.
-    let stub = if generic_path.exists() {
+    let stub = if crate::vfs::exists(&generic_path) {
         let generic = GenericMapping::load(&generic_path)?;
         if generic.is_empty() && !src_paths.legacy_mapping_files().is_empty() {
-            Some(std::fs::read_to_string(&generic_path)?)
+            Some(crate::vfs::read_to_string(&generic_path)?)
         } else {
             None
         }
     } else {
         None
     };
-    if generic_path.exists() && stub.is_none() {
+    if crate::vfs::exists(&generic_path) && stub.is_none() {
         let generic = GenericMapping::load(&generic_path)?;
         // Validate the existing, hand-authored file every time it's loaded —
         // this is the ONLY place the happy path (no legacy conversion) runs
@@ -187,7 +187,7 @@ fn load_or_migrate_mapping(
             generic.save(&generic_path)?;
         }
         for path in &converted {
-            std::fs::remove_file(path)
+            crate::vfs::remove_file(path)
                 .with_context(|| format!("removing legacy mapping {}", path.display()))?;
         }
     }
@@ -364,9 +364,8 @@ fn is_sidecar(rel: &Path) -> bool {
 fn list_overlay_files(overlay_dir: &Path) -> Result<Vec<PathBuf>> {
     fn walk(base: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
         for entry in
-            std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))?
+            crate::vfs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))?
         {
-            let entry = entry.with_context(|| format!("listing {}", dir.display()))?;
             let path = entry.path();
             if entry.file_type()?.is_dir() {
                 if entry.file_name() == "__pycache__" {
@@ -384,7 +383,7 @@ fn list_overlay_files(overlay_dir: &Path) -> Result<Vec<PathBuf>> {
         Ok(())
     }
     let mut out = Vec::new();
-    if overlay_dir.exists() {
+    if crate::vfs::exists(overlay_dir) {
         walk(overlay_dir, overlay_dir, &mut out)?;
     }
     out.sort();
@@ -912,11 +911,11 @@ fn transform_file(
         // sidecar's content for this target env. `run` validates the overlay dir
         // up-front, so any shadow present here mirrors a real source sidecar.
         let shadow = tgt_root.join(crate::paths::OVERLAY_DIR).join(&dst_rel);
-        let bytes = if shadow.is_file() {
-            std::fs::read(&shadow)
+        let bytes = if crate::vfs::is_file(&shadow) {
+            crate::vfs::read(&shadow)
                 .with_context(|| format!("reading overlay shadow {}", shadow.display()))?
         } else {
-            std::fs::read(&src_path).with_context(|| format!("reading {}", src_path.display()))?
+            crate::vfs::read(&src_path).with_context(|| format!("reading {}", src_path.display()))?
         };
         // A sidecar that differs from the target's only in its EOF newline is
         // the same code as far as rdc is concerned: `sidecar_bytes_for_hash`
@@ -927,7 +926,7 @@ fn transform_file(
         // push, the file stays modified in `git diff`, and the next migrate does
         // it again: a working tree that never comes clean. Keep what the target
         // already has; a real content change still lands.
-        let bytes = match std::fs::read(&dst_path) {
+        let bytes = match crate::vfs::read(&dst_path) {
             Ok(existing)
                 if crate::snapshot::codec::sidecar_bytes_for_hash(&existing)
                     == crate::snapshot::codec::sidecar_bytes_for_hash(&bytes) =>
@@ -940,7 +939,7 @@ fn transform_file(
     }
 
     let raw =
-        std::fs::read(&src_path).with_context(|| format!("reading {}", src_path.display()))?;
+        crate::vfs::read(&src_path).with_context(|| format!("reading {}", src_path.display()))?;
     let mut value: serde_json::Value = serde_json::from_slice(&raw)
         .with_context(|| format!("parsing JSON {}", src_path.display()))?;
 
@@ -1274,7 +1273,7 @@ fn org_columns_missing_in_target(
             if rel.file_name().and_then(|n| n.to_str()) != Some("schema.json") {
                 continue;
             }
-            if let Ok(bytes) = std::fs::read(tgt_root.join(&rel))
+            if let Ok(bytes) = crate::vfs::read(tgt_root.join(&rel))
                 && let Ok(schema) = serde_json::from_slice::<serde_json::Value>(&bytes)
             {
                 collect_schema_ids(&schema, &mut known);
@@ -1342,7 +1341,7 @@ enum FileOutcome {
 /// [`crate::snapshot::writer::write_atomic`], which also treats an unreadable
 /// target as "not known equal".
 fn settle(dst_path: &Path, bytes: &[u8], dry_run: bool) -> Result<FileOutcome> {
-    let outcome = match std::fs::read(dst_path) {
+    let outcome = match crate::vfs::read(dst_path) {
         Ok(existing) if existing == bytes => FileOutcome::Unchanged,
         Ok(_) => FileOutcome::Updated,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => FileOutcome::Created,
@@ -1433,12 +1432,12 @@ fn emptied_dirs(tgt_root: &Path, pruned: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
     /// Returns whether `dir` still holds a surviving file, pushing every
     /// fully-emptied directory (children before parents) onto `out`.
     fn walk(base: &Path, dir: &Path, pruned: &BTreeSet<PathBuf>, out: &mut Vec<PathBuf>) -> bool {
-        let Ok(entries) = std::fs::read_dir(dir) else {
+        let Ok(entries) = crate::vfs::read_dir(dir) else {
             return true;
         };
         let mut survives = false;
         let mut children = Vec::new();
-        for entry in entries.flatten() {
+        for entry in entries {
             let path = entry.path();
             match entry.file_type() {
                 Ok(ft) if ft.is_dir() => children.push(path),
@@ -1467,7 +1466,7 @@ fn emptied_dirs(tgt_root: &Path, pruned: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for dir in MANAGED_DIRS {
         let managed = tgt_root.join(dir);
-        if managed.exists() {
+        if crate::vfs::exists(&managed) {
             walk(tgt_root, &managed, pruned, &mut out);
         }
     }
@@ -1776,7 +1775,7 @@ fn walk_remap_ids(
 fn reconcile_score_thresholds(value: &mut serde_json::Value, kind: &str, tgt_path: &Path) {
     // The target snapshot (if it exists) is the source of truth for thresholds.
     // Absent/unparseable => brand-new object => `None` => every threshold drops.
-    let target: Option<serde_json::Value> = std::fs::read(tgt_path)
+    let target: Option<serde_json::Value> = crate::vfs::read(tgt_path)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok());
 
@@ -1887,7 +1886,7 @@ fn reconcile_target_owned_keys(
         return;
     }
     // Absent/unparseable target => brand-new queue => every key drops.
-    let target: Option<serde_json::Value> = std::fs::read(tgt_path)
+    let target: Option<serde_json::Value> = crate::vfs::read(tgt_path)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok());
     let Some(obj) = value.as_object_mut() else {
@@ -2043,7 +2042,7 @@ fn reconcile_email_prefix(
         return None;
     }
     let source_prefix = obj.get(KEY).and_then(|v| v.as_str()).map(str::to_string);
-    let target: Option<serde_json::Value> = std::fs::read(tgt_path)
+    let target: Option<serde_json::Value> = crate::vfs::read(tgt_path)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok());
     // An explicit `null` is not a prefix: adopting it would send
@@ -2371,7 +2370,7 @@ fn reconcile_target_identity(
         .map(|m| m.keys().filter(|k| !kept.contains(*k)).cloned().collect())
         .unwrap_or_default();
 
-    let tgt: Option<serde_json::Value> = std::fs::read(tgt_path)
+    let tgt: Option<serde_json::Value> = crate::vfs::read(tgt_path)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok());
 
@@ -2476,14 +2475,14 @@ fn enumerate_files(env_root: &Path, env: &str) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     for dir in MANAGED_DIRS {
         let managed = env_root.join(dir);
-        if managed.exists() {
+        if crate::vfs::exists(&managed) {
             walk_dir(env_root, &managed, env, &mut out)?;
         }
     }
     // The organization singleton lives at the env root, outside MANAGED_DIRS, so
     // it is added explicitly rather than by loosening `should_skip` (which also
     // guards `_index.md` / `overlay.toml`, both of which stay excluded).
-    if env_root.join("organization.json").exists() {
+    if crate::vfs::exists(env_root.join("organization.json")) {
         out.push(PathBuf::from("organization.json"));
     }
     out.sort();
@@ -2498,10 +2497,10 @@ fn enumerate_files(env_root: &Path, env: &str) -> Result<Vec<PathBuf>> {
 /// treated as "no file here" — this is an advisory hint, never a gate.
 fn env_tree_has_managed_file(env_root: &Path, env: &str) -> bool {
     fn any_managed(dir: &Path, env: &str) -> bool {
-        let Ok(entries) = std::fs::read_dir(dir) else {
+        let Ok(entries) = crate::vfs::read_dir(dir) else {
             return false;
         };
-        for entry in entries.flatten() {
+        for entry in entries {
             let name = entry.file_name().to_string_lossy().into_owned();
             let Ok(ft) = entry.file_type() else { continue };
             if ft.is_dir() {
@@ -2519,7 +2518,7 @@ fn env_tree_has_managed_file(env_root: &Path, env: &str) -> bool {
     }
     MANAGED_DIRS.iter().any(|dir| {
         let managed = env_root.join(dir);
-        managed.exists() && any_managed(&managed, env)
+        crate::vfs::exists(&managed) && any_managed(&managed, env)
     })
 }
 
@@ -2538,8 +2537,7 @@ fn is_managed_leaf(name: &str) -> bool {
 }
 
 fn walk_dir(base: &Path, dir: &Path, env: &str, out: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
-        let entry = entry.with_context(|| format!("listing {}", dir.display()))?;
+    for entry in crate::vfs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let path = entry.path();
         let file_type = entry.file_type()?;
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -2752,7 +2750,7 @@ fn object_tokens(
         let inner = inner.to_string_lossy();
         let path = env_root.join(file);
         let bytes =
-            std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+            crate::vfs::read(&path).with_context(|| format!("reading {}", path.display()))?;
         let json = (file.extension().is_some_and(|e| e == "json"))
             .then(|| serde_json::from_slice::<Value>(&bytes).ok())
             .flatten();
@@ -2964,7 +2962,7 @@ fn unique_template_skips(
         if !is_template {
             continue;
         }
-        let Ok(raw) = std::fs::read(src_root.join(rel)) else {
+        let Ok(raw) = crate::vfs::read(src_root.join(rel)) else {
             continue;
         };
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(&raw) else {
@@ -3202,14 +3200,14 @@ pub fn run_at(
     // `envs/<src>/` always exists once `rdc init` scaffolded overlay.toml, so
     // only the lockfile proves a pull. A mirror from an unpulled source would
     // prune every target file, and the deploy job turns that into deletes.
-    if mirror && !src_paths.lockfile().exists() {
+    if mirror && !crate::vfs::exists(src_paths.lockfile()) {
         anyhow::bail!(
             "'{src}' has never been pulled (no {}), and --mirror from it would prune \
              every object in '{tgt}' — pull '{src}' first (`rdc sync {src}`)",
             src_paths.lockfile().display()
         );
     }
-    if !src_root.exists() {
+    if !crate::vfs::exists(&src_root) {
         anyhow::bail!(
             "source snapshot {} does not exist — pull '{src}' first (`rdc sync {src}`)",
             src_root.display()
@@ -3285,7 +3283,7 @@ pub fn run_at(
     // Only the boolean is needed, so probe with an early-exit scan instead of
     // `enumerate_files(..).is_empty()`, which walks + collects + sorts the whole
     // target tree just to discard it.
-    let tgt_was_empty = !tgt_root.exists() || !env_tree_has_managed_file(&tgt_root, tgt);
+    let tgt_was_empty = !crate::vfs::exists(&tgt_root) || !env_tree_has_managed_file(&tgt_root, tgt);
 
     // Un-creatable duplicate unique-typed email templates: when the SOURCE
     // queue holds more than one template of a per-queue-unique type, the
@@ -3444,7 +3442,7 @@ pub fn run_at(
         // target file there is nothing to restore, so skip rather than emit a
         // settings-only `organization.json` no pull would ever produce.
         if rel.as_path() == Path::new("organization.json") {
-            if !tgt_root.join(rel).exists() {
+            if !crate::vfs::exists(tgt_root.join(rel)) {
                 log.event(
                     crate::log::Action::Warn,
                     &format!(
@@ -3466,7 +3464,7 @@ pub fn run_at(
             // state no pull would ever produce. Skip instead: leave the
             // target's `organization.json` byte-untouched, exactly as if this
             // file were absent from the migration.
-            let src_has_settings = std::fs::read(src_root.join(rel))
+            let src_has_settings = crate::vfs::read(src_root.join(rel))
                 .ok()
                 .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
                 .is_some_and(|v| v.get("settings").is_some_and(|s| !s.is_null()));
@@ -3596,7 +3594,7 @@ pub fn run_at(
                 );
             } else {
                 let abs = tgt_root.join(rel);
-                std::fs::remove_file(&abs).with_context(|| format!("pruning {}", abs.display()))?;
+                crate::vfs::remove_file(&abs).with_context(|| format!("pruning {}", abs.display()))?;
             }
         }
         // A pruned object's directory must go too, or the target keeps a phantom
@@ -3609,7 +3607,7 @@ pub fn run_at(
         for rel in emptied_dirs(&tgt_root, &prune_set) {
             let abs = tgt_root.join(&rel);
             if !dry_run
-                && let Err(e) = std::fs::remove_dir(&abs)
+                && let Err(e) = crate::vfs::remove_dir(&abs)
             {
                 log.event(
                     crate::log::Action::Warn,

@@ -63,7 +63,7 @@ pub async fn push(
             skipped += batched_skipped;
 
             let disk_bytes =
-                std::fs::read(ws_path).with_context(|| format!("reading {}", ws_path.display()))?;
+                crate::vfs::read(ws_path).with_context(|| format!("reading {}", ws_path.display()))?;
             let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
                 .with_context(|| format!("parsing {}", ws_path.display()))?;
             crate::snapshot::refs::resolve_value(&mut payload, lockfile);
@@ -205,7 +205,7 @@ async fn push_update_batch(
             };
             let id = entry.id;
 
-            let disk_bytes = std::fs::read(ws_path)
+            let disk_bytes = crate::vfs::read(ws_path)
                 .with_context(|| format!("reading {}", ws_path.display()))?;
             let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
                 .with_context(|| format!("parsing {}", ws_path.display()))?;
@@ -405,7 +405,7 @@ async fn push_one_drifted(
     let id = entry.id;
 
     let disk_bytes =
-        std::fs::read(ws_path).with_context(|| format!("reading {}", ws_path.display()))?;
+        crate::vfs::read(ws_path).with_context(|| format!("reading {}", ws_path.display()))?;
     let mut payload: serde_json::Value = serde_json::from_slice(&disk_bytes)
         .with_context(|| format!("parsing {}", ws_path.display()))?;
     crate::snapshot::refs::resolve_value(&mut payload, lockfile);

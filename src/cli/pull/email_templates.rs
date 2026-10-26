@@ -83,7 +83,7 @@ pub async fn process(
 
         let result: Result<()> = (async || {
             let dir = ctx.paths.queue_email_templates_dir(&ws_slug, &q_slug);
-            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+            crate::vfs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
             // Canonical on-disk bytes via KindCodec: strips `modified_at`.
             let value = serde_json::to_value(t)?;

@@ -64,7 +64,7 @@ impl ChangeList {
         let mut out = Vec::new();
         let mut check = |kind: &'static str, map: &BTreeMap<String, std::path::PathBuf>| {
             for (slug, path) in map {
-                let Ok(bytes) = std::fs::read(path) else {
+                let Ok(bytes) = crate::vfs::read(path) else {
                     continue; // unreadable ≠ unparseable; push surfaces I/O errors
                 };
                 if let Err(e) = serde_json::from_slice::<serde_json::Value>(&bytes) {
@@ -127,7 +127,7 @@ impl ChangeList {
 
         let mut check = |kind: &'static str, map: &BTreeMap<String, std::path::PathBuf>| {
             for (slug, path) in map {
-                let Ok(bytes) = std::fs::read(path) else {
+                let Ok(bytes) = crate::vfs::read(path) else {
                     continue; // unreadable — push surfaces I/O errors
                 };
                 let Ok(mut body) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
@@ -170,7 +170,7 @@ impl ChangeList {
         // the sidecar — that is the file the user opens to fix it.
         for (slug, json_path) in &self.rules {
             let py_path = json_path.with_extension("py");
-            let Ok(text) = std::fs::read_to_string(&py_path) else {
+            let Ok(text) = crate::vfs::read_to_string(&py_path) else {
                 continue; // no trigger_condition, or unreadable — push surfaces I/O errors
             };
             if let Some(v) = crate::snapshot::limits::check_text(
@@ -268,7 +268,7 @@ impl ChangeList {
                 if tracked && !also_on_update {
                     continue; // a PATCH, not a POST
                 }
-                let Ok(bytes) = std::fs::read(path) else {
+                let Ok(bytes) = crate::vfs::read(path) else {
                     continue; // unreadable — push surfaces I/O errors
                 };
                 let Ok(mut body) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
@@ -353,7 +353,7 @@ impl ChangeList {
             let mut newly = Vec::new();
             for kind in PUSH_KINDS {
                 for (slug, path) in self.map(kind) {
-                    let Ok(bytes) = std::fs::read(path) else {
+                    let Ok(bytes) = crate::vfs::read(path) else {
                         continue;
                     };
                     let Ok(mut body) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
@@ -455,7 +455,7 @@ impl ChangeList {
         let Some(path) = &self.organization else {
             return Vec::new();
         };
-        let Ok(bytes) = std::fs::read(path) else {
+        let Ok(bytes) = crate::vfs::read(path) else {
             return Vec::new();
         };
         let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
@@ -474,7 +474,7 @@ impl ChangeList {
     pub fn unshared_saved_views(&self) -> Vec<crate::snapshot::limits::UnsharedSavedView> {
         let mut out = Vec::new();
         for (slug, path) in &self.saved_views {
-            let Ok(bytes) = std::fs::read(path) else {
+            let Ok(bytes) = crate::vfs::read(path) else {
                 continue; // unreadable != unshared; push surfaces I/O errors
             };
             let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
@@ -500,7 +500,7 @@ impl ChangeList {
     ) -> Vec<crate::snapshot::limits::FormulaFieldWithoutFormula> {
         let mut out = Vec::new();
         for (slug, path) in &self.schemas {
-            let Ok(bytes) = std::fs::read(path) else {
+            let Ok(bytes) = crate::vfs::read(path) else {
                 continue; // unreadable — push surfaces I/O errors
             };
             let Ok(body) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
@@ -534,7 +534,7 @@ impl ChangeList {
     pub fn queue_engine_conflicts(&self) -> Vec<crate::snapshot::limits::EngineSlotConflict> {
         let mut out = Vec::new();
         for (slug, path) in &self.queues {
-            let Ok(bytes) = std::fs::read(path) else {
+            let Ok(bytes) = crate::vfs::read(path) else {
                 continue; // unreadable — push surfaces I/O errors
             };
             let Ok(body) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
@@ -872,14 +872,14 @@ pub fn follow_moved_email_templates(
         let parts: Vec<&str> = key.splitn(3, '/').collect();
         let [ws, q, t] = parts[..] else { continue };
         let file = format!("{t}.json");
-        if paths.queue_email_templates_dir(ws, q).join(&file).exists() {
+        if crate::vfs::exists(paths.queue_email_templates_dir(ws, q).join(&file)) {
             continue;
         }
-        let Ok(workspaces) = std::fs::read_dir(paths.workspaces_dir()) else { continue };
+        let Ok(workspaces) = crate::vfs::read_dir(paths.workspaces_dir()) else { continue };
         let found: Vec<String> = workspaces
-            .flatten()
+            .into_iter()
             .map(|w| w.file_name().to_string_lossy().to_string())
-            .filter(|w| w != ws && paths.queue_email_templates_dir(w, q).join(&file).exists())
+            .filter(|w| w != ws && crate::vfs::exists(paths.queue_email_templates_dir(w, q).join(&file)))
             .collect();
         // Exactly one candidate, or it is not a move rdc can tell apart.
         let [new_ws] = &found[..] else { continue };
@@ -935,7 +935,7 @@ pub fn detect_tombstones(paths: &Paths, lockfile: &Lockfile) -> Tombstones {
     if let Some(map) = lockfile.objects.get("workspaces") {
         for (slug, entry) in map {
             let path = paths.workspace_dir(slug).join("workspace.json");
-            if !path.exists() {
+            if !crate::vfs::exists(&path) {
                 t.workspaces.insert(slug.clone(), entry.id);
             }
         }
@@ -954,7 +954,7 @@ pub fn detect_tombstones(paths: &Paths, lockfile: &Lockfile) -> Tombstones {
                 let path = paths
                     .queue_email_templates_dir(parts[0], parts[1])
                     .join(format!("{}.json", parts[2]));
-                if !path.exists() {
+                if !crate::vfs::exists(&path) {
                     t.email_templates.insert(key.clone(), entry.id);
                 }
             }
@@ -965,7 +965,7 @@ pub fn detect_tombstones(paths: &Paths, lockfile: &Lockfile) -> Tombstones {
     if let Some(map) = lockfile.objects.get("engines") {
         for (slug, entry) in map {
             let path = paths.engines_dir().join(slug).join("engine.json");
-            if !path.exists() {
+            if !crate::vfs::exists(&path) {
                 t.engines.insert(slug.clone(), entry.id);
             }
         }
@@ -994,7 +994,7 @@ fn detect_flat(
     };
     for (slug, entry) in map {
         let path = dir.join(format!("{slug}.json"));
-        if !path.exists() {
+        if !crate::vfs::exists(&path) {
             out.insert(slug.clone(), entry.id);
         }
     }
@@ -1019,23 +1019,23 @@ fn detect_queue_nested(
 
 fn queue_nested_file_exists(paths: &Paths, q_slug: &str, file_name: &str) -> bool {
     let ws_dir = paths.workspaces_dir();
-    if !ws_dir.exists() {
+    if !crate::vfs::exists(&ws_dir) {
         return false;
     }
-    let Ok(entries) = std::fs::read_dir(&ws_dir) else {
+    let Ok(entries) = crate::vfs::read_dir(&ws_dir) else {
         return false;
     };
-    for entry in entries.flatten() {
+    for entry in entries {
         if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
-        if entry
-            .path()
-            .join("queues")
-            .join(q_slug)
-            .join(file_name)
-            .exists()
-        {
+        if crate::vfs::exists(
+            entry
+                .path()
+                .join("queues")
+                .join(q_slug)
+                .join(file_name),
+        ) {
             return true;
         }
     }
@@ -1048,28 +1048,29 @@ fn engine_field_file_exists(paths: &Paths, composite_key: &str) -> bool {
     // when the key isn't composite (legacy flat lockfile entry that
     // hasn't migrated yet).
     if let Some((e_slug, f_slug)) = composite_key.split_once('/') {
-        return paths
-            .engine_fields_dir(e_slug)
-            .join(format!("{f_slug}.json"))
-            .exists();
+        return crate::vfs::exists(
+            paths
+                .engine_fields_dir(e_slug)
+                .join(format!("{f_slug}.json")),
+        );
     }
     let engines_dir = paths.engines_dir();
-    if !engines_dir.exists() {
+    if !crate::vfs::exists(&engines_dir) {
         return false;
     }
-    let Ok(entries) = std::fs::read_dir(&engines_dir) else {
+    let Ok(entries) = crate::vfs::read_dir(&engines_dir) else {
         return false;
     };
-    for entry in entries.flatten() {
+    for entry in entries {
         if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
-        if entry
-            .path()
-            .join("fields")
-            .join(format!("{composite_key}.json"))
-            .exists()
-        {
+        if crate::vfs::exists(
+            entry
+                .path()
+                .join("fields")
+                .join(format!("{composite_key}.json")),
+        ) {
             return true;
         }
     }
@@ -1085,21 +1086,20 @@ fn scan_engines(
 ) -> Result<usize> {
     use crate::state::content_hash;
     let engines_dir = paths.engines_dir();
-    if !engines_dir.exists() {
+    if !crate::vfs::exists(&engines_dir) {
         return Ok(0);
     }
     let mut scanned = 0;
-    for e_entry in std::fs::read_dir(&engines_dir)? {
-        let e_entry = e_entry?;
+    for e_entry in crate::vfs::read_dir(&engines_dir)? {
         if !e_entry.file_type()?.is_dir() {
             continue;
         }
         let e_slug = e_entry.file_name().to_string_lossy().to_string();
         let e_json_path = e_entry.path().join("engine.json");
-        if !e_json_path.exists() {
+        if !crate::vfs::exists(&e_json_path) {
             continue;
         }
-        let bytes = std::fs::read(&e_json_path)?;
+        let bytes = crate::vfs::read(&e_json_path)?;
         let local_hash = content_hash(&bytes, &crate::state::Lockfile::default());
         scanned += 1;
         let base_hash = lockfile
@@ -1125,22 +1125,20 @@ fn scan_engine_fields(
 ) -> Result<usize> {
     use crate::state::content_hash;
     let engines_dir = paths.engines_dir();
-    if !engines_dir.exists() {
+    if !crate::vfs::exists(&engines_dir) {
         return Ok(0);
     }
     let mut scanned = 0;
-    for e_entry in std::fs::read_dir(&engines_dir)? {
-        let e_entry = e_entry?;
+    for e_entry in crate::vfs::read_dir(&engines_dir)? {
         if !e_entry.file_type()?.is_dir() {
             continue;
         }
         let e_slug = e_entry.file_name().to_string_lossy().to_string();
         let fields_dir = paths.engine_fields_dir(&e_slug);
-        if !fields_dir.exists() {
+        if !crate::vfs::exists(&fields_dir) {
             continue;
         }
-        for f_entry in std::fs::read_dir(&fields_dir)? {
-            let f_entry = f_entry?;
+        for f_entry in crate::vfs::read_dir(&fields_dir)? {
             let f_path = f_entry.path();
             let name = f_entry.file_name().to_string_lossy().to_string();
             // Skip env-named shadow artifacts.
@@ -1154,7 +1152,7 @@ fn scan_engine_fields(
                 continue;
             };
             let composite_key = format!("{e_slug}/{f_slug}");
-            let bytes = std::fs::read(&f_path)?;
+            let bytes = crate::vfs::read(&f_path)?;
             let local_hash = content_hash(&bytes, &crate::state::Lockfile::default());
             scanned += 1;
             let base_hash = lockfile
@@ -1185,12 +1183,11 @@ fn scan_rules(
 ) -> Result<usize> {
     use crate::state::rule_combined_hash;
     let dir = paths.rules_dir();
-    if !dir.exists() {
+    if !crate::vfs::exists(&dir) {
         return Ok(0);
     }
     let mut scanned = 0;
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
+    for entry in crate::vfs::read_dir(&dir)? {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
         // Skip env-named shadow artifacts.
@@ -1203,10 +1200,10 @@ fn scan_rules(
         let Some(slug) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
-        let json_bytes = std::fs::read(&path)?;
+        let json_bytes = crate::vfs::read(&path)?;
         let py_path = path.with_extension("py");
-        let code = if py_path.exists() {
-            Some(std::fs::read_to_string(&py_path)?)
+        let code = if crate::vfs::exists(&py_path) {
+            Some(crate::vfs::read_to_string(&py_path)?)
         } else {
             None
         };
@@ -1231,21 +1228,20 @@ fn scan_workspaces(
 ) -> Result<usize> {
     use crate::state::content_hash;
     let workspaces_dir = paths.workspaces_dir();
-    if !workspaces_dir.exists() {
+    if !crate::vfs::exists(&workspaces_dir) {
         return Ok(0);
     }
     let mut scanned = 0;
-    for ws_entry in std::fs::read_dir(&workspaces_dir)? {
-        let ws_entry = ws_entry?;
+    for ws_entry in crate::vfs::read_dir(&workspaces_dir)? {
         if !ws_entry.file_type()?.is_dir() {
             continue;
         }
         let ws_slug = ws_entry.file_name().to_string_lossy().to_string();
         let ws_json_path = ws_entry.path().join("workspace.json");
-        if !ws_json_path.exists() {
+        if !crate::vfs::exists(&ws_json_path) {
             continue;
         }
-        let bytes = std::fs::read(&ws_json_path)?;
+        let bytes = crate::vfs::read(&ws_json_path)?;
         let local_hash = content_hash(&bytes, &crate::state::Lockfile::default());
         scanned += 1;
         let base_hash = lockfile
@@ -1268,12 +1264,11 @@ fn scan_hooks(
     use crate::snapshot::hook::hook_code_extension_from_value;
     use crate::state::hook_combined_hash;
     let dir = paths.hooks_dir();
-    if !dir.exists() {
+    if !crate::vfs::exists(&dir) {
         return Ok(0);
     }
     let mut scanned = 0;
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
+    for entry in crate::vfs::read_dir(&dir)? {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
         // Skip env-named shadow artifacts (e.g. "validator-invoices.json.dev").
@@ -1286,7 +1281,7 @@ fn scan_hooks(
         let Some(slug) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
-        let json_bytes = std::fs::read(&path)?;
+        let json_bytes = crate::vfs::read(&path)?;
         // Sidecar extension derives from the JSON's `config.runtime`:
         // `.js` for Node.js runtimes, `.py` otherwise. Fall back to the
         // other extension if the runtime-derived one is missing
@@ -1300,10 +1295,10 @@ fn scan_hooks(
         let ext = hook_code_extension_from_value(&value);
         let primary = path.with_extension(ext);
         let fallback = path.with_extension(if ext == "py" { "js" } else { "py" });
-        let code = if primary.exists() {
-            Some(std::fs::read_to_string(&primary)?)
-        } else if fallback.exists() {
-            Some(std::fs::read_to_string(&fallback)?)
+        let code = if crate::vfs::exists(&primary) {
+            Some(crate::vfs::read_to_string(&primary)?)
+        } else if crate::vfs::exists(&fallback) {
+            Some(crate::vfs::read_to_string(&fallback)?)
         } else {
             None
         };
@@ -1329,12 +1324,11 @@ fn scan_flat_kind(
     out: &mut BTreeMap<String, std::path::PathBuf>,
 ) -> Result<usize> {
     use crate::state::content_hash;
-    if !dir.exists() {
+    if !crate::vfs::exists(&dir) {
         return Ok(0);
     }
     let mut scanned = 0;
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
+    for entry in crate::vfs::read_dir(&dir)? {
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
@@ -1342,7 +1336,7 @@ fn scan_flat_kind(
         let Some(slug) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
-        let bytes = std::fs::read(&path)?;
+        let bytes = crate::vfs::read(&path)?;
         let local_hash = content_hash(&bytes, &crate::state::Lockfile::default());
         scanned += 1;
         let base_hash = lockfile
@@ -1366,34 +1360,32 @@ fn scan_queue_nested_json(
 ) -> Result<usize> {
     use crate::state::content_hash;
     let workspaces_dir = paths.workspaces_dir();
-    if !workspaces_dir.exists() {
+    if !crate::vfs::exists(&workspaces_dir) {
         return Ok(0);
     }
     let mut scanned = 0;
-    for ws_entry in std::fs::read_dir(&workspaces_dir)? {
-        let ws_entry = ws_entry?;
+    for ws_entry in crate::vfs::read_dir(&workspaces_dir)? {
         if !ws_entry.file_type()?.is_dir() {
             continue;
         }
         let ws_slug = ws_entry.file_name().to_string_lossy().to_string();
         let queues_dir = paths.queues_dir(&ws_slug);
-        if !queues_dir.exists() {
+        if !crate::vfs::exists(&queues_dir) {
             continue;
         }
-        for q_entry in std::fs::read_dir(&queues_dir)? {
-            let q_entry = q_entry?;
+        for q_entry in crate::vfs::read_dir(&queues_dir)? {
             if !q_entry.file_type()?.is_dir() {
                 continue;
             }
             let q_path = q_entry.path();
             let target = q_path.join(filename);
-            if !target.exists() {
+            if !crate::vfs::exists(&target) {
                 continue;
             }
             let Some(q_slug) = q_path.file_name().and_then(|s| s.to_str()) else {
                 continue;
             };
-            let bytes = std::fs::read(&target)?;
+            let bytes = crate::vfs::read(&target)?;
             let local_hash = content_hash(&bytes, &crate::state::Lockfile::default());
             scanned += 1;
             let base_hash = lockfile
@@ -1417,34 +1409,32 @@ fn scan_schemas(
     use crate::snapshot::schema::read_local_formulas;
     use crate::state::schema_combined_hash;
     let workspaces_dir = paths.workspaces_dir();
-    if !workspaces_dir.exists() {
+    if !crate::vfs::exists(&workspaces_dir) {
         return Ok(0);
     }
     let mut scanned = 0;
-    for ws_entry in std::fs::read_dir(&workspaces_dir)? {
-        let ws_entry = ws_entry?;
+    for ws_entry in crate::vfs::read_dir(&workspaces_dir)? {
         if !ws_entry.file_type()?.is_dir() {
             continue;
         }
         let ws_slug = ws_entry.file_name().to_string_lossy().to_string();
         let queues_dir = paths.queues_dir(&ws_slug);
-        if !queues_dir.exists() {
+        if !crate::vfs::exists(&queues_dir) {
             continue;
         }
-        for q_entry in std::fs::read_dir(&queues_dir)? {
-            let q_entry = q_entry?;
+        for q_entry in crate::vfs::read_dir(&queues_dir)? {
             if !q_entry.file_type()?.is_dir() {
                 continue;
             }
             let q_path = q_entry.path();
             let schema_path = q_path.join("schema.json");
-            if !schema_path.exists() {
+            if !crate::vfs::exists(&schema_path) {
                 continue;
             }
             let Some(q_slug) = q_path.file_name().and_then(|s| s.to_str()) else {
                 continue;
             };
-            let json_bytes = std::fs::read(&schema_path)?;
+            let json_bytes = crate::vfs::read(&schema_path)?;
             let formulas = read_local_formulas(&q_path).unwrap_or_default();
             let local_hash =
                 schema_combined_hash(&json_bytes, &formulas, &crate::state::Lockfile::default());
@@ -1469,32 +1459,29 @@ fn scan_email_templates(
 ) -> Result<usize> {
     use crate::state::content_hash;
     let workspaces_dir = paths.workspaces_dir();
-    if !workspaces_dir.exists() {
+    if !crate::vfs::exists(&workspaces_dir) {
         return Ok(0);
     }
     let mut scanned = 0;
-    for ws_entry in std::fs::read_dir(&workspaces_dir)? {
-        let ws_entry = ws_entry?;
+    for ws_entry in crate::vfs::read_dir(&workspaces_dir)? {
         if !ws_entry.file_type()?.is_dir() {
             continue;
         }
         let ws_slug = ws_entry.file_name().to_string_lossy().to_string();
         let queues_dir = paths.queues_dir(&ws_slug);
-        if !queues_dir.exists() {
+        if !crate::vfs::exists(&queues_dir) {
             continue;
         }
-        for q_entry in std::fs::read_dir(&queues_dir)? {
-            let q_entry = q_entry?;
+        for q_entry in crate::vfs::read_dir(&queues_dir)? {
             if !q_entry.file_type()?.is_dir() {
                 continue;
             }
             let q_slug = q_entry.file_name().to_string_lossy().to_string();
             let templates_dir = q_entry.path().join("email-templates");
-            if !templates_dir.exists() {
+            if !crate::vfs::exists(&templates_dir) {
                 continue;
             }
-            for t_entry in std::fs::read_dir(&templates_dir)? {
-                let t_entry = t_entry?;
+            for t_entry in crate::vfs::read_dir(&templates_dir)? {
                 let t_path = t_entry.path();
                 if t_path.extension().and_then(|s| s.to_str()) != Some("json") {
                     continue;
@@ -1503,7 +1490,7 @@ fn scan_email_templates(
                     continue;
                 };
                 let compound = format!("{ws_slug}/{q_slug}/{t_slug}");
-                let bytes = std::fs::read(&t_path)?;
+                let bytes = crate::vfs::read(&t_path)?;
                 let local_hash = content_hash(&bytes, &crate::state::Lockfile::default());
                 scanned += 1;
                 let base_hash = lockfile
@@ -1532,10 +1519,10 @@ fn scan_organization(
 ) -> Result<usize> {
     use crate::state::content_hash;
     let path = paths.organization_file();
-    if !path.exists() {
+    if !crate::vfs::exists(&path) {
         return Ok(0);
     }
-    let bytes = std::fs::read(&path)?;
+    let bytes = crate::vfs::read(&path)?;
     let local_hash = content_hash(&bytes, &crate::state::Lockfile::default());
     let base_hash = lockfile
         .objects
@@ -1674,16 +1661,16 @@ pub(crate) fn find_queue_nested_path(
     file_name: &str,
 ) -> Option<std::path::PathBuf> {
     let ws_dir = paths.workspaces_dir();
-    if !ws_dir.exists() {
+    if !crate::vfs::exists(&ws_dir) {
         return None;
     }
-    let entries = std::fs::read_dir(&ws_dir).ok()?;
-    for entry in entries.flatten() {
+    let entries = crate::vfs::read_dir(&ws_dir).ok()?;
+    for entry in entries {
         if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
         let candidate = entry.path().join("queues").join(q_slug).join(file_name);
-        if candidate.exists() {
+        if crate::vfs::exists(&candidate) {
             return Some(candidate);
         }
     }
@@ -1699,16 +1686,16 @@ fn find_engine_field_path(paths: &Paths, composite_key: &str) -> Option<std::pat
         let candidate = paths
             .engine_fields_dir(e_slug)
             .join(format!("{f_slug}.json"));
-        if candidate.exists() {
+        if crate::vfs::exists(&candidate) {
             return Some(candidate);
         }
     }
     let engines_dir = paths.engines_dir();
-    if !engines_dir.exists() {
+    if !crate::vfs::exists(&engines_dir) {
         return None;
     }
-    let entries = std::fs::read_dir(&engines_dir).ok()?;
-    for entry in entries.flatten() {
+    let entries = crate::vfs::read_dir(&engines_dir).ok()?;
+    for entry in entries {
         if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
@@ -1716,7 +1703,7 @@ fn find_engine_field_path(paths: &Paths, composite_key: &str) -> Option<std::pat
             .path()
             .join("fields")
             .join(format!("{composite_key}.json"));
-        if candidate.exists() {
+        if crate::vfs::exists(&candidate) {
             return Some(candidate);
         }
     }
@@ -1734,21 +1721,21 @@ fn find_engine_field_path(paths: &Paths, composite_key: &str) -> Option<std::pat
 /// workspace slugs` only for slugs present in more than one workspace.
 pub fn detect_slug_collisions(paths: &Paths) -> BTreeMap<String, Vec<String>> {
     let mut by_slug: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let Ok(ws_entries) = std::fs::read_dir(paths.workspaces_dir()) else {
+    let Ok(ws_entries) = crate::vfs::read_dir(paths.workspaces_dir()) else {
         return BTreeMap::new();
     };
-    for ws in ws_entries.flatten() {
-        if !ws.path().is_dir() {
+    for ws in ws_entries {
+        if !crate::vfs::is_dir(ws.path()) {
             continue;
         }
         let ws_slug = ws.file_name().to_string_lossy().to_string();
-        let Ok(q_entries) = std::fs::read_dir(paths.queues_dir(&ws_slug)) else {
+        let Ok(q_entries) = crate::vfs::read_dir(paths.queues_dir(&ws_slug)) else {
             continue;
         };
-        for q in q_entries.flatten() {
+        for q in q_entries {
             // Only real queues (a queue.json present) count — partial-state
             // dirs are not lockfile-keyed and can't collide.
-            if q.path().join("queue.json").is_file() {
+            if crate::vfs::is_file(q.path().join("queue.json")) {
                 let slug = q.file_name().to_string_lossy().to_string();
                 by_slug.entry(slug).or_default().push(ws_slug.clone());
             }

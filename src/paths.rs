@@ -144,11 +144,11 @@ impl Paths {
     /// Superseded by [`Self::mapping_file`]; enumerated only to migrate them once.
     pub fn legacy_mapping_files(&self) -> Vec<PathBuf> {
         let dir = self.mapping_dir();
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+        let Ok(entries) = crate::vfs::read_dir(&dir) else {
             return Vec::new();
         };
         let mut out: Vec<PathBuf> = entries
-            .flatten()
+            .into_iter()
             .map(|e| e.path())
             .filter(|p| {
                 p.extension().and_then(|s| s.to_str()) == Some("toml")
@@ -280,16 +280,15 @@ pub fn ensure_no_symlinks_under(root: &Path, dir: &Path) -> anyhow::Result<()> {
     let mut cur = root.to_path_buf();
     for comp in dir.strip_prefix(root).unwrap_or(dir).components() {
         cur.push(comp);
-        match std::fs::symlink_metadata(&cur) {
-            Ok(m) if m.file_type().is_symlink() => return Err(refuse(root, &cur)),
+        match crate::vfs::symlink_metadata(&cur) {
+            Ok(m) if m.is_symlink() => return Err(refuse(root, &cur)),
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(anyhow::Error::new(e).context(format!("inspecting {}", cur.display()))),
         }
     }
     fn walk(root: &Path, dir: &Path) -> anyhow::Result<()> {
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
+        for entry in crate::vfs::read_dir(dir)? {
             let ft = entry.file_type()?; // does not follow links
             if ft.is_symlink() {
                 return Err(refuse(root, &entry.path()));
@@ -300,7 +299,7 @@ pub fn ensure_no_symlinks_under(root: &Path, dir: &Path) -> anyhow::Result<()> {
         }
         Ok(())
     }
-    if std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
+    if crate::vfs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
         walk(root, dir).with_context(|| format!("checking {} for symlinks", dir.display()))?;
     }
     Ok(())

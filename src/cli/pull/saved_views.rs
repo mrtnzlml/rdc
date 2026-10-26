@@ -91,7 +91,7 @@ pub async fn process(
 
         let result: Result<()> = (async || {
             if !dir_created {
-                std::fs::create_dir_all(ctx.paths.saved_views_dir()).with_context(|| {
+                crate::vfs::create_dir_all(ctx.paths.saved_views_dir()).with_context(|| {
                     format!("creating {}", ctx.paths.saved_views_dir().display())
                 })?;
                 dir_created = true;

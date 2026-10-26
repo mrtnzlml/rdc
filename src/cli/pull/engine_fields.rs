@@ -86,7 +86,7 @@ pub async fn process(
 
         let result: Result<()> = (async || {
             let fields_dir = ctx.paths.engine_fields_dir(&engine_slug);
-            std::fs::create_dir_all(&fields_dir)
+            crate::vfs::create_dir_all(&fields_dir)
                 .with_context(|| format!("creating {}", fields_dir.display()))?;
 
             // Canonical on-disk bytes via KindCodec: strips `modified_at`.

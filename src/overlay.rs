@@ -84,10 +84,10 @@ pub struct Overlay {
 
 impl Overlay {
     pub fn load(path: &Path) -> Result<Option<Self>> {
-        if !path.exists() {
+        if !crate::vfs::exists(path) {
             return Ok(None);
         }
-        let raw = std::fs::read_to_string(path)
+        let raw = crate::vfs::read_to_string(path)
             .with_context(|| format!("reading {}", path.display()))?;
         let overlay: Overlay = toml::from_str(&raw)
             .with_context(|| format!("parsing {}", path.display()))?;

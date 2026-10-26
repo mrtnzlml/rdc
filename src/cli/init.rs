@@ -42,7 +42,7 @@ pub async fn run(env_specs: Vec<String>, force: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let cfg_path = cwd.join("rdc.toml");
 
-    let (mut cfg, mode) = if cfg_path.exists() {
+    let (mut cfg, mode) = if crate::vfs::exists(&cfg_path) {
         let existing = ProjectConfig::load(&cfg_path).with_context(|| {
             format!("loading existing project config from {}", cfg_path.display())
         })?;
@@ -118,13 +118,13 @@ pub async fn run(env_specs: Vec<String>, force: bool) -> Result<()> {
         (".gitlab-ci.yml".into(), write_gitlab_ci(&cwd, &cfg, force)?),
     ];
     scaffold.extend(write_testkit(&cwd, force)?.into_iter().map(|(n, o)| (n.into(), o)));
-    std::fs::create_dir_all(cwd.join("secrets"))
+    crate::vfs::create_dir_all(cwd.join("secrets"))
         .with_context(|| format!("creating {}", cwd.join("secrets").display()))?;
     for env in &new_env_names {
         let paths = Paths::for_env(&cwd, env);
-        std::fs::create_dir_all(paths.env_root())
+        crate::vfs::create_dir_all(paths.env_root())
             .with_context(|| format!("creating {}", paths.env_root().display()))?;
-        std::fs::create_dir_all(paths.hooks_dir())
+        crate::vfs::create_dir_all(paths.hooks_dir())
             .with_context(|| format!("creating {}", paths.hooks_dir().display()))?;
     }
     // Every env, not just the ones this run added: a project that predates
@@ -556,13 +556,13 @@ fn write_gitignore(root: &Path) -> Result<Scaffolded> {
         "/.pytest_cache",
     ];
 
-    if !path.exists() {
+    if !crate::vfs::exists(&path) {
         let body: String = PATTERNS.iter().map(|p| format!("{p}\n")).collect();
         write_atomic(&path, body.as_bytes())?;
         return Ok(Scaffolded::Created);
     }
 
-    let existing = std::fs::read_to_string(&path)
+    let existing = crate::vfs::read_to_string(&path)
         .with_context(|| format!("reading {}", path.display()))?;
     let existing_lines: std::collections::HashSet<&str> =
         existing.lines().map(str::trim).collect();
@@ -597,8 +597,8 @@ fn write_gitignore(root: &Path) -> Result<Scaffolded> {
 fn write_gitattributes(root: &Path) -> Result<Scaffolded> {
     let path = root.join(".gitattributes");
     let body = ".rdc/** linguist-generated=true\n";
-    if path.exists() {
-        let existing = std::fs::read_to_string(&path)
+    if crate::vfs::exists(&path) {
+        let existing = crate::vfs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
         if existing.contains(".rdc/** linguist-generated") {
             return Ok(Scaffolded::Unchanged);
@@ -624,11 +624,11 @@ fn write_gitattributes(root: &Path) -> Result<Scaffolded> {
 /// delegated to [`write_template_file_bytes`] once the existing bytes (if
 /// any) are in hand.
 fn write_template_file(path: &Path, body: &str, force: bool) -> Result<Scaffolded> {
-    if !path.exists() {
+    if !crate::vfs::exists(path) {
         write_atomic(path, body.as_bytes())?;
         return Ok(Scaffolded::Created);
     }
-    let existing = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let existing = crate::vfs::read(path).with_context(|| format!("reading {}", path.display()))?;
     write_template_file_bytes(path, body.as_bytes(), &existing, force)
 }
 
@@ -669,13 +669,13 @@ fn write_gitlab_ci(root: &Path, cfg: &ProjectConfig, force: bool) -> Result<Scaf
 
     let generated = || crate::cli::gitlab_ci::generate(GITLAB_CI_TEMPLATE, &cfg.envs);
 
-    if !path.exists() {
+    if !crate::vfs::exists(&path) {
         write_atomic(&path, generated()?.as_bytes())?;
         return Ok(Scaffolded::Created);
     }
 
     let existing =
-        std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        crate::vfs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     // A hand-edited pipeline that isn't valid UTF-8 can't be spliced; treat it
     // like write_template_file does — byte comparison, never a parse.
     let Ok(text) = String::from_utf8(existing.clone()) else {
@@ -707,7 +707,7 @@ fn write_gitlab_ci(root: &Path, cfg: &ProjectConfig, force: bool) -> Result<Scaf
 /// nothing collected exits 5, which would make the pipeline's test job red on a
 /// project that has not written any tests yet.
 fn write_testkit(root: &Path, force: bool) -> Result<Vec<(&'static str, Scaffolded)>> {
-    std::fs::create_dir_all(root.join("testkit"))
+    crate::vfs::create_dir_all(root.join("testkit"))
         .with_context(|| format!("creating {}", root.join("testkit").display()))?;
     TESTKIT_TEMPLATES
         .iter()
@@ -738,7 +738,7 @@ pub(crate) fn write_env_scaffolds(
     let paths = Paths::for_env(root, env);
 
     let overlay = paths.overlay_file();
-    let overlay_outcome = if overlay.exists() {
+    let overlay_outcome = if crate::vfs::exists(&overlay) {
         Scaffolded::Unchanged
     } else {
         write_atomic(&overlay, OVERLAY_TEMPLATE.as_bytes())?;
@@ -766,7 +766,7 @@ pub(crate) fn write_mapping_scaffold(root: &Path) -> Result<(String, Scaffolded)
     let name = ".rdc/mapping.toml".to_string();
     let paths = Paths::for_env(root, "");
     let path = paths.mapping_file();
-    if path.exists() || !paths.legacy_mapping_files().is_empty() {
+    if crate::vfs::exists(&path) || !paths.legacy_mapping_files().is_empty() {
         return Ok((name, Scaffolded::Unchanged));
     }
     write_atomic(&path, MAPPING_TEMPLATE.as_bytes())?;
@@ -821,13 +821,13 @@ fn write_doc_with_regions(
         })
     };
 
-    if !path.exists() {
+    if !crate::vfs::exists(path) {
         let body = generated()?;
         write_atomic(path, body.as_bytes())?;
         return Ok(Scaffolded::Created);
     }
 
-    let existing = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let existing = crate::vfs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let Ok(text) = String::from_utf8(existing.clone()) else {
         return write_template_file_bytes(path, generated()?.as_bytes(), &existing, force);
     };
@@ -954,7 +954,7 @@ pub fn write_scaffold_files(
     write_gitignore(cwd)?;
     write_gitattributes(cwd)?;
     let cfg_path = cwd.join("rdc.toml");
-    let mut cfg = if cfg_path.exists() {
+    let mut cfg = if crate::vfs::exists(&cfg_path) {
         // An unreadable/undecodable rdc.toml is the local `rdc` commands'
         // problem to report; here it just means "fall back to what the caller
         // told us" rather than failing a sync that hasn't started.

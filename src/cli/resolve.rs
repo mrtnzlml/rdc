@@ -187,7 +187,7 @@ fn is_json_path(path: &Path) -> bool {
 /// Read base bytes from `local_path` if it exists; used for the
 /// "local has changes" / "remote has changes" header in the prompt.
 fn read_local(path: &Path) -> Result<Vec<u8>> {
-    std::fs::read(path).with_context(|| format!("reading {}", path.display()))
+    crate::vfs::read(path).with_context(|| format!("reading {}", path.display()))
 }
 
 /// Top-level entry point. Auto-detects color mode from environment and TTY.
@@ -797,7 +797,7 @@ async fn run_editor_loop<R: LineSource, W: Write>(
 
     let buf = build_conflict_buffer(&local_view, &remote_view, env);
 
-    std::fs::write(&path, &buf)
+    crate::vfs::write(&path, &buf)
         .with_context(|| format!("writing temp conflict file {}", path.display()))?;
 
     let result = (async || -> Result<EditOutcome> {
@@ -809,7 +809,7 @@ async fn run_editor_loop<R: LineSource, W: Write>(
             if !status.success() {
                 anyhow::bail!("editor '{editor}' exited with non-zero status");
             }
-            let edited = std::fs::read(&path)
+            let edited = crate::vfs::read(&path)
                 .with_context(|| format!("reading edited conflict file {}", path.display()))?;
             match validate_edited(&edited, local_path) {
                 Ok(()) => return Ok(EditOutcome::Edited(edited)),
@@ -833,7 +833,7 @@ async fn run_editor_loop<R: LineSource, W: Write>(
             }
         }
     })().await;
-    let _ = std::fs::remove_file(&path);
+    let _ = crate::vfs::remove_file(&path);
     result
 }
 
@@ -1200,7 +1200,7 @@ async fn run_single_hunk_editor<R: LineSource, W: Write>(
     buf.push_str(env);
     buf.push('\n');
 
-    std::fs::write(&path, buf.as_bytes())
+    crate::vfs::write(&path, buf.as_bytes())
         .with_context(|| format!("writing temp hunk file {}", path.display()))?;
 
     let result = (async || -> Result<Option<Vec<u8>>> {
@@ -1212,7 +1212,7 @@ async fn run_single_hunk_editor<R: LineSource, W: Write>(
             if !status.success() {
                 anyhow::bail!("editor '{editor}' exited with non-zero status");
             }
-            let edited = std::fs::read(&path)
+            let edited = crate::vfs::read(&path)
                 .with_context(|| format!("reading edited hunk file {}", path.display()))?;
             match validate_edited_markers_only(&edited) {
                 Ok(()) => return Ok(Some(edited)),
@@ -1236,7 +1236,7 @@ async fn run_single_hunk_editor<R: LineSource, W: Write>(
             }
         }
     })().await;
-    let _ = std::fs::remove_file(&path);
+    let _ = crate::vfs::remove_file(&path);
     result
 }
 

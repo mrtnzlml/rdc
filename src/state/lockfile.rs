@@ -143,11 +143,11 @@ impl Lockfile {
     /// from `id` + `api_base`, and `api_base` defaults to `""` until a
     /// production caller sets it from the env config.
     pub fn load(path: &Path) -> Result<Self> {
-        if !path.exists() {
+        if !crate::vfs::exists(path) {
             return Ok(Self::default());
         }
         let raw =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+            crate::vfs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let mut lf: Lockfile =
             serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
 

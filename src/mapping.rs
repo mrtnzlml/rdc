@@ -70,10 +70,10 @@ impl Default for Mapping {
 
 impl Mapping {
     pub fn load(path: &Path) -> Result<Self> {
-        if !path.exists() {
+        if !crate::vfs::exists(path) {
             return Ok(Self::default());
         }
-        let raw = std::fs::read_to_string(path)
+        let raw = crate::vfs::read_to_string(path)
             .with_context(|| format!("reading {}", path.display()))?;
         let mut m: Mapping = toml::from_str(&raw)
             .with_context(|| format!("parsing {}", path.display()))?;
@@ -222,10 +222,10 @@ impl GenericMapping {
     ];
 
     pub fn load(path: &Path) -> Result<Self> {
-        if !path.exists() {
+        if !crate::vfs::exists(path) {
             return Ok(Self::default());
         }
-        let raw = std::fs::read_to_string(path)
+        let raw = crate::vfs::read_to_string(path)
             .with_context(|| format!("reading {}", path.display()))?;
         let g: GenericMapping = toml::from_str(&raw)
             .with_context(|| format!("parsing {}", path.display()))?;
@@ -234,7 +234,7 @@ impl GenericMapping {
 
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
+            crate::vfs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
         let s = toml::to_string_pretty(self).context("serializing mapping")?;

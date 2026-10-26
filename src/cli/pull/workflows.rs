@@ -51,7 +51,7 @@ pub async fn process(
             // workflow's JSON lives at `workflow.json` inside it, alongside
             // `steps/`.
             let workflow_dir = ctx.paths.workflow_dir(&slug);
-            std::fs::create_dir_all(&workflow_dir)
+            crate::vfs::create_dir_all(&workflow_dir)
                 .with_context(|| format!("creating {}", workflow_dir.display()))?;
 
             // Canonical on-disk bytes via KindCodec: strips `modified_at`.

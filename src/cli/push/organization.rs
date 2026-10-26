@@ -48,7 +48,7 @@ pub async fn push(
         return Ok((0, 1));
     };
 
-    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let bytes = crate::vfs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let local: serde_json::Value =
         serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
 

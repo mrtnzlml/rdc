@@ -69,7 +69,7 @@ fn derive_data_storage_base(api_base: &str) -> String {
 
 impl ProjectConfig {
     pub fn load(path: &Path) -> Result<Self> {
-        let raw = match std::fs::read_to_string(path) {
+        let raw = match crate::vfs::read_to_string(path) {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Self-contained, actionable error. The most common reason

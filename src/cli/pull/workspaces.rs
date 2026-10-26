@@ -46,14 +46,14 @@ pub async fn process(
 
         let result: Result<()> = (|| {
             if !dir_created {
-                std::fs::create_dir_all(ctx.paths.workspaces_dir()).with_context(|| {
+                crate::vfs::create_dir_all(ctx.paths.workspaces_dir()).with_context(|| {
                     format!("creating {}", ctx.paths.workspaces_dir().display())
                 })?;
                 dir_created = true;
             }
 
             let ws_dir = ctx.paths.workspace_dir(&slug);
-            std::fs::create_dir_all(&ws_dir)
+            crate::vfs::create_dir_all(&ws_dir)
                 .with_context(|| format!("creating {}", ws_dir.display()))?;
 
             // Canonical on-disk bytes via KindCodec: strips `modified_at`.

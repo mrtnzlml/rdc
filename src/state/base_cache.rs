@@ -93,10 +93,10 @@ pub fn read(paths: &Paths, env_file: &Path) -> Result<Option<Vec<u8>>> {
     let Some(mirror) = cache_mirror(paths, env_file) else {
         return Ok(None);
     };
-    if !mirror.exists() {
+    if !crate::vfs::exists(&mirror) {
         return Ok(None);
     }
-    let bytes = std::fs::read(&mirror)
+    let bytes = crate::vfs::read(&mirror)
         .with_context(|| format!("reading base cache {}", mirror.display()))?;
     Ok(Some(bytes))
 }
@@ -106,8 +106,8 @@ pub fn read(paths: &Paths, env_file: &Path) -> Result<Option<Vec<u8>>> {
 /// orphan cache file would otherwise survive until the next GC pass.
 pub fn forget(paths: &Paths, env_file: &Path) -> Result<()> {
     let Some(mirror) = cache_mirror(paths, env_file) else { return Ok(()) };
-    if mirror.exists() {
-        std::fs::remove_file(&mirror)
+    if crate::vfs::exists(&mirror) {
+        crate::vfs::remove_file(&mirror)
             .with_context(|| format!("removing base cache {}", mirror.display()))?;
     }
     Ok(())
@@ -123,7 +123,7 @@ pub fn forget(paths: &Paths, env_file: &Path) -> Result<()> {
 /// lockfile isn't authoritative for the cache, the on-disk env is.
 pub fn prune_orphans(paths: &Paths) -> Result<usize> {
     let cache_root = paths.base_cache_root();
-    if !cache_root.exists() {
+    if !crate::vfs::exists(&cache_root) {
         return Ok(0);
     }
     let env_root = paths.env_root();
@@ -134,8 +134,8 @@ pub fn prune_orphans(paths: &Paths) -> Result<usize> {
             Err(_) => return Ok(()),
         };
         let env_counterpart = env_root.join(rel);
-        if !env_counterpart.exists() {
-            std::fs::remove_file(cache_file)
+        if !crate::vfs::exists(&env_counterpart) {
+            crate::vfs::remove_file(cache_file)
                 .with_context(|| format!("pruning base cache {}", cache_file.display()))?;
             removed += 1;
         }
@@ -152,10 +152,9 @@ fn walk_files(
 ) -> Result<()> {
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir)
+        for entry in crate::vfs::read_dir(&dir)
             .with_context(|| format!("reading {}", dir.display()))?
         {
-            let entry = entry?;
             let ft = entry.file_type()?;
             let path = entry.path();
             if ft.is_dir() {
@@ -177,7 +176,7 @@ fn prune_empty_dirs(root: &Path) -> Result<()> {
     dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
     for d in dirs {
         if d == *root { continue; } // never delete the cache root itself
-        let _ = std::fs::remove_dir(&d);
+        let _ = crate::vfs::remove_dir(&d);
     }
     Ok(())
 }
@@ -186,8 +185,7 @@ fn walk_dirs(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         out.push(dir.clone());
-        for entry in std::fs::read_dir(&dir).context("read_dir")? {
-            let entry = entry?;
+        for entry in crate::vfs::read_dir(&dir).context("read_dir")? {
             if entry.file_type()?.is_dir() {
                 stack.push(entry.path());
             }

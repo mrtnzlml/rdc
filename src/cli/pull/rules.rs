@@ -55,7 +55,7 @@ pub async fn process(
 
         let result: Result<()> = (async || {
             if !dir_created {
-                std::fs::create_dir_all(ctx.paths.rules_dir())
+                crate::vfs::create_dir_all(ctx.paths.rules_dir())
                     .with_context(|| format!("creating {}", ctx.paths.rules_dir().display()))?;
                 dir_created = true;
             }
@@ -66,17 +66,17 @@ pub async fn process(
 
             let local_path = ctx.paths.rules_dir().join(format!("{slug}.json"));
             let py_path = ctx.paths.rules_dir().join(format!("{slug}.py"));
-            let pre_local_json = if local_path.exists() {
+            let pre_local_json = if crate::vfs::exists(&local_path) {
                 Some(
-                    std::fs::read(&local_path)
+                    crate::vfs::read(&local_path)
                         .with_context(|| format!("reading {}", local_path.display()))?,
                 )
             } else {
                 None
             };
-            let pre_local_code = if py_path.exists() {
+            let pre_local_code = if crate::vfs::exists(&py_path) {
                 Some(
-                    std::fs::read_to_string(&py_path)
+                    crate::vfs::read_to_string(&py_path)
                         .with_context(|| format!("reading {}", py_path.display()))?,
                 )
             } else {
@@ -127,8 +127,8 @@ pub async fn process(
                             &code_disk_path,
                             code.as_bytes(),
                         )?;
-                    } else if py_path.exists() {
-                        std::fs::remove_file(&py_path)
+                    } else if crate::vfs::exists(&py_path) {
+                        crate::vfs::remove_file(&py_path)
                             .with_context(|| format!("removing stale {}", py_path.display()))?;
                         crate::state::base_cache::forget(ctx.paths, &py_path)?;
                     }

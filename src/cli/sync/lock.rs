@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result};
 use fs4::{FileExt, TryLockError};
-use std::fs::{File, OpenOptions};
+use crate::vfs::LockFile as File;
 use std::path::Path;
 use std::time::Duration;
 
@@ -20,7 +20,9 @@ use std::time::Duration;
 
 #[derive(Debug)]
 pub struct EnvLock {
-    file: File,
+    /// `None` off the native filesystem, where there is no second process to
+    /// exclude and nothing to lock.
+    file: Option<File>,
 }
 
 impl EnvLock {
@@ -28,11 +30,14 @@ impl EnvLock {
     /// 200 ms while blocked. Creates the lock file (and the parent
     /// directory) if needed.
     pub fn acquire(lock_path: &Path, timeout: Duration) -> Result<Self> {
+        if !crate::vfs::is_native() {
+            return Ok(EnvLock { file: None });
+        }
         let file = open_lock_file(lock_path)?;
         let deadline = std::time::Instant::now() + timeout;
         loop {
             match <File as FileExt>::try_lock(&file) {
-                Ok(()) => return Ok(EnvLock { file }),
+                Ok(()) => return Ok(EnvLock { file: Some(file) }),
                 Err(TryLockError::WouldBlock) => {
                     if std::time::Instant::now() >= deadline {
                         // Name the holder and the remedy. The bare timeout
@@ -68,9 +73,12 @@ impl EnvLock {
     /// Take the lock only if it is free right now. `Ok(None)` means another
     /// process holds it; the caller words the refusal for its own context.
     pub fn try_acquire(lock_path: &Path) -> Result<Option<Self>> {
+        if !crate::vfs::is_native() {
+            return Ok(Some(EnvLock { file: None }));
+        }
         let file = open_lock_file(lock_path)?;
         match <File as FileExt>::try_lock(&file) {
-            Ok(()) => Ok(Some(EnvLock { file })),
+            Ok(()) => Ok(Some(EnvLock { file: Some(file) })),
             Err(TryLockError::WouldBlock) => Ok(None),
             Err(TryLockError::Error(e)) => {
                 Err(e).with_context(|| format!("acquiring exclusive lock on {}", lock_path.display()))
@@ -82,21 +90,18 @@ impl EnvLock {
 /// Open the lock file, creating it and its parent directory if needed.
 fn open_lock_file(lock_path: &Path) -> Result<File> {
     if let Some(parent) = lock_path.parent() {
-        std::fs::create_dir_all(parent)
+        crate::vfs::create_dir_all(parent)
             .with_context(|| format!("creating lock parent dir {}", parent.display()))?;
     }
-    OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(lock_path)
+    crate::vfs::open_lock_file(lock_path)
         .with_context(|| format!("opening lock file {}", lock_path.display()))
 }
 
 impl Drop for EnvLock {
     fn drop(&mut self) {
-        let _ = <File as FileExt>::unlock(&self.file);
+        if let Some(file) = &self.file {
+            let _ = <File as FileExt>::unlock(file);
+        }
     }
 }
 
