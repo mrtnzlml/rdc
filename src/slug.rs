@@ -48,7 +48,7 @@ pub fn is_safe_relative_key(key: &str) -> bool {
 const RESERVED: &[&str] = &["conftest"];
 
 /// Given a base slug and a set of slugs already in use, return a slug that does
-/// not collide. Adds `-2`, `-3`, ... as needed. A [reserved](RESERVED) slug
+/// not collide. Adds `-2`, `-3`, ... as needed. A reserved slug (`RESERVED`)
 /// counts as taken.
 pub fn slugify_unique(input: &str, used: &std::collections::HashSet<String>) -> String {
     let base = slugify(input);
