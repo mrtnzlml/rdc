@@ -1,0 +1,33 @@
+[package]
+name = "rdc_wasm"
+# Fixed on purpose: this crate is never published, and the release ships it
+# under rdc's own version, so `.github/scripts/bump-version.sh` never edits it.
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Own workspace, like desktop/rust: not a member of the parent rdc workspace.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rdc = { path = ".." }
+anyhow = "1"
+futures = { version = "0.3", default-features = false, features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["sync"] }
+# Pinned exactly: the release job installs `wasm-bindgen-cli` at this version,
+# and the CLI refuses a module built by a different `wasm-bindgen`.
+wasm-bindgen = "=0.2.129"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+serde-wasm-bindgen = "0.6"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
+
+[profile.release]
+opt-level = "s"
+lto = true

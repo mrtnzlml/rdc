@@ -1,5 +1,6 @@
 # Rust
 /target
+/wasm/target
 Cargo.lock.bak
 
 # rdc tool-managed paths (per design spec)
