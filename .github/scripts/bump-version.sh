@@ -1,6 +1,7 @@
 #!/bin/sh
-# Rewrite the crate version in the three files a release commit touches:
-# Cargo.toml, Cargo.lock and desktop/rust/Cargo.lock.
+# Rewrite the crate version in the four files a release commit touches:
+# Cargo.toml, Cargo.lock, desktop/rust/Cargo.lock and wasm/Cargo.lock (the wasm
+# build runs `cargo build --locked`, which fails on a stale `rdc` entry).
 #
 # templates/gitlab-ci.yml is NOT one of them: the scaffolded pipeline installs
 # `RDC_VERSION: "latest"`, so it names no version for a release to rewrite, and
@@ -59,7 +60,7 @@ edit "$root/Cargo.toml" '^version = "' '
   { if (!done && $0 ~ /^version = "/) { $0 = "version = \"" new "\""; done = 1 } print }
 '
 
-# The two lockfiles: the `version` key inside the `[[package]] name = "rdc"`
+# The three lockfiles: the `version` key inside the `[[package]] name = "rdc"`
 # block, identified by the line before it. Preferred over `cargo metadata`,
 # which needs a warm registry cache or a network fetch and can rewrite unrelated
 # entries when the lock is stale. `^name = "rdc"$` is anchored, so the sibling
@@ -76,3 +77,4 @@ lock_program='
 '
 edit "$root/Cargo.lock" '^name = "rdc"$' "$lock_program"
 edit "$root/desktop/rust/Cargo.lock" '^name = "rdc"$' "$lock_program"
+edit "$root/wasm/Cargo.lock" '^name = "rdc"$' "$lock_program"

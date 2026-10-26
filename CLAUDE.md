@@ -65,9 +65,10 @@ Project-specific instructions for working in this repo.
   linux triple are inlined.
 - Therefore the **full version literal must appear nowhere** in
   `templates/gitlab-ci.yml`, and `.github/scripts/bump-version.sh` must not
-  touch that file: it edits three files, not four.
+  touch that file: it edits four files (`Cargo.toml` and the three
+  `Cargo.lock`s), never that one.
   `the_committed_template_floats_and_names_no_version` (`src/cli/gitlab_ci.rs`)
-  enforces both halves, and `bumps_all_three_files` (`tests/bump_version.rs`)
+  enforces both halves, and `bumps_all_four_files` (`tests/bump_version.rs`)
   asserts the template comes back byte-identical. Prose says `<version>`,
   `vX.Y.Z` or `vX.Y`, never the literal.
 - Releases are cut by **`.github/workflows/weekly-release.yaml`** (Monday 06:17
@@ -118,8 +119,9 @@ Project-specific instructions for working in this repo.
   `wasm/Cargo.toml`'s. The tarball is `wasm-bindgen --target web` output
   (`rdc_wasm.js`, `rdc_wasm_bg.wasm`, `.d.ts` files), an ES module. The job
   installs `wasm-bindgen-cli` at exactly the `wasm-bindgen` version in
-  `wasm/Cargo.lock` (`=`-pinned in `wasm/Cargo.toml`); bump all three together,
-  in `release.yaml` and `ci.yaml`. It is **blocking**: `release` needs
+  `wasm/Cargo.lock` (`=`-pinned in `wasm/Cargo.toml`); a bump touches four
+  places, together: `wasm/Cargo.toml`, `wasm/Cargo.lock`, `release.yaml` and
+  `ci.yaml`. It is **blocking**: `release` needs
   `build-wasm` to succeed, unlike the desktop jobs. `wasm/` is in the ship gate
   of `release-plan.sh` because the tarball is built from it; without that a
   wasm-only week would release nothing. `tests/vfs_boundary.rs` guards the

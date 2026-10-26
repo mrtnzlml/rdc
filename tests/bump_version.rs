@@ -51,6 +51,20 @@ name = "rdc_bridge"
 version = "0.1.0"
 "#;
 
+const WASM_LOCK: &str = r#"version = 4
+
+[[package]]
+name = "rdc"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+]
+
+[[package]]
+name = "rdc_wasm"
+version = "0.0.0"
+"#;
+
 /// The scaffolded pipeline names no version at all, so a bump must leave it
 /// exactly as it is.
 const TEMPLATE: &str = r#"variables:
@@ -63,6 +77,8 @@ fn tree() -> TempDir {
     fs::write(dir.path().join("Cargo.lock"), ROOT_LOCK).unwrap();
     fs::create_dir_all(dir.path().join("desktop/rust")).unwrap();
     fs::write(dir.path().join("desktop/rust/Cargo.lock"), DESKTOP_LOCK).unwrap();
+    fs::create_dir_all(dir.path().join("wasm")).unwrap();
+    fs::write(dir.path().join("wasm/Cargo.lock"), WASM_LOCK).unwrap();
     fs::create_dir_all(dir.path().join("templates")).unwrap();
     fs::write(dir.path().join("templates/gitlab-ci.yml"), TEMPLATE).unwrap();
     dir
@@ -86,7 +102,7 @@ fn stderr(out: &Output) -> String {
 }
 
 #[test]
-fn bumps_all_three_files() {
+fn bumps_all_four_files() {
     let t = tree();
     let out = bump(t.path(), "0.8.0");
     assert!(out.status.success(), "{}", stderr(&out));
@@ -96,6 +112,8 @@ fn bumps_all_three_files() {
     assert!(
         read(t.path(), "desktop/rust/Cargo.lock").contains("name = \"rdc\"\nversion = \"0.8.0\"\n")
     );
+    assert!(read(t.path(), "wasm/Cargo.lock").contains("name = \"rdc\"\nversion = \"0.8.0\"\n"));
+    assert!(read(t.path(), "wasm/Cargo.lock").contains("name = \"rdc_wasm\"\nversion = \"0.0.0\""));
     assert_eq!(read(t.path(), "templates/gitlab-ci.yml"), TEMPLATE, "the template was rewritten");
 }
 
@@ -171,6 +189,7 @@ fn leaves_no_temp_files_behind() {
         "Cargo.toml.tmp",
         "Cargo.lock.tmp",
         "desktop/rust/Cargo.lock.tmp",
+        "wasm/Cargo.lock.tmp",
         "templates/gitlab-ci.yml.tmp",
     ] {
         assert!(!t.path().join(rel).exists(), "{rel} was left behind");
@@ -179,12 +198,13 @@ fn leaves_no_temp_files_behind() {
 
 #[test]
 fn bumps_the_real_repository_tree_in_a_copy() {
-    // Guards the three real files against a rename or a reshuffle: copy them out
+    // Guards the four real files against a rename or a reshuffle: copy them out
     // of the checkout and bump the copy. Never touches the working tree.
     let t = TempDir::new().unwrap();
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
     fs::create_dir_all(t.path().join("desktop/rust")).unwrap();
-    for rel in ["Cargo.toml", "Cargo.lock", "desktop/rust/Cargo.lock"] {
+    fs::create_dir_all(t.path().join("wasm")).unwrap();
+    for rel in ["Cargo.toml", "Cargo.lock", "desktop/rust/Cargo.lock", "wasm/Cargo.lock"] {
         fs::copy(repo.join(rel), t.path().join(rel)).unwrap();
     }
 
@@ -197,6 +217,9 @@ fn bumps_the_real_repository_tree_in_a_copy() {
     assert!(
         read(t.path(), "desktop/rust/Cargo.lock")
             .contains("name = \"rdc\"\nversion = \"99.99.99\"\n")
+    );
+    assert!(
+        read(t.path(), "wasm/Cargo.lock").contains("name = \"rdc\"\nversion = \"99.99.99\"\n")
     );
     // And the old version is gone from the one file that spells it out.
     assert!(
