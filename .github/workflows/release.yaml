@@ -149,11 +149,21 @@ jobs:
             ~/.cargo/git
             wasm/target
           key: cargo-wasm-release-${{ hashFiles('wasm/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-wasm-release-
+
+      - name: Cache wasm-bindgen-cli
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/bin/wasm-bindgen
+          key: wasm-bindgen-cli-${{ runner.os }}-0.2.129
 
       - name: Install wasm-bindgen-cli
         # Must equal the wasm-bindgen version in wasm/Cargo.lock (and the
         # `=` pin in wasm/Cargo.toml), or the glue does not match the module.
-        run: cargo install wasm-bindgen-cli --version 0.2.129 --locked
+        run: |
+          if [ "$(wasm-bindgen --version 2>/dev/null)" != "wasm-bindgen 0.2.129" ]; then
+            cargo install wasm-bindgen-cli --version 0.2.129 --locked
+          fi
 
       - name: Build
         working-directory: wasm

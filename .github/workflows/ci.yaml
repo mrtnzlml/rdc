@@ -120,8 +120,17 @@ jobs:
         working-directory: wasm
         run: cargo build --release --locked --target wasm32-unknown-unknown
 
+      - name: Cache wasm-bindgen-cli
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/bin/wasm-bindgen
+          key: wasm-bindgen-cli-${{ runner.os }}-0.2.129
+
       - name: Install wasm-bindgen-cli
-        run: cargo install wasm-bindgen-cli --version 0.2.129 --locked
+        run: |
+          if [ "$(wasm-bindgen --version 2>/dev/null)" != "wasm-bindgen 0.2.129" ]; then
+            cargo install wasm-bindgen-cli --version 0.2.129 --locked
+          fi
 
       - name: Package
         run: |
@@ -129,6 +138,11 @@ jobs:
             wasm/target/wasm32-unknown-unknown/release/rdc_wasm.wasm
           tar czf dist/rdc-wasm.tar.gz -C dist/pkg .
           tar tzf dist/rdc-wasm.tar.gz
+          # The release asset is useless without all three.
+          for f in rdc_wasm.js rdc_wasm_bg.wasm rdc_wasm.d.ts; do
+            tar tzf dist/rdc-wasm.tar.gz | grep -Eqx "(\./)?$f" \
+              || { echo "::error::tarball is missing $f"; exit 1; }
+          done
 
   # The Python testkit that `rdc init` scaffolds. Its self-tests run in every
   # project's pipeline, so a break here turns every project's test job red.
