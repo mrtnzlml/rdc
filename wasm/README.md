@@ -65,8 +65,9 @@ bridge's DTOs in camelCase. Differences from the desktop app:
 
 - **Keys are relative** to the project root. A key that leaves the tree is
   refused.
-- **`onChange`** reports every write, including the temporary file an atomic
-  write goes through (written, then removed). Replace a key's bytes on a write
+- **`onChange`** reports one event per file written, renamed or removed (a
+  rename is a removal and a creation). The writer writes the target directly on
+  this store, so no temporary file is reported. Replace a key's bytes on a write
   and drop the key on `null`.
 - **`ProjectSummary`**: `id` and `name` are the slug of the name given to
   `create` or `editProject` (empty for a project opened from files); `folder`
