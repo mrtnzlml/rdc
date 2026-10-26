@@ -242,6 +242,7 @@ async fn watch_in_memory_never_touches_disk() {
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": 1, "url": queue_url, "name": "Invoices (locally edited)", "workspace": ws_url,
         })))
+        .expect(1)
         .mount(&server)
         .await;
 
@@ -320,6 +321,131 @@ async fn watch_in_memory_never_touches_disk() {
 
     let (res, ()) = tokio::join!(watch, driver);
     res.expect("watch stops cleanly");
+    assert!(!root.exists(), "the watch touched the real disk");
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0, "the watch wrote under the tempdir");
+}
+
+/// A 401 in a watch is answered with `force_relogin` from the credentials in
+/// the in-memory `secrets/` file; the fresh token lands back in that file and
+/// nothing reaches the real disk.
+#[tokio::test]
+async fn watch_in_memory_relogs_in_after_a_401() {
+    let server = MockServer::start().await;
+    // The initial reconcile (which does not refresh a token) must pass, so the
+    // stale token is only revoked once the driver flips this flag.
+    let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let revoked_in_mock = revoked.clone();
+    let org_url = format!("{}/organizations/1", server.uri());
+    Mock::given(method("GET"))
+        .and(path("/organizations/1"))
+        .respond_with(move |req: &wiremock::Request| {
+            let stale = req.headers.get("authorization").map(|v| v.to_str().unwrap()) == Some("token stale");
+            if stale && revoked_in_mock.load(std::sync::atomic::Ordering::SeqCst) {
+                ResponseTemplate::new(401).set_body_json(serde_json::json!({"detail": "Invalid token."}))
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": 1, "name": "test-org", "url": org_url
+                }))
+            }
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/auth/login"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "key": "fresh"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    for kind in [
+        "workspaces", "queues", "schemas", "inboxes", "hooks", "rules", "labels", "engines",
+        "engine_fields", "workflows", "workflow_steps", "email_templates", "saved_views",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("/{}", kind)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [], "pagination": {"next": null, "total_pages": 1, "total": 0}
+            })))
+            .mount(&server)
+            .await;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("project");
+    let store = Arc::new(
+        MemStore::from_files(
+            root.clone(),
+            [
+                (
+                    "rdc.toml".to_string(),
+                    format!("[envs.test]\napi_base = \"{}\"\norg_id = 1\n", server.uri())
+                        .into_bytes(),
+                ),
+                // The shape `secrets::save_password_credentials` writes.
+                (
+                    "secrets/test.secrets.json".to_string(),
+                    br#"{"username": "alice", "password": "pw"}"#.to_vec(),
+                ),
+            ],
+        )
+        .unwrap(),
+    );
+
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let cancel = CancelToken::new();
+    let log = SharedLog::default();
+    let api_base = server.uri();
+    let watch = watch_logged_in(
+        store.clone() as Arc<dyn Store>,
+        &root,
+        "test",
+        &api_base,
+        "stale".to_string(),
+        None,
+        Box::new(log.clone()),
+        Arc::new(NoAnswer),
+        cancel.clone(),
+        None,
+        Some(rx),
+    );
+
+    let driver = async {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !String::from_utf8_lossy(&log.0.lock().unwrap()).contains("start envs/test") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the watch never recovered from the 401: {}",
+                String::from_utf8_lossy(&log.0.lock().unwrap())
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        revoked.store(true, std::sync::atomic::Ordering::SeqCst);
+        tx.send(CycleTrigger::Poll).await.unwrap();
+        while !String::from_utf8_lossy(&log.0.lock().unwrap()).contains("token expired") {
+            assert!(std::time::Instant::now() < deadline, "the 401 never reached the refresher");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // Give the retried cycle time to finish before stopping the watch.
+        while !server.received_requests().await.unwrap().iter().any(|r| {
+            r.url.path() == "/organizations/1"
+                && r.headers.get("authorization").map(|v| v.to_str().unwrap()) == Some("token fresh")
+        }) {
+            assert!(std::time::Instant::now() < deadline, "the fresh token was never used");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        cancel.cancel();
+    };
+
+    let (res, ()) = tokio::join!(watch, driver);
+    res.expect("watch stops cleanly");
+
+    let secrets: serde_json::Value = serde_json::from_slice(
+        store.files().get("secrets/test.secrets.json").expect("secrets file kept"),
+    )
+    .unwrap();
+    assert_eq!(secrets["api_token"], "fresh", "the refreshed token is written to the store");
+    assert_eq!(secrets["username"], "alice", "the credentials are kept");
     assert!(!root.exists(), "the watch touched the real disk");
     assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0, "the watch wrote under the tempdir");
 }
