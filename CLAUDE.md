@@ -72,7 +72,7 @@ Project-specific instructions for working in this repo.
   `vX.Y.Z` or `vX.Y`, never the literal.
 - Releases are cut by **`.github/workflows/weekly-release.yaml`** (Monday 06:17
   UTC, plus `workflow_dispatch`), not by hand. It releases only when a commit
-  since the last tag touched `src/`, `templates/`, `desktop/`, `Cargo.toml` or
+  since the last tag touched `src/`, `templates/`, `desktop/`, `wasm/`, `Cargo.toml` or
   `Cargo.lock`; the level is derived from commit types (any `feat`, any
   `type!:`, or `BREAKING CHANGE:` → minor, else patch), which is what keeps the
   template's documented `vX.Y` series pin — *"picks up fixes, never a new
