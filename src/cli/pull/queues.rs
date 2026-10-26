@@ -169,7 +169,7 @@ pub async fn process(
             continue;
         }
 
-        let queue_result: Result<()> = (async || {
+        let queue_result: Result<()> = async {
             let queue_dir = ctx.paths.queue_dir(&ws_slug, &q_slug);
             crate::vfs::create_dir_all(&queue_dir)
                 .with_context(|| format!("creating {}", queue_dir.display()))?;
@@ -254,7 +254,7 @@ pub async fn process(
                 queue_dir,
             });
             Ok(())
-        })().await;
+        }.await;
         queue_result?;
     }
 

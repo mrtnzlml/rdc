@@ -813,7 +813,7 @@ async fn run_editor_loop<R: LineSource, W: Write>(
     crate::vfs::write(&path, &buf)
         .with_context(|| format!("writing temp conflict file {}", path.display()))?;
 
-    let result = (async || -> Result<EditOutcome> {
+    let result: Result<EditOutcome> = async {
         loop {
             let status = Command::new(&editor)
                 .arg(&path)
@@ -845,7 +845,7 @@ async fn run_editor_loop<R: LineSource, W: Write>(
                 }
             }
         }
-    })().await;
+    }.await;
     let _ = crate::vfs::remove_file(&path);
     result
 }
@@ -1216,7 +1216,7 @@ async fn run_single_hunk_editor<R: LineSource, W: Write>(
     crate::vfs::write(&path, buf.as_bytes())
         .with_context(|| format!("writing temp hunk file {}", path.display()))?;
 
-    let result = (async || -> Result<Option<Vec<u8>>> {
+    let result: Result<Option<Vec<u8>>> = async {
         loop {
             let status = Command::new(&editor)
                 .arg(&path)
@@ -1248,7 +1248,7 @@ async fn run_single_hunk_editor<R: LineSource, W: Write>(
                 }
             }
         }
-    })().await;
+    }.await;
     let _ = crate::vfs::remove_file(&path);
     result
 }

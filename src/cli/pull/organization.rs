@@ -20,7 +20,7 @@ pub async fn process(
     org: Organization,
     progress: &Arc<Log>,
 ) -> Result<(usize, usize)> {
-    let result: Result<(usize, usize)> = (async || {
+    let result: Result<(usize, usize)> = async {
         let path = ctx.paths.organization_file();
         if let Some(parent) = path.parent() {
             crate::vfs::create_dir_all(parent)
@@ -66,6 +66,6 @@ pub async fn process(
         progress.event(Action::Pull, &format!("organization ({} pulled)", org.name));
 
         Ok((1, conflicts))
-    })().await;
+    }.await;
     result
 }

@@ -78,7 +78,7 @@ pub async fn process(
             continue;
         }
 
-        let result: Result<()> = (async || {
+        let result: Result<()> = async {
             let steps_dir = ctx.paths.workflow_steps_dir(&workflow_slug);
             crate::vfs::create_dir_all(&steps_dir)
                 .with_context(|| format!("creating {}", steps_dir.display()))?;
@@ -140,7 +140,7 @@ pub async fn process(
             );
             written += 1;
             Ok(())
-        })().await;
+        }.await;
         result?;
     }
 

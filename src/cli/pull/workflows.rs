@@ -46,7 +46,7 @@ pub async fn process(
             continue;
         }
 
-        let result: Result<()> = (async || {
+        let result: Result<()> = async {
             // Each workflow owns a directory: `workflows/<slug>/`. The
             // workflow's JSON lives at `workflow.json` inside it, alongside
             // `steps/`.
@@ -97,7 +97,7 @@ pub async fn process(
             );
             written += 1;
             Ok(())
-        })().await;
+        }.await;
         result?;
     }
 

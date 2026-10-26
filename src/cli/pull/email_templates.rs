@@ -81,7 +81,7 @@ pub async fn process(
             continue;
         }
 
-        let result: Result<()> = (async || {
+        let result: Result<()> = async {
             let dir = ctx.paths.queue_email_templates_dir(&ws_slug, &q_slug);
             crate::vfs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
@@ -127,7 +127,7 @@ pub async fn process(
             );
             count += 1;
             Ok(())
-        })().await;
+        }.await;
         result?;
     }
 

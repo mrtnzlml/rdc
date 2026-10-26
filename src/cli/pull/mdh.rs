@@ -1102,7 +1102,7 @@ pub async fn process(
         let Some(index_set) = by_slug.get(slug) else {
             continue;
         };
-        let ix_action: PullAction = (async || -> Result<PullAction> {
+        let ix_action: PullAction = async {
             let ix_path = dataset_dir.join("indexes.json");
 
             // Serialize to the exact on-disk bytes a pull would write.
@@ -1143,8 +1143,8 @@ pub async fn process(
                 ).await?
             };
             record_object(ctx.lockfile, "mdh_indexes", slug, 0, None, None, Some(i_recorded));
-            Ok(i_action)
-        })().await?;
+            Ok::<PullAction, anyhow::Error>(i_action)
+        }.await?;
         // `Write` overwrote the local indexes.json; `Conflict` wrote merged
         // bytes / a shadow. `NoChange` and `KeepLocal` left the file alone.
         if matches!(ix_action, PullAction::Write | PullAction::Conflict) {

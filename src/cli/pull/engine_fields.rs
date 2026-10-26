@@ -84,7 +84,7 @@ pub async fn process(
             continue;
         }
 
-        let result: Result<()> = (async || {
+        let result: Result<()> = async {
             let fields_dir = ctx.paths.engine_fields_dir(&engine_slug);
             crate::vfs::create_dir_all(&fields_dir)
                 .with_context(|| format!("creating {}", fields_dir.display()))?;
@@ -145,7 +145,7 @@ pub async fn process(
             );
             written += 1;
             Ok(())
-        })().await;
+        }.await;
         result?;
     }
 

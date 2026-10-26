@@ -89,7 +89,7 @@ pub async fn process(
             continue;
         }
 
-        let result: Result<()> = (async || {
+        let result: Result<()> = async {
             if !dir_created {
                 crate::vfs::create_dir_all(ctx.paths.saved_views_dir()).with_context(|| {
                     format!("creating {}", ctx.paths.saved_views_dir().display())
@@ -138,7 +138,7 @@ pub async fn process(
             );
             written += 1;
             Ok(())
-        })().await;
+        }.await;
         result?;
     }
 
