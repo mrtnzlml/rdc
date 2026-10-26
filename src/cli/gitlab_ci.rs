@@ -521,7 +521,7 @@ mod tests {
     /// on a fresh project; a project that wants the release decided by a commit
     /// sets `RDC_RELEASE` to `vX.Y.Z` itself. And with no literal
     /// anywhere, `.github/scripts/bump-version.sh` has nothing to rewrite in
-    /// this file -- it edits three files, not four -- so no comment here can be
+    /// this file -- it edits four files, none of them this one -- so no comment here can be
     /// silently falsified by a release.
     #[test]
     fn the_archive_job_prepares_its_env_so_credentials_can_be_scoped() {

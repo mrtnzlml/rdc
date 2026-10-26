@@ -4,7 +4,7 @@
 # build runs `cargo build --locked`, which fails on a stale `rdc` entry).
 #
 # templates/gitlab-ci.yml is NOT one of them: the scaffolded pipeline installs
-# `RDC_VERSION: "latest"`, so it names no version for a release to rewrite, and
+# `RDC_RELEASE: "latest"`, so it names no version for a release to rewrite, and
 # `the_committed_template_floats_and_names_no_version` in src/cli/gitlab_ci.rs
 # keeps it that way. Do not add it back without removing that test first.
 #
