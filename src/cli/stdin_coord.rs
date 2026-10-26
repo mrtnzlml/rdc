@@ -339,17 +339,29 @@ impl<R: LineSource + ?Sized> LineSource for Borrowed<'_, R> {
 /// remote-delete resolvers. Construction is cheap and acquires nothing —
 /// the first read is what blocks/locks, so a conflict-free cycle that
 /// never reads also never touches stdin.
-pub struct CoordinatorStdin;
+pub struct CoordinatorStdin {
+    /// Latched on the first end of input, so a resolver that reuses this
+    /// source for every remaining item does not re-ask (a route would emit
+    /// a fresh prompt each time; the coordinator could re-block).
+    eof: bool,
+}
 
 impl CoordinatorStdin {
     pub fn new() -> Self {
-        Self
+        Self { eof: false }
     }
 }
 
 impl LineSource for CoordinatorStdin {
     fn read_line(&mut self) -> crate::rt::BoxFuture<'_, io::Result<Option<String>>> {
-        Box::pin(read_line_coordinated())
+        Box::pin(async move {
+            if self.eof {
+                return Ok(None);
+            }
+            let line = read_line_coordinated().await?;
+            self.eof = line.is_none();
+            Ok(line)
+        })
     }
 }
 
@@ -431,6 +443,26 @@ mod tests {
     async fn async_route_answers_through_await() {
         let got = with_route(Arc::new(SlowYes), read_line_coordinated()).await;
         assert_eq!(got.unwrap(), Some("y".to_string()));
+    }
+
+    struct CountingNone(std::sync::atomic::AtomicUsize);
+    impl PromptRoute for CountingNone {
+        fn ask<'a>(&'a self, _prompt: &'a Prompt) -> crate::rt::BoxFuture<'a, Option<String>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { None })
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinator_stdin_latches_end_of_input() {
+        let route = Arc::new(CountingNone(std::sync::atomic::AtomicUsize::new(0)));
+        with_route(route.clone(), async {
+            let mut src = CoordinatorStdin::new();
+            assert_eq!(LineSource::read_line(&mut src).await.unwrap(), None);
+            assert_eq!(LineSource::read_line(&mut src).await.unwrap(), None);
+        })
+        .await;
+        assert_eq!(route.0.load(Ordering::SeqCst), 1, "route asked again after EOF");
     }
 
     #[tokio::test]
