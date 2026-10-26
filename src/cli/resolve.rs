@@ -320,11 +320,12 @@ pub async fn prompt_resolve_with_bytes_and_color<R: LineSource, W: Write>(
     // conflicts) and the diff shows only the genuine change. Deriving it from
     // cwd + `env` keeps this self-contained; an unloadable lockfile falls back
     // to empty (prior behavior).
-    // Where there is no working directory (wasm32 errs on `current_dir`),
-    // the project root is read off `local_path` instead.
-    let lockfile = std::env::current_dir()
-        .ok()
-        .or_else(|| project_root_of(local_path, env))
+    // The project root is read off `local_path` first: the desktop app and
+    // in-memory embedders run with a cwd that is not the project (and wasm32
+    // has no `current_dir` at all). A relative CLI path yields an empty root,
+    // i.e. the working directory, as before.
+    let lockfile = project_root_of(local_path, env)
+        .or_else(|| std::env::current_dir().ok())
         .map(|cwd| crate::paths::Paths::for_env(&cwd, env))
         .and_then(|p| crate::state::Lockfile::load(&p.lockfile()).ok())
         .unwrap_or_default();
@@ -3094,6 +3095,48 @@ mod tests {
             s.contains("[h] one change at a time"),
             "multi-hunk re-prompt should include [h]: {s}"
         );
+    }
+
+    /// The conflict view loads the lockfile of the project the file lives in,
+    /// not of the working directory: the desktop app and in-memory embedders
+    /// run with a cwd that is not the project. A URL ref on the remote side
+    /// then portabilizes to the local `rdc://` form, the two sides agree and
+    /// nothing is asked.
+    #[tokio::test]
+    async fn conflict_view_uses_the_lockfile_of_a_project_that_is_not_the_cwd() {
+        let project = tempfile::TempDir::new().unwrap();
+        let api_base = "https://example.rossum.app/api/v1";
+        let paths = crate::paths::Paths::for_env(project.path(), "dev");
+        let mut lf = crate::state::Lockfile {
+            api_base: api_base.to_string(),
+            ..crate::state::Lockfile::default()
+        };
+        lf.upsert(
+            "queues",
+            "invoices",
+            crate::state::ObjectEntry {
+                id: 10,
+                modified_at: None,
+                modified_by: None,
+                content_hash: None,
+                secrets_hash: None,
+            },
+        );
+        std::fs::create_dir_all(paths.lockfile().parent().unwrap()).unwrap();
+        lf.save(&paths.lockfile()).unwrap();
+
+        let local_path = project.path().join("envs/dev/queues/invoices/queue.json");
+        let mut out: Vec<u8> = Vec::new();
+        let r = prompt_resolve_with_bytes_and_color(
+            Cursor::new(b""), &mut out, 1, 1, ObjectRef { kind: "queues", slug: "invoices" },
+            &local_path,
+            br#"{"workspace":"rdc://queues/invoices"}"#,
+            format!(r#"{{"workspace":"{api_base}/queues/10"}}"#).as_bytes(),
+            "dev", ColorMode::Plain, None, false,
+        ).await
+        .unwrap();
+        assert!(matches!(r, Resolution::KeepLocal), "lockfile not found: {r:?}");
+        assert!(out.is_empty(), "nothing should be shown: {}", String::from_utf8_lossy(&out));
     }
 
     #[tokio::test]
