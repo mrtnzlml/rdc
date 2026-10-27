@@ -233,6 +233,11 @@ jobs:
     # No trigger is involved, so the GITHUB_TOKEN event restriction that stops a
     # pushed tag from starting release.yaml never applies here.
     uses: ./.github/workflows/release.yaml
+    # A called workflow gets at most what its caller grants: release.yaml's
+    # npm job needs packages:write on top of the workflow's contents:write.
+    permissions:
+      contents: write
+      packages: write
     # The tap job needs HOMEBREW_TAP_TOKEN.
     secrets: inherit
     with:

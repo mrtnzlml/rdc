@@ -227,6 +227,51 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true
 
+  npm:
+    # Publishes the wasm build as @mrtnzlml/rdc-wasm to GitHub's npm registry,
+    # from the same tarball the release carries. Non-blocking, like the tap.
+    # Installing needs a token with read:packages, even for a public package.
+    name: Publish wasm to GitHub npm registry
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download wasm artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: rdc-wasm32-unknown-unknown
+          path: artifacts
+
+      - uses: actions/setup-node@v4
+        with:
+          registry-url: https://npm.pkg.github.com
+          scope: '@mrtnzlml'
+
+      - name: Publish
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+          NODE_AUTH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          mkdir pkg
+          tar xzf "artifacts/rdc-${version}-wasm32-unknown-unknown.tar.gz" -C pkg
+          # `repository` links the package to this repo on GitHub.
+          jq -n --arg v "$version" '{
+            name: "@mrtnzlml/rdc-wasm",
+            version: $v,
+            type: "module",
+            main: "rdc_wasm.js",
+            types: "rdc_wasm.d.ts",
+            repository: "https://github.com/mrtnzlml/rdc",
+            publishConfig: { registry: "https://npm.pkg.github.com" }
+          }' > pkg/package.json
+          cd pkg
+          npm publish
+
   homebrew:
     # Regenerates Formula/rdc.rb in mrtnzlml/homebrew-tap so `brew install
     # mrtnzlml/tap/rdc` resolves to this tag. Requires a repo secret
