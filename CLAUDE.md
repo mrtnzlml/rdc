@@ -190,10 +190,21 @@ Project-specific instructions for working in this repo.
   a file both sides changed) otherwise. So the store must live as long as the
   tab's `Project` (`wasm/` caches one per env); a store per run would wipe the
   host's edits on every sync.
-- `is_internal_collection` is true for `__` names **and** for the collection of
-  the task's scoped state store. Every MDH path goes through it (listing,
-  `local_only_dataset_slugs`) or through migrate's own skip (`state_datasets`).
-  The CLI scopes no store, so it still mirrors such a collection without `__`.
+- `is_internal_collection` is true for `__` names, for the Chrome extension's
+  `_SA_EXTENSION__*` names (**on every surface, the CLI included** — an owner
+  decision of 2026-11-03 and a deliberate CLI behaviour change), and for the
+  collection of the task's scoped state store. Every MDH path goes through it
+  (listing, `local_only_dataset_slugs`) or through migrate's own skip
+  (`state_datasets`, which skips `_SA_EXTENSION__*` and the scoped collection
+  but still copies other `__` datasets, as before). rdc has no collection drop,
+  so no path can delete such a collection.
+- A tree that pulled an `_SA_EXTENSION__*` dataset before the rule: the next
+  sync removes it locally **only if the env lists at least one other dataset**
+  (the stage-4 orphan prune is gated on a non-empty listing so an MDH outage
+  cannot mass-delete); an edited one is deferred with a `-deleted` marker; on
+  an env with no other dataset it stays in the tree and lockfile, inert. No
+  sync writes to it, `--allow-deletes` or not
+  (`tests/live/support/fake/extension_collections.rs`).
 - `.rdc/mapping.toml`, `rdc.toml` and `secrets/` are **host-owned** in the
   browser, never in Data Storage: the mapping is project-level and each env's
   state lives in another org, so two copies would have no correct merge. See

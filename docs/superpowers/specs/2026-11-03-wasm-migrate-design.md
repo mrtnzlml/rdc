@@ -188,9 +188,9 @@ files by hand.
 `StateStore` gains `fn collection(&self) -> Option<String>` (default `None`);
 `DataStorageStateStore` returns its collection.
 `cli::pull::mdh::is_internal_collection(name)` is true for a `__` name (as
-before) **or** for the collection of the state store scoped to the task. A
-native run scopes none, so the CLI is unchanged. Every MDH path goes through
-one of three points:
+before), for an `_SA_EXTENSION__` name (see below), **or** for the collection
+of the state store scoped to the task. Every MDH path goes through one of
+three points:
 
 1. **Listing** (`mdh::list`): the env's collections minus internal ones. Pull,
    push (index and row diffs), the dry-run planner and the stage-4 orphan
@@ -200,15 +200,42 @@ one of three points:
    create pass and the dry-run planner): a folder whose `collection.json`
    names an internal collection is never created.
 3. **Migrate** (new): a source dataset whose `collection.json` names the
-   scoped state collection is not copied to the target. The CLI scopes no
-   store, so its migrate is unchanged.
+   scoped state collection or an `_SA_EXTENSION__` collection is not copied
+   to the target.
 
 There is no collection drop anywhere in rdc (`api::data_storage` implements
 only `collections/create`), so no path can delete the state collection.
 
-Open, not fixed (it would change the CLI): the native CLI knows no configured
-collection, so `rdc sync` run by the CLI on the same org mirrors
-`_SA_EXTENSION__rdc_state` as an ordinary dataset, and `rdc migrate` copies it.
+*Owner decision, 2026-11-03:* every collection whose name starts with
+`_SA_EXTENSION__` (the extension's prefix) is internal too, exactly like
+`__`, **in the CLI as well** — an accepted CLI behaviour change. So the CLI
+never pulls, pushes, creates or migrates the extension's state collection
+either. Migrate's skip (§4.3) covers `_SA_EXTENSION__*` and the scoped
+collection; other `__` datasets in an old tree are still copied, as before.
+
+A project that already pulled such a dataset into `envs/<env>/mdh/`
+(verified against the fake, `tests/live/support/fake/extension_collections.rs`):
+
+- The listing no longer shows it, so the next sync's stage-4 orphan prune
+  treats it as deleted on the env — **but only when the env lists at least
+  one other dataset**. That prune is gated on a non-empty listing, so an MDH
+  outage can never mass-delete local datasets. Then an unchanged dataset is
+  removed locally (files, base copy, both lockfile entries) and logged as
+  `mdh/<slug> (deleted on <env>)`; an edited one is deferred with a
+  `-deleted` marker under `.rdc/conflicts/<env>/` (non-interactive) or
+  prompted for.
+- On an env whose only dataset it is, nothing happens: it stays in the tree
+  and the lockfile, inert. Not pushed (only listed datasets are), not
+  re-created (`local_only_dataset_slugs` skips it, and a recorded one is left
+  to the prune).
+- `--allow-deletes` changes none of this: no MDH path deletes a collection
+  (there is no drop in rdc) or rows of an unlisted one.
+- `rdc migrate` never copies it; a `--mirror` prune of a target copy removes
+  local files only.
+
+So "it becomes remote-deleted locally on the next sync" holds only when the
+env has another dataset. Making it hold always (gating the prune on the
+listing before the internal filter) is a separate decision, not taken here.
 
 ### 5. `Project.migrate`
 

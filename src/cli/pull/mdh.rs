@@ -93,12 +93,26 @@ pub(crate) fn manifest_bytes_merged(existing: Option<&[u8]>, name: &str) -> Resu
 /// configuration, and mirroring one would let `migrate` create it in another
 /// env, so rdc lists, pulls and creates none of them.
 ///
-/// The collection the task's [`crate::state::store::StateStore`] keeps the
-/// sync state in counts too, whatever its name: a browser host may choose one
-/// without the `__` prefix. A native run scopes no such store.
+/// The rdc Chrome extension's collections (prefix [`EXTENSION_PREFIX`]) are
+/// skipped the same way, on every surface, the CLI included: they hold its
+/// sync state, never project configuration. And the collection the task's
+/// [`crate::state::store::StateStore`] keeps the sync state in counts too,
+/// whatever its name.
 pub(crate) fn is_internal_collection(name: &str) -> bool {
-    name.starts_with("__")
-        || crate::state::store::scoped().and_then(|s| s.collection()).is_some_and(|c| c == name)
+    name.starts_with("__") || is_extension_collection(name) || is_scoped_state_collection(name)
+}
+
+/// The prefix of the rdc Chrome extension's Data Storage collections.
+pub(crate) const EXTENSION_PREFIX: &str = "_SA_EXTENSION__";
+
+/// Whether `name` is one of the Chrome extension's collections.
+pub(crate) fn is_extension_collection(name: &str) -> bool {
+    name.starts_with(EXTENSION_PREFIX)
+}
+
+/// Whether `name` is the collection of the state store this task is scoped to.
+pub(crate) fn is_scoped_state_collection(name: &str) -> bool {
+    crate::state::store::scoped().and_then(|s| s.collection()).is_some_and(|c| c == name)
 }
 
 /// Read a dataset's collection name from its manifest. Returns `None` when
@@ -1352,14 +1366,16 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
         fn collection(&self) -> Option<String> {
-            Some("_SA_EXTENSION__rdc_state".into())
+            Some("rdc_browser_state".into())
         }
     }
 
     #[tokio::test]
     async fn the_scoped_state_collection_is_internal_and_never_created() {
-        let name = "_SA_EXTENSION__rdc_state";
-        assert!(!is_internal_collection(name), "unscoped, only `__` names are internal");
+        let name = "rdc_browser_state";
+        assert!(!is_internal_collection(name), "unscoped, a plain name is a dataset");
+        assert!(is_internal_collection("_SA_EXTENSION__rdc_state"), "the extension's prefix always is internal");
+        assert!(!is_internal_collection("SA_EXTENSION__x") && !is_internal_collection("_SA_EXTENSION_x"));
         let mdh = tempfile::TempDir::new().unwrap();
         for (slug, coll) in [("state", name), ("vendors", "vendors")] {
             let dir = mdh.path().join(slug);

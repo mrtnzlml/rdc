@@ -3351,13 +3351,14 @@ pub fn run_at_logged(
     );
 
     let mut files = enumerate_files(&src_root, src)?;
-    // The dataset that mirrors the sync state's own collection, should a
-    // tree carry one, is never promoted (`mdh::is_internal_collection`). Only
-    // a scoped state store names one, so a native run copies everything.
+    // A dataset that mirrors a collection holding sync state — the rdc Chrome
+    // extension's (`_SA_EXTENSION__*`) or the scoped state store's — is never
+    // promoted, should a tree pulled before they were skipped still carry
+    // one. Other `__` datasets are copied as before.
     for slug in state_datasets(&src_root) {
         log.event(
             crate::log::Action::Info,
-            &format!("skipping mdh/{slug}: its collection holds the sync state"),
+            &format!("skipping mdh/{slug}: its collection holds sync state, not configuration"),
         );
         files.retain(|rel| comps_of(rel).get(..2) != Some(&["mdh".to_string(), slug.clone()][..]));
     }
@@ -3881,18 +3882,19 @@ pub fn run_at_logged(
     Ok(report)
 }
 
-/// The source dataset slugs whose `collection.json` names the collection of
-/// the state store this task is scoped to; empty when none is scoped.
+/// The source dataset slugs whose `collection.json` names a collection that
+/// holds sync state: the Chrome extension's, or the scoped state store's.
 fn state_datasets(src_root: &Path) -> Vec<String> {
-    let Some(name) = crate::state::store::scoped().and_then(|s| s.collection()) else {
-        return Vec::new();
-    };
+    use crate::cli::pull::mdh::{is_extension_collection, is_scoped_state_collection, read_collection_name};
     let Ok(entries) = crate::vfs::read_dir(src_root.join("mdh")) else {
         return Vec::new();
     };
     let mut out: Vec<String> = entries
         .into_iter()
-        .filter(|e| crate::cli::pull::mdh::read_collection_name(&e.path()).as_deref() == Some(name.as_str()))
+        .filter(|e| {
+            read_collection_name(&e.path())
+                .is_some_and(|n| is_extension_collection(&n) || is_scoped_state_collection(&n))
+        })
         .filter_map(|e| e.file_name().to_str().map(str::to_owned))
         .collect();
     out.sort();
@@ -7485,7 +7487,7 @@ If they are unrelated, run it again with --allow-recreate."
             Box::pin(async { Ok(()) })
         }
         fn collection(&self) -> Option<String> {
-            Some("_SA_EXTENSION__rdc_state".into())
+            Some("rdc_browser_state".into())
         }
     }
 
@@ -7493,20 +7495,30 @@ If they are unrelated, run it again with --allow-recreate."
     async fn the_state_collections_dataset_is_never_promoted() {
         let project = report_project();
         let root = project.path().to_path_buf();
-        let dir = root.join("envs/dev/mdh/sa-extension-rdc-state");
-        write_snapshot_json(&dir.join("collection.json"), &serde_json::json!({ "name": "_SA_EXTENSION__rdc_state" }));
-        write_snapshot_json(&dir.join("indexes.json"), &serde_json::json!({ "regular": [], "search": [] }));
-        let target = root.join("envs/prod/mdh/sa-extension-rdc-state/indexes.json");
+        let dataset = |slug: &str, name: &str| {
+            let dir = root.join("envs/dev/mdh").join(slug);
+            write_snapshot_json(&dir.join("collection.json"), &serde_json::json!({ "name": name }));
+            write_snapshot_json(&dir.join("indexes.json"), &serde_json::json!({ "regular": [], "search": [] }));
+            root.join("envs/prod/mdh").join(slug).join("indexes.json")
+        };
+        let target = dataset("rdc-browser-state", "rdc_browser_state");
+        let extension = dataset("sa-extension-rdc-state", "_SA_EXTENSION__rdc_state");
+        let internal = dataset("tmp-x", "__tmp_x");
 
         let scoped = crate::state::store::scope(std::sync::Arc::new(NamedState), async {
             run_at_logged(&root, "dev", "prod", MirrorMode::Additive, false, vec![], Carry::NONE, quiet()).unwrap()
         })
         .await;
         assert!(!target.exists(), "the state's dataset was copied");
-        assert!(scoped.objects.iter().all(|o| o.kind != "mdh"), "{:?}", scoped.objects);
+        assert!(!extension.exists(), "the extension's dataset was copied");
+        let mdh: Vec<&str> = scoped.objects.iter().filter(|o| o.kind == "mdh").map(|o| o.slug.as_str()).collect();
+        assert_eq!(mdh, vec!["tmp-x"], "other `__` datasets are copied as before");
+        assert!(internal.exists());
 
-        // Unscoped (the CLI), the folder is an ordinary dataset, as before.
+        // Unscoped (the CLI): the extension's dataset is still skipped; a
+        // plain-named one is an ordinary dataset, as before.
         run_at_logged(&root, "dev", "prod", MirrorMode::Additive, false, vec![], Carry::NONE, quiet()).unwrap();
         assert!(target.exists());
+        assert!(!extension.exists(), "the CLI skips the extension's dataset too");
     }
 }

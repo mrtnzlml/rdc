@@ -492,3 +492,5 @@ mod crash_matrix;
 mod state_store;
 #[cfg(test)]
 mod browser_migrate;
+#[cfg(test)]
+mod extension_collections;
