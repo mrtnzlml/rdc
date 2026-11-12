@@ -50,7 +50,7 @@ fn load_or_migrate_mapping(
     src_paths: &crate::paths::Paths,
     known_envs: &BTreeSet<String>,
     dry_run: bool,
-    log: &crate::log::Log,
+    log: &Notes,
 ) -> Result<GenericMapping> {
     let generic_path = src_paths.mapping_file();
     // A file with no rows — the stub `rdc init` scaffolds — records nothing, so
@@ -196,7 +196,7 @@ fn load_or_migrate_mapping(
 
 /// Log each `GenericMapping::validate` warning (e.g. a row referencing an env
 /// no longer in `rdc.toml`) via `log`, one event per warning.
-fn log_mapping_warnings(log: &crate::log::Log, warnings: &[String]) {
+fn log_mapping_warnings(log: &Notes, warnings: &[String]) {
     for w in warnings {
         log.event(crate::log::Action::Warn, w);
     }
@@ -1325,7 +1325,7 @@ fn collect_schema_ids(value: &serde_json::Value, out: &mut std::collections::BTr
 /// rather than the size of the snapshot: a target already holding these exact
 /// bytes is [`FileOutcome::Unchanged`] and nothing is written.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum FileOutcome {
+pub enum FileOutcome {
     /// No file at the target path.
     Created,
     /// A file at the target path held different bytes.
@@ -3147,6 +3147,79 @@ impl MirrorMode {
     }
 }
 
+/// The run's log, which also keeps the text of every warning for the
+/// [`MigrateReport`].
+pub(crate) struct Notes {
+    log: std::sync::Arc<crate::log::Log>,
+    warnings: std::sync::Mutex<Vec<String>>,
+}
+
+impl Notes {
+    fn new(log: std::sync::Arc<crate::log::Log>) -> Self {
+        Self { log, warnings: Default::default() }
+    }
+
+    fn event(&self, action: crate::log::Action, message: &str) {
+        if action == crate::log::Action::Warn {
+            self.warnings.lock().unwrap_or_else(|p| p.into_inner()).push(message.to_string());
+        }
+        self.log.event(action, message);
+    }
+}
+
+/// What a target object becomes: the per-object tally the summary counts, plus a prune.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ObjectChange {
+    /// `sync` will POST it.
+    Create,
+    /// `sync` will PATCH it.
+    Update,
+    /// `sync` has nothing to do for it.
+    Unchanged,
+    /// `--mirror` pruned its primary file: `sync` will offer to delete it.
+    Delete,
+}
+
+/// One file a migrate considered. Paths are relative to the env roots.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct MigratedFile {
+    pub source: PathBuf,
+    pub target: PathBuf,
+    pub change: FileOutcome,
+}
+
+/// One target object a migrate touched, by its target slug.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct MigratedObject {
+    pub kind: String,
+    pub slug: String,
+    pub change: ObjectChange,
+}
+
+/// What one migrate changed, or under `dry_run` would change: the per-file
+/// and per-object outcomes the summary lines count. Paths are relative to the
+/// env roots (`envs/<src>/`, `envs/<tgt>/`).
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct MigrateReport {
+    pub dry_run: bool,
+    /// Every file considered, in source path order.
+    pub files: Vec<MigratedFile>,
+    /// Sorted by `(kind, slug)`.
+    pub objects: Vec<MigratedObject>,
+    /// Target files pruned by `--mirror`.
+    pub pruned: Vec<PathBuf>,
+    /// Target directories `--mirror` emptied and removed.
+    pub pruned_dirs: Vec<PathBuf>,
+    /// Source files left out: un-creatable duplicate unique email templates.
+    pub skipped: Vec<PathBuf>,
+    /// The text of every warning the run logged.
+    pub warnings: Vec<String>,
+    /// Files whose bytes changed (or would).
+    pub files_changed: usize,
+    /// Files whose path the mapping changed.
+    pub renamed: usize,
+}
+
 /// `--mirror` additionally deletes target-only objects (files present in tgt
 /// but not produced by the migration). `--dry-run` prints the plan and writes
 /// nothing. `--only <selector>` narrows the operation to matching
@@ -3176,7 +3249,12 @@ pub fn run_at(
     only: Vec<String>,
     carry: Carry,
 ) -> Result<()> {
-    let mirror = mirror_mode.is_mirror();
+    let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode());
+    run_at_logged(cwd, src, tgt, mirror_mode, dry_run, only, carry, log).map(drop)
+}
+
+/// The project config, once `src` and `tgt` are two envs it defines.
+pub(crate) fn check_envs(cwd: &Path, src: &str, tgt: &str) -> Result<crate::config::ProjectConfig> {
     if src == tgt {
         anyhow::bail!(
             "src and tgt envs are the same ('{src}'). Use two different envs for `rdc migrate`."
@@ -3187,6 +3265,24 @@ pub fn run_at(
     let project_cfg = crate::config::ProjectConfig::load(&cwd.join("rdc.toml"))?;
     project_cfg.env_or_err(src)?;
     project_cfg.env_or_err(tgt)?;
+    Ok(project_cfg)
+}
+
+/// [`run_at`], logging to `log`, and returning what it changed. The
+/// embedders' entry point (`cli::sync::embed::migrate_logged_in`).
+#[allow(clippy::too_many_arguments)]
+pub fn run_at_logged(
+    cwd: &Path,
+    src: &str,
+    tgt: &str,
+    mirror_mode: MirrorMode,
+    dry_run: bool,
+    only: Vec<String>,
+    carry: Carry,
+    log: std::sync::Arc<crate::log::Log>,
+) -> Result<MigrateReport> {
+    let mirror = mirror_mode.is_mirror();
+    let project_cfg = check_envs(cwd, src, tgt)?;
 
     let src_paths = crate::paths::Paths::for_env(cwd, src);
     let tgt_paths = crate::paths::Paths::for_env(cwd, tgt);
@@ -3214,7 +3310,8 @@ pub fn run_at(
         );
     }
 
-    let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode());
+    let log = Notes::new(log);
+    let mut report = MigrateReport { dry_run, ..MigrateReport::default() };
 
     let known_envs: std::collections::BTreeSet<String> =
         project_cfg.envs.keys().cloned().collect();
@@ -3253,7 +3350,17 @@ pub fn run_at(
         tgt_env_cfg.org_id
     );
 
-    let files = enumerate_files(&src_root, src)?;
+    let mut files = enumerate_files(&src_root, src)?;
+    // The dataset that mirrors the sync state's own collection, should a
+    // tree carry one, is never promoted (`mdh::is_internal_collection`). Only
+    // a scoped state store names one, so a native run copies everything.
+    for slug in state_datasets(&src_root) {
+        log.event(
+            crate::log::Action::Info,
+            &format!("skipping mdh/{slug}: its collection holds the sync state"),
+        );
+        files.retain(|rel| comps_of(rel).get(..2) != Some(&["mdh".to_string(), slug.clone()][..]));
+    }
 
     // Guardrail: warn (don't abort) when an oriented mapping row's SOURCE slug
     // has no matching object on disk in '<src>'. This restores the check the
@@ -3294,6 +3401,7 @@ pub fn run_at(
     // (and let `--mirror` prune stale copies of them from the target tree).
     let tgt_lockfile = crate::state::Lockfile::load(&tgt_paths.lockfile()).unwrap_or_default();
     let unique_tpl_skips = unique_template_skips(&files, &src_root, &mapping, &tgt_lockfile);
+    report.skipped = unique_tpl_skips.iter().cloned().collect();
     if !unique_tpl_skips.is_empty() {
         let listing: Vec<String> = unique_tpl_skips
             .iter()
@@ -3520,6 +3628,7 @@ pub fn run_at(
         if outcome != FileOutcome::Unchanged {
             written += 1;
         }
+        report.files.push(MigratedFile { source: rel.clone(), target: dst_rel.clone(), change: outcome });
         // Report the id rewrites this file needed. Silent remapping would be the
         // very thing that made the original bug invisible, so each one is named.
         if id_hits.len() > hits_before {
@@ -3587,6 +3696,9 @@ pub fn run_at(
         pruned_rels = prune.clone();
         for rel in &prune {
             pruned += 1;
+            if let Some((kind, slug)) = classify(rel).or_else(|| classify_managed_primary(rel)) {
+                report.objects.push(MigratedObject { kind: kind.to_string(), slug, change: ObjectChange::Delete });
+            }
             if dry_run {
                 log.event(
                     crate::log::Action::Delete,
@@ -3619,6 +3731,7 @@ pub fn run_at(
                 crate::log::Action::Delete,
                 &format!("prune dir {}", rel.display()),
             );
+            report.pruned_dirs.push(rel);
         }
     }
 
@@ -3722,6 +3835,20 @@ pub fn run_at(
         }
     }
 
+    report.pruned = pruned_rels.clone();
+    report.files_changed = written;
+    report.renamed = renamed;
+    report.objects.extend(obj_status.iter().map(|((kind, slug), status)| MigratedObject {
+        kind: kind.to_string(),
+        slug: slug.clone(),
+        change: match status {
+            ObjStatus::Created => ObjectChange::Create,
+            ObjStatus::Updated => ObjectChange::Update,
+            ObjStatus::Unchanged => ObjectChange::Unchanged,
+        },
+    }));
+    report.objects.sort_by(|a, b| (&a.kind, &a.slug).cmp(&(&b.kind, &b.slug)));
+
     let verb = if dry_run { "would migrate" } else { "migrated" };
     log.event(
         crate::log::Action::Done,
@@ -3750,7 +3877,26 @@ pub fn run_at(
         );
     }
 
-    Ok(())
+    report.warnings = std::mem::take(&mut *log.warnings.lock().unwrap_or_else(|p| p.into_inner()));
+    Ok(report)
+}
+
+/// The source dataset slugs whose `collection.json` names the collection of
+/// the state store this task is scoped to; empty when none is scoped.
+fn state_datasets(src_root: &Path) -> Vec<String> {
+    let Some(name) = crate::state::store::scoped().and_then(|s| s.collection()) else {
+        return Vec::new();
+    };
+    let Ok(entries) = crate::vfs::read_dir(src_root.join("mdh")) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = entries
+        .into_iter()
+        .filter(|e| crate::cli::pull::mdh::read_collection_name(&e.path()).as_deref() == Some(name.as_str()))
+        .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+        .collect();
+    out.sort();
+    out
 }
 
 /// Remap a snapshot-relative path's structured slug components to their
@@ -3992,7 +4138,7 @@ mod tests {
         std::fs::write(&unknown_path, b"not valid mapping toml, never parsed").unwrap();
 
         let known_envs: BTreeSet<String> = BTreeSet::from(["dev".to_string(), "test".to_string()]);
-        let log = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
+        let log = Notes::new(crate::log::Log::new(crate::cli::resolve::ColorMode::Plain));
 
         let generic = load_or_migrate_mapping(&paths, &known_envs, false, &log).unwrap();
         assert!(!generic.is_empty(), "the known-pair edge should have been converted");
@@ -7232,5 +7378,135 @@ If they are unrelated, run it again with --allow-recreate."
                 created: "vendor-invoices".into(),
             }]
         );
+    }
+
+    // ---- the report `run_at_logged` returns (the embedders' plan screen)
+
+    fn quiet() -> std::sync::Arc<crate::log::Log> {
+        crate::log::Log::for_sink(crate::cli::resolve::ColorMode::Plain, Box::new(std::io::sink()))
+    }
+
+    /// dev holds labels `a` and `b`; prod holds a different `b` and an extra
+    /// `c`. Both are pulled (lockfiles present).
+    fn report_project() -> tempfile::TempDir {
+        let project = saved_view_project();
+        let root = project.path();
+        let label = |name: &str, color: &str| {
+            serde_json::json!({ "name": name, "color": color, "organization": "https://dev.example/api/v1/organizations/1" })
+        };
+        write_snapshot_json(&root.join("envs/dev/labels/a.json"), &label("a", "#111111"));
+        write_snapshot_json(&root.join("envs/dev/labels/b.json"), &label("b", "#222222"));
+        write_snapshot_json(&root.join("envs/prod/labels/b.json"), &label("b", "#999999"));
+        write_snapshot_json(&root.join("envs/prod/labels/c.json"), &label("c", "#333333"));
+        for env in ["dev", "prod"] {
+            crate::state::Lockfile::default()
+                .save(&crate::paths::Paths::for_env(root, env).lockfile())
+                .unwrap();
+        }
+        project
+    }
+
+    fn changes(report: &MigrateReport) -> Vec<(String, String, ObjectChange)> {
+        report.objects.iter().map(|o| (o.kind.clone(), o.slug.clone(), o.change)).collect()
+    }
+
+    #[test]
+    fn the_report_names_every_file_object_and_prune() {
+        let project = report_project();
+        let root = project.path();
+        let mirror = MirrorMode::Mirror { allow_recreate: false };
+        let report = run_at_logged(root, "dev", "prod", mirror, false, vec![], Carry::NONE, quiet()).unwrap();
+
+        assert!(!report.dry_run);
+        let files: Vec<(PathBuf, PathBuf, FileOutcome)> =
+            report.files.iter().map(|f| (f.source.clone(), f.target.clone(), f.change)).collect();
+        assert_eq!(
+            files,
+            vec![
+                (PathBuf::from("labels/a.json"), PathBuf::from("labels/a.json"), FileOutcome::Created),
+                (PathBuf::from("labels/b.json"), PathBuf::from("labels/b.json"), FileOutcome::Updated),
+            ]
+        );
+        assert_eq!(
+            changes(&report),
+            vec![
+                ("labels".into(), "a".into(), ObjectChange::Create),
+                ("labels".into(), "b".into(), ObjectChange::Update),
+                ("labels".into(), "c".into(), ObjectChange::Delete),
+            ]
+        );
+        assert_eq!(report.pruned, vec![PathBuf::from("labels/c.json")]);
+        assert_eq!((report.files_changed, report.renamed), (2, 0));
+        assert!(!root.join("envs/prod/labels/c.json").exists(), "the prune happened");
+
+        // The same run again changes nothing.
+        let again = run_at_logged(root, "dev", "prod", mirror, false, vec![], Carry::NONE, quiet()).unwrap();
+        assert!(again.objects.iter().all(|o| o.change == ObjectChange::Unchanged), "{:?}", again.objects);
+        assert_eq!(again.files_changed, 0);
+    }
+
+    #[test]
+    fn a_dry_run_reports_the_same_plan_and_writes_nothing() {
+        let project = report_project();
+        let root = project.path();
+        let before = std::fs::read(root.join("envs/prod/labels/b.json")).unwrap();
+        let mirror = MirrorMode::Mirror { allow_recreate: false };
+        let dry = run_at_logged(root, "dev", "prod", mirror, true, vec![], Carry::NONE, quiet()).unwrap();
+        assert!(dry.dry_run);
+        assert_eq!(std::fs::read(root.join("envs/prod/labels/b.json")).unwrap(), before);
+        assert!(!root.join("envs/prod/labels/a.json").exists());
+        assert!(root.join("envs/prod/labels/c.json").exists());
+        let real = run_at_logged(root, "dev", "prod", mirror, false, vec![], Carry::NONE, quiet()).unwrap();
+        assert_eq!((dry.files, dry.objects, dry.pruned), (real.files, real.objects, real.pruned));
+    }
+
+    #[test]
+    fn the_report_carries_the_warnings_and_respects_only() {
+        let project = report_project();
+        let root = project.path();
+        write_snapshot_json(&root.join("envs/dev/organization.json"), &serde_json::json!({ "settings": {} }));
+        let report = run_at_logged(root, "dev", "prod", MirrorMode::Additive, true, vec![], Carry::NONE, quiet()).unwrap();
+        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+        assert!(report.warnings[0].contains("organization.json does not exist yet"), "{:?}", report.warnings);
+        let only =
+            run_at_logged(root, "dev", "prod", MirrorMode::Additive, true, vec!["labels/a".into()], Carry::NONE, quiet())
+                .unwrap();
+        assert_eq!(changes(&only), vec![("labels".into(), "a".into(), ObjectChange::Create)]);
+        assert!(only.warnings.is_empty(), "{:?}", only.warnings);
+    }
+
+    /// A state store configured with a collection of its own name.
+    struct NamedState;
+    impl crate::state::store::StateStore for NamedState {
+        fn hydrate<'a>(&'a self, _: &'a crate::paths::Paths) -> crate::rt::BoxFuture<'a, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn checkpoint<'a>(&'a self, _: &'a crate::paths::Paths) -> crate::rt::BoxFuture<'a, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn collection(&self) -> Option<String> {
+            Some("_SA_EXTENSION__rdc_state".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_state_collections_dataset_is_never_promoted() {
+        let project = report_project();
+        let root = project.path().to_path_buf();
+        let dir = root.join("envs/dev/mdh/sa-extension-rdc-state");
+        write_snapshot_json(&dir.join("collection.json"), &serde_json::json!({ "name": "_SA_EXTENSION__rdc_state" }));
+        write_snapshot_json(&dir.join("indexes.json"), &serde_json::json!({ "regular": [], "search": [] }));
+        let target = root.join("envs/prod/mdh/sa-extension-rdc-state/indexes.json");
+
+        let scoped = crate::state::store::scope(std::sync::Arc::new(NamedState), async {
+            run_at_logged(&root, "dev", "prod", MirrorMode::Additive, false, vec![], Carry::NONE, quiet()).unwrap()
+        })
+        .await;
+        assert!(!target.exists(), "the state's dataset was copied");
+        assert!(scoped.objects.iter().all(|o| o.kind != "mdh"), "{:?}", scoped.objects);
+
+        // Unscoped (the CLI), the folder is an ordinary dataset, as before.
+        run_at_logged(&root, "dev", "prod", MirrorMode::Additive, false, vec![], Carry::NONE, quiet()).unwrap();
+        assert!(target.exists());
     }
 }

@@ -153,8 +153,10 @@ async fn checkpoint_called_after_every_lockfile_save() {
     .expect("no-push sync succeeds");
 
     assert_eq!(state.hydrates.load(Ordering::SeqCst), 1);
-    // Nothing is journaled yet, so the run's one save is the final commit.
-    assert_eq!(state.checkpoints.load(Ordering::SeqCst), 1);
+    // Nothing is journaled yet, so the run's one save is the final commit;
+    // the tree is also checkpointed before the first write and after
+    // `_index.md`, for a store that keeps the env tree.
+    assert_eq!(state.checkpoints.load(Ordering::SeqCst), 3);
     assert!(store.files().contains_key(".rdc/state/main.lock.json"));
 }
 
@@ -206,8 +208,9 @@ async fn checkpoint_runs_when_a_push_fails_midway() {
     assert!(format!("{err:#}").contains("creating 'b'"), "{err:#}");
 
     assert_eq!(state.hydrates.load(Ordering::SeqCst), 1);
-    // begin a, finish a, begin b, abandon b (refused), then the error-path commit.
-    assert_eq!(state.checkpoints.load(Ordering::SeqCst), 5, "the error path commits");
+    // The start of the run, begin a, finish a, begin b, abandon b (refused),
+    // then the error-path commit.
+    assert_eq!(state.checkpoints.load(Ordering::SeqCst), 6, "the error path commits");
     let lock: serde_json::Value =
         serde_json::from_slice(&store.files()[".rdc/state/main.lock.json"]).unwrap();
     assert_eq!(lock["objects"]["labels"]["a"]["id"], 11, "partial progress saved: {lock}");

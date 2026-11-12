@@ -303,6 +303,73 @@ pub(crate) fn watch_logged_config<'a>(
     }
 }
 
+// ------------------------------------------------------------ migrate
+
+pub use crate::cli::migrate::{
+    Carry, CarryGroup, FileOutcome, MigrateReport, MigratedFile, MigratedObject, MirrorMode, ObjectChange,
+};
+
+/// How an embedder wants one `rdc migrate` run: its flags.
+#[derive(Debug, Clone)]
+pub struct EmbedMigrateOptions {
+    pub mirror: MirrorMode,
+    pub dry_run: bool,
+    pub only: Vec<String>,
+    pub carry: Carry,
+}
+
+impl Default for EmbedMigrateOptions {
+    /// An unflagged `rdc migrate`.
+    fn default() -> Self {
+        Self { mirror: MirrorMode::Additive, dry_run: false, only: Vec::new(), carry: Carry::NONE }
+    }
+}
+
+/// `rdc migrate <src> <tgt>` on the project held by `store`, logging into
+/// `log_sink` as [`sync_logged`] does, and returning what it changed.
+///
+/// Each env's state comes from its store first (migrate reads both
+/// lockfiles and both trees), and the target's store makes the run's writes
+/// durable after it (not under `dry_run`, which writes nothing). Taking the
+/// envs' locks is the caller's: migrate runs no lock of its own on disk.
+#[allow(clippy::too_many_arguments)]
+pub async fn migrate_logged_in(
+    store: Arc<dyn Store>,
+    src_state: Arc<dyn StateStore>,
+    tgt_state: Arc<dyn StateStore>,
+    root: &Path,
+    src: &str,
+    tgt: &str,
+    opts: EmbedMigrateOptions,
+    log_sink: Box<dyn std::io::Write + Send>,
+) -> Result<MigrateReport> {
+    use anyhow::Context as _;
+    let log = Log::for_sink(crate::cli::resolve::ColorMode::Color, log_sink);
+    crate::vfs::scope(store, async move {
+        // The checks `run_at` makes before it reads anything, made before
+        // the stores are read too.
+        crate::cli::migrate::check_envs(root, src, tgt)?;
+        let (src_paths, tgt_paths) = (crate::paths::Paths::for_env(root, src), crate::paths::Paths::for_env(root, tgt));
+        src_state.hydrate(&src_paths).await.with_context(|| format!("loading env '{src}'"))?;
+        tgt_state.hydrate(&tgt_paths).await.with_context(|| format!("loading env '{tgt}'"))?;
+        let mut report = crate::state::store::scope(tgt_state.clone(), async {
+            crate::cli::migrate::run_at_logged(
+                root, src, tgt, opts.mirror, opts.dry_run, opts.only, opts.carry, log.clone(),
+            )
+        })
+        .await?;
+        if !opts.dry_run {
+            tgt_state.checkpoint(&tgt_paths).await.with_context(|| format!("saving env '{tgt}'"))?;
+            for w in tgt_state.take_warnings() {
+                log.event(crate::log::Action::Warn, &w);
+                report.warnings.push(w);
+            }
+        }
+        Ok(report)
+    })
+    .await
+}
+
 // ------------------------------------------------------------ project and env management
 //
 // The project and env bookkeeping every embedder offers: create a project,

@@ -153,6 +153,12 @@ The state is `.rdc/state/<env>.lock.json`, `.rdc/state/<env>.base/**` and
 `.rdc/conflicts/<env>/**`. `.rdc/mapping.toml` is hand-written and stays in
 the project tree.
 
+*Amended 2026-11-03* (`2026-11-03-wasm-migrate-design.md`): the Data Storage
+manifest also holds `envs/<env>/**`, its collection is chosen by the host,
+`run_cycle` checkpoints when a run starts and after `_index.md` too, and a
+hydrate decides per file which side wins. The text below describes the
+state-only store as first built.
+
 - **`FsStateStore`** (CLI, desktop, the wasm default): both methods are
   no-ops; files are already written atomically on disk. The CLI's behaviour is
   therefore unchanged; `EnvLock` stays.

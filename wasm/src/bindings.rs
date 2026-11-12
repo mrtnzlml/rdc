@@ -2,8 +2,8 @@
 //! calls out. No logic of its own beyond the conversions.
 
 use crate::{
-    AskFn, DataStorageStateOptions, check_state_option_keys, EditProjectInput, EnvInput, EnvLocks, HeldLock, Prompt,
-    ProjectCore, SyncOptions, WatchControl, log_and_route,
+    AskFn, DataStorageStateOptions, check_migrate_option_keys, check_state_option_keys, EditProjectInput, EnvInput,
+    EnvLocks, HeldLock, MigrateOptions, Prompt, ProjectCore, SyncOptions, WatchControl, log_and_route,
 };
 use anyhow::anyhow;
 use serde::Serialize;
@@ -64,9 +64,24 @@ export interface SyncOptions {
 }
 export type PromptKind =
   | "conflict" | "remoteDelete" | "bulkConfirm" | "deleteGate" | "deleteDrift"
-  | "mdhIndexDrop" | "mdhRowDelete" | "unknown";
+  | "mdhIndexDrop" | "mdhRowDelete" | "recoverCreate" | "unknown";
 export interface Prompt { kind: PromptKind; question: string; choices: { key: string; label: string }[]; }
-export interface DataStorageStateOptions { key: string; chunkBytes?: number; }
+export interface DataStorageStateOptions { key: string; collection?: string; chunkBytes?: number; }
+export type CarryGroup = "scoreThresholds" | "emailPrefixes" | "automation" | "all";
+export interface MigrateOptions {
+  dryRun?: boolean; mirror?: boolean; allowRecreate?: boolean; only?: string[]; carry?: CarryGroup[];
+}
+export type FileChange = "create" | "update" | "unchanged";
+export type ObjectChange = "create" | "update" | "unchanged" | "delete";
+export interface MigrateFile { source: string; target: string; change: FileChange; }
+export interface MigrateObject { kind: string; slug: string; change: ObjectChange; }
+export interface MigrateResult {
+  dryRun: boolean; source: string; target: string;
+  files: MigrateFile[]; objects: MigrateObject[];
+  pruned: string[]; prunedDirs: string[]; skipped: string[]; warnings: string[];
+  creates: number; updates: number; unchanged: number; deletes: number;
+  filesChanged: number; renamed: number;
+}
 export interface CycleOutcome {
   itemsPushed: number; itemsPulled: number; conflicts: number;
   remoteDeletesResolved: number; fileCount: number;
@@ -291,9 +306,10 @@ impl Project {
         to_js(&self.core.rename_env(&old_name, &new_name).map_err(|e| self.err(e))?)
     }
 
-    /// Keep each env's sync state in Data Storage under `key` (collection
-    /// `__rdc_state`) from the next `sync` or `watch` on. Throws on an empty
-    /// key or an unknown option (`collection` included: it is fixed).
+    /// Keep each env's sync state and tree in Data Storage under `key`, in
+    /// `collection` (default `__rdc_state`) of the env's own org, from the
+    /// next `sync`, `watch` or `migrate` on. Throws on an empty key or
+    /// collection, or an unknown option.
     #[wasm_bindgen(js_name = useDataStorageState)]
     pub fn use_data_storage_state(
         &self,
@@ -327,6 +343,41 @@ impl Project {
         Ok(future_to_promise(async move {
             match core.clone().sync(env, opts, log, route).await {
                 Ok(o) => Ok(to_js(&o)?),
+                Err(e) => Err(JsError::new(&core.message(&e)).into()),
+            }
+        }))
+    }
+
+    /// `rdc migrate src tgt` on the tree. Resolves with what it changed (or,
+    /// under `dryRun`, would change). Throws on an unknown option or
+    /// `allowRecreate` without `mirror`; rejects when either env is busy here
+    /// or, with Data Storage state on, the target's org is locked in another
+    /// tab.
+    #[wasm_bindgen(unchecked_return_type = "Promise<MigrateResult>")]
+    pub fn migrate(
+        &self,
+        src: String,
+        tgt: String,
+        #[wasm_bindgen(unchecked_param_type = "MigrateOptions | null | undefined")] opts: JsValue,
+        #[wasm_bindgen(js_name = onLog, unchecked_param_type = "(line: string) => void")]
+        on_log: js_sys::Function,
+    ) -> Result<js_sys::Promise, JsError> {
+        let opts: MigrateOptions = if opts.is_undefined() || opts.is_null() {
+            MigrateOptions::default()
+        } else {
+            if opts.is_object() {
+                let keys: Vec<String> =
+                    js_sys::Object::keys(opts.unchecked_ref::<js_sys::Object>()).iter().filter_map(|k| k.as_string()).collect();
+                check_migrate_option_keys(keys).map_err(|e| self.err(e))?;
+            }
+            from_js(opts)?
+        };
+        // Migrate asks nothing; the route only carries the log's line buffer.
+        let (log, _route) = log_and_route(log_fn(on_log), Box::new(|_| Box::pin(async { None })), None);
+        let core = self.core.clone();
+        Ok(future_to_promise(async move {
+            match core.clone().migrate(src, tgt, opts, log).await {
+                Ok(r) => Ok(to_js(&r)?),
                 Err(e) => Err(JsError::new(&core.message(&e)).into()),
             }
         }))

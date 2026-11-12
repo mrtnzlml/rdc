@@ -394,8 +394,19 @@ async fn several_matches_prompt_interactively() {
     .await
     .expect("recovery");
 
-    let keys: Vec<char> = route.seen.lock().unwrap()[0].keys.iter().map(|k| k.key).collect();
+    let asked = route.seen.lock().unwrap()[0].clone();
+    let keys: Vec<char> = asked.keys.iter().map(|k| k.key).collect();
     assert_eq!(keys, vec!['1', '2', 'a']);
+    assert_eq!(asked.kind, rdc::cli::sync::embed::PromptKind::RecoverCreate);
+    assert_eq!(
+        asked.question,
+        format!(
+            "labels/priority: an unfinished run's create may have made any of 2 labels (ids {}, {}). \
+             Which one did it create?",
+            ids[0], ids[1]
+        ),
+        "the whole question"
+    );
     assert_eq!(report.completed, vec![("labels".to_string(), "priority".to_string(), ids[1])]);
     assert_eq!(lf.objects["labels"]["priority"].id, ids[1]);
     assert!(project.path().join(LABEL).exists());

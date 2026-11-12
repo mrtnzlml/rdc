@@ -267,7 +267,7 @@ pub(crate) async fn run_cycle(
         renderer.unwrap_or_else(|| Log::new(crate::cli::resolve::detect_color_mode()));
     // Every lockfile save from here on goes through the journal, which
     // checkpoints the state store after it.
-    let journal = crate::state::store::journal_for(&paths, lockfile.clone(), state, progress.clone());
+    let journal = crate::state::store::journal_for(&paths, lockfile.clone(), state.clone(), progress.clone());
     let started = web_time::Instant::now();
 
     // Recovery of a crashed run's journal, before the offline pre-flight: the scan
@@ -300,6 +300,13 @@ pub(crate) async fn run_cycle(
     if !dry_run {
         crate::cli::init::write_env_scaffolds(&cwd, env)?;
         crate::cli::init::write_mapping_scaffold(&cwd)?;
+        // The tree this run starts from, the host's edits included, is
+        // durable before the first remote write, as it is on disk: a store
+        // that keeps the env tree publishes it here. A no-op on disk.
+        state.checkpoint(&paths).await?;
+        for w in state.take_warnings() {
+            progress.event(Action::Warn, &w);
+        }
     }
 
     // Phase 0: offline pre-flight. Scanning the local tree needs nothing
@@ -867,6 +874,12 @@ pub(crate) async fn run_cycle(
     journal.commit(&lockfile).await?;
     crate::cli::index::generate(&paths, &lockfile)
         .with_context(|| format!("generating _index.md for env '{env}'"))?;
+    // `_index.md` is written after the commit; a store that keeps the env
+    // tree takes it too. A no-op on disk.
+    state.checkpoint(&paths).await?;
+    for w in state.take_warnings() {
+        progress.event(Action::Warn, &w);
+    }
 
     let elapsed = started.elapsed();
     let total_changed = outcome.items_pushed + outcome.items_pulled;

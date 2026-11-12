@@ -311,7 +311,10 @@ async fn during_a_pull() {
     fake.state()
         .create("labels", json!({ "name": format!("{}remote", run_id.list_prefix()), "organization": org_url, "color": "#654321" }))
         .unwrap();
-    let store = CrashStore::new(|_| true, true);
+    // The commit: the first checkpoint that records the pulled label (the
+    // run also checkpoints, as a no-op on disk, before its first write).
+    let remote = format!("{}remote", run_id.list_prefix());
+    let store = CrashStore::new(move |lf| lf.objects.get("labels").is_some_and(|m| m.contains_key(&remote)), true);
 
     until_crash(sync_in_process(project.path(), TOKEN, yes(false), store.clone()), &store.fired).await;
     let pulled = project.read_json(&format!("envs/test/labels/{}priority.json", run_id.list_prefix()));
@@ -614,13 +617,14 @@ mod mem {
 
     // The same crashes with the state in the fake's Data Storage
     // (`DataStorageStateStore`): every run is a reloaded tab, a fresh
-    // `MemStore` holding the env tree and none of the state, which the run's
+    // `MemStore` holding neither the env tree nor its state, which the run's
     // hydrate brings back. What survives a crash is what Data Storage holds.
     mod data_storage {
         use super::*;
         use rdc::state::data_storage_store::DataStorageStateStore;
 
-        const STATE_PREFIXES: &[&str] = &[".rdc/state/test.lock.json", ".rdc/state/test.base/", ".rdc/conflicts/test/"];
+        const STATE_PREFIXES: &[&str] =
+            &[".rdc/state/test.lock.json", ".rdc/state/test.base/", ".rdc/conflicts/test/", "envs/test/"];
 
         fn state_store(fake: &FakeOrg) -> Arc<DataStorageStateStore> {
             let base = rdc::config::EnvConfig { api_base: fake.api_base(), org_id: 1 }.data_storage_base();
@@ -628,7 +632,7 @@ mod mem {
             Arc::new(DataStorageStateStore::new(client, rdc::state::data_storage_store::STATE_COLLECTION.into(), "acme/main".into(), 4096))
         }
 
-        /// A reloaded tab: `tab`'s files without the env's state.
+        /// A reloaded tab: `tab`'s files without the env's tree and state.
         fn reload(tab: &MemStore, root: &std::path::Path) -> Arc<MemStore> {
             let files = tab.files().into_iter().filter(|(k, _)| !STATE_PREFIXES.iter().any(|p| k.starts_with(p)));
             Arc::new(MemStore::from_files(root.to_path_buf(), files).unwrap())
@@ -756,11 +760,23 @@ mod mem {
             (project, reload(&first, &root), root)
         }
 
+        /// A new tab loads the env with an audit sync, as the extension
+        /// does before it edits; the returned store is that tab's, which
+        /// keeps the host's later edits (they are local changes).
+        async fn loaded(fake: &FakeOrg, tab: &Arc<MemStore>, root: &std::path::Path) -> Arc<dyn StateStore> {
+            let state: Arc<dyn StateStore> = state_store(fake);
+            let audit = EmbedSyncOptions { interactive: false, no_push: true, ..Default::default() };
+            sync(tab, root, audit, state.clone()).await.expect("the loading sync");
+            assert!(tab.files().keys().any(|k| k.starts_with("envs/test/labels/")), "the env tree is back");
+            state
+        }
+
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn mid_update_batch() {
             let fake = FakeOrg::start().await;
             let run_id = RunId::new();
             let (_project, tab, root) = synced_labels(&fake, &run_id).await;
+            let state = loaded(&fake, &tab, &root).await;
             rdc::vfs::scope_sync(tab.clone() as Arc<dyn Store>, || {
                 for i in 1..=6 {
                     let path = root.join(label_path(&run_id, i));
@@ -772,7 +788,7 @@ mod mem {
             let is_patch = |req: &Request| req.method.as_str() == "PATCH" && req.url.path().starts_with("/api/v1/labels/");
             let fired = fake.crash_on(Box::new(is_patch), 2, CrashPoint::AfterApplyBeforeResponse);
 
-            until_crash(sync(&tab, &root, yes(false), state_store(&fake)), &fired).await;
+            until_crash(sync(&tab, &root, yes(false), state), &fired).await;
 
             finish_and_check(&fake, &tab, &root, false, "in memory, state in Data Storage: mid update batch").await;
             let st = fake.state();
@@ -786,6 +802,7 @@ mod mem {
             let fake = FakeOrg::start().await;
             let run_id = RunId::new();
             let (_project, tab, root) = synced_labels(&fake, &run_id).await;
+            let state = loaded(&fake, &tab, &root).await;
             rdc::vfs::scope_sync(tab.clone() as Arc<dyn Store>, || {
                 for i in 1..=3 {
                     rdc::vfs::remove_file(root.join(label_path(&run_id, i))).unwrap();
@@ -794,7 +811,7 @@ mod mem {
             let is_delete = |req: &Request| req.method.as_str() == "DELETE" && req.url.path().starts_with("/api/v1/labels/");
             let fired = fake.crash_on(Box::new(is_delete), 2, CrashPoint::AfterApplyBeforeResponse);
 
-            until_crash(sync(&tab, &root, yes(true), state_store(&fake)), &fired).await;
+            until_crash(sync(&tab, &root, yes(true), state), &fired).await;
 
             finish_and_check(&fake, &tab, &root, true, "in memory, state in Data Storage: mid delete phase").await;
             assert_eq!(fake.state().ids("labels").len(), 3, "the kept labels are left");

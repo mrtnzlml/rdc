@@ -39,6 +39,8 @@ pub struct DataStorage {
     pub collections: BTreeMap<String, Collection>,
     /// Feeds generated ObjectIds.
     next_oid: u64,
+    /// `data/find` requests answered, for tests that count downloads.
+    pub finds: usize,
 }
 
 impl DataStorage {
@@ -154,6 +156,7 @@ fn route(ds: &mut DataStorage, verb: &str, body: &Value) -> Answer {
             None => Err((404, "Dataset not found".to_string())),
         },
         "data/find" => {
+            ds.finds += 1;
             let query = body.get("query").ok_or_else(|| bad("query is required"))?;
             check(query)?;
             let projection = body.get("projection").filter(|p| !p.is_null());

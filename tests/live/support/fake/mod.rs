@@ -490,3 +490,5 @@ mod crash;
 mod crash_matrix;
 #[cfg(test)]
 mod state_store;
+#[cfg(test)]
+mod browser_migrate;

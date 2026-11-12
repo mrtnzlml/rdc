@@ -1,7 +1,7 @@
 //! `DataStorageStateStore` against the fake's Data Storage: an env's sync
-//! state (lockfile, base cache, conflict shadows) survives a page that is
-//! gone, a second writer is refused, and a crash between the blobs and the
-//! manifest leaves the previous state whole.
+//! state (lockfile, base cache, conflict shadows) and its tree survive a page
+//! that is gone, a second writer is refused, and a crash between the blobs
+//! and the manifest leaves the previous state whole.
 
 use super::crash::until_crash;
 use super::*;
@@ -94,17 +94,21 @@ async fn hydrate_then_checkpoint_round_trips() {
         (BASE, "{\"name\": \"priority\"}\n"),
         (SHADOW, "{\"name\": \"théirs ✓\"}\n"),
         ("envs/test/labels/priority.json", "{}\n"),
+        ("envs/test/overlay.toml", "version = 1\n# edited\n"),
         (".rdc/state/test.lock", ""),
+        ("rdc.toml", "[envs.test]\n"),
     ]);
     let state = store(&fake, 512 * 1024);
     hydrate(&state, &first).await.unwrap();
     assert_eq!(manifest(&fake), None, "nothing is published by a hydrate");
     checkpoint(&state, &first).await.unwrap();
 
-    // A reloaded tab: the env tree is back, the state is not, and a stale
-    // shadow the manifest lacks is there.
+    // A reloaded tab: only what the host keeps, a scaffolded overlay, and
+    // stale files the manifest lacks.
     let second = tab(&[
-        ("envs/test/labels/priority.json", "{}\n"),
+        ("rdc.toml", "[envs.test]\n"),
+        ("envs/test/overlay.toml", "version = 1\n"),
+        ("envs/test/labels/stale.json", "{}\n"),
         (".rdc/conflicts/test/labels/stale.json", "{}\n"),
         (".rdc/conflicts/dev/labels/other_env.json", "{}\n"),
     ]);
@@ -116,15 +120,100 @@ async fn hydrate_then_checkpoint_round_trips() {
         (BASE, "{\"name\": \"priority\"}\n"),
         (SHADOW, "{\"name\": \"théirs ✓\"}\n"),
         ("envs/test/labels/priority.json", "{}\n"),
+        ("envs/test/overlay.toml", "version = 1\n# edited\n"),
+        ("rdc.toml", "[envs.test]\n"),
         (".rdc/conflicts/dev/labels/other_env.json", "{}\n"),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v.to_string()))
     .collect();
-    assert_eq!(got, want, "the state is the manifest's; the env tree, the env lock and other envs are not state");
+    assert_eq!(got, want, "the state and the env tree are the manifest's; the env lock, rdc.toml and other envs are not kept");
     let m = manifest(&fake).unwrap();
     assert_eq!(m["rev"], 1);
-    assert_eq!(m["files"].as_object().unwrap().len(), 3);
+    assert_eq!(m["files"].as_object().unwrap().len(), 5);
+}
+
+/// Later runs of the same store keep what the host changed in the env tree
+/// since: it is a local edit, as on disk. The state stays the manifest's.
+#[tokio::test]
+async fn a_later_hydrate_keeps_the_hosts_edits() {
+    let fake = ds_fake().await;
+    let page = tab(&[(LOCKFILE, "v1\n"), ("envs/test/labels/a.json", "a1\n"), ("envs/test/labels/b.json", "b1\n")]);
+    let state = store(&fake, 1024);
+    hydrate(&state, &page).await.unwrap();
+    checkpoint(&state, &page).await.unwrap();
+
+    write(&page, "envs/test/labels/a.json", b"a2 by the host\n");
+    write(&page, "envs/test/labels/c.json", b"new\n");
+    rdc::vfs::scope_sync(page.clone() as Arc<dyn Store>, || rdc::vfs::remove_file(Path::new("/p/envs/test/labels/b.json")).unwrap());
+    write(&page, LOCKFILE, b"tampered\n");
+    let finds_before = finds(&fake);
+    hydrate(&state, &page).await.unwrap();
+
+    let got = text_files(&page);
+    assert_eq!(got["envs/test/labels/a.json"], "a2 by the host\n");
+    assert_eq!(got["envs/test/labels/c.json"], "new\n");
+    assert!(!got.contains_key("envs/test/labels/b.json"), "a local delete stays a local delete");
+    assert_eq!(got[LOCKFILE], "v1\n", "the state is the manifest's");
+    assert_eq!(finds(&fake) - finds_before, 2, "one manifest read, one read of the lockfile's blob");
+}
+
+/// Two tabs on one env: what one publishes reaches the other, merged with
+/// the other's own edits; a file both changed refuses the run, writing nothing.
+#[tokio::test]
+async fn another_tabs_publish_is_merged_three_ways() {
+    let fake = ds_fake().await;
+    let seed = [(LOCKFILE, "v1\n"), ("envs/test/labels/a.json", "a1\n"), ("envs/test/labels/b.json", "b1\n"), ("envs/test/labels/c.json", "c1\n")];
+    let (a, b) = (tab(&seed), tab(&[]));
+    let (sa, sb) = (store(&fake, 1024), store(&fake, 1024));
+    hydrate(&sa, &a).await.unwrap();
+    checkpoint(&sa, &a).await.unwrap();
+    hydrate(&sb, &b).await.unwrap();
+    assert_eq!(b.files(), a.files(), "a new tab gets the published tree");
+
+    // Tab a edits `a` and deletes `c`, and publishes; tab b edits `b`.
+    write(&a, "envs/test/labels/a.json", b"a2\n");
+    rdc::vfs::scope_sync(a.clone() as Arc<dyn Store>, || rdc::vfs::remove_file(Path::new("/p/envs/test/labels/c.json")).unwrap());
+    write(&a, LOCKFILE, b"v2\n");
+    checkpoint(&sa, &a).await.unwrap();
+    write(&b, "envs/test/labels/b.json", b"b2\n");
+    hydrate(&sb, &b).await.unwrap();
+
+    let got = text_files(&b);
+    assert_eq!(got["envs/test/labels/a.json"], "a2\n", "only the other tab changed it");
+    assert_eq!(got["envs/test/labels/b.json"], "b2\n", "only this tab changed it");
+    assert!(!got.contains_key("envs/test/labels/c.json"), "the other tab deleted it");
+    assert_eq!(got[LOCKFILE], "v2\n");
+
+    // Both change `a` now.
+    write(&b, "envs/test/labels/a.json", b"a3 by b\n");
+    checkpoint(&sb, &b).await.unwrap();
+    write(&a, "envs/test/labels/a.json", b"a3 by a\n");
+    let before = a.files();
+    let err = format!("{:#}", hydrate(&sa, &a).await.unwrap_err());
+    assert!(err.contains("envs/test/labels/a.json") && err.contains("changed here and by another run"), "{err}");
+    assert_eq!(a.files(), before, "a refused hydrate writes nothing");
+}
+
+/// The store keeps the state in the collection it was given.
+#[tokio::test]
+async fn the_collection_is_the_configured_one() {
+    let fake = ds_fake().await;
+    let custom = "_SA_EXTENSION__rdc_state";
+    let state = DataStorageStateStore::new(client(&fake), custom.into(), KEY.into(), 1024);
+    let page = tab(&[(LOCKFILE, "v1\n"), ("envs/test/labels/a.json", "a1\n")]);
+    hydrate(&state, &page).await.unwrap();
+    checkpoint(&state, &page).await.unwrap();
+    let st = fake.state();
+    let ds = st.data_storage.as_ref().unwrap();
+    assert!(ds.doc(custom, &json!(format!("{KEY}/test"))).is_some(), "the manifest is in {custom}");
+    assert!(ds.docs(COLLECTION).is_empty(), "nothing went to the default collection");
+    assert_eq!(state.collection().as_deref(), Some(custom));
+}
+
+/// `data/find` requests the fake has answered so far.
+fn finds(fake: &FakeOrg) -> usize {
+    fake.state().data_storage.as_ref().unwrap().finds
 }
 
 #[tokio::test]
@@ -397,7 +486,7 @@ async fn hydrate_retries_once_when_a_blob_vanishes() {
 
 #[tokio::test]
 async fn hydrate_refuses_a_key_outside_the_state_prefixes() {
-    for key in ["envs/test/hooks/x.py", "../x", ".rdc/conflicts/test/../../envs/test/hooks/x.py", ".rdc/state/dev.lock.json"] {
+    for key in ["envs/dev/hooks/x.py", "rdc.toml", "../x", ".rdc/conflicts/test/../../envs/test/hooks/x.py", ".rdc/state/dev.lock.json"] {
         let fake = ds_fake().await;
         let (blob, file) = one_chunk("print('planted')\n");
         put(&fake, blob);

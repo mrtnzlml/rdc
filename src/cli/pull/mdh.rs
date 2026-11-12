@@ -92,8 +92,13 @@ pub(crate) fn manifest_bytes_merged(existing: Option<&[u8]>, name: &str) -> Resu
 /// not found` every time (observed live 2026-09-25). None of them is project
 /// configuration, and mirroring one would let `migrate` create it in another
 /// env, so rdc lists, pulls and creates none of them.
+///
+/// The collection the task's [`crate::state::store::StateStore`] keeps the
+/// sync state in counts too, whatever its name: a browser host may choose one
+/// without the `__` prefix. A native run scopes no such store.
 pub(crate) fn is_internal_collection(name: &str) -> bool {
     name.starts_with("__")
+        || crate::state::store::scoped().and_then(|s| s.collection()).is_some_and(|c| c == name)
 }
 
 /// Read a dataset's collection name from its manifest. Returns `None` when
@@ -1334,6 +1339,42 @@ mod tests {
         }
         let remote = BTreeSet::new();
         assert_eq!(local_only_dataset_slugs(mdh.path(), &remote, &BTreeMap::new()).unwrap(), vec!["vendors".to_string()]);
+    }
+
+    /// A state store whose collection has no `__` prefix, as a browser host
+    /// may configure.
+    struct NamedState;
+    impl crate::state::store::StateStore for NamedState {
+        fn hydrate<'a>(&'a self, _: &'a crate::paths::Paths) -> crate::rt::BoxFuture<'a, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn checkpoint<'a>(&'a self, _: &'a crate::paths::Paths) -> crate::rt::BoxFuture<'a, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn collection(&self) -> Option<String> {
+            Some("_SA_EXTENSION__rdc_state".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_scoped_state_collection_is_internal_and_never_created() {
+        let name = "_SA_EXTENSION__rdc_state";
+        assert!(!is_internal_collection(name), "unscoped, only `__` names are internal");
+        let mdh = tempfile::TempDir::new().unwrap();
+        for (slug, coll) in [("state", name), ("vendors", "vendors")] {
+            let dir = mdh.path().join(slug);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("indexes.json"), "{}").unwrap();
+            std::fs::write(dir.join(COLLECTION_MANIFEST), format!("{{\"name\": \"{coll}\"}}")).unwrap();
+        }
+        crate::state::store::scope(Arc::new(NamedState), async {
+            assert!(is_internal_collection(name));
+            assert!(is_internal_collection("__tmp_x"));
+            assert!(!is_internal_collection("vendors"));
+            let remote = BTreeSet::new();
+            assert_eq!(local_only_dataset_slugs(mdh.path(), &remote, &BTreeMap::new()).unwrap(), vec!["vendors".to_string()]);
+        })
+        .await;
     }
 
     #[test]

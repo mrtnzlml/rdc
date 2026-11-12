@@ -10,7 +10,8 @@ and the desktop app unchanged.
 
 The API covers what the desktop app does (`desktop/rust/src/api/rdc.rs`):
 create and validate a project; edit, add, rename and remove an env; sync one
-env; watch envs; answer the prompts a sync raises.
+env; watch envs; answer the prompts a sync raises. It also runs `rdc migrate`
+between two envs, which the desktop app leaves to GitLab CI.
 
 ## Layout
 
@@ -52,9 +53,11 @@ export class Project {
   addEnv(input: EnvInput): ProjectSummary;
   removeEnv(env: string): ProjectSummary | null;
   renameEnv(oldName: string, newName: string): RenameEnvResult;
-  useDataStorageState(opts: { key: string; chunkBytes?: number }): void;
+  useDataStorageState(opts: { key: string; collection?: string; chunkBytes?: number }): void;
   sync(env: string, opts: SyncOptions, onPrompt: (p: Prompt) => Promise<string | null>,
        onLog: (line: string) => void): Promise<CycleOutcome>;
+  migrate(src: string, tgt: string, opts: MigrateOptions | null | undefined,
+          onLog: (line: string) => void): Promise<MigrateResult>;
   watch(env: string, pollSecs: number | null, onPrompt: (p: Prompt) => Promise<string | null>,
         onLog: (line: string) => void, onIdle: (nextSecs: number | null) => void): WatchHandle;
 }
@@ -81,7 +84,11 @@ bridge's DTOs in camelCase. Differences from the desktop app:
   desktop app trashes the folder).
 - **Prompts**: `[e]` and `[h]` are never offered. An answer that is not one of
   `choices` — or a rejected promise — counts as `null` (skip / no).
-  `WatchHandle.stop()` answers a pending prompt with `null`.
+  `WatchHandle.stop()` answers a pending prompt with `null`. `question` is
+  the choices on one line, except for `recoverCreate` (several objects on the
+  env match a create a closed tab or crashed run left unfinished), whose
+  `question` is the whole question; its choices are one digit per candidate
+  and `a` (abort the sync).
 - **One sync or watch per env**: a second call on a busy env is rejected (the
   on-disk `EnvLock` does not apply in memory). `renameEnv` and `removeEnv`
   of a busy env are rejected too.
@@ -99,19 +106,52 @@ bridge's DTOs in camelCase. Differences from the desktop app:
   of running unlocked.
 - **Sync state in Data Storage**: by default an env's sync state
   (`.rdc/state/<env>.lock.json`, `.rdc/state/<env>.base/`,
-  `.rdc/conflicts/<env>/`) lives in the tree like any file. After
-  `useDataStorageState({ key, chunkBytes })` the next `sync` or `watch` keeps
-  it in Rossum Data Storage instead, in the collection `__rdc_state` (fixed;
-  rdc never syncs it as an MDH dataset), under the host-chosen `key` (for
-  example the org and project). The run reads the state from Data Storage
-  before it starts and saves it there after every lockfile write, with the
-  env's cluster and the token each cycle uses (a watch's refreshed token
-  after a 401 included). `chunkBytes` (default `524288`) bounds one stored
-  document. Any other option throws; `collection` too, since the collection
-  is fixed. Those `.rdc/state` and `.rdc/conflicts` keys
-  then come from Data Storage: the copies in `new Project(files)` or seen via
-  `onChange` are not authoritative. Once Data Storage holds a state for the
-  env, each run replaces the tree's copies with it; before that, the first
-  run uploads whatever state the tree has.
+  `.rdc/conflicts/<env>/`) and its tree (`envs/<env>/`) live only in the
+  in-memory tree. After `useDataStorageState({ key, collection, chunkBytes })`
+  the next `sync`, `watch` or `migrate` also keeps them in Rossum Data
+  Storage, in the env's own org: one manifest per env, `<key>/<env>`, in
+  `collection` (default `__rdc_state`). `key` is the host's choice (for
+  example the project). `chunkBytes` (default `524288`) bounds one stored
+  document. Any other option throws, as does an empty `key` or `collection`.
+  rdc never syncs, migrates or creates `collection` as an MDH dataset,
+  whatever its name. Every file must be UTF-8.
+  - **When it is saved**: when a run starts (not under `dryRun`), after every
+    lockfile write of a sync (before and after each create, and at its end),
+    and after a `migrate` (not under `dryRun`). Each save is one
+    compare-and-swap, so the state and the tree in Data Storage are always
+    from the same moment; a save another tab or device got in first fails
+    the run with `the state of env '<env>' was changed by another run`.
+  - **When it is loaded**: at the start of every run of the env. The state
+    files are always the saved ones. For `envs/<env>/`: the first run of an
+    env in a `Project` takes the saved tree whole (files are written, files
+    it does not name are removed), so after a closed tab the tree comes back
+    with its state and nothing reads as a local delete. Later runs of the
+    same `Project` keep the tree's own changes (the host's edits, migrate's
+    output), and take what another tab or device saved since for files this
+    tab did not change; a file both changed refuses the run and names the
+    files. Edits written into `envs/<env>/` before an env's first run in a
+    `Project` are therefore replaced: load the env first (a `sync` with
+    `noPush`), then edit. An edit reaches Data Storage when the next run
+    starts.
+  - **What it does not keep**: `rdc.toml`, `secrets/`, `.rdc/mapping.toml`
+    (and legacy `.rdc/map/`) are the host's to keep, as before; rdc reports
+    every write to them through `onChange`. The scaffold (`.gitlab-ci.yml`,
+    `README.md`, `CLAUDE.md`, the testkit) is written again by every `sync`.
+    See `docs/superpowers/specs/2026-11-03-wasm-migrate-design.md` for why.
+- **Migrate**: `migrate(src, tgt, opts, onLog)` runs `rdc migrate` on the tree
+  (`cli::migrate::run_at`). `opts` — `dryRun`, `mirror`, `allowRecreate`
+  (needs `mirror`), `only` (selectors) and `carry` (`"scoreThresholds"`,
+  `"emailPrefixes"`, `"automation"`, `"all"`) — are the CLI's flags; any other
+  option throws. It claims both envs, as a sync claims one. With Data Storage
+  state on, it loads both envs' state first, holds the target org's Web Lock,
+  and saves the target after (not under `dryRun`). `onLog` gets the CLI's
+  output. The result is the plan: every file considered (`files`, with
+  `source` and `target` keys and `"create"` / `"update"` / `"unchanged"`),
+  every target object (`objects`, by target slug, with what the next `sync`
+  of the target does: `"create"` / `"update"` / `"unchanged"` / `"delete"`),
+  the `pruned` files and `prunedDirs`, the `skipped` email templates, the
+  `warnings` it logged, and their counts. A refusal (recreate guard, a
+  dangling overlay key, an unresolvable saved-view ref) rejects with rdc's
+  message. Then `sync(tgt, ...)` pushes it.
 - **Watch** has no file watcher. It polls on `pollSecs`, and `trigger()` runs a
   cycle as a local file change would; call it after `writeFile`.

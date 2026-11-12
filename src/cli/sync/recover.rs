@@ -245,11 +245,11 @@ async fn choose(
         .map(|(id, key)| PromptKey::new(key, &format!("it is id {id}")))
         .collect();
     keys.push(PromptKey::new('a', "abort the sync"));
-    // Announced as a conflict: which object is ours is that kind of decision,
-    // and a consumer titles its dialog by kind only.
+    // Its own kind, with the whole question: a consumer titles its dialog by
+    // kind, and no other prompt asks which object a lost create made.
     crate::cli::stdin_coord::announce(Prompt {
-        kind: PromptKind::Conflict,
-        question: crate::cli::change_view::menu_one_line(&keys),
+        kind: PromptKind::RecoverCreate,
+        question: format!("{question}. Which one did it create?"),
         keys: keys.clone(),
     });
     let mode = crate::cli::resolve::detect_color_mode();

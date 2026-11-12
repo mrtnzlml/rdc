@@ -647,6 +647,9 @@ fn kind_to_dto(k: rdc::cli::sync::embed::PromptKind) -> PromptKindDto {
         K::DeleteDrift => PromptKindDto::DeleteDrift,
         K::MdhIndexDrop => PromptKindDto::MdhIndexDrop,
         K::MdhRowDelete => PromptKindDto::MdhRowDelete,
+        // The desktop dialog stays the conflict one it was before the core
+        // kind existed; which object is ours is that kind of decision.
+        K::RecoverCreate => PromptKindDto::Conflict,
         K::Unknown => PromptKindDto::Unknown,
     }
 }

@@ -9,9 +9,19 @@
 //! - one manifest `{_id: "<key>/<env>", rev, files: {"<relpath>": {sha256,
 //!   chunks}}}`, the state as of the last checkpoint.
 //!
-//! The state files are `.rdc/state/<env>.lock.json`, `.rdc/state/<env>.base/**`
-//! and `.rdc/conflicts/<env>/**`, keyed by their path relative to the project
-//! root with `/` separators.
+//! The files are the env's sync state — `.rdc/state/<env>.lock.json`,
+//! `.rdc/state/<env>.base/**`, `.rdc/conflicts/<env>/**` — and its tree,
+//! `envs/<env>/**`, keyed by their path relative to the project root with `/`
+//! separators. One manifest holds both, so the state and the tree in Data
+//! Storage are always from the same checkpoint: after a closed tab the tree
+//! comes back with its lockfile, instead of every object reading as a local
+//! delete.
+//!
+//! A hydrate decides per file which side wins (`plan_hydrate`). The state
+//! files are always the manifest's. The env tree is the manifest's on the
+//! first hydrate of a store; after that it is the tree's, except for files
+//! another run changed since this store's last read or write, which are
+//! merged three ways with that manifest as the base.
 //!
 //! A checkpoint uploads the blobs first and publishes them with one write of
 //! the manifest, a compare-and-swap on its `rev`: a run that dies between the
@@ -26,8 +36,8 @@
 //! clean-up is a warning, not a failed run ([`StateStore::take_warnings`]).
 //!
 //! The manifest is data anyone with Data Storage access can write, so a
-//! hydrate refuses a manifest naming a path outside this env's state files
-//! before it writes anything. `data/bulk_write` is never used: its completion
+//! hydrate refuses a manifest naming a path outside this env's files before
+//! it writes anything. `data/bulk_write` is never used: its completion
 //! cannot be observed.
 
 use crate::api::data_storage::DataStorageClient;
@@ -42,9 +52,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-/// The collection a host keeps the sync state in. Its `__` prefix is the one
-/// Rossum's own collections carry, which a sync never mirrors as an MDH
-/// dataset (`cli::pull::mdh::is_internal_collection`).
+/// The default collection a host keeps the sync state in. Its `__` prefix is
+/// the one Rossum's own collections carry; a sync never mirrors it, nor any
+/// other collection a store is configured with, as an MDH dataset
+/// (`cli::pull::mdh::is_internal_collection`).
 pub const STATE_COLLECTION: &str = "__rdc_state";
 
 /// Blob uploads in flight at once; the client's bucket does the pacing.
@@ -74,7 +85,8 @@ pub struct DataStorageStateStore {
     key: String,
     chunk_bytes: usize,
     /// Per env, the manifest this store last read or wrote; `None` when it
-    /// found none. An env absent here was never hydrated by this store.
+    /// found none. An env absent here was never hydrated by this store. It
+    /// is what the tree agreed with then, the base of a hydrate's merge.
     known: Mutex<BTreeMap<String, Option<Manifest>>>,
     /// Warnings not taken yet ([`StateStore::take_warnings`]).
     warnings: Mutex<Vec<String>>,
@@ -112,7 +124,11 @@ impl DataStorageStateStore {
     }
 
     fn last_known(&self, env: &str) -> Option<Manifest> {
-        self.known.lock().unwrap_or_else(|p| p.into_inner()).get(env).cloned().flatten()
+        self.known_entry(env).flatten()
+    }
+
+    fn known_entry(&self, env: &str) -> Option<Option<Manifest>> {
+        self.known.lock().unwrap_or_else(|p| p.into_inner()).get(env).cloned()
     }
 
     async fn read_manifest(&self, env: &str) -> Result<Option<Manifest>> {
@@ -129,19 +145,14 @@ impl DataStorageStateStore {
         Ok(Some(Manifest { rev, files }))
     }
 
-    /// The manifest and the files it names, checked to be this env's state
-    /// files. `Ok(Err(_))`: a blob the manifest names is missing.
-    async fn read_state(&self, paths: &Paths) -> Result<std::result::Result<(Option<Manifest>, BTreeMap<String, String>), anyhow::Error>> {
-        let env = paths.env();
-        let Some(m) = self.read_manifest(env).await? else {
-            return Ok(Ok((None, BTreeMap::new())));
-        };
-        for rel in m.files.keys() {
-            if !is_state_path(rel, env) {
-                bail!("the manifest names '{rel}', which is not a sync state file of env '{env}'; refusing to write it");
-            }
-        }
-        let ids: Vec<String> = self.blob_ids(env, &m.files).into_iter().collect();
+    /// The texts of `files` from their blobs, checked against their hashes.
+    /// `Ok(Err(_))`: a blob is missing.
+    async fn read_blobs(
+        &self,
+        env: &str,
+        files: &BTreeMap<String, FileRef>,
+    ) -> Result<std::result::Result<BTreeMap<String, String>, anyhow::Error>> {
+        let ids: Vec<String> = self.blob_ids(env, files).into_iter().collect();
         let mut texts: BTreeMap<String, String> = BTreeMap::new();
         for batch in ids.chunks(FIND_BATCH) {
             let docs = self
@@ -155,7 +166,7 @@ impl DataStorageStateStore {
             }
         }
         let mut contents = BTreeMap::new();
-        for (rel, f) in &m.files {
+        for (rel, f) in files {
             let mut text = String::new();
             for n in 0..f.chunks {
                 let id = self.blob_id(env, &f.sha256, n);
@@ -169,43 +180,59 @@ impl DataStorageStateStore {
             }
             contents.insert(rel.clone(), text);
         }
-        Ok(Ok((Some(m), contents)))
+        Ok(Ok(contents))
     }
 
     async fn hydrate_env(&self, paths: &Paths) -> Result<()> {
         let env = paths.env();
         // A blob can vanish under a reader: a run that published since our
         // manifest read cleans up the blobs it replaced. Read once more.
-        let (manifest, contents) = match self.read_state(paths).await? {
-            Ok(read) => read,
-            Err(_vanished) => self.read_state(paths).await??,
-        };
-        if manifest.is_none() {
-            // Nothing published yet: local state, if any, stays, and the
-            // first checkpoint publishes it.
-            self.remember(env, None);
-            return Ok(());
-        }
-        // Make the state files exactly the manifest's set.
-        for rel in state_files(paths)?.keys() {
-            if !contents.contains_key(rel) {
+        let mut retried = false;
+        loop {
+            let Some(m) = self.read_manifest(env).await? else {
+                // Nothing published yet: the local files stay, and the first
+                // checkpoint publishes them.
+                self.remember(env, None);
+                return Ok(());
+            };
+            for rel in m.files.keys() {
+                if !is_persisted_path(rel, env) {
+                    bail!("the manifest names '{rel}', which is not a file of env '{env}'; refusing to write it");
+                }
+            }
+            let local: BTreeMap<String, String> = persisted_files(paths)?
+                .into_iter()
+                .map(|(rel, bytes)| (rel, crate::state::raw_content_hash(&bytes)))
+                .collect();
+            let plan = plan_hydrate(env, &local, &m, self.known_entry(env).as_ref())?;
+            let wanted: BTreeMap<String, FileRef> =
+                plan.write.iter().map(|rel| (rel.clone(), m.files[rel].clone())).collect();
+            let contents = match self.read_blobs(env, &wanted).await? {
+                Ok(c) => c,
+                Err(e) if retried => return Err(e),
+                Err(_vanished) => {
+                    retried = true;
+                    continue;
+                }
+            };
+            for rel in &plan.remove {
                 crate::vfs::remove_file(paths.root().join(rel)).with_context(|| format!("removing {rel}"))?;
             }
-        }
-        for (rel, text) in &contents {
-            let path = paths.root().join(rel);
-            if let Some(dir) = path.parent() {
-                crate::vfs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+            for (rel, text) in &contents {
+                let path = paths.root().join(rel);
+                if let Some(dir) = path.parent() {
+                    crate::vfs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+                }
+                crate::vfs::write(&path, text).with_context(|| format!("writing {rel}"))?;
             }
-            crate::vfs::write(&path, text).with_context(|| format!("writing {rel}"))?;
+            self.remember(env, Some(m));
+            return Ok(());
         }
-        self.remember(env, manifest);
-        Ok(())
     }
 
     async fn checkpoint_env(&self, paths: &Paths) -> Result<()> {
         let env = paths.env();
-        let texts = state_files(paths)?;
+        let texts = persisted_texts(paths)?;
         let files: BTreeMap<String, FileRef> = texts
             .iter()
             .map(|(rel, text)| {
@@ -327,38 +354,139 @@ impl StateStore for DataStorageStateStore {
     fn use_token(&self, token: &str) {
         self.client.lock().unwrap_or_else(|p| p.into_inner()).set_token(token.to_string());
     }
+
+    fn collection(&self) -> Option<String> {
+        Some(self.collection.clone())
+    }
 }
 
-/// The env's state files in the vfs, relpath → content. A file that is not
-/// UTF-8 is an error naming it.
-fn state_files(paths: &Paths) -> Result<BTreeMap<String, String>> {
+/// What a hydrate writes and removes, relpaths.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct HydratePlan {
+    write: BTreeSet<String>,
+    remove: BTreeSet<String>,
+}
+
+/// Decide a hydrate. `local` is the tree's files (relpath → SHA-256), `m` the
+/// manifest now in Data Storage, `known` what this store last read or wrote
+/// (`None`: never hydrated; `Some(None)`: found no manifest then).
+///
+/// - The state files become exactly `m`'s.
+/// - `envs/<env>/**` becomes exactly `m`'s on a first hydrate; is left alone
+///   when `m` is still `known` (the tree's changes since are local ones);
+///   and is merged three ways otherwise, `known` as the base: a file only
+///   `m` changed takes `m`'s side, a file only the tree changed keeps its
+///   own, `_index.md` (generated) takes `m`'s, and a file both changed
+///   differently is an error naming it.
+fn plan_hydrate(
+    env: &str,
+    local: &BTreeMap<String, String>,
+    m: &Manifest,
+    known: Option<&Option<Manifest>>,
+) -> Result<HydratePlan> {
+    let theirs = |rel: &str| m.files.get(rel).map(|f| f.sha256.as_str());
+    let mut plan = HydratePlan::default();
+    let take = |plan: &mut HydratePlan, rel: &str| match (local.get(rel).map(String::as_str), theirs(rel)) {
+        (l, t) if l == t => {}
+        (_, Some(_)) => {
+            plan.write.insert(rel.to_string());
+        }
+        (Some(_), None) => {
+            plan.remove.insert(rel.to_string());
+        }
+        (None, None) => {}
+    };
+    let rels: BTreeSet<&String> = local.keys().chain(m.files.keys()).collect();
+    let base: Option<&BTreeMap<String, FileRef>> = match known {
+        None => None,
+        Some(k) if k.as_ref() == Some(m) => {
+            for rel in rels.iter().filter(|r| is_state_file(r, env)) {
+                take(&mut plan, rel);
+            }
+            return Ok(plan);
+        }
+        Some(k) => Some(k.as_ref().map(|k| &k.files).unwrap_or(&EMPTY)),
+    };
+    let index = format!("envs/{env}/_index.md");
+    let mut both: Vec<&str> = Vec::new();
+    for rel in rels {
+        let Some(base) = base.filter(|_| !is_state_file(rel, env)) else {
+            take(&mut plan, rel);
+            continue;
+        };
+        let (ours, theirs_now, was) =
+            (local.get(rel).map(String::as_str), theirs(rel), base.get(rel).map(|f| f.sha256.as_str()));
+        if ours == theirs_now || theirs_now == was {
+            continue; // agreed, or only the tree changed it
+        }
+        if ours == was || *rel == index {
+            take(&mut plan, rel);
+        } else {
+            both.push(rel);
+        }
+    }
+    if !both.is_empty() {
+        bail!(
+            "{} file(s) of env '{env}' were changed here and by another run since this project last \
+             synced env '{env}': {}. Open the project again without envs/{env}/ to take the other \
+             run's version.",
+            both.len(),
+            both.join(", ")
+        );
+    }
+    Ok(plan)
+}
+
+static EMPTY: BTreeMap<String, FileRef> = BTreeMap::new();
+
+/// The env's files in the vfs — its sync state and `envs/<env>/**` —
+/// relpath → bytes.
+fn persisted_files(paths: &Paths) -> Result<BTreeMap<String, Vec<u8>>> {
     let mut found = Vec::new();
     if crate::vfs::is_file(paths.lockfile()) {
         found.push(paths.lockfile());
     }
     walk(&paths.base_cache_root(), &mut found)?;
     walk(&paths.root().join(".rdc").join("conflicts").join(paths.env()), &mut found)?;
+    walk(&paths.env_root(), &mut found)?;
     let mut out = BTreeMap::new();
     for path in found {
         let rel = relpath(paths.root(), &path)?;
         let bytes = crate::vfs::read(&path).with_context(|| format!("reading {rel}"))?;
-        let text = String::from_utf8(bytes).map_err(|_| anyhow!("{rel} is not UTF-8; Data Storage keeps text only"))?;
-        out.insert(rel, text);
+        out.insert(rel, bytes);
     }
     Ok(out)
 }
 
+/// [`persisted_files`] as text. A file that is not UTF-8 is an error naming it.
+fn persisted_texts(paths: &Paths) -> Result<BTreeMap<String, String>> {
+    persisted_files(paths)?
+        .into_iter()
+        .map(|(rel, bytes)| match String::from_utf8(bytes) {
+            Ok(text) => Ok((rel, text)),
+            Err(_) => Err(anyhow!("{rel} is not UTF-8; Data Storage keeps text only")),
+        })
+        .collect()
+}
+
+/// Whether `rel` is a plain relative path under `prefix`.
+fn plainly_under(rel: &str, prefix: &str) -> bool {
+    rel.strip_prefix(prefix)
+        .is_some_and(|rest| rest.split('/').all(|c| !c.is_empty() && c != "." && c != ".." && !c.contains('\\')))
+}
+
 /// Whether `rel` is one of `env`'s state files: the lockfile, or a plain
 /// relative path under its base cache or its conflict shadows.
-fn is_state_path(rel: &str, env: &str) -> bool {
-    if rel == format!(".rdc/state/{env}.lock.json") {
-        return true;
-    }
-    let under = [format!(".rdc/state/{env}.base/"), format!(".rdc/conflicts/{env}/")];
-    under.iter().any(|p| {
-        rel.strip_prefix(p.as_str())
-            .is_some_and(|rest| rest.split('/').all(|c| !c.is_empty() && c != "." && c != ".." && !c.contains('\\')))
-    })
+fn is_state_file(rel: &str, env: &str) -> bool {
+    rel == format!(".rdc/state/{env}.lock.json")
+        || plainly_under(rel, &format!(".rdc/state/{env}.base/"))
+        || plainly_under(rel, &format!(".rdc/conflicts/{env}/"))
+}
+
+/// Whether `rel` is a file this store keeps for `env`: a state file, or a
+/// plain relative path under `envs/<env>/`.
+fn is_persisted_path(rel: &str, env: &str) -> bool {
+    is_state_file(rel, env) || plainly_under(rel, &format!("envs/{env}/"))
 }
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
@@ -427,22 +555,109 @@ mod tests {
     }
 
     #[test]
-    fn state_paths_are_this_envs_state_files() {
-        for ok in [".rdc/state/dev.lock.json", ".rdc/state/dev.base/hooks/x.py", ".rdc/conflicts/dev/labels/a.json"] {
-            assert!(is_state_path(ok, "dev"), "{ok}");
+    fn persisted_paths_are_this_envs_state_and_tree() {
+        for ok in [
+            ".rdc/state/dev.lock.json",
+            ".rdc/state/dev.base/hooks/x.py",
+            ".rdc/conflicts/dev/labels/a.json",
+            "envs/dev/hooks/x.py",
+            "envs/dev/overlay.toml",
+        ] {
+            assert!(is_persisted_path(ok, "dev"), "{ok}");
         }
         for bad in [
-            "envs/dev/hooks/x.py",
+            "envs/test/hooks/x.py",
+            "envs/dev/../test/hooks/x.py",
+            "envs/dev",
             "../x",
             ".rdc/state/test.lock.json",
             ".rdc/state/dev.base/../../../envs/dev/hooks/x.py",
             ".rdc/conflicts/dev//x",
             ".rdc/conflicts/dev/./x",
             ".rdc/state/dev.lock",
+            ".rdc/mapping.toml",
+            "secrets/dev.secrets.json",
             "rdc.toml",
         ] {
-            assert!(!is_state_path(bad, "dev"), "{bad}");
+            assert!(!is_persisted_path(bad, "dev"), "{bad}");
         }
+        assert!(!is_state_file("envs/dev/hooks/x.py", "dev"));
+    }
+
+    fn manifest(rev: u64, files: &[(&str, &str)]) -> Manifest {
+        Manifest {
+            rev,
+            files: files.iter().map(|(r, sha)| (r.to_string(), FileRef { sha256: sha.to_string(), chunks: 1 })).collect(),
+        }
+    }
+
+    fn local(files: &[(&str, &str)]) -> BTreeMap<String, String> {
+        files.iter().map(|(r, sha)| (r.to_string(), sha.to_string())).collect()
+    }
+
+    fn set(rels: &[&str]) -> BTreeSet<String> {
+        rels.iter().map(|r| r.to_string()).collect()
+    }
+
+    const LOCK: &str = ".rdc/state/dev.lock.json";
+
+    #[test]
+    fn a_first_hydrate_takes_the_manifest_whole() {
+        let m = manifest(3, &[(LOCK, "l3"), ("envs/dev/a.json", "a3"), ("envs/dev/overlay.toml", "o3")]);
+        let tree = local(&[("envs/dev/overlay.toml", "scaffold"), ("envs/dev/stale.json", "s"), (".rdc/state/dev.base/x", "x")]);
+        let plan = plan_hydrate("dev", &tree, &m, None).unwrap();
+        assert_eq!(plan.write, set(&[LOCK, "envs/dev/a.json", "envs/dev/overlay.toml"]));
+        assert_eq!(plan.remove, set(&["envs/dev/stale.json", ".rdc/state/dev.base/x"]));
+    }
+
+    #[test]
+    fn an_unchanged_manifest_leaves_the_tree_and_restores_the_state() {
+        let m = manifest(3, &[(LOCK, "l3"), ("envs/dev/a.json", "a3")]);
+        let tree = local(&[(LOCK, "edited"), ("envs/dev/a.json", "host edit"), ("envs/dev/new.json", "n")]);
+        let plan = plan_hydrate("dev", &tree, &m, Some(&Some(m.clone()))).unwrap();
+        assert_eq!(plan, HydratePlan { write: set(&[LOCK]), remove: BTreeSet::new() });
+        // A tree with no change at all needs nothing, not even a download.
+        let same = local(&[(LOCK, "l3"), ("envs/dev/a.json", "a3")]);
+        assert_eq!(plan_hydrate("dev", &same, &m, Some(&Some(m.clone()))).unwrap(), HydratePlan::default());
+    }
+
+    #[test]
+    fn a_newer_manifest_merges_three_ways() {
+        let k = manifest(3, &[(LOCK, "l3"), ("envs/dev/theirs.json", "t3"), ("envs/dev/ours.json", "o3"), ("envs/dev/gone.json", "g3"), ("envs/dev/_index.md", "i3")]);
+        let m = manifest(5, &[(LOCK, "l5"), ("envs/dev/theirs.json", "t5"), ("envs/dev/ours.json", "o3"), ("envs/dev/added.json", "n5"), ("envs/dev/_index.md", "i5")]);
+        let tree = local(&[
+            (LOCK, "l3"),
+            ("envs/dev/theirs.json", "t3"),
+            ("envs/dev/ours.json", "o4"),
+            ("envs/dev/gone.json", "g3"),
+            ("envs/dev/_index.md", "i4"),
+            ("envs/dev/mine.json", "m4"),
+        ]);
+        let plan = plan_hydrate("dev", &tree, &m, Some(&Some(k))).unwrap();
+        assert_eq!(plan.write, set(&[LOCK, "envs/dev/theirs.json", "envs/dev/added.json", "envs/dev/_index.md"]));
+        assert_eq!(plan.remove, set(&["envs/dev/gone.json"]));
+    }
+
+    #[test]
+    fn a_file_both_sides_changed_refuses_the_hydrate() {
+        let k = manifest(3, &[("envs/dev/a.json", "a3"), ("envs/dev/b.json", "b3")]);
+        let m = manifest(4, &[("envs/dev/a.json", "a4"), ("envs/dev/b.json", "b3")]);
+        let tree = local(&[("envs/dev/a.json", "mine"), ("envs/dev/b.json", "b3")]);
+        let err = plan_hydrate("dev", &tree, &m, Some(&Some(k))).unwrap_err().to_string();
+        assert!(err.contains("envs/dev/a.json") && !err.contains("b.json"), "{err}");
+        // A deleted file the other run edited is a both-changed file too.
+        let k = manifest(3, &[("envs/dev/a.json", "a3")]);
+        let m = manifest(4, &[("envs/dev/a.json", "a4")]);
+        assert!(plan_hydrate("dev", &local(&[]), &m, Some(&Some(k))).is_err());
+    }
+
+    #[test]
+    fn a_manifest_first_seen_after_none_merges_on_an_empty_base() {
+        let m = manifest(1, &[(LOCK, "l1"), ("envs/dev/a.json", "a1"), ("envs/dev/b.json", "b1")]);
+        let tree = local(&[("envs/dev/a.json", "a1"), ("envs/dev/mine.json", "m")]);
+        let plan = plan_hydrate("dev", &tree, &m, Some(&None)).unwrap();
+        assert_eq!(plan.write, set(&[LOCK, "envs/dev/b.json"]));
+        assert!(plan.remove.is_empty(), "{plan:?}");
     }
 
 }

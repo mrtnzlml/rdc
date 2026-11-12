@@ -178,10 +178,33 @@ Project-specific instructions for working in this repo.
   top-level `secrets` is never hashed, nor is a secret-named sub-key of hook
   `config` / engine `settings`; secret-named keys anywhere else are hashed.
 - `StateStore`: `FsStateStore` is a no-op; `DataStorageStateStore` keeps blobs and
-  a CAS manifest in collection `__rdc_state`. The `__` prefix is deliberate: MDH
-  sync already skips such collections.
+  a CAS manifest per env in the env's own org, in a host-chosen collection
+  (default `__rdc_state`). The manifest holds the state **and `envs/<env>/**`**:
+  without the tree, a closed tab came back with every object reading as a local
+  delete. `run_cycle` checkpoints when a run starts and after `_index.md` as well
+  as at every journal persist; all three are no-ops on disk, so the CLI is
+  unchanged, but a test store counts them.
+- Hydrate (`plan_hydrate`): the state files are always the manifest's; the env
+  tree is the manifest's on a store's **first** hydrate, the tree's own when the
+  manifest is still the one the store last saw, and a three-way merge (refusing
+  a file both sides changed) otherwise. So the store must live as long as the
+  tab's `Project` (`wasm/` caches one per env); a store per run would wipe the
+  host's edits on every sync.
+- `is_internal_collection` is true for `__` names **and** for the collection of
+  the task's scoped state store. Every MDH path goes through it (listing,
+  `local_only_dataset_slugs`) or through migrate's own skip (`state_datasets`).
+  The CLI scopes no store, so it still mirrors such a collection without `__`.
+- `.rdc/mapping.toml`, `rdc.toml` and `secrets/` are **host-owned** in the
+  browser, never in Data Storage: the mapping is project-level and each env's
+  state lives in another org, so two copies would have no correct merge. See
+  `docs/superpowers/specs/2026-11-03-wasm-migrate-design.md`.
+- `cli::migrate::run_at` is a wrapper over `run_at_logged`, which returns a
+  `MigrateReport`; `embed::migrate_logged_in` is the embedders' migrate (hydrate
+  both envs, run, checkpoint the target). Keep the report built from what
+  `run_at_logged` already computes, never a second pass.
 - Tests: the fake-only crash matrix is `tests/live/support/fake/crash_matrix.rs`
-  (with `recover.rs`, `state_store.rs`); live scenarios are
+  (with `recover.rs`, `state_store.rs`, and `browser_migrate.rs` for the closed
+  tab across two orgs); live scenarios are
   `tests/live/scenarios/crash_recovery.rs`.
 
 ## Customer confidentiality
