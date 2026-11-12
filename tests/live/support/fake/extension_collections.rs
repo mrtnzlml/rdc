@@ -166,8 +166,9 @@ async fn an_edited_already_pulled_dataset_is_deferred_not_pushed() {
     assert_eq!(remote_rows(&fake), rows());
 }
 
-/// Migrate never copies it, and a `--mirror` prune of a target copy only
-/// removes local files: the target's next sync deletes nothing on the env.
+/// Migrate never copies it, nor does `--mirror` prune a target copy (the
+/// plan would show a delete no sync performs); the target's next sync
+/// removes it locally as above and deletes nothing on the env.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn migrate_skips_it_and_a_mirror_prune_stays_local() {
     let (fake, project) = already_pulled(true).await;
@@ -179,13 +180,14 @@ async fn migrate_skips_it_and_a_mirror_prune_stays_local() {
     assert!(!project.exists(&format!("envs/prod/mdh/{SLUG}")), "not copied:\n{stderr}");
     assert!(stderr.contains(&format!("skipping mdh/{SLUG}")), "{stderr}");
 
-    // `test` is now the target: prod produces no dataset, so `--mirror`
-    // prunes test's copy, and the push that follows deletes nothing remote.
+    // `test` is now the target: prod does not produce the dataset, and
+    // `--mirror` still leaves test's copy alone.
     assert_ok(&project.run_rdc(&["migrate", "prod", "test", "--mirror"]), "migrate prod -> test --mirror");
-    assert!(!project.exists(&format!("{DIR}/indexes.json")), "pruned locally");
+    assert!(project.exists(&format!("{DIR}/indexes.json")), "not pruned by the mirror");
     assert_ok(&project.run_rdc(&["sync", "test", "--yes", "--allow-deletes"]), "sync test");
     let lf = load_lockfile(project.path(), "test").unwrap();
     assert!(!lf.objects.get("mdh_indexes").is_some_and(|m| m.contains_key(SLUG)), "the entry is dropped");
+    assert!(!project.exists(DIR), "the sync removed it locally");
     assert_eq!(remote_rows(&fake), rows());
     assert!(writes.lock().unwrap().is_empty(), "{:?}", writes.lock().unwrap());
 }

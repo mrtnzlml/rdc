@@ -101,6 +101,7 @@ pub mod collision;
 pub mod embed;
 pub mod execute;
 pub mod lock;
+pub mod plan;
 pub mod recover;
 pub mod watch;
 
@@ -125,6 +126,10 @@ pub struct CycleOutcome {
     pub items_pulled: usize,
     pub conflicts: usize,
     pub remote_deletes_resolved: usize,
+    /// What a dry run would do; `None` for any other run.
+    pub plan: Option<plan::SyncPlan>,
+    /// What this cycle did not write, and why ([`plan::record`]).
+    pub skipped: Vec<plan::SkippedItem>,
 }
 
 /// Entry point for `rdc sync <env>`. Drives the unified pipeline:
@@ -210,6 +215,40 @@ pub(crate) async fn run_cycle(
     token_override: Option<String>,
     hold_unresolved: bool,
 ) -> Result<CycleOutcome> {
+    let (out, skipped) = plan::collect(Box::pin(run_cycle_inner(
+        env,
+        interactive,
+        dry_run,
+        allow_deletes,
+        no_push,
+        no_pull,
+        conflict_strategy,
+        renderer,
+        cwd_override,
+        token_override,
+        hold_unresolved,
+    )))
+    .await;
+    out.map(|mut o| {
+        o.skipped = skipped;
+        o
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_cycle_inner(
+    env: &str,
+    interactive: bool,
+    dry_run: bool,
+    allow_deletes: bool,
+    no_push: bool,
+    no_pull: bool,
+    conflict_strategy: Option<ConflictStrategy>,
+    renderer: Option<Arc<Log>>,
+    cwd_override: Option<&std::path::Path>,
+    token_override: Option<String>,
+    hold_unresolved: bool,
+) -> Result<CycleOutcome> {
     if no_push && no_pull {
         anyhow::bail!(
             "--no-push and --no-pull are mutually exclusive. \
@@ -277,6 +316,7 @@ pub(crate) async fn run_cycle(
     // its one commit makes the recovered state durable before classify, and
     // an error leaves the journal on disk as it was.
     let mut token_override = token_override;
+    let mut recovery = recover::RecoveryReport::default();
     if recoverable {
         let token = match token_override.take() {
             Some(t) => t,
@@ -284,7 +324,7 @@ pub(crate) async fn run_cycle(
         };
         let client = RossumClient::new(env_cfg.api_base.clone(), token.clone())
             .context("constructing Rossum API client")?;
-        recover::recover(&paths, &mut lockfile, &client, interactive, dry_run, &progress).await?;
+        recovery = recover::recover(&paths, &mut lockfile, &client, interactive, dry_run, &progress).await?;
         if !dry_run {
             journal.commit(&lockfile).await?;
         }
@@ -436,6 +476,7 @@ pub(crate) async fn run_cycle(
     // prefix on each section label.
     if dry_run {
         use crate::cli::sync::classify::SyncClass;
+        let mut problems: Vec<String> = Vec::new();
 
         // MDH bypasses the classifier, so its would-be writes are invisible
         // to the classified plan above. `plan_mdh` predicts the STRUCTURAL
@@ -627,6 +668,7 @@ pub(crate) async fn run_cycle(
                 let _ = writeln!(body, "- hooks/{slug} -- secret entry has no matching hook");
             }
             progress.block(&body);
+            problems.extend(body.lines().map(str::to_string));
         }
 
         if !parse_errors.is_empty() {
@@ -637,6 +679,7 @@ pub(crate) async fn run_cycle(
                 let _ = writeln!(body, "- {}/{} -- {}: {}", e.kind, e.slug, e.path.display(), e.error);
             }
             progress.block(&body);
+            problems.extend(body.lines().map(str::to_string));
         }
 
         if !limit_violations.is_empty() {
@@ -656,6 +699,7 @@ pub(crate) async fn run_cycle(
                 );
             }
             progress.block(&body);
+            problems.extend(body.lines().map(str::to_string));
         }
 
         if !missing_create_fields.is_empty() {
@@ -674,6 +718,7 @@ pub(crate) async fn run_cycle(
                 );
             }
             progress.block(&body);
+            problems.extend(body.lines().map(str::to_string));
         }
 
         if !settings_problems.is_empty() {
@@ -684,6 +729,7 @@ pub(crate) async fn run_cycle(
                 let _ = writeln!(body, "- {} -- {}: {}", path.display(), p.location, p.problem);
             }
             progress.block(&body);
+            problems.extend(body.lines().map(str::to_string));
         }
 
         if !unshared_views.is_empty() {
@@ -699,6 +745,7 @@ pub(crate) async fn run_cycle(
                 );
             }
             progress.block(&body);
+            problems.extend(body.lines().map(str::to_string));
         }
 
         if !engine_conflicts.is_empty() {
@@ -715,6 +762,7 @@ pub(crate) async fn run_cycle(
                 );
             }
             progress.block(&body);
+            problems.extend(body.lines().map(str::to_string));
         }
 
         if !missing_formulas.is_empty() {
@@ -731,6 +779,7 @@ pub(crate) async fn run_cycle(
                 );
             }
             progress.block(&body);
+            problems.extend(body.lines().map(str::to_string));
         }
 
         if !renderer_was_supplied {
@@ -758,7 +807,61 @@ pub(crate) async fn run_cycle(
                 ),
             );
         }
-        return Ok(CycleOutcome::default());
+        // The same items the rows above show, in the same order, as data.
+        use plan::{PlanChange as C, PlanDirection as D, PlanItem, PlanPrompt as P};
+        let item = |kind: &str, slug: &str, direction, change, prompt, note: Option<String>| PlanItem {
+            kind: kind.to_string(),
+            slug: slug.to_string(),
+            direction,
+            change,
+            prompt,
+            note,
+        };
+        let mut items: Vec<PlanItem> = Vec::new();
+        for it in &pull_items {
+            let (change, note) = match it.class {
+                SyncClass::RemoteCreate => (C::Create, Some("new".to_string())),
+                SyncClass::RemoteDelete => (C::Delete, Some("delete local; deleted on env".to_string())),
+                _ => (C::Update, None),
+            };
+            items.push(item(&it.kind, &it.slug, D::Pull, change, None, note));
+        }
+        items.extend(mdh_pull.iter().map(|i| item("mdh", &i.slug, D::Pull, i.change, None, i.note.clone())));
+        for it in &push_items {
+            let (change, prompt) = match it.class {
+                SyncClass::LocalEdit => (C::Update, None),
+                SyncClass::LocalCreate => (C::Create, None),
+                _ => (C::Delete, (!allow_deletes).then_some(P::DeleteGate)),
+            };
+            items.push(item(&it.kind, &it.slug, D::Push, change, prompt, None));
+        }
+        items.extend(mdh_push.iter().map(|i| item("mdh", &i.slug, D::Push, i.change, None, i.note.clone())));
+        items.extend(
+            secret_only.iter().map(|s| item("hooks", s, D::Push, C::Update, None, Some("secrets".to_string()))),
+        );
+        for it in &prompt_items {
+            let (prompt, tag) = match it.class {
+                SyncClass::BothDiverged => (P::Conflict, "both diverged"),
+                SyncClass::LocalEditRemoteDelete => (P::RemoteDelete, "local edit, deleted on env"),
+                _ => (P::RemoteDelete, "local delete, edited on env"),
+            };
+            let prompt = conflict_strategy.is_none().then_some(prompt);
+            items.push(item(&it.kind, &it.slug, D::Both, C::Conflict, prompt, Some(tag.to_string())));
+        }
+        let recovered = recovery
+            .completed
+            .iter()
+            .map(|(kind, slug, id)| plan::PlanRecovery { kind: kind.clone(), slug: slug.clone(), id: Some(*id) })
+            .chain(recovery.dropped.iter().map(|(kind, slug)| plan::PlanRecovery {
+                kind: kind.clone(),
+                slug: slug.clone(),
+                id: None,
+            }))
+            .collect();
+        return Ok(CycleOutcome {
+            plan: Some(plan::SyncPlan { items, recovered, problems }),
+            ..CycleOutcome::default()
+        });
     }
 
     // Phase 5: execute. The destructive-delete gate (`--allow-deletes`)
@@ -834,6 +937,8 @@ pub(crate) async fn run_cycle(
                 conflicts: main.conflicts + settled.conflicts,
                 remote_deletes_resolved: main.remote_deletes_resolved
                     + settled.remote_deletes_resolved,
+                plan: None,
+                skipped: Vec::new(),
             })
         }
         other => other,
@@ -875,8 +980,15 @@ pub(crate) async fn run_cycle(
     crate::cli::index::generate(&paths, &lockfile)
         .with_context(|| format!("generating _index.md for env '{env}'"))?;
     // `_index.md` is written after the commit; a store that keeps the env
-    // tree takes it too. A no-op on disk.
-    state.checkpoint(&paths).await?;
+    // tree takes it too. A no-op on disk. Only a warning when it fails: the
+    // commit already saved the state and the tree, `_index.md` is derived,
+    // and the next run regenerates and saves it.
+    if let Err(e) = state.checkpoint(&paths).await {
+        progress.event(
+            Action::Warn,
+            &format!("the sync is done, but saving _index.md with the sync state failed: {e:#}"),
+        );
+    }
     for w in state.take_warnings() {
         progress.event(Action::Warn, &w);
     }

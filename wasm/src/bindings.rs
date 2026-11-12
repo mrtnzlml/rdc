@@ -73,18 +73,36 @@ export interface MigrateOptions {
 }
 export type FileChange = "create" | "update" | "unchanged";
 export type ObjectChange = "create" | "update" | "unchanged" | "delete";
-export interface MigrateFile { source: string; target: string; change: FileChange; }
+export interface MigrateFile {
+  source: string; target: string; change: FileChange;
+  kind: string | null; slug: string | null;
+}
 export interface MigrateObject { kind: string; slug: string; change: ObjectChange; }
+export interface MigratePruned { target: string; kind: string | null; slug: string | null; }
 export interface MigrateResult {
   dryRun: boolean; source: string; target: string;
   files: MigrateFile[]; objects: MigrateObject[];
-  pruned: string[]; prunedDirs: string[]; skipped: string[]; warnings: string[];
+  pruned: MigratePruned[]; prunedDirs: string[]; skipped: string[]; warnings: string[];
   creates: number; updates: number; unchanged: number; deletes: number;
   filesChanged: number; renamed: number;
 }
+export type PlanDirection = "push" | "pull" | "both";
+export type PlanChange = "create" | "update" | "delete" | "conflict";
+export type PlanPrompt = "deleteGate" | "conflict" | "remoteDelete";
+export interface PlanItem {
+  kind: string; slug: string; direction: PlanDirection; change: PlanChange;
+  prompt: PlanPrompt | null; note: string | null;
+}
+export interface PlanRecovery { kind: string; slug: string; id: number | null; }
+export interface SyncPlan { items: PlanItem[]; recovered: PlanRecovery[]; problems: string[]; }
+export type SkipReason =
+  | "deleteGateDeclined" | "deleteDriftSkipped" | "pushDriftSkipped" | "conflictSkipped"
+  | "remoteDeleteSkipped" | "mdhIndexDropDeclined" | "mdhRowDeleteDeclined";
+export interface SkippedItem { kind: string; slug: string; reason: SkipReason; }
 export interface CycleOutcome {
   itemsPushed: number; itemsPulled: number; conflicts: number;
   remoteDeletesResolved: number; fileCount: number;
+  plan: SyncPlan | null; skipped: SkippedItem[];
 }
 "#;
 

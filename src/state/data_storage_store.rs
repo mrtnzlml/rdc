@@ -3,11 +3,14 @@
 //!
 //! One collection holds, per `(key, env)`:
 //!
-//! - blob documents `{_id: "<key>/<env>/blob/<sha256>/<n>", text}`: a state
-//!   file's UTF-8 content in chunks of at most `chunk_bytes`, addressed by
-//!   the content's SHA-256, so an upload is idempotent;
+//! - blob documents `{_id: "<key>/<env>/blob/<sha256>/<chunk_bytes>/<n>",
+//!   text}`: a file's UTF-8 content in chunks of at most `chunk_bytes`,
+//!   addressed by the content's SHA-256 and the chunk size, so an upload is
+//!   idempotent and two stores with different chunk sizes never share an id
+//!   for different bytes;
 //! - one manifest `{_id: "<key>/<env>", rev, files: {"<relpath>": {sha256,
-//!   chunks}}}`, the state as of the last checkpoint.
+//!   chunk_bytes, chunks}}}`, the state as of the last checkpoint. A file
+//!   unchanged since the last manifest keeps that manifest's chunking.
 //!
 //! The files are the env's sync state — `.rdc/state/<env>.lock.json`,
 //! `.rdc/state/<env>.base/**`, `.rdc/conflicts/<env>/**` — and its tree,
@@ -67,6 +70,8 @@ const FIND_BATCH: usize = 8;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct FileRef {
     sha256: String,
+    /// The chunk size the file was split with; part of its blob ids.
+    chunk_bytes: usize,
     chunks: usize,
 }
 
@@ -111,12 +116,12 @@ impl DataStorageStateStore {
         format!("{}/{env}/blob/", self.key)
     }
 
-    fn blob_id(&self, env: &str, sha256: &str, n: usize) -> String {
-        format!("{}{sha256}/{n}", self.blob_prefix(env))
+    fn blob_id(&self, env: &str, f: &FileRef, n: usize) -> String {
+        format!("{}{}/{}/{n}", self.blob_prefix(env), f.sha256, f.chunk_bytes)
     }
 
     fn blob_ids(&self, env: &str, files: &BTreeMap<String, FileRef>) -> BTreeSet<String> {
-        files.values().flat_map(|f| (0..f.chunks).map(|n| self.blob_id(env, &f.sha256, n))).collect()
+        files.values().flat_map(|f| (0..f.chunks).map(|n| self.blob_id(env, f, n))).collect()
     }
 
     fn remember(&self, env: &str, manifest: Option<Manifest>) {
@@ -169,7 +174,7 @@ impl DataStorageStateStore {
         for (rel, f) in files {
             let mut text = String::new();
             for n in 0..f.chunks {
-                let id = self.blob_id(env, &f.sha256, n);
+                let id = self.blob_id(env, f, n);
                 match texts.get(&id) {
                     Some(t) => text.push_str(t),
                     None => return Ok(Err(anyhow!("{rel}: blob {id} is missing"))),
@@ -233,14 +238,23 @@ impl DataStorageStateStore {
     async fn checkpoint_env(&self, paths: &Paths) -> Result<()> {
         let env = paths.env();
         let texts = persisted_texts(paths)?;
+        let known = self.last_known(env);
+        // A file the last manifest already holds with these bytes keeps its
+        // chunking there (and so its blobs); anything else is split with this
+        // store's chunk size.
         let files: BTreeMap<String, FileRef> = texts
             .iter()
             .map(|(rel, text)| {
-                let chunks = chunk(text, self.chunk_bytes).len();
-                (rel.clone(), FileRef { sha256: crate::state::raw_content_hash(text.as_bytes()), chunks })
+                let sha256 = crate::state::raw_content_hash(text.as_bytes());
+                let kept = known.as_ref().and_then(|m| m.files.get(rel)).filter(|f| f.sha256 == sha256).cloned();
+                let f = kept.unwrap_or_else(|| FileRef {
+                    chunks: chunk(text, self.chunk_bytes).len(),
+                    chunk_bytes: self.chunk_bytes,
+                    sha256,
+                });
+                (rel.clone(), f)
             })
             .collect();
-        let known = self.last_known(env);
         match &known {
             Some(m) if m.files == files => return Ok(()),
             None if files.is_empty() => return Ok(()),
@@ -252,9 +266,9 @@ impl DataStorageStateStore {
         let have = known.as_ref().map(|m| self.blob_ids(env, &m.files)).unwrap_or_default();
         let mut uploads: BTreeMap<String, String> = BTreeMap::new();
         for (rel, text) in &texts {
-            let sha = &files[rel].sha256;
-            for (n, part) in chunk(text, self.chunk_bytes).into_iter().enumerate() {
-                let id = self.blob_id(env, sha, n);
+            let f = &files[rel];
+            for (n, part) in chunk(text, f.chunk_bytes).into_iter().enumerate() {
+                let id = self.blob_id(env, f, n);
                 if !have.contains(&id) {
                     uploads.insert(id, part.to_string());
                 }
@@ -587,7 +601,7 @@ mod tests {
     fn manifest(rev: u64, files: &[(&str, &str)]) -> Manifest {
         Manifest {
             rev,
-            files: files.iter().map(|(r, sha)| (r.to_string(), FileRef { sha256: sha.to_string(), chunks: 1 })).collect(),
+            files: files.iter().map(|(r, sha)| (r.to_string(), FileRef { sha256: sha.to_string(), chunk_bytes: 1024, chunks: 1 })).collect(),
         }
     }
 

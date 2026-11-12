@@ -1481,6 +1481,7 @@ pub async fn resolve_push_drift(
     progress: &Arc<crate::log::Log>,
 ) -> Result<PushDriftOutcome> {
     if !interactive {
+        crate::cli::sync::plan::record(obj.kind, obj.slug, crate::cli::sync::plan::SkipReason::PushDriftSkipped);
         return Ok(PushDriftOutcome::Skip);
     }
 
@@ -1512,8 +1513,10 @@ pub async fn resolve_push_drift(
         // the API and the server would reject the marker text. Force a
         // Skip so the local file stays put; the user can re-run with a
         // cleaner resolution.
-        Resolution::EditWithMarkers(_) => Ok(PushDriftOutcome::Skip),
-        Resolution::Skip => Ok(PushDriftOutcome::Skip),
+        Resolution::EditWithMarkers(_) | Resolution::Skip => {
+            crate::cli::sync::plan::record(obj.kind, obj.slug, crate::cli::sync::plan::SkipReason::PushDriftSkipped);
+            Ok(PushDriftOutcome::Skip)
+        }
         Resolution::Abort => Err(anyhow::Error::new(PullAborted)),
         Resolution::KeepLocalAll | Resolution::KeepRemoteAll => {
             unreachable!("bulk *All resolutions are normalized to KeepLocal/KeepRemote before this match")

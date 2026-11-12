@@ -174,6 +174,9 @@ pub async fn confirm_or_refuse(
     if ans == "y" || ans == "yes" {
         Ok(ConfirmOutcome::Proceed)
     } else {
+        for (kind, slug, _) in &rows {
+            crate::cli::sync::plan::record(kind, slug, crate::cli::sync::plan::SkipReason::DeleteGateDeclined);
+        }
         Ok(ConfirmOutcome::Aborted)
     }
 }
@@ -448,10 +451,12 @@ async fn delete_one(
         match resolve_delete_drift(progress, interactive, kind, slug).await? {
             DeleteDriftChoice::KeepDelete => { /* fall through to DELETE */ }
             DeleteDriftChoice::Skip => {
+                crate::cli::sync::plan::record(kind, slug, crate::cli::sync::plan::SkipReason::DeleteDriftSkipped);
                 progress.event(Action::Skip, &format!("{kind}/{slug} (drift)"));
                 return Ok(DeleteOutcome::Skipped);
             }
             DeleteDriftChoice::Restore => {
+                crate::cli::sync::plan::record(kind, slug, crate::cli::sync::plan::SkipReason::DeleteDriftSkipped);
                 progress.event(
                     Action::Skip,
                     &format!("{kind}/{slug} (drift; run `rdc sync` to restore)"),

@@ -299,3 +299,47 @@ async fn a_crashed_runs_journal_is_recovered_at_once() {
         serde_json::from_slice(&store.files()[".rdc/state/main.lock.json"]).unwrap();
     assert!(after.get("pending").is_none(), "the journal is settled: {after}");
 }
+
+/// Fails every checkpoint once `_index.md` exists: only the save after it.
+struct FailsAfterIndex;
+
+impl StateStore for FailsAfterIndex {
+    fn hydrate<'a>(&'a self, _: &'a Paths) -> rdc::rt::BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn checkpoint<'a>(&'a self, paths: &'a Paths) -> rdc::rt::BoxFuture<'a, anyhow::Result<()>> {
+        let indexed = rdc::vfs::exists(paths.env_root().join("_index.md"));
+        Box::pin(async move { if indexed { anyhow::bail!("refused by the test") } else { Ok(()) } })
+    }
+}
+
+#[derive(Clone, Default)]
+struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+impl std::io::Write for Buf {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The save after `_index.md` only makes a derived file durable: the commit
+/// before it already saved the state and the tree. Its failure is a warning,
+/// not a failed sync.
+#[tokio::test]
+async fn a_failed_save_after_the_index_only_warns() {
+    let server = MockServer::start().await;
+    mount_empty_org(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("project");
+    let store = project(&server, &root, &[]);
+    let log = Buf::default();
+    let opts = EmbedSyncOptions { interactive: false, no_push: true, ..Default::default() };
+    sync_logged_in_with_state(store.clone() as Arc<dyn Store>, Arc::new(FailsAfterIndex), &root, "main", "fake-token", opts, Box::new(log.clone()))
+        .await
+        .expect("the sync is done");
+    let out = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    assert!(out.contains("_index.md") && out.contains("refused by the test"), "{out}");
+}

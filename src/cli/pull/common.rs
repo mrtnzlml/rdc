@@ -1010,6 +1010,7 @@ async fn resolve_conflict_interactive(
             }
         }
         Resolution::Skip => {
+            crate::cli::sync::plan::record(obj.kind, obj.slug, crate::cli::sync::plan::SkipReason::ConflictSkipped);
             shadow_file_conflict(local_path, remote_bytes, progress, paths, base_hash, mode)
         }
         Resolution::Abort => Err(anyhow::Error::new(PullAborted)),

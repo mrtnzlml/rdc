@@ -117,7 +117,9 @@ bridge's DTOs in camelCase. Differences from the desktop app:
   whatever its name. Every file must be UTF-8.
   - **When it is saved**: when a run starts (not under `dryRun`), after every
     lockfile write of a sync (before and after each create, and at its end),
-    and after a `migrate` (not under `dryRun`). Each save is one
+    after `_index.md` (a failure there is a warning: the save before it
+    already holds the state and the tree), and after a `migrate` (not under
+    `dryRun`). Each save is one
     compare-and-swap, so the state and the tree in Data Storage are always
     from the same moment; a save another tab or device got in first fails
     the run with `the state of env '<env>' was changed by another run`.
@@ -146,12 +148,46 @@ bridge's DTOs in camelCase. Differences from the desktop app:
   state on, it loads both envs' state first, holds the target org's Web Lock,
   and saves the target after (not under `dryRun`). `onLog` gets the CLI's
   output. The result is the plan: every file considered (`files`, with
-  `source` and `target` keys and `"create"` / `"update"` / `"unchanged"`),
-  every target object (`objects`, by target slug, with what the next `sync`
-  of the target does: `"create"` / `"update"` / `"unchanged"` / `"delete"`),
-  the `pruned` files and `prunedDirs`, the `skipped` email templates, the
-  `warnings` it logged, and their counts. A refusal (recreate guard, a
+  `source` and `target` keys, `"create"` / `"update"` / `"unchanged"`, and
+  the `kind` and `slug` of the target object it belongs to — the same
+  identity a `sync`'s `plan` and `skipped` use, so a file the host edits maps
+  to what a later sync reports; sidecars (`.py`, `.js`, `formulas/*.py`)
+  name their hook, rule or schema, every file of `mdh/<slug>/` names
+  `mdh`/`<slug>`, a workflow step `workflow_steps`/`<workflow>/<step>`;
+  `null` for a file of no object),
+  every target object (`objects`, by target slug, with what this run did to
+  its files in the target tree: `"create"` = the tree had no file for it,
+  `"update"` = its files changed, `"unchanged"`, `"delete"` = `mirror`
+  removed it). This is the tree, not the env: what the next `sync` sends
+  also depends on the target's lockfile and the org (an object deleted
+  locally but still on the env shows as `"create"`, and the sync does not
+  create it again),
+  the `pruned` files (each `{ target, kind, slug }`, the same identity as a
+  file's) and `prunedDirs`, the `skipped` email templates, the
+  `warnings` it logged, and their counts. `mirror` never prunes a folder of
+  a collection rdc skips (`__*`, `_SA_EXTENSION__*`, the state collection).
+  A `dryRun` saves nothing, but its loading of the two envs is a run like
+  any other: in a new `Project` it is the envs' first run, so `envs/<env>/`
+  becomes the saved tree there, as described above. A refusal (recreate guard, a
   dangling overlay key, an unresolvable saved-view ref) rejects with rdc's
   message. Then `sync(tgt, ...)` pushes it.
+- **`CycleOutcome.plan`**: a `sync` with `dryRun` returns what it would do as
+  data, besides the log: `items` (one per object, in the log's order:
+  `kind`, `slug`, `direction` `"push"` / `"pull"` / `"both"` for a conflict,
+  `change` `"create"` / `"update"` / `"delete"` / `"conflict"`, `prompt` —
+  `"deleteGate"`, `"conflict"` or `"remoteDelete"` when an interactive run
+  would ask, `null` when `allowDeletes` or `conflict` waives it — and the log
+  row's `note`; MDH datasets have kind `"mdh"` and no prompt), `recovered`
+  (creates a crashed run left, which the dry run's recovery found: `id` to
+  adopt, or `null`), and `problems` (every line of the dry run's blocks:
+  parse errors, field limits, ...). Any other run returns `plan: null`.
+  Recovery itself is not predicted: a dry run runs it, and an ambiguous one
+  asks then (`recoverCreate`).
+- **`CycleOutcome.skipped`**: what the cycle did not write, and why: one
+  `{ kind, slug, reason }` per object, `reason` one of
+  `"deleteGateDeclined"`, `"deleteDriftSkipped"`, `"pushDriftSkipped"`,
+  `"conflictSkipped"`, `"remoteDeleteSkipped"`, `"mdhIndexDropDeclined"`,
+  `"mdhRowDeleteDeclined"`. An unanswered prompt counts as declined. Empty
+  for a dry run.
 - **Watch** has no file watcher. It polls on `pollSecs`, and `trigger()` runs a
   cycle as a local file change would; call it after `writeFile`.

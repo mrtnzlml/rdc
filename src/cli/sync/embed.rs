@@ -306,7 +306,7 @@ pub(crate) fn watch_logged_config<'a>(
 // ------------------------------------------------------------ migrate
 
 pub use crate::cli::migrate::{
-    Carry, CarryGroup, FileOutcome, MigrateReport, MigratedFile, MigratedObject, MirrorMode, ObjectChange,
+    Carry, CarryGroup, FileOutcome, MigrateReport, MigratedFile, MigratedObject, MirrorMode, ObjectChange, PrunedFile,
 };
 
 /// How an embedder wants one `rdc migrate` run: its flags.

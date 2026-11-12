@@ -494,3 +494,7 @@ mod state_store;
 mod browser_migrate;
 #[cfg(test)]
 mod extension_collections;
+#[cfg(test)]
+mod sync_plan;
+#[cfg(test)]
+mod migrate_identity;

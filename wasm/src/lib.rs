@@ -194,7 +194,7 @@ impl From<SyncOptions> for embed::EmbedSyncOptions {
 }
 
 /// One cycle's result: the core's counts, plus the desktop `Done` phase's
-/// file count.
+/// file count, a dry run's plan and what the cycle did not write.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CycleOutcome {
@@ -203,6 +203,135 @@ pub struct CycleOutcome {
     pub conflicts: usize,
     pub remote_deletes_resolved: usize,
     pub file_count: u64,
+    /// Set only by a dry run.
+    pub plan: Option<SyncPlan>,
+    pub skipped: Vec<SkippedItem>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PlanDirection {
+    Push,
+    Pull,
+    Both,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PlanChange {
+    Create,
+    Update,
+    Delete,
+    Conflict,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PlanPrompt {
+    DeleteGate,
+    Conflict,
+    RemoteDelete,
+}
+
+/// One row of a dry run's plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PlanItem {
+    pub kind: String,
+    pub slug: String,
+    pub direction: PlanDirection,
+    pub change: PlanChange,
+    pub prompt: Option<PlanPrompt>,
+    pub note: Option<String>,
+}
+
+/// A crashed run's create the dry run's recovery settled: `id` to adopt, or
+/// `null` when it made nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PlanRecovery {
+    pub kind: String,
+    pub slug: String,
+    pub id: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SyncPlan {
+    pub items: Vec<PlanItem>,
+    pub recovered: Vec<PlanRecovery>,
+    pub problems: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SkipReason {
+    DeleteGateDeclined,
+    DeleteDriftSkipped,
+    PushDriftSkipped,
+    ConflictSkipped,
+    RemoteDeleteSkipped,
+    MdhIndexDropDeclined,
+    MdhRowDeleteDeclined,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SkippedItem {
+    pub kind: String,
+    pub slug: String,
+    pub reason: SkipReason,
+}
+
+// No catch-all arms below, as for `kind_of`: a new core variant must fail to
+// compile here rather than reach the host mislabelled.
+impl From<rdc::cli::sync::plan::SyncPlan> for SyncPlan {
+    fn from(p: rdc::cli::sync::plan::SyncPlan) -> Self {
+        use rdc::cli::sync::plan as core;
+        let items = p
+            .items
+            .into_iter()
+            .map(|i| PlanItem {
+                kind: i.kind,
+                slug: i.slug,
+                direction: match i.direction {
+                    core::PlanDirection::Push => PlanDirection::Push,
+                    core::PlanDirection::Pull => PlanDirection::Pull,
+                    core::PlanDirection::Both => PlanDirection::Both,
+                },
+                change: match i.change {
+                    core::PlanChange::Create => PlanChange::Create,
+                    core::PlanChange::Update => PlanChange::Update,
+                    core::PlanChange::Delete => PlanChange::Delete,
+                    core::PlanChange::Conflict => PlanChange::Conflict,
+                },
+                prompt: i.prompt.map(|p| match p {
+                    core::PlanPrompt::DeleteGate => PlanPrompt::DeleteGate,
+                    core::PlanPrompt::Conflict => PlanPrompt::Conflict,
+                    core::PlanPrompt::RemoteDelete => PlanPrompt::RemoteDelete,
+                }),
+                note: i.note,
+            })
+            .collect();
+        let recovered =
+            p.recovered.into_iter().map(|r| PlanRecovery { kind: r.kind, slug: r.slug, id: r.id }).collect();
+        Self { items, recovered, problems: p.problems }
+    }
+}
+
+impl From<rdc::cli::sync::plan::SkippedItem> for SkippedItem {
+    fn from(i: rdc::cli::sync::plan::SkippedItem) -> Self {
+        use rdc::cli::sync::plan::SkipReason as R;
+        Self {
+            kind: i.kind,
+            slug: i.slug,
+            reason: match i.reason {
+                R::DeleteGateDeclined => SkipReason::DeleteGateDeclined,
+                R::DeleteDriftSkipped => SkipReason::DeleteDriftSkipped,
+                R::PushDriftSkipped => SkipReason::PushDriftSkipped,
+                R::ConflictSkipped => SkipReason::ConflictSkipped,
+                R::RemoteDeleteSkipped => SkipReason::RemoteDeleteSkipped,
+                R::MdhIndexDropDeclined => SkipReason::MdhIndexDropDeclined,
+                R::MdhRowDeleteDeclined => SkipReason::MdhRowDeleteDeclined,
+            },
+        }
+    }
 }
 
 /// A `--carry` group.
@@ -287,21 +416,36 @@ pub enum ObjectChange {
     Delete,
 }
 
-/// One file a migrate considered, by project key.
+/// One file a migrate considered, by project key, and the target object it
+/// belongs to (`kind`/`slug` as the sync plan and `skipped` name it; `null`
+/// for a file of no object).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MigrateFile {
     pub source: String,
     pub target: String,
     pub change: FileChange,
+    pub kind: Option<String>,
+    pub slug: Option<String>,
 }
 
-/// One target object, by its target slug, and what the next `sync` of the
-/// target does with it.
+/// One target object, by its target slug, and what this run did to its
+/// files in the target tree (`cli::migrate::ObjectChange`): `create` = the
+/// tree had no file for it, `update` = its files changed, `unchanged`,
+/// `delete` = `mirror` removed it. Not what the next `sync` sends.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MigrateObject {
     pub kind: String,
     pub slug: String,
     pub change: ObjectChange,
+}
+
+/// A target file `mirror` pruned, by project key, and the object it belonged
+/// to, as [`MigrateFile`] names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MigratePruned {
+    pub target: String,
+    pub kind: Option<String>,
+    pub slug: Option<String>,
 }
 
 /// What a migrate changed, or under `dryRun` would change. Paths are
@@ -314,7 +458,7 @@ pub struct MigrateResult {
     pub target: String,
     pub files: Vec<MigrateFile>,
     pub objects: Vec<MigrateObject>,
-    pub pruned: Vec<String>,
+    pub pruned: Vec<MigratePruned>,
     pub pruned_dirs: Vec<String>,
     pub skipped: Vec<String>,
     pub warnings: Vec<String>,
@@ -364,6 +508,8 @@ impl MigrateResult {
                         embed::FileOutcome::Updated => FileChange::Update,
                         embed::FileOutcome::Unchanged => FileChange::Unchanged,
                     },
+                    kind: f.object.as_ref().map(|(k, _)| k.clone()),
+                    slug: f.object.as_ref().map(|(_, s)| s.clone()),
                 })
                 .collect(),
             creates: count(ObjectChange::Create),
@@ -371,7 +517,15 @@ impl MigrateResult {
             unchanged: count(ObjectChange::Unchanged),
             deletes: count(ObjectChange::Delete),
             objects,
-            pruned: r.pruned.iter().map(|p| env_key(tgt, p)).collect(),
+            pruned: r
+                .pruned
+                .iter()
+                .map(|p| MigratePruned {
+                    target: env_key(tgt, &p.target),
+                    kind: p.object.as_ref().map(|(k, _)| k.clone()),
+                    slug: p.object.as_ref().map(|(_, s)| s.clone()),
+                })
+                .collect(),
             pruned_dirs: r.pruned_dirs.iter().map(|p| env_key(tgt, p)).collect(),
             skipped: r.skipped.iter().map(|p| env_key(src, p)).collect(),
             warnings: r.warnings,
@@ -1007,6 +1161,8 @@ impl ProjectCore {
             conflicts: o.conflicts,
             remote_deletes_resolved: o.remote_deletes_resolved,
             file_count,
+            plan: o.plan.map(Into::into),
+            skipped: o.skipped.into_iter().map(Into::into).collect(),
         })
     }
 
@@ -1383,6 +1539,67 @@ mod state_tests {
             .await;
     }
 
+    /// The org endpoints of [`mount_world`] over a Data Storage that keeps
+    /// what it is sent: manifests and blobs are found again, and a stale
+    /// compare-and-swap matches nothing. The collections are returned.
+    async fn mount_world_with_storage(server: &MockServer) -> Arc<Mutex<BTreeMap<String, Vec<serde_json::Value>>>> {
+        use serde_json::{Value, json};
+        let store: Arc<Mutex<BTreeMap<String, Vec<Value>>>> = Arc::default();
+        let ok = |result: Value| ResponseTemplate::new(200).set_body_json(json!({ "code": "ok", "message": "", "result": result }));
+        // Top-level equality, or `{"$in": [...]}`.
+        fn matches(doc: &Value, filter: &Value) -> bool {
+            filter.as_object().is_some_and(|f| {
+                f.iter().all(|(k, want)| match want.get("$in").and_then(Value::as_array) {
+                    Some(any) => any.contains(&doc[k]),
+                    None => &doc[k] == want,
+                })
+            })
+        }
+        let db = store.clone();
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::path_regex(format!("^{DS}/data/")))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&req.body).unwrap();
+                let name = body["collectionName"].as_str().unwrap().to_string();
+                let mut db = db.lock().unwrap();
+                let docs = db.entry(name).or_default();
+                match req.url.path().rsplit('/').next().unwrap() {
+                    "find" => ok(Value::Array(docs.iter().filter(|d| matches(d, &body["query"])).cloned().collect())),
+                    "insert_many" => {
+                        let new = body["documents"].as_array().unwrap();
+                        if new.iter().any(|n| docs.iter().any(|d| d["_id"] == n["_id"])) {
+                            return ResponseTemplate::new(400).set_body_json(json!({ "code": "error", "message": "duplicate key" }));
+                        }
+                        docs.extend(new.iter().cloned());
+                        ok(Value::Null)
+                    }
+                    "replace_one" => {
+                        let mut doc = body["replacement"].clone();
+                        if let Some(i) = docs.iter().position(|d| matches(d, &body["filter"])) {
+                            doc["_id"] = docs[i]["_id"].clone();
+                            docs[i] = doc;
+                            ok(json!({ "matched_count": 1, "modified_count": 1, "upserted_id": null }))
+                        } else if body["options"]["upsert"] == true {
+                            doc["_id"] = body["filter"]["_id"].clone();
+                            docs.push(doc);
+                            ok(json!({ "matched_count": 0, "modified_count": 0, "upserted_id": body["filter"]["_id"] }))
+                        } else {
+                            ok(json!({ "matched_count": 0, "modified_count": 0, "upserted_id": null }))
+                        }
+                    }
+                    "delete_many" => {
+                        docs.retain(|d| !matches(d, &body["filter"]));
+                        ok(json!({ "deleted_count": 0 }))
+                    }
+                    other => panic!("unexpected Data Storage call {other}"),
+                }
+            })
+            .mount(server)
+            .await;
+        mount_world(server, None).await;
+        store
+    }
+
     fn token_env(server: &MockServer) -> EnvInput {
         EnvInput {
             name: "dev".into(),
@@ -1503,10 +1720,15 @@ mod state_tests {
             vec![("labels", "a", ObjectChange::Create), ("labels", "b", ObjectChange::Create), ("labels", "c", ObjectChange::Delete)]
         );
         assert_eq!((r.creates, r.updates, r.deletes), (2, 0, 1));
-        assert_eq!(r.pruned, vec!["envs/prod/labels/c.json"]);
+        assert_eq!(
+            serde_json::to_value(&r.pruned).unwrap(),
+            serde_json::json!([{ "target": "envs/prod/labels/c.json", "kind": "labels", "slug": "c" }])
+        );
         assert!(r.files.iter().any(|f| f.source == "envs/dev/labels/a.json"
             && f.target == "envs/prod/labels/a.json"
             && f.change == FileChange::Create));
+        let a = serde_json::to_value(r.files.iter().find(|f| f.target == "envs/prod/labels/a.json").unwrap()).unwrap();
+        assert_eq!((&a["kind"], &a["slug"]), (&serde_json::json!("labels"), &serde_json::json!("a")));
         let files = p.files();
         assert!(files.contains_key("envs/prod/labels/a.json") && !files.contains_key("envs/prod/labels/c.json"));
         assert!(lines.iter().any(|l| l.contains("migrated envs/dev -> envs/prod")), "{lines:?}");
@@ -1587,6 +1809,94 @@ mod state_tests {
         let r = migrate(&p, MigrateOptions { only: vec!["labels/b".into()], ..MigrateOptions::default() }).await.0.unwrap();
         assert_eq!(r.objects.iter().map(|o| o.slug.as_str()).collect::<Vec<_>>(), vec!["b"]);
         assert!(!p.files().contains_key("envs/prod/labels/a.json"));
+    }
+
+    /// The project keeps one store per env, so its second sync knows the
+    /// manifest its first one saved and keeps the host's edit made between
+    /// them. A store per call would see a "first" hydrate and put the saved
+    /// tree back over the edit.
+    #[tokio::test]
+    async fn a_projects_second_sync_keeps_the_hosts_edit() {
+        let server = MockServer::start().await;
+        let db = mount_world_with_storage(&server).await;
+        let p = project_on(&server, &MemLocks::default());
+        p.use_data_storage_state(ds_state("acme-key")).unwrap();
+        sync(&p, "dev").await.expect("loading dev");
+        assert!(db.lock().unwrap()["__rdc_state"].iter().any(|d| d["_id"] == "acme-key/dev"), "a manifest was saved");
+
+        p.write_file("envs/dev/overlay.toml", b"version = 1\n# the host's edit\n").unwrap();
+        p.write_file("envs/dev/labels/new.json", b"{}\n").unwrap();
+        sync(&p, "dev").await.expect("the second sync");
+        let files = p.files();
+        assert_eq!(files["envs/dev/overlay.toml"], b"version = 1\n# the host's edit\n");
+        assert!(files.contains_key("envs/dev/labels/new.json"));
+
+        // A new project (a reopened tab) gets the edit back from Data Storage.
+        let reopened = ProjectCore::open(files.into_iter().filter(|(k, _)| k == "rdc.toml" || k.starts_with("secrets/")))
+            .unwrap()
+            .with_locks(Arc::new(MemLocks::default()));
+        reopened.use_data_storage_state(ds_state("acme-key")).unwrap();
+        sync(&reopened, "dev").await.expect("the reopened tab's sync");
+        assert_eq!(reopened.files()["envs/dev/overlay.toml"], b"version = 1\n# the host's edit\n");
+    }
+
+    /// A dry-run migrate saves nothing, but in a new project its loading of
+    /// the envs is a first hydrate: the tree's `envs/<env>/` becomes the
+    /// saved one, as for any first run.
+    #[tokio::test]
+    async fn a_dry_run_migrate_in_a_new_project_loads_the_saved_trees() {
+        let server = MockServer::start().await;
+        let db = mount_world_with_storage(&server).await;
+        let first = two_envs(&server, &MemLocks::default()).await;
+        first.use_data_storage_state(ds_state("acme-key")).unwrap();
+        sync(&first, "dev").await.unwrap();
+        sync(&first, "prod").await.unwrap();
+        let saved = db.lock().unwrap().clone();
+
+        let mut files = first.files();
+        files.insert("envs/prod/labels/stray.json".into(), b"{}\n".to_vec());
+        files.insert("envs/prod/labels/c.json".into(), b"{\"name\": \"edited before loading\"}\n".to_vec());
+        let reopened = ProjectCore::open(files).unwrap().with_locks(Arc::new(MemLocks::default()));
+        reopened.use_data_storage_state(ds_state("acme-key")).unwrap();
+        let r = migrate(&reopened, MigrateOptions { dry_run: true, ..MigrateOptions::default() }).await.0.unwrap();
+        assert!(r.dry_run);
+        let after = reopened.files();
+        assert!(!after.contains_key("envs/prod/labels/stray.json"), "a file the saved tree lacks is removed");
+        assert_eq!(after["envs/prod/labels/c.json"], first.files()["envs/prod/labels/c.json"], "the saved version is back");
+        assert_eq!(*db.lock().unwrap(), saved, "nothing was saved");
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_sync_returns_its_plan_as_camel_case() {
+        let server = MockServer::start().await;
+        mount_world(&server, None).await;
+        let p = two_envs(&server, &MemLocks::default()).await;
+        let opts = SyncOptions { interactive: false, dry_run: true, ..SyncOptions::default() };
+        let o = p.clone().sync("dev".into(), opts, Box::new(std::io::sink()), quiet_route()).await.unwrap();
+        let v = serde_json::to_value(&o).unwrap();
+        let items = v["plan"]["items"].as_array().expect("a plan");
+        assert!(
+            items.contains(&serde_json::json!({
+                "kind": "labels", "slug": "a", "direction": "push", "change": "create", "prompt": null, "note": null
+            })),
+            "{v}"
+        );
+        assert_eq!(v["plan"]["recovered"], serde_json::json!([]));
+        assert_eq!(v["skipped"], serde_json::json!([]));
+        let plain = p.clone().sync("dev".into(), SyncOptions { interactive: false, no_push: true, ..SyncOptions::default() },
+            Box::new(std::io::sink()), quiet_route()).await.unwrap();
+        assert!(plain.plan.is_none());
+        let names: Vec<String> = [
+            rdc::cli::sync::plan::SkipReason::DeleteGateDeclined,
+            rdc::cli::sync::plan::SkipReason::MdhRowDeleteDeclined,
+        ]
+        .into_iter()
+        .map(|r| {
+            let item: SkippedItem = rdc::cli::sync::plan::SkippedItem { kind: "k".into(), slug: "s".into(), reason: r }.into();
+            serde_json::to_value(item).unwrap()["reason"].as_str().unwrap().to_string()
+        })
+        .collect();
+        assert_eq!(names, vec!["deleteGateDeclined", "mdhRowDeleteDeclined"]);
     }
 
     #[test]

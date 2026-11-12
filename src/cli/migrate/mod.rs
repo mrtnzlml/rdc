@@ -3167,16 +3167,20 @@ impl Notes {
     }
 }
 
-/// What a target object becomes: the per-object tally the summary counts, plus a prune.
+/// What this run did to a target object's files: the per-object tally the
+/// summary counts, plus a prune. It describes the target TREE, not the env:
+/// what the next `sync` sends depends on the target's lockfile and the org
+/// too (an object whose file was deleted locally but is still recorded is
+/// `Create` here, and the sync PATCHes or leaves it).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ObjectChange {
-    /// `sync` will POST it.
+    /// The target tree had no primary file for it before this run.
     Create,
-    /// `sync` will PATCH it.
+    /// It had one, and at least one of its files changed.
     Update,
-    /// `sync` has nothing to do for it.
+    /// Every one of its files was already byte-identical.
     Unchanged,
-    /// `--mirror` pruned its primary file: `sync` will offer to delete it.
+    /// `--mirror` removed its primary file from the target tree.
     Delete,
 }
 
@@ -3186,6 +3190,45 @@ pub struct MigratedFile {
     pub source: PathBuf,
     pub target: PathBuf,
     pub change: FileOutcome,
+    /// The target object the file belongs to, as [`sync_identity`] names it;
+    /// `None` for a file of no object.
+    pub object: Option<(String, String)>,
+}
+
+/// The object a target file belongs to, by the identity the sync plan and
+/// its skipped items use: the lockfile's `(kind, slug)`, with `"mdh"` for a
+/// dataset. The flag says whether the file is the object's primary one (its
+/// absence makes the object new). Wider than the object tally whose
+/// workflow tally the CLI's summary line keeps: a workflow step is an object
+/// of its own here, as it is to sync.
+pub fn sync_identity(rel: &Path) -> Option<(&'static str, String, bool)> {
+    let comps = comps_of(rel);
+    let leaf = comps.last()?;
+    match comps.first().map(String::as_str) {
+        Some("workflows") if comps.len() == 3 && leaf == "workflow.json" => {
+            return Some(("workflows", comps[1].clone(), true));
+        }
+        Some("workflows") if comps.len() == 4 && comps[2] == "steps" => {
+            return leaf
+                .strip_suffix(".json")
+                .map(|step| ("workflow_steps", format!("{}/{step}", comps[1]), true));
+        }
+        Some("workflows") => return None,
+        Some("mdh") if comps.len() >= 3 => return Some(("mdh", comps[1].clone(), leaf == "indexes.json")),
+        _ => {}
+    }
+    if let Some((kind, slug)) = classify(rel) {
+        return Some((kind, slug, true));
+    }
+    classify_for_selection(rel).map(|(kind, slug)| (kind, slug, false))
+}
+
+/// One target file `--mirror` pruned. The path is relative to the target
+/// env root; `object` as in [`MigratedFile`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PrunedFile {
+    pub target: PathBuf,
+    pub object: Option<(String, String)>,
 }
 
 /// One target object a migrate touched, by its target slug.
@@ -3206,8 +3249,8 @@ pub struct MigrateReport {
     pub files: Vec<MigratedFile>,
     /// Sorted by `(kind, slug)`.
     pub objects: Vec<MigratedObject>,
-    /// Target files pruned by `--mirror`.
-    pub pruned: Vec<PathBuf>,
+    /// Target files pruned by `--mirror`, with their objects.
+    pub pruned: Vec<PrunedFile>,
     /// Target directories `--mirror` emptied and removed.
     pub pruned_dirs: Vec<PathBuf>,
     /// Source files left out: un-creatable duplicate unique email templates.
@@ -3482,11 +3525,16 @@ pub fn run_at_logged(
     // remapped, subtracted from the target tree, and every path the write loop
     // adds to that tree is by construction one the migration produces — which
     // is exactly what `mirror_prune_paths` filters out.
-    let prune_plan: Vec<PathBuf> = if mirror {
+    let mut prune_plan: Vec<PathBuf> = if mirror {
         mirror_prune_paths(&src_root, src, &tgt_root, tgt, &mapping, &unique_tpl_skips)?
     } else {
         Vec::new()
     };
+    // Nor is a target folder mirroring such a collection pruned: no sync would
+    // delete it on the env, so the plan must not say one does.
+    for slug in state_datasets(&tgt_root) {
+        prune_plan.retain(|rel| comps_of(rel).get(..2) != Some(&["mdh".to_string(), slug.clone()][..]));
+    }
     if mirror && !mirror_mode.allows_recreate() {
         let produced = produced_paths(&src_root, src, &mapping, &unique_tpl_skips)?;
         let pairs = recreate_pairs(
@@ -3511,6 +3559,9 @@ pub fn run_at_logged(
     let mut written = 0usize;
     let mut renamed = 0usize;
     let mut obj_status: BTreeMap<(&'static str, String), ObjStatus> = BTreeMap::new();
+    // The report's tally, by the sync identity (see `sync_identity`); the CLI's
+    // summary line keeps `obj_status`.
+    let mut report_status: BTreeMap<(&'static str, String), ObjStatus> = BTreeMap::new();
     let mut id_hits: Vec<(String, u64, u64)> = Vec::new();
     let mut carried_prefixes: Vec<(String, String)> = Vec::new();
     let mut missing_schema_ids: Vec<String> = Vec::new();
@@ -3629,7 +3680,23 @@ pub fn run_at_logged(
         if outcome != FileOutcome::Unchanged {
             written += 1;
         }
-        report.files.push(MigratedFile { source: rel.clone(), target: dst_rel.clone(), change: outcome });
+        let identity = sync_identity(&dst_rel);
+        report.files.push(MigratedFile {
+            source: rel.clone(),
+            target: dst_rel.clone(),
+            change: outcome,
+            object: identity.as_ref().map(|(k, s, _)| (k.to_string(), s.clone())),
+        });
+        if let Some((kind, slug, primary)) = identity {
+            let slot = report_status.entry((kind, slug)).or_insert(ObjStatus::Unchanged);
+            if *slot != ObjStatus::Created {
+                *slot = match (primary, outcome) {
+                    (true, FileOutcome::Created) => ObjStatus::Created,
+                    (_, FileOutcome::Unchanged) => *slot,
+                    _ => ObjStatus::Updated,
+                };
+            }
+        }
         // Report the id rewrites this file needed. Silent remapping would be the
         // very thing that made the original bug invisible, so each one is named.
         if id_hits.len() > hits_before {
@@ -3697,7 +3764,7 @@ pub fn run_at_logged(
         pruned_rels = prune.clone();
         for rel in &prune {
             pruned += 1;
-            if let Some((kind, slug)) = classify(rel).or_else(|| classify_managed_primary(rel)) {
+            if let Some((kind, slug, true)) = sync_identity(rel) {
                 report.objects.push(MigratedObject { kind: kind.to_string(), slug, change: ObjectChange::Delete });
             }
             if dry_run {
@@ -3836,10 +3903,16 @@ pub fn run_at_logged(
         }
     }
 
-    report.pruned = pruned_rels.clone();
+    report.pruned = pruned_rels
+        .iter()
+        .map(|rel| PrunedFile {
+            target: rel.clone(),
+            object: sync_identity(rel).map(|(k, s, _)| (k.to_string(), s)),
+        })
+        .collect();
     report.files_changed = written;
     report.renamed = renamed;
-    report.objects.extend(obj_status.iter().map(|((kind, slug), status)| MigratedObject {
+    report.objects.extend(report_status.iter().map(|((kind, slug), status)| MigratedObject {
         kind: kind.to_string(),
         slug: slug.clone(),
         change: match status {
@@ -7437,7 +7510,10 @@ If they are unrelated, run it again with --allow-recreate."
                 ("labels".into(), "c".into(), ObjectChange::Delete),
             ]
         );
-        assert_eq!(report.pruned, vec![PathBuf::from("labels/c.json")]);
+        assert_eq!(
+            report.pruned,
+            vec![PrunedFile { target: PathBuf::from("labels/c.json"), object: Some(("labels".into(), "c".into())) }]
+        );
         assert_eq!((report.files_changed, report.renamed), (2, 0));
         assert!(!root.join("envs/prod/labels/c.json").exists(), "the prune happened");
 
@@ -7520,5 +7596,45 @@ If they are unrelated, run it again with --allow-recreate."
         run_at_logged(&root, "dev", "prod", MirrorMode::Additive, false, vec![], Carry::NONE, quiet()).unwrap();
         assert!(target.exists());
         assert!(!extension.exists(), "the CLI skips the extension's dataset too");
+    }
+
+    /// `--mirror` never prunes a target folder mirroring a skipped
+    /// collection: sync would never delete it on the env, so the plan must
+    /// not say it does.
+    #[test]
+    fn a_mirror_leaves_a_target_folder_of_a_skipped_collection_alone() {
+        let project = report_project();
+        let root = project.path();
+        let dir = root.join("envs/prod/mdh/sa-extension-rdc-state");
+        write_snapshot_json(&dir.join("collection.json"), &serde_json::json!({ "name": "_SA_EXTENSION__rdc_state" }));
+        write_snapshot_json(&dir.join("indexes.json"), &serde_json::json!({ "regular": [], "search": [] }));
+        let mirror = MirrorMode::Mirror { allow_recreate: false };
+        let r = run_at_logged(root, "dev", "prod", mirror, false, vec![], Carry::NONE, quiet()).unwrap();
+        assert!(r.objects.iter().all(|o| o.kind != "mdh"), "{:?}", r.objects);
+        assert!(r.pruned.iter().all(|p| !p.target.starts_with("mdh")), "{:?}", r.pruned);
+        assert!(dir.join("indexes.json").exists() && dir.join("collection.json").exists());
+    }
+
+    #[test]
+    fn sync_identity_names_every_file_by_its_object() {
+        let id = |p: &str| sync_identity(Path::new(p)).map(|(k, s, primary)| (k.to_string(), s, primary));
+        let some = |k: &str, s: &str, p: bool| Some((k.to_string(), s.to_string(), p));
+        assert_eq!(id("hooks/a.json"), some("hooks", "a", true));
+        assert_eq!(id("hooks/a.py"), some("hooks", "a", false));
+        assert_eq!(id("hooks/a.js"), some("hooks", "a", false));
+        assert_eq!(id("rules/r.py"), some("rules", "r", false));
+        assert_eq!(id("workspaces/w/queues/q/formulas/total.py"), some("schemas", "q", false));
+        assert_eq!(id("workspaces/w/queues/q/schema.json"), some("schemas", "q", true));
+        assert_eq!(id("workspaces/w/queues/q/email-templates/t.json"), some("email_templates", "w/q/t", true));
+        assert_eq!(id("engines/e/fields/f.json"), some("engine_fields", "e/f", true));
+        assert_eq!(id("mdh/v/indexes.json"), some("mdh", "v", true));
+        assert_eq!(id("mdh/v/data.jsonl"), some("mdh", "v", false));
+        assert_eq!(id("mdh/v/collection.json"), some("mdh", "v", false));
+        assert_eq!(id("workflows/w/workflow.json"), some("workflows", "w", true));
+        assert_eq!(id("workflows/w/steps/s.json"), some("workflow_steps", "w/s", true));
+        assert_eq!(id("organization.json"), some("organization", "self", true));
+        for none in ["overlay.toml", "_index.md", "workflows/w/notes.md", "README.md"] {
+            assert_eq!(id(none), None, "{none}");
+        }
     }
 }

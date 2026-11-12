@@ -1506,6 +1506,7 @@ async fn resolve_one_conflict<R: LineSource>(
     if matches!(conflict_strategy, Some(ConflictStrategy::Skip))
         || (conflict_strategy.is_none() && !interactive)
     {
+        crate::cli::sync::plan::record(&it.kind, &it.slug, crate::cli::sync::plan::SkipReason::ConflictSkipped);
         // Non-TTY/--yes: fall back to legacy shadow-file behavior so the
         // run still completes without blocking on stdin. The local file
         // stays as-is and the lockfile is pinned to the prior base —
@@ -1937,6 +1938,7 @@ async fn resolve_one_conflict<R: LineSource>(
             );
         }
         Resolution::Skip => {
+            crate::cli::sync::plan::record(&it.kind, &it.slug, crate::cli::sync::plan::SkipReason::ConflictSkipped);
             // Shadow-file fallback. Park the remote side of every
             // divergent half under `.rdc/conflicts/<env>/` (mirroring
             // each anchor's env-tree relpath), keep local on disk, pin
@@ -2449,6 +2451,7 @@ async fn prune_mdh_orphans<R: LineSource>(
 
         // Non-tty: defer with a marker, never silently delete local files.
         if !interactive {
+            crate::cli::sync::plan::record("mdh", &slug, crate::cli::sync::plan::SkipReason::RemoteDeleteSkipped);
             let marker = deleted_marker_path(ctx.paths, &indexes_path);
             write_atomic(&marker, b"")?;
             progress.event(
@@ -2500,6 +2503,7 @@ async fn prune_mdh_orphans<R: LineSource>(
                 );
             }
             Resolution::Skip => {
+                crate::cli::sync::plan::record("mdh", &slug, crate::cli::sync::plan::SkipReason::RemoteDeleteSkipped);
                 let marker = deleted_marker_path(ctx.paths, &indexes_path);
                 write_atomic(&marker, b"")?;
                 progress.event(
@@ -3357,6 +3361,7 @@ async fn resolve_remote_deletes_projected<R: LineSource>(
                         }
                     }
                     Resolution::Skip => {
+                        crate::cli::sync::plan::record(&it.kind, &it.slug, crate::cli::sync::plan::SkipReason::RemoteDeleteSkipped);
                         if no_pull {
                             for path in &restored {
                                 let _ = crate::vfs::remove_file(path);

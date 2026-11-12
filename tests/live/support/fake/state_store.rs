@@ -322,11 +322,11 @@ async fn crash_between_blobs_and_manifest_keeps_old_state() {
     // unreferenced (only a replaced manifest's blobs are ever deleted).
     write(&fresh, LOCKFILE, b"v3\n");
     checkpoint(&next, &fresh).await.unwrap();
-    let v3 = format!("{KEY}/test/blob/{}/0", rdc::state::raw_content_hash(b"v3\n"));
-    let v2 = format!("{KEY}/test/blob/{}/0", rdc::state::raw_content_hash(b"v2\n"));
+    let v3 = format!("{KEY}/test/blob/{}/1024/0", rdc::state::raw_content_hash(b"v3\n"));
+    let v2 = format!("{KEY}/test/blob/{}/1024/0", rdc::state::raw_content_hash(b"v2\n"));
     let left = blob_ids(&fake);
     assert!(left.contains(&v3) && left.contains(&v2), "{left:?}");
-    assert!(!left.contains(&format!("{KEY}/test/blob/{}/0", rdc::state::raw_content_hash(b"v1\n"))), "the replaced v1 lockfile blob is gone");
+    assert!(!left.contains(&format!("{KEY}/test/blob/{}/1024/0", rdc::state::raw_content_hash(b"v1\n"))), "the replaced v1 lockfile blob is gone");
 }
 
 #[tokio::test]
@@ -343,10 +343,10 @@ async fn unreferenced_blobs_are_collected() {
     checkpoint(&state, &page).await.unwrap();
 
     let sha = rdc::state::raw_content_hash(b"v2\n");
-    assert_eq!(blob_ids(&fake), vec![format!("{KEY}/test/blob/{sha}/0")]);
+    assert_eq!(blob_ids(&fake), vec![format!("{KEY}/test/blob/{sha}/1024/0")]);
     let m = manifest(&fake).unwrap();
     assert_eq!(m["rev"], 2);
-    assert_eq!(m["files"], json!({ LOCKFILE: { "sha256": sha, "chunks": 1 } }));
+    assert_eq!(m["files"], json!({ LOCKFILE: { "sha256": sha, "chunk_bytes": 1024, "chunks": 1 } }));
 }
 
 #[tokio::test]
@@ -389,7 +389,7 @@ fn put(fake: &FakeOrg, doc: Value) {
 /// `text` as a published one-chunk state file: its blob, and its manifest entry.
 fn one_chunk(text: &str) -> (Value, Value) {
     let sha = rdc::state::raw_content_hash(text.as_bytes());
-    (json!({ "_id": format!("{KEY}/test/blob/{sha}/0"), "text": text }), json!({ "sha256": sha, "chunks": 1 }))
+    (json!({ "_id": format!("{KEY}/test/blob/{sha}/1024/0"), "text": text }), json!({ "sha256": sha, "chunk_bytes": 1024, "chunks": 1 }))
 }
 
 /// Another run publishes a later manifest between this run's publish and
@@ -423,7 +423,7 @@ async fn cleanup_spares_blobs_of_a_later_manifest() {
     let fresh = tab(&[]);
     hydrate(&store(&fake, 1024), &fresh).await.unwrap();
     assert_eq!(text_files(&fresh)[LOCKFILE], "later\n", "the later manifest is whole");
-    let v1 = format!("{KEY}/test/blob/{}/0", rdc::state::raw_content_hash(b"v1\n"));
+    let v1 = format!("{KEY}/test/blob/{}/1024/0", rdc::state::raw_content_hash(b"v1\n"));
     assert!(!blob_ids(&fake).contains(&v1), "the replaced manifest's blob is gone");
 }
 
@@ -540,4 +540,66 @@ async fn a_crash_after_the_manifest_write_applied_keeps_the_new_state() {
     let fresh = tab(&[]);
     hydrate(&store(&fake, 1024), &fresh).await.unwrap();
     assert_eq!(text_files(&fresh)[LOCKFILE], "v2\n");
+}
+
+/// Two tabs on one key with different chunk sizes: a file one published in
+/// several chunks is never republished by the other as fewer chunks of the
+/// same ids, so no clean-up can delete chunks a manifest still needs.
+#[tokio::test]
+async fn mixed_chunk_sizes_never_corrupt_the_state() {
+    let fake = ds_fake().await;
+    let big: String = "0123456789".repeat(1000); // 10 KB
+    let small = store(&fake, 4096);
+    let a = tab(&[(LOCKFILE, "v1\n"), ("envs/test/mdh/x/data.jsonl", &big)]);
+    hydrate(&small, &a).await.unwrap();
+    checkpoint(&small, &a).await.unwrap();
+    assert_eq!(manifest(&fake).unwrap()["files"]["envs/test/mdh/x/data.jsonl"]["chunks"], 3);
+
+    // Tab b, a large chunk size: loads it, changes another file, saves.
+    let large = store(&fake, 524_288);
+    let b = tab(&[]);
+    hydrate(&large, &b).await.unwrap();
+    write(&b, LOCKFILE, b"v2\n");
+    checkpoint(&large, &b).await.unwrap();
+    // And back: tab a saves again from its own (stale) view, after reloading.
+    let fresh = tab(&[]);
+    let again = store(&fake, 4096);
+    hydrate(&again, &fresh).await.unwrap();
+    assert_eq!(text_files(&fresh)["envs/test/mdh/x/data.jsonl"], big);
+    write(&fresh, LOCKFILE, b"v3\n");
+    write(&fresh, "envs/test/mdh/x/data.jsonl", format!("{big}more\n").as_bytes());
+    checkpoint(&again, &fresh).await.unwrap();
+    write(&b, "envs/test/labels/b.json", b"{}\n");
+
+    for chunk in [16, 4096, 524_288] {
+        let reader = tab(&[]);
+        hydrate(&store(&fake, chunk), &reader).await.unwrap_or_else(|e| panic!("chunk {chunk}: {e:#}"));
+        assert_eq!(text_files(&reader)["envs/test/mdh/x/data.jsonl"], format!("{big}more\n"));
+        assert_eq!(text_files(&reader)[LOCKFILE], "v3\n");
+    }
+}
+
+/// A file published under one chunk size and unchanged since is not
+/// uploaded again by a store with another.
+#[tokio::test]
+async fn an_unchanged_file_keeps_its_blobs_across_chunk_sizes() {
+    let fake = ds_fake().await;
+    let big: String = "abcdefghij".repeat(1000);
+    let a = tab(&[(LOCKFILE, "v1\n"), ("envs/test/mdh/x/data.jsonl", &big)]);
+    let small = store(&fake, 4096);
+    hydrate(&small, &a).await.unwrap();
+    checkpoint(&small, &a).await.unwrap();
+    let blobs = blob_ids(&fake);
+
+    let large = store(&fake, 524_288);
+    let b = tab(&[]);
+    hydrate(&large, &b).await.unwrap();
+    write(&b, LOCKFILE, b"v2\n");
+    checkpoint(&large, &b).await.unwrap();
+    let after = blob_ids(&fake);
+    let kept: Vec<&String> = blobs.iter().filter(|id| !id.contains(&rdc::state::raw_content_hash(b"v1\n"))).collect();
+    assert!(kept.iter().all(|id| after.contains(id)), "the data file's blobs are reused: {after:?}");
+    let fresh = tab(&[]);
+    hydrate(&store(&fake, 16), &fresh).await.unwrap();
+    assert_eq!(text_files(&fresh)["envs/test/mdh/x/data.jsonl"], big);
 }

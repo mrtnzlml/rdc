@@ -30,6 +30,9 @@ fn rescope(mut f: BoxFuture<'static, ()>) -> BoxFuture<'static, ()> {
     if let Some(route) = crate::cli::stdin_coord::current_route() {
         f = Box::pin(crate::cli::stdin_coord::with_route(route, f));
     }
+    if let Some(skipped) = crate::cli::sync::plan::current() {
+        f = Box::pin(crate::cli::sync::plan::scope(skipped, f));
+    }
     if let Some(state) = crate::state::store::scoped() {
         f = Box::pin(crate::state::store::scope(state, f));
     }

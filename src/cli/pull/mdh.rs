@@ -195,6 +195,8 @@ pub(crate) struct MdhPlanItem {
     pub verb: crate::cli::change_view::RowVerb,
     /// Trailing detail for the row's note column, e.g. `new` or `data PATCH`.
     pub note: Option<String>,
+    /// What the row does to the dataset, for the structured dry-run plan.
+    pub change: crate::cli::sync::plan::PlanChange,
 }
 
 #[cfg(test)]
@@ -277,6 +279,7 @@ pub(crate) fn plan_mdh(
                     slug: slug.to_string(),
                     verb: crate::cli::change_view::RowVerb::Patch,
                     note: None,
+                    change: crate::cli::sync::plan::PlanChange::Update,
                 });
             }
         }
@@ -313,6 +316,7 @@ pub(crate) fn plan_mdh(
                     slug: slug.to_string(),
                     verb: crate::cli::change_view::RowVerb::Patch,
                     note: Some("data".to_string()),
+                    change: crate::cli::sync::plan::PlanChange::Update,
                 });
             }
         }
@@ -329,6 +333,7 @@ pub(crate) fn plan_mdh(
                 slug: slug.to_string(),
                     verb: crate::cli::change_view::RowVerb::Post,
                     note: None,
+                change: crate::cli::sync::plan::PlanChange::Create,
             });
         }
     }
@@ -342,6 +347,7 @@ pub(crate) fn plan_mdh(
                 slug: slug.to_string(),
                     verb: crate::cli::change_view::RowVerb::Pull,
                     note: Some("new".to_string()),
+                change: crate::cli::sync::plan::PlanChange::Create,
             });
         }
     }
@@ -365,6 +371,7 @@ pub(crate) fn plan_mdh(
                 slug: slug.to_string(),
                     verb: crate::cli::change_view::RowVerb::Pull,
                     note: Some("data (new)".to_string()),
+                change: crate::cli::sync::plan::PlanChange::Create,
             });
         }
     }
@@ -382,6 +389,7 @@ pub(crate) fn plan_mdh(
                     slug: slug.to_string(),
                     verb: crate::cli::change_view::RowVerb::Pull,
                     note: Some("delete local; deleted on env".to_string()),
+                    change: crate::cli::sync::plan::PlanChange::Delete,
                 });
             }
         }
@@ -416,6 +424,7 @@ fn index_edit_item(
             slug: slug.to_string(),
                     verb: crate::cli::change_view::RowVerb::Pull,
                     note: Some("index update".to_string()),
+            change: crate::cli::sync::plan::PlanChange::Update,
         }),
         // NoChange: local already matches remote. KeepLocal / Conflict: the
         // local file diverged — a push or the resolver owns those, not a pull.
@@ -518,6 +527,7 @@ pub(crate) async fn plan_mdh_index_edits(
                         slug: slug.to_string(),
                     verb: crate::cli::change_view::RowVerb::Pull,
                     note: Some("data (update)".to_string()),
+                        change: crate::cli::sync::plan::PlanChange::Update,
                     });
                 }
             }
