@@ -81,54 +81,16 @@ pub async fn push(
                 .with_context(|| format!("reading local rule '{slug}' for create"))?;
             crate::snapshot::refs::resolve_value(&mut payload, lockfile);
             strip_for_create(&mut payload, "rules");
-            let create_result = client
-                .create_rule(&payload, Some(progress.clone()))
+            client.observe_lockfile(lockfile).await;
+            let create_result = crate::state::journal::item(
+                "rules",
+                slug,
+                client.create_rule(&payload, Some(progress.clone())),
+            )
                 .await
                 .with_context(|| format!("POST /rules (creating '{slug}')"));
             let created = create_result?;
-            let (created_json, created_code) = serialize_rule(&created)?;
-            // Register the new rule's id NOW so its own `url` (and any ref to an
-            // already-created object) portabilizes to `rdc://`. Concrete env URLs
-            // must never touch disk, even transiently (an interrupted sync whose
-            // portabilize post-pass never runs would freeze them into the snapshot).
-            lockfile.upsert(
-                "rules",
-                slug,
-                ObjectEntry {
-                    id: created.id,
-                    modified_at: created.modified_at().map(|s| s.to_string()),
-                    modified_by: created.modified_by().map(|s| s.to_string()),
-                    content_hash: None,
-                    secrets_hash: None,
-                },
-            );
-            let created_json =
-                crate::cli::pull::common::portabilize_proposed(&created_json, lockfile);
-            let created_hash = rule_combined_hash(&created_json, &created_code, lockfile);
-            crate::state::base_cache::write_disk_and_cache(paths, local_json_path, &created_json)
-                .with_context(|| format!("writing post-create canonical form for '{slug}'"))?;
-            let created_py_path = rules_dir.join(format!("{slug}.py"));
-            if let Some(code) = &created_code {
-                write_rule_code(&rules_dir, slug, code)
-                    .with_context(|| format!("writing rule code for '{slug}'"))?;
-                // Mirror the sidecar into the base cache, as the PATCH path
-                // does — otherwise a later code conflict has no merge base.
-                crate::state::base_cache::write(paths, &created_py_path, code.as_bytes())
-                    .with_context(|| format!("caching base rule code for '{slug}'"))?;
-            } else {
-                crate::state::base_cache::forget(paths, &created_py_path)?;
-            }
-            lockfile.upsert(
-                "rules",
-                slug,
-                ObjectEntry {
-                    id: created.id,
-                    modified_at: created.modified_at().map(|s| s.to_string()),
-                    modified_by: created.modified_by().map(|s| s.to_string()),
-                    content_hash: Some(created_hash),
-                    secrets_hash: None,
-                },
-            );
+            complete_create(paths, lockfile, slug, local_json_path, &created)?;
             progress.event(Action::Post, &format!("rule/{slug} id={}", created.id));
             pushed += 1;
             continue;
@@ -153,6 +115,89 @@ pub async fn push(
     skipped += batched_skipped;
 
     Ok((pushed, skipped))
+}
+
+/// The canonical form of a created rule, with its id registered in
+/// `lockfile` first so its own refs portabilize: the bytes a successful POST
+/// writes (the code sidecar in `sidecar`) and the entry it records. Writes
+/// nothing. Shared by [`complete_create`] and `cli::sync::recover`.
+pub(crate) fn created_form(
+    lockfile: &mut Lockfile,
+    slug: &str,
+    created: &crate::model::Rule,
+) -> Result<super::CreatedForm<Option<String>>> {
+    let (created_json, created_code) = serialize_rule(created)?;
+    // Register the new rule's id NOW so its own `url` (and any ref to an
+    // already-created object) portabilizes to `rdc://`. Concrete env URLs
+    // must never touch disk, even transiently (an interrupted sync whose
+    // portabilize post-pass never runs would freeze them into the snapshot).
+    lockfile.upsert(
+        "rules",
+        slug,
+        ObjectEntry {
+            id: created.id,
+            modified_at: created.modified_at().map(|s| s.to_string()),
+            modified_by: created.modified_by().map(|s| s.to_string()),
+            content_hash: None,
+            secrets_hash: None,
+        },
+    );
+    let created_json =
+        crate::cli::pull::common::portabilize_proposed(&created_json, lockfile);
+    let created_hash = rule_combined_hash(&created_json, &created_code, lockfile);
+    Ok(super::CreatedForm {
+        entry: ObjectEntry {
+            id: created.id,
+            modified_at: created.modified_at().map(|s| s.to_string()),
+            modified_by: created.modified_by().map(|s| s.to_string()),
+            content_hash: Some(created_hash),
+            secrets_hash: None,
+        },
+        json: created_json,
+        sidecar: created_code,
+    })
+}
+
+/// Record a created rule and write its canonical form: the lockfile entry
+/// and the env-tree files (with their base-cache copies), exactly as a
+/// successful POST leaves them.
+pub(crate) fn complete_create(
+    paths: &Paths,
+    lockfile: &mut Lockfile,
+    slug: &str,
+    local_json_path: &std::path::Path,
+    created: &crate::model::Rule,
+) -> Result<()> {
+    let rules_dir = paths.rules_dir();
+    let form = created_form(lockfile, slug, created)?;
+    crate::state::base_cache::write_disk_and_cache(paths, local_json_path, &form.json)
+        .with_context(|| format!("writing post-create canonical form for '{slug}'"))?;
+    if let Some(code) = &form.sidecar {
+        write_rule_code(&rules_dir, slug, code)
+            .with_context(|| format!("writing rule code for '{slug}'"))?;
+    }
+    cache_created_code(paths, slug, &form)?;
+    lockfile.upsert("rules", slug, form.entry);
+    Ok(())
+}
+
+/// The base-cache side of a created rule's code: mirror the code sidecar, or
+/// forget a leftover one when the rule has no code. Shared by
+/// [`complete_create`] and `cli::sync::recover`, which writes the cache
+/// without touching the env tree.
+pub(crate) fn cache_created_code(
+    paths: &Paths,
+    slug: &str,
+    form: &super::CreatedForm<Option<String>>,
+) -> Result<()> {
+    let created_py_path = paths.rules_dir().join(format!("{slug}.py"));
+    match &form.sidecar {
+        // Mirror the sidecar into the base cache, as the PATCH path
+        // does — otherwise a later code conflict has no merge base.
+        Some(code) => crate::state::base_cache::write(paths, &created_py_path, code.as_bytes())
+            .with_context(|| format!("caching base rule code for '{slug}'")),
+        None => crate::state::base_cache::forget(paths, &created_py_path),
+    }
 }
 
 /// Fan out one maximal run of consecutive rule UPDATES, then apply the results.

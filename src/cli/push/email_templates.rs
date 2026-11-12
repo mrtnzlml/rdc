@@ -26,7 +26,7 @@ use std::sync::Arc;
 /// the surviving binding perpetually mismatched (churn). Selecting the lowest
 /// unclaimed id — rather than an arbitrary `HashMap` iteration order — also
 /// makes the pairing deterministic across runs and environments.
-fn pick_adoption_id(
+pub(crate) fn pick_adoption_id(
     remotes: &std::collections::HashMap<u64, crate::model::EmailTemplate>,
     local_queue: &Option<String>,
     local_type: Option<&str>,
@@ -335,51 +335,17 @@ pub async fn push(
                 );
             }
             strip_for_create(&mut payload, "email_templates");
-            match client
-                .create_email_template(&payload, Some(progress.clone()))
+            client.observe_lockfile(lockfile).await;
+            match crate::state::journal::item(
+                "email_templates",
+                lockfile_key,
+                client.create_email_template(&payload, Some(progress.clone())),
+            )
                 .await
             {
                 Ok(created) => {
                     claimed.insert(created.id);
-                    let codec = crate::snapshot::codec::codec("email_templates").unwrap();
-                    let created_art = codec
-                        .disk_bytes(
-                            &serde_json::to_value(&created)
-                                .context("serializing created email template")?,
-                        )
-                        .context("codec disk_bytes for created email template")?;
-                    // Register the new template's id NOW so its own `url` (and
-                    // its `queue` ref) portabilizes to `rdc://` — concrete env
-                    // URLs must never touch disk, even transiently.
-                    lockfile.upsert(
-                        "email_templates",
-                        lockfile_key,
-                        ObjectEntry {
-                            id: created.id,
-                            modified_at: created.modified_at().map(|s| s.to_string()),
-                            modified_by: created.modified_by().map(|s| s.to_string()),
-                            content_hash: None,
-                            secrets_hash: None,
-                        },
-                    );
-                    let created_bytes =
-                        crate::cli::pull::common::portabilize_proposed(&created_art.json, lockfile);
-                    let created_hash =
-                        combined_hash(&created_bytes, &created_art.sidecars, lockfile);
-                    crate::state::base_cache::write_disk_and_cache(paths, template_path, &created_bytes).with_context(|| {
-                        format!("writing post-create canonical form for '{lockfile_key}'")
-                    })?;
-                    lockfile.upsert(
-                        "email_templates",
-                        lockfile_key,
-                        ObjectEntry {
-                            id: created.id,
-                            modified_at: created.modified_at().map(|s| s.to_string()),
-                            modified_by: created.modified_by().map(|s| s.to_string()),
-                            content_hash: Some(created_hash),
-                            secrets_hash: None,
-                        },
-                    );
+                    complete_create(paths, lockfile, lockfile_key, template_path, &created)?;
                     progress.event(
                         Action::Post,
                         &format!("email_template/{lockfile_key} id={}", created.id),
@@ -420,6 +386,71 @@ pub async fn push(
     skipped += batched_skipped;
 
     Ok((pushed, skipped))
+}
+
+/// The canonical form of a created email template, with its id registered in
+/// `lockfile` first so its own refs portabilize: the bytes a successful POST
+/// writes and the entry it records. Writes nothing. Shared by
+/// [`complete_create`] and `cli::sync::recover`.
+pub(crate) fn created_form(
+    lockfile: &mut Lockfile,
+    lockfile_key: &str,
+    created: &crate::model::EmailTemplate,
+) -> Result<super::CreatedForm> {
+    let codec = crate::snapshot::codec::codec("email_templates").unwrap();
+    let created_art = codec
+        .disk_bytes(
+            &serde_json::to_value(created)
+                .context("serializing created email template")?,
+        )
+        .context("codec disk_bytes for created email template")?;
+    // Register the new template's id NOW so its own `url` (and
+    // its `queue` ref) portabilizes to `rdc://` — concrete env
+    // URLs must never touch disk, even transiently.
+    lockfile.upsert(
+        "email_templates",
+        lockfile_key,
+        ObjectEntry {
+            id: created.id,
+            modified_at: created.modified_at().map(|s| s.to_string()),
+            modified_by: created.modified_by().map(|s| s.to_string()),
+            content_hash: None,
+            secrets_hash: None,
+        },
+    );
+    let created_bytes =
+        crate::cli::pull::common::portabilize_proposed(&created_art.json, lockfile);
+    let created_hash =
+        combined_hash(&created_bytes, &created_art.sidecars, lockfile);
+    Ok(super::CreatedForm {
+        entry: ObjectEntry {
+            id: created.id,
+            modified_at: created.modified_at().map(|s| s.to_string()),
+            modified_by: created.modified_by().map(|s| s.to_string()),
+            content_hash: Some(created_hash),
+            secrets_hash: None,
+        },
+        json: created_bytes,
+        sidecar: (),
+    })
+}
+
+/// Record a created email template and write its canonical form: the lockfile entry
+/// and the env-tree files (with their base-cache copies), exactly as a
+/// successful POST leaves them.
+pub(crate) fn complete_create(
+    paths: &Paths,
+    lockfile: &mut Lockfile,
+    lockfile_key: &str,
+    template_path: &std::path::Path,
+    created: &crate::model::EmailTemplate,
+) -> Result<()> {
+    let form = created_form(lockfile, lockfile_key, created)?;
+    crate::state::base_cache::write_disk_and_cache(paths, template_path, &form.json).with_context(|| {
+        format!("writing post-create canonical form for '{lockfile_key}'")
+    })?;
+    lockfile.upsert("email_templates", lockfile_key, form.entry);
+    Ok(())
 }
 
 /// Fan out one maximal run of consecutive email-template UPDATES, then apply

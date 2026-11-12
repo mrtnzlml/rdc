@@ -210,8 +210,12 @@ pub async fn push(
                     None => {
                         let install_body =
                             crate::cli::deploy::store_extensions::build_install_body(&payload)?;
-                        let installed = client
-                            .create_hook_via_install(&install_body, Some(progress.clone()))
+                        client.observe_lockfile(lockfile).await;
+                        let installed = crate::state::journal::item(
+                            "hooks",
+                            slug,
+                            client.create_hook_via_install(&install_body, Some(progress.clone())),
+                        )
                             .await
                             .with_context(|| {
                                 format!(
@@ -252,8 +256,12 @@ pub async fn push(
                 // Regular hook: strip server-only fields, inject secrets, POST.
                 strip_for_create(&mut payload, "hooks");
                 inject_hook_secrets(&mut payload, slug, &hook_secrets);
-                client
-                    .create_hook(&payload, Some(progress.clone()))
+                client.observe_lockfile(lockfile).await;
+                crate::state::journal::item(
+                    "hooks",
+                    slug,
+                    client.create_hook(&payload, Some(progress.clone())),
+                )
                     .await
                     .with_context(|| format!("POST /hooks (creating '{slug}')"))?
             };
@@ -265,61 +273,7 @@ pub async fn push(
             // extension is derived from the server's response runtime so
             // it stays canonical even if the local JSON declared a
             // different runtime.
-            let (created_json, created_code) = serialize_hook(&created)?;
-            // Register the new hook's id NOW so its own `url` (and any ref to an
-            // already-created object) portabilizes to `rdc://` below. Concrete
-            // env URLs must never be written to disk — not even transiently: an
-            // interrupted sync (whose portabilize post-pass never runs) would
-            // otherwise freeze the raw response's env URLs into the snapshot.
-            lockfile.upsert(
-                "hooks",
-                slug,
-                ObjectEntry {
-                    id: created.id,
-                    modified_at: created.modified_at().map(|s| s.to_string()),
-                    modified_by: created.modified_by().map(|s| s.to_string()),
-                    content_hash: None,
-                    secrets_hash: None,
-                },
-            );
-            let created_json =
-                crate::cli::pull::common::portabilize_proposed(&created_json, lockfile);
-            let created_hash = hook_combined_hash(&created_json, &created_code, lockfile);
-            let created_ext = hook_code_extension(&created);
-            crate::state::base_cache::write_disk_and_cache(paths, local_json_path, &created_json)
-                .with_context(|| format!("writing post-create canonical form for '{slug}'"))?;
-            let created_code_path = hooks_dir.join(format!("{slug}.{created_ext}"));
-            if let Some(code) = &created_code {
-                write_hook_code(&hooks_dir, slug, code, created_ext)
-                    .with_context(|| format!("writing hook code for '{slug}'"))?;
-                // Mirror the code sidecar into the base cache, exactly as the
-                // PATCH path does. Without it the cache holds the `.json` but
-                // not the `.py`, so the first `BothDiverged` on this hook has
-                // no base to 3-way-merge the code against.
-                crate::state::base_cache::write(paths, &created_code_path, code.as_bytes())
-                    .with_context(|| format!("caching base hook code for '{slug}'"))?;
-            }
-            // Sweep any stale sidecar with the *other* extension that may
-            // have been left over from a previous runtime — from disk AND the
-            // cache mirror.
-            let other_created_ext = if created_ext == "py" { "js" } else { "py" };
-            let stale_created = hooks_dir.join(format!("{slug}.{other_created_ext}"));
-            if crate::vfs::exists(&stale_created) {
-                crate::vfs::remove_file(&stale_created)
-                    .with_context(|| format!("removing stale {}", stale_created.display()))?;
-            }
-            crate::state::base_cache::forget(paths, &stale_created)?;
-            lockfile.upsert(
-                "hooks",
-                slug,
-                ObjectEntry {
-                    id: created.id,
-                    modified_at: created.modified_at().map(|s| s.to_string()),
-                    modified_by: created.modified_by().map(|s| s.to_string()),
-                    content_hash: Some(created_hash),
-                    secrets_hash: Some(created_secrets_hash),
-                },
-            );
+            complete_create(paths, lockfile, slug, local_json_path, &created, Some(created_secrets_hash))?;
             if !deferred.is_empty() {
                 relink.push(crate::cli::push::relink::DeferredRelink {
                     kind: "hooks".to_string(),
@@ -428,6 +382,113 @@ pub async fn push(
     }
 
     Ok((pushed + secrets_pushed, skipped))
+}
+
+/// The canonical form of a created hook, with its id registered in
+/// `lockfile` first so its own refs portabilize: the bytes a successful POST
+/// writes (the code sidecar and its extension in `sidecar`) and the entry it
+/// records, without a `secrets_hash`. Writes nothing. Shared by
+/// [`complete_create`] and `cli::sync::recover`.
+pub(crate) fn created_form(
+    lockfile: &mut Lockfile,
+    slug: &str,
+    created: &crate::model::Hook,
+) -> Result<super::CreatedForm<(Option<String>, &'static str)>> {
+    let (created_json, created_code) = serialize_hook(created)?;
+    // Register the new hook's id NOW so its own `url` (and any ref to an
+    // already-created object) portabilizes to `rdc://` below. Concrete
+    // env URLs must never be written to disk — not even transiently: an
+    // interrupted sync (whose portabilize post-pass never runs) would
+    // otherwise freeze the raw response's env URLs into the snapshot.
+    lockfile.upsert(
+        "hooks",
+        slug,
+        ObjectEntry {
+            id: created.id,
+            modified_at: created.modified_at().map(|s| s.to_string()),
+            modified_by: created.modified_by().map(|s| s.to_string()),
+            content_hash: None,
+            secrets_hash: None,
+        },
+    );
+    let created_json =
+        crate::cli::pull::common::portabilize_proposed(&created_json, lockfile);
+    let created_hash = hook_combined_hash(&created_json, &created_code, lockfile);
+    Ok(super::CreatedForm {
+        entry: ObjectEntry {
+            id: created.id,
+            modified_at: created.modified_at().map(|s| s.to_string()),
+            modified_by: created.modified_by().map(|s| s.to_string()),
+            content_hash: Some(created_hash),
+            secrets_hash: None,
+        },
+        json: created_json,
+        sidecar: (created_code, hook_code_extension(created)),
+    })
+}
+
+/// Record a created hook and write its canonical form: the lockfile entry
+/// and the env-tree files (with their base-cache copies), exactly as a
+/// successful POST leaves them.
+pub(crate) fn complete_create(
+    paths: &Paths,
+    lockfile: &mut Lockfile,
+    slug: &str,
+    local_json_path: &std::path::Path,
+    created: &crate::model::Hook,
+    created_secrets_hash: Option<String>,
+) -> Result<()> {
+    let hooks_dir = paths.hooks_dir();
+    let form = created_form(lockfile, slug, created)?;
+    let (created_code, created_ext) = &form.sidecar;
+    let created_ext = *created_ext;
+    crate::state::base_cache::write_disk_and_cache(paths, local_json_path, &form.json)
+        .with_context(|| format!("writing post-create canonical form for '{slug}'"))?;
+    if let Some(code) = created_code {
+        write_hook_code(&hooks_dir, slug, code, created_ext)
+            .with_context(|| format!("writing hook code for '{slug}'"))?;
+    }
+    // Sweep any stale sidecar with the *other* extension that may
+    // have been left over from a previous runtime — from disk here, and
+    // from the cache mirror in `cache_created_code`.
+    let stale_created = stale_code_path(&hooks_dir, slug, created_ext);
+    if crate::vfs::exists(&stale_created) {
+        crate::vfs::remove_file(&stale_created)
+            .with_context(|| format!("removing stale {}", stale_created.display()))?;
+    }
+    cache_created_code(paths, slug, &form)?;
+    let entry = ObjectEntry { secrets_hash: created_secrets_hash, ..form.entry };
+    lockfile.upsert("hooks", slug, entry);
+    Ok(())
+}
+
+/// `slug`'s code sidecar under the extension other than `ext`: what a previous
+/// runtime may have left behind.
+fn stale_code_path(hooks_dir: &std::path::Path, slug: &str, ext: &str) -> std::path::PathBuf {
+    let other = if ext == "py" { "js" } else { "py" };
+    hooks_dir.join(format!("{slug}.{other}"))
+}
+
+/// The base-cache side of a created hook's code: mirror the code sidecar, and
+/// forget the other extension's. Shared by [`complete_create`] and
+/// `cli::sync::recover`, which writes the cache without touching the env tree.
+pub(crate) fn cache_created_code(
+    paths: &Paths,
+    slug: &str,
+    form: &super::CreatedForm<(Option<String>, &'static str)>,
+) -> Result<()> {
+    let hooks_dir = paths.hooks_dir();
+    let (created_code, created_ext) = &form.sidecar;
+    if let Some(code) = created_code {
+        // Mirror the code sidecar into the base cache, exactly as the
+        // PATCH path does. Without it the cache holds the `.json` but
+        // not the `.py`, so the first `BothDiverged` on this hook has
+        // no base to 3-way-merge the code against.
+        let created_code_path = hooks_dir.join(format!("{slug}.{created_ext}"));
+        crate::state::base_cache::write(paths, &created_code_path, code.as_bytes())
+            .with_context(|| format!("caching base hook code for '{slug}'"))?;
+    }
+    crate::state::base_cache::forget(paths, &stale_code_path(&hooks_dir, slug, created_ext))
 }
 
 /// Fan out one maximal run of consecutive hook UPDATES, then apply the results.

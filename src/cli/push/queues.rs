@@ -95,48 +95,16 @@ pub async fn push(
             // wire unresolvable is the one that reports worst.
             crate::cli::push::relink::restore_undeferrable("queues", &mut payload, &mut deferred);
             strip_for_create(&mut payload, "queues");
-            let create_result = client
-                .create_queue(&payload, Some(progress.clone()))
+            client.observe_lockfile(lockfile).await;
+            let create_result = crate::state::journal::item(
+                "queues",
+                q_slug,
+                client.create_queue(&payload, Some(progress.clone())),
+            )
                 .await
                 .with_context(|| format!("POST /queues (creating '{q_slug}')"));
             let created = create_result?;
-            // Canonical on-disk bytes via KindCodec: redacts `counts` and
-            // strips hidden fields — matching exactly what pull produces.
-            let codec = crate::snapshot::codec::codec("queues").unwrap();
-            let created_art = codec
-                .disk_bytes(&serde_json::to_value(&created).context("serializing created queue")?)
-                .context("codec disk_bytes for created queue")?;
-            // Register the new queue's id NOW so its own `url` (and any ref to
-            // an already-created object) portabilizes to `rdc://`. Concrete env
-            // URLs must never touch disk, even transiently (an interrupted sync
-            // whose portabilize post-pass never runs would freeze them in).
-            lockfile.upsert(
-                "queues",
-                q_slug,
-                ObjectEntry {
-                    id: created.id,
-                    modified_at: created.modified_at().map(|s| s.to_string()),
-                    modified_by: created.modified_by().map(|s| s.to_string()),
-                    content_hash: None,
-                    secrets_hash: None,
-                },
-            );
-            let created_bytes =
-                crate::cli::pull::common::portabilize_proposed(&created_art.json, lockfile);
-            let created_hash = combined_hash(&created_bytes, &created_art.sidecars, lockfile);
-            crate::state::base_cache::write_disk_and_cache(paths, queue_path, &created_bytes)
-                .with_context(|| format!("writing post-create canonical form for '{q_slug}'"))?;
-            lockfile.upsert(
-                "queues",
-                q_slug,
-                ObjectEntry {
-                    id: created.id,
-                    modified_at: created.modified_at().map(|s| s.to_string()),
-                    modified_by: created.modified_by().map(|s| s.to_string()),
-                    content_hash: Some(created_hash),
-                    secrets_hash: None,
-                },
-            );
+            complete_create(paths, lockfile, q_slug, queue_path, &created)?;
             if !deferred.is_empty() {
                 relink.push(crate::cli::push::relink::DeferredRelink {
                     kind: "queues".to_string(),
@@ -170,6 +138,69 @@ pub async fn push(
     skipped += batched_skipped;
 
     Ok((pushed, skipped))
+}
+
+/// The canonical form of a created queue, with its id registered in
+/// `lockfile` first so its own refs portabilize: the bytes a successful POST
+/// writes and the entry it records. Writes nothing. Shared by
+/// [`complete_create`] and `cli::sync::recover`.
+pub(crate) fn created_form(
+    lockfile: &mut Lockfile,
+    q_slug: &str,
+    created: &crate::model::Queue,
+) -> Result<super::CreatedForm> {
+    // Canonical on-disk bytes via KindCodec: redacts `counts` and
+    // strips hidden fields — matching exactly what pull produces.
+    let codec = crate::snapshot::codec::codec("queues").unwrap();
+    let created_art = codec
+        .disk_bytes(&serde_json::to_value(created).context("serializing created queue")?)
+        .context("codec disk_bytes for created queue")?;
+    // Register the new queue's id NOW so its own `url` (and any ref to
+    // an already-created object) portabilizes to `rdc://`. Concrete env
+    // URLs must never touch disk, even transiently (an interrupted sync
+    // whose portabilize post-pass never runs would freeze them in).
+    lockfile.upsert(
+        "queues",
+        q_slug,
+        ObjectEntry {
+            id: created.id,
+            modified_at: created.modified_at().map(|s| s.to_string()),
+            modified_by: created.modified_by().map(|s| s.to_string()),
+            content_hash: None,
+            secrets_hash: None,
+        },
+    );
+    let created_bytes =
+        crate::cli::pull::common::portabilize_proposed(&created_art.json, lockfile);
+    let created_hash = combined_hash(&created_bytes, &created_art.sidecars, lockfile);
+    Ok(super::CreatedForm {
+        entry: ObjectEntry {
+            id: created.id,
+            modified_at: created.modified_at().map(|s| s.to_string()),
+            modified_by: created.modified_by().map(|s| s.to_string()),
+            content_hash: Some(created_hash),
+            secrets_hash: None,
+        },
+        json: created_bytes,
+        sidecar: (),
+    })
+}
+
+/// Record a created queue and write its canonical form: the lockfile entry
+/// and the env-tree files (with their base-cache copies), exactly as a
+/// successful POST leaves them.
+pub(crate) fn complete_create(
+    paths: &Paths,
+    lockfile: &mut Lockfile,
+    q_slug: &str,
+    queue_path: &std::path::Path,
+    created: &crate::model::Queue,
+) -> Result<()> {
+    let form = created_form(lockfile, q_slug, created)?;
+    crate::state::base_cache::write_disk_and_cache(paths, queue_path, &form.json)
+        .with_context(|| format!("writing post-create canonical form for '{q_slug}'"))?;
+    lockfile.upsert("queues", q_slug, form.entry);
+    Ok(())
 }
 
 /// What one queue's concurrent stage carries across to its apply stage.

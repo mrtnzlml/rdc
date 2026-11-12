@@ -65,47 +65,16 @@ pub async fn push(
                 .with_context(|| format!("parsing {}", inbox_path.display()))?;
             crate::snapshot::refs::resolve_value(&mut payload, lockfile);
             strip_for_create(&mut payload, "inboxes");
-            let create_result = client
-                .create_inbox(&payload, Some(progress.clone()))
+            client.observe_lockfile(lockfile).await;
+            let create_result = crate::state::journal::item(
+                "inboxes",
+                q_slug,
+                client.create_inbox(&payload, Some(progress.clone())),
+            )
                 .await
                 .with_context(|| format!("POST /inboxes (creating for queue '{q_slug}')"));
             let created = create_result?;
-            let codec = crate::snapshot::codec::codec("inboxes").unwrap();
-            let created_art = codec
-                .disk_bytes(&serde_json::to_value(&created).context("serializing created inbox")?)
-                .context("codec disk_bytes for created inbox")?;
-            // Register the new inbox's id NOW so its own `url` (and its `queues`
-            // ref) portabilizes to `rdc://`. Concrete env URLs must never touch
-            // disk, even transiently (an interrupted sync whose portabilize
-            // post-pass never runs would freeze them into the snapshot).
-            lockfile.upsert(
-                "inboxes",
-                q_slug,
-                ObjectEntry {
-                    id: created.id,
-                    modified_at: created.modified_at().map(|s| s.to_string()),
-                    modified_by: created.modified_by().map(|s| s.to_string()),
-                    content_hash: None,
-                    secrets_hash: None,
-                },
-            );
-            let created_bytes =
-                crate::cli::pull::common::portabilize_proposed(&created_art.json, lockfile);
-            let created_hash = combined_hash(&created_bytes, &created_art.sidecars, lockfile);
-            crate::state::base_cache::write_disk_and_cache(paths, inbox_path, &created_bytes).with_context(|| {
-                format!("writing post-create canonical form for inbox '{q_slug}'")
-            })?;
-            lockfile.upsert(
-                "inboxes",
-                q_slug,
-                ObjectEntry {
-                    id: created.id,
-                    modified_at: created.modified_at().map(|s| s.to_string()),
-                    modified_by: created.modified_by().map(|s| s.to_string()),
-                    content_hash: Some(created_hash),
-                    secrets_hash: None,
-                },
-            );
+            complete_create(paths, lockfile, q_slug, inbox_path, &created)?;
             progress.event(Action::Post, &format!("inbox/{q_slug} id={}", created.id));
             pushed += 1;
             continue;
@@ -129,6 +98,68 @@ pub async fn push(
     skipped += batched_skipped;
 
     Ok((pushed, skipped))
+}
+
+/// The canonical form of a created inbox, with its id registered in
+/// `lockfile` first so its own refs portabilize: the bytes a successful POST
+/// writes and the entry it records. Writes nothing. Shared by
+/// [`complete_create`] and `cli::sync::recover`.
+pub(crate) fn created_form(
+    lockfile: &mut Lockfile,
+    q_slug: &str,
+    created: &crate::model::Inbox,
+) -> Result<super::CreatedForm> {
+    let codec = crate::snapshot::codec::codec("inboxes").unwrap();
+    let created_art = codec
+        .disk_bytes(&serde_json::to_value(created).context("serializing created inbox")?)
+        .context("codec disk_bytes for created inbox")?;
+    // Register the new inbox's id NOW so its own `url` (and its `queues`
+    // ref) portabilizes to `rdc://`. Concrete env URLs must never touch
+    // disk, even transiently (an interrupted sync whose portabilize
+    // post-pass never runs would freeze them into the snapshot).
+    lockfile.upsert(
+        "inboxes",
+        q_slug,
+        ObjectEntry {
+            id: created.id,
+            modified_at: created.modified_at().map(|s| s.to_string()),
+            modified_by: created.modified_by().map(|s| s.to_string()),
+            content_hash: None,
+            secrets_hash: None,
+        },
+    );
+    let created_bytes =
+        crate::cli::pull::common::portabilize_proposed(&created_art.json, lockfile);
+    let created_hash = combined_hash(&created_bytes, &created_art.sidecars, lockfile);
+    Ok(super::CreatedForm {
+        entry: ObjectEntry {
+            id: created.id,
+            modified_at: created.modified_at().map(|s| s.to_string()),
+            modified_by: created.modified_by().map(|s| s.to_string()),
+            content_hash: Some(created_hash),
+            secrets_hash: None,
+        },
+        json: created_bytes,
+        sidecar: (),
+    })
+}
+
+/// Record a created inbox and write its canonical form: the lockfile entry
+/// and the env-tree files (with their base-cache copies), exactly as a
+/// successful POST leaves them.
+pub(crate) fn complete_create(
+    paths: &Paths,
+    lockfile: &mut Lockfile,
+    q_slug: &str,
+    inbox_path: &std::path::Path,
+    created: &crate::model::Inbox,
+) -> Result<()> {
+    let form = created_form(lockfile, q_slug, created)?;
+    crate::state::base_cache::write_disk_and_cache(paths, inbox_path, &form.json).with_context(|| {
+        format!("writing post-create canonical form for inbox '{q_slug}'")
+    })?;
+    lockfile.upsert("inboxes", q_slug, form.entry);
+    Ok(())
 }
 
 /// What one inbox's concurrent stage carries across to its apply stage.

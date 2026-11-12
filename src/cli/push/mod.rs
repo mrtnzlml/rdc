@@ -8,24 +8,34 @@ use std::sync::Arc;
 pub mod deletes;
 pub mod relink;
 mod concurrent;
-mod email_templates;
-mod engine_fields;
-mod engines;
-mod hooks;
+pub(crate) mod email_templates;
+pub(crate) mod engine_fields;
+pub(crate) mod engines;
+pub(crate) mod hooks;
 /// Re-exported for the `--dry-run` planner in [`crate::cli::sync`], which needs
 /// to predict the hooks secrets-only pass network-free.
 pub(crate) use hooks::plan_secret_pushes;
-mod inboxes;
-mod labels;
+pub(crate) mod inboxes;
+pub(crate) mod labels;
 pub mod mdh;
 pub mod mdh_data;
 mod organization;
-mod queues;
-mod rules;
-mod saved_views;
+pub(crate) mod queues;
+pub(crate) mod rules;
+pub(crate) mod saved_views;
 pub mod scan;
-mod schemas;
-mod workspaces;
+pub(crate) mod schemas;
+pub(crate) mod workspaces;
+
+/// What a successful create leaves behind, computed from the server's object
+/// by each driver's `created_form`: the lockfile entry (its `content_hash` is
+/// the hash of the canonical form), the canonical JSON bytes, and the kind's
+/// sidecar part of that form (`()` when it has none).
+pub(crate) struct CreatedForm<S = ()> {
+    pub entry: crate::state::ObjectEntry,
+    pub json: Vec<u8>,
+    pub sidecar: S,
+}
 
 /// Whether this entry can reach the drift check at all — and, if so, the base
 /// the remote is checked against.

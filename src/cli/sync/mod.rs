@@ -101,6 +101,7 @@ pub mod collision;
 pub mod embed;
 pub mod execute;
 pub mod lock;
+pub mod recover;
 pub mod watch;
 
 use crate::api::RossumClient;
@@ -227,11 +228,26 @@ pub(crate) async fn run_cycle(
     // Before any read or write: every later step trusts the tree has no links.
     paths.ensure_no_symlinks()?;
 
+    let state = crate::state::store::current();
+    state
+        .hydrate(&paths)
+        .await
+        .with_context(|| format!("loading sync state for env '{env}'"))?;
     let mut lockfile = Lockfile::load(&paths.lockfile())?;
     // Set the env's api_base so the lockfile can DERIVE object URLs from
     // ids (push ref resolution, deploy cross-ref rewriting). Without this an
     // empty api_base makes `url_for_slug` return None and push refs fail loud.
     lockfile.api_base = env_cfg.api_base.clone();
+    // A journal with ops belongs to a run that is over: the caller holds the
+    // env lock, which that run held while it ran. It is recovered below,
+    // before anything is classified.
+    let recoverable = lockfile.pending.as_ref().is_some_and(|p| !p.ops.is_empty());
+    if !recoverable {
+        lockfile.pending = None;
+    }
+    // Every lockfile save from here on goes through the journal, which
+    // checkpoints the state store after it.
+    let journal = crate::state::store::journal_for(&paths, lockfile.clone(), state);
 
     let _title = if dry_run {
         format!("rdc sync {env} (dry run)")
@@ -250,6 +266,27 @@ pub(crate) async fn run_cycle(
     let progress: Arc<Log> =
         renderer.unwrap_or_else(|| Log::new(crate::cli::resolve::detect_color_mode()));
     let started = web_time::Instant::now();
+
+    // Recovery of a crashed run's journal, before the offline pre-flight: the scan
+    // below must already see the creates it completes as recorded, or it
+    // would offer their local files as creates again. It needs the env, so
+    // the token is resolved here for such a run. It persists nothing itself;
+    // its one commit makes the recovered state durable before classify, and
+    // an error leaves the journal on disk as it was.
+    let mut token_override = token_override;
+    if recoverable {
+        let token = match token_override.take() {
+            Some(t) => t,
+            None => resolve_token(&cwd, env, &env_cfg.api_base).await?,
+        };
+        let client = RossumClient::new(env_cfg.api_base.clone(), token.clone())
+            .context("constructing Rossum API client")?;
+        recover::recover(&paths, &mut lockfile, &client, interactive, dry_run, &progress).await?;
+        if !dry_run {
+            journal.commit(&lockfile).await?;
+        }
+        token_override = Some(token);
+    }
 
     // The two per-env files nobody finds on their own: `envs/<env>/overlay.toml`
     // and `secrets/<env>.hook-secrets.json`. Both are created-if-absent and
@@ -327,7 +364,8 @@ pub(crate) async fn run_cycle(
         None => resolve_token(&cwd, env, &env_cfg.api_base).await?,
     };
     let client = RossumClient::new(env_cfg.api_base.clone(), token.clone())
-        .context("constructing Rossum API client")?;
+        .context("constructing Rossum API client")?
+        .with_journal(journal.clone());
 
     // Phase 1: list remote. Mirrors `pull::run`'s `PullCtx` construction
     // verbatim so the listing semantics are identical.
@@ -350,6 +388,9 @@ pub(crate) async fn run_cycle(
         )
         .await?
     };
+    // Everything listed here existed before this cycle's first create, so no
+    // lost create can be one of them, tracked or not.
+    journal.note_existing(catalog_ids(&catalog)).await;
 
     // Surface queue-slug collisions: two queue dirs sharing a slug across
     // workspaces collapse onto one lockfile entry, so one is re-pushed every
@@ -792,13 +833,13 @@ pub(crate) async fn run_cycle(
         Err(e) => {
             // `execute::run` records each object in `lockfile` AS it commits
             // the write to the remote, but a mid-run error would otherwise skip
-            // the `lockfile.save` at the end of this function — discarding every
+            // the `journal.commit` at the end of this function — discarding every
             // record of what was already created/updated. A re-run would then
             // re-create those objects (duplicating them, since name isn't
             // unique) instead of resuming. Persist the partial progress
             // (best-effort) before propagating so the next sync sees the
             // committed objects and continues from there.
-            if let Err(save_err) = lockfile.save(&paths.lockfile()) {
+            if let Err(save_err) = journal.commit(&lockfile).await {
                 progress.event(
                     Action::Warn,
                     &format!("could not persist partial progress to the lockfile: {save_err:#}"),
@@ -820,7 +861,7 @@ pub(crate) async fn run_cycle(
     let _classified_after =
         from_catalog_scan_lockfile(&catalog, &changes_after, &tombstones_after, &lockfile)
             .unwrap_or_default();
-    lockfile.save(&paths.lockfile())?;
+    journal.commit(&lockfile).await?;
     crate::cli::index::generate(&paths, &lockfile)
         .with_context(|| format!("generating _index.md for env '{env}'"))?;
 
@@ -841,6 +882,29 @@ pub(crate) async fn run_cycle(
         progress.event(Action::Idle, "envs match remote");
     }
     Ok(outcome)
+}
+
+/// The ids of `catalog`, per lockfile kind.
+fn catalog_ids(
+    catalog: &crate::cli::pull::common::RemoteCatalog,
+) -> std::collections::BTreeMap<String, std::collections::HashSet<u64>> {
+    let ids = |it: &mut dyn Iterator<Item = u64>| it.collect::<std::collections::HashSet<u64>>();
+    [
+        ("workspaces", ids(&mut catalog.workspaces.iter().map(|o| o.id))),
+        ("queues", ids(&mut catalog.queues.iter().map(|o| o.id))),
+        ("schemas", ids(&mut catalog.schemas_by_queue_id.values().map(|o| o.id))),
+        ("inboxes", ids(&mut catalog.inboxes_by_queue_id.values().map(|o| o.id))),
+        ("hooks", ids(&mut catalog.hooks.iter().map(|o| o.id))),
+        ("rules", ids(&mut catalog.rules.iter().map(|o| o.id))),
+        ("labels", ids(&mut catalog.labels.iter().map(|o| o.id))),
+        ("engines", ids(&mut catalog.engines.iter().map(|o| o.id))),
+        ("engine_fields", ids(&mut catalog.engine_fields.iter().map(|o| o.id))),
+        ("email_templates", ids(&mut catalog.email_templates.iter().map(|o| o.id))),
+        ("saved_views", ids(&mut catalog.saved_views.iter().map(|o| o.id))),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect()
 }
 
 /// Read the env back after a cycle that wrote to it, and pull what those

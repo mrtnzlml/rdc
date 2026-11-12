@@ -96,44 +96,16 @@ pub async fn push(
                 .with_context(|| format!("reading local schema for queue '{q_slug}' to create"))?;
             crate::snapshot::refs::resolve_value(&mut payload, lockfile);
             strip_for_create(&mut payload, "schemas");
-            let create_result = client
-                .create_schema(&payload, Some(progress.clone()))
+            client.observe_lockfile(lockfile).await;
+            let create_result = crate::state::journal::item(
+                "schemas",
+                q_slug,
+                client.create_schema(&payload, Some(progress.clone())),
+            )
                 .await
                 .with_context(|| format!("POST /schemas (creating for queue '{q_slug}')"));
             let created = create_result?;
-            let (created_json, created_formulas) = serialize_schema(&created)?;
-            // Register the new schema's id NOW so its own `url` (and its `queues`
-            // back-ref) portabilizes to `rdc://`. Concrete env URLs must never
-            // touch disk, even transiently (an interrupted sync whose portabilize
-            // post-pass never runs would freeze them into the snapshot).
-            lockfile.upsert(
-                "schemas",
-                q_slug,
-                ObjectEntry {
-                    id: created.id,
-                    modified_at: created.modified_at().map(|s| s.to_string()),
-                    modified_by: created.modified_by().map(|s| s.to_string()),
-                    content_hash: None,
-                    secrets_hash: None,
-                },
-            );
-            let created_json =
-                crate::cli::pull::common::portabilize_proposed(&created_json, lockfile);
-            let created_hash = schema_combined_hash(&created_json, &created_formulas, lockfile);
-            write_schema_bytes(queue_dir, &created_json, &created_formulas).with_context(|| {
-                format!("writing post-create canonical form for schema '{q_slug}'")
-            })?;
-            lockfile.upsert(
-                "schemas",
-                q_slug,
-                ObjectEntry {
-                    id: created.id,
-                    modified_at: created.modified_at().map(|s| s.to_string()),
-                    modified_by: created.modified_by().map(|s| s.to_string()),
-                    content_hash: Some(created_hash),
-                    secrets_hash: None,
-                },
-            );
+            complete_create(lockfile, q_slug, schema_path, &created)?;
             progress.event(Action::Post, &format!("schema/{q_slug} id={}", created.id));
             pushed += 1;
             continue;
@@ -187,6 +159,70 @@ pub async fn push(
     skipped += batched_skipped;
 
     Ok((pushed, skipped))
+}
+
+/// A schema's formula sidecars: `(field id, code)`.
+pub(crate) type Formulas = Vec<(String, Vec<u8>)>;
+
+/// The canonical form of a created schema, with its id registered in
+/// `lockfile` first so its own refs portabilize: the bytes a successful POST
+/// writes (the formula sidecars in `sidecar`) and the entry it records.
+/// Writes nothing. Shared by [`complete_create`] and `cli::sync::recover`.
+pub(crate) fn created_form(
+    lockfile: &mut Lockfile,
+    q_slug: &str,
+    created: &crate::model::Schema,
+) -> Result<super::CreatedForm<Formulas>> {
+    let (created_json, created_formulas) = serialize_schema(created)?;
+    // Register the new schema's id NOW so its own `url` (and its `queues`
+    // back-ref) portabilizes to `rdc://`. Concrete env URLs must never
+    // touch disk, even transiently (an interrupted sync whose portabilize
+    // post-pass never runs would freeze them into the snapshot).
+    lockfile.upsert(
+        "schemas",
+        q_slug,
+        ObjectEntry {
+            id: created.id,
+            modified_at: created.modified_at().map(|s| s.to_string()),
+            modified_by: created.modified_by().map(|s| s.to_string()),
+            content_hash: None,
+            secrets_hash: None,
+        },
+    );
+    let created_json =
+        crate::cli::pull::common::portabilize_proposed(&created_json, lockfile);
+    let created_hash = schema_combined_hash(&created_json, &created_formulas, lockfile);
+    Ok(super::CreatedForm {
+        entry: ObjectEntry {
+            id: created.id,
+            modified_at: created.modified_at().map(|s| s.to_string()),
+            modified_by: created.modified_by().map(|s| s.to_string()),
+            content_hash: Some(created_hash),
+            secrets_hash: None,
+        },
+        json: created_json,
+        sidecar: created_formulas,
+    })
+}
+
+/// Record a created schema and write its canonical form: the lockfile entry
+/// and the env-tree files (no base-cache copy, as before), exactly as a
+/// successful POST leaves them.
+pub(crate) fn complete_create(
+    lockfile: &mut Lockfile,
+    q_slug: &str,
+    schema_path: &std::path::Path,
+    created: &crate::model::Schema,
+) -> Result<()> {
+    let queue_dir = schema_path
+        .parent()
+        .with_context(|| format!("schema path has no parent: {}", schema_path.display()))?;
+    let form = created_form(lockfile, q_slug, created)?;
+    write_schema_bytes(queue_dir, &form.json, &form.sidecar).with_context(|| {
+        format!("writing post-create canonical form for schema '{q_slug}'")
+    })?;
+    lockfile.upsert("schemas", q_slug, form.entry);
+    Ok(())
 }
 
 /// Fan out one maximal run of consecutive schema UPDATES, then apply the results.

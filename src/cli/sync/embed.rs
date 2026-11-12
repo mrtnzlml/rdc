@@ -13,6 +13,7 @@
 
 use crate::cli::resolve::ConflictStrategy;
 use crate::cli::sync::CycleOutcome;
+use crate::state::store::{FsStateStore, StateStore};
 use crate::vfs::Store;
 use crate::log::Log;
 use anyhow::Result;
@@ -106,7 +107,27 @@ pub async fn sync_logged_in(
     opts: EmbedSyncOptions,
     log_sink: Box<dyn std::io::Write + Send>,
 ) -> Result<CycleOutcome> {
-    crate::vfs::scope(store, sync_logged(root, env, token, opts, log_sink)).await
+    sync_logged_in_with_state(store, Arc::new(FsStateStore), root, env, token, opts, log_sink).await
+}
+
+/// [`sync_logged_in`] with the env's sync state kept in `state`: the run
+/// hydrates from it before reading the lockfile and checkpoints into it after
+/// every lockfile persist.
+pub async fn sync_logged_in_with_state(
+    store: Arc<dyn Store>,
+    state: Arc<dyn StateStore>,
+    root: &Path,
+    env: &str,
+    token: &str,
+    opts: EmbedSyncOptions,
+    log_sink: Box<dyn std::io::Write + Send>,
+) -> Result<CycleOutcome> {
+    crate::vfs::scope(
+        store,
+        // Boxed for the same reason as in `watch_logged_in_with_state`.
+        crate::state::store::scope(state, Box::pin(sync_logged(root, env, token, opts, log_sink))),
+    )
+    .await
 }
 
 /// [`watch_logged`] on a project held by `store`. `triggers` is the host's
@@ -126,9 +147,49 @@ pub async fn watch_logged_in(
     on_idle: Option<Arc<dyn Fn(Option<u64>) + Send + Sync>>,
     triggers: Option<tokio::sync::mpsc::Receiver<CycleTrigger>>,
 ) -> Result<()> {
+    watch_logged_in_with_state(
+        store,
+        Arc::new(FsStateStore),
+        root,
+        env,
+        api_base,
+        token,
+        poll,
+        log_sink,
+        route,
+        cancel,
+        on_idle,
+        triggers,
+    )
+    .await
+}
+
+/// [`watch_logged_in`] with the env's sync state kept in `state`, as
+/// [`sync_logged_in_with_state`] does for one cycle.
+pub async fn watch_logged_in_with_state(
+    store: Arc<dyn Store>,
+    state: Arc<dyn StateStore>,
+    root: &Path,
+    env: &str,
+    api_base: &str,
+    token: String,
+    poll: Option<Duration>,
+    log_sink: Box<dyn std::io::Write + Send>,
+    route: Arc<dyn PromptRoute>,
+    cancel: crate::cli::sync::watch::CancelToken,
+    on_idle: Option<Arc<dyn Fn(Option<u64>) + Send + Sync>>,
+    triggers: Option<tokio::sync::mpsc::Receiver<CycleTrigger>>,
+) -> Result<()> {
     crate::vfs::scope(
         store,
-        watch_inner(root, env, api_base, token, poll, log_sink, route, cancel, on_idle, triggers),
+        // Boxed: the watch future is large, and one more by-value layer
+        // around it overflows a test thread's stack in debug builds.
+        crate::state::store::scope(
+            state,
+            Box::pin(watch_inner(
+                root, env, api_base, token, poll, log_sink, route, cancel, on_idle, triggers,
+            )),
+        ),
     )
     .await
 }

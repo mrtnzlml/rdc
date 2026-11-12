@@ -80,8 +80,12 @@ pub async fn push(
                 .with_context(|| format!("parsing {}", path.display()))?;
             let deferred = crate::snapshot::refs::resolve_value_deferring(&mut payload, lockfile);
             strip_for_create(&mut payload, "engines");
-            let create_result = client
-                .create_engine(&payload, Some(progress.clone()))
+            client.observe_lockfile(lockfile).await;
+            let create_result = crate::state::journal::item(
+                "engines",
+                slug,
+                client.create_engine(&payload, Some(progress.clone())),
+            )
                 .await
                 .with_context(|| format!("POST /engines (creating '{slug}')"));
             let created = match create_result {
@@ -94,43 +98,7 @@ pub async fn push(
                 }
                 Err(e) => return Err(e),
             };
-            // Canonical on-disk bytes via KindCodec: redacts `agenda_id` and
-            // strips hidden fields — matching exactly what pull produces.
-            let codec = crate::snapshot::codec::codec("engines").unwrap();
-            let created_art = codec
-                .disk_bytes(&serde_json::to_value(&created).context("serializing created engine")?)
-                .context("codec disk_bytes for created engine")?;
-            // Register the new engine's id NOW so its own `url` (and any ref to
-            // an already-created object) portabilizes to `rdc://`. Concrete env
-            // URLs must never touch disk, even transiently (an interrupted sync
-            // whose portabilize post-pass never runs would freeze them in).
-            lockfile.upsert(
-                "engines",
-                slug,
-                ObjectEntry {
-                    id: created.id,
-                    modified_at: created.modified_at().map(|s| s.to_string()),
-                    modified_by: created.modified_by().map(|s| s.to_string()),
-                    content_hash: None,
-                    secrets_hash: None,
-                },
-            );
-            let created_bytes =
-                crate::cli::pull::common::portabilize_proposed(&created_art.json, lockfile);
-            let created_hash = combined_hash(&created_bytes, &created_art.sidecars, lockfile);
-            crate::state::base_cache::write_disk_and_cache(paths, path, &created_bytes)
-                .with_context(|| format!("writing post-create canonical form for '{slug}'"))?;
-            lockfile.upsert(
-                "engines",
-                slug,
-                ObjectEntry {
-                    id: created.id,
-                    modified_at: created.modified_at().map(|s| s.to_string()),
-                    modified_by: created.modified_by().map(|s| s.to_string()),
-                    content_hash: Some(created_hash),
-                    secrets_hash: None,
-                },
-            );
+            complete_create(paths, lockfile, slug, path, &created)?;
             if !deferred.is_empty() {
                 relink.push(crate::cli::push::relink::DeferredRelink {
                     kind: "engines".to_string(),
@@ -164,6 +132,69 @@ pub async fn push(
     skipped += batched_skipped;
 
     Ok((pushed, skipped))
+}
+
+/// The canonical form of a created engine, with its id registered in
+/// `lockfile` first so its own refs portabilize: the bytes a successful POST
+/// writes and the entry it records. Writes nothing. Shared by
+/// [`complete_create`] and `cli::sync::recover`.
+pub(crate) fn created_form(
+    lockfile: &mut Lockfile,
+    slug: &str,
+    created: &crate::model::Engine,
+) -> Result<super::CreatedForm> {
+    // Canonical on-disk bytes via KindCodec: redacts `agenda_id` and
+    // strips hidden fields — matching exactly what pull produces.
+    let codec = crate::snapshot::codec::codec("engines").unwrap();
+    let created_art = codec
+        .disk_bytes(&serde_json::to_value(created).context("serializing created engine")?)
+        .context("codec disk_bytes for created engine")?;
+    // Register the new engine's id NOW so its own `url` (and any ref to
+    // an already-created object) portabilizes to `rdc://`. Concrete env
+    // URLs must never touch disk, even transiently (an interrupted sync
+    // whose portabilize post-pass never runs would freeze them in).
+    lockfile.upsert(
+        "engines",
+        slug,
+        ObjectEntry {
+            id: created.id,
+            modified_at: created.modified_at().map(|s| s.to_string()),
+            modified_by: created.modified_by().map(|s| s.to_string()),
+            content_hash: None,
+            secrets_hash: None,
+        },
+    );
+    let created_bytes =
+        crate::cli::pull::common::portabilize_proposed(&created_art.json, lockfile);
+    let created_hash = combined_hash(&created_bytes, &created_art.sidecars, lockfile);
+    Ok(super::CreatedForm {
+        entry: ObjectEntry {
+            id: created.id,
+            modified_at: created.modified_at().map(|s| s.to_string()),
+            modified_by: created.modified_by().map(|s| s.to_string()),
+            content_hash: Some(created_hash),
+            secrets_hash: None,
+        },
+        json: created_bytes,
+        sidecar: (),
+    })
+}
+
+/// Record a created engine and write its canonical form: the lockfile entry
+/// and the env-tree files (with their base-cache copies), exactly as a
+/// successful POST leaves them.
+pub(crate) fn complete_create(
+    paths: &Paths,
+    lockfile: &mut Lockfile,
+    slug: &str,
+    path: &std::path::Path,
+    created: &crate::model::Engine,
+) -> Result<()> {
+    let form = created_form(lockfile, slug, created)?;
+    crate::state::base_cache::write_disk_and_cache(paths, path, &form.json)
+        .with_context(|| format!("writing post-create canonical form for '{slug}'"))?;
+    lockfile.upsert("engines", slug, form.entry);
+    Ok(())
 }
 
 /// What one engine's concurrent stage carries across to its apply stage.
