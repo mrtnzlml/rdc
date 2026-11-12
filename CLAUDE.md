@@ -155,6 +155,35 @@ Project-specific instructions for working in this repo.
   markers. `rdc.toml` stores envs in a `BTreeMap`, so init cannot derive a
   promotion chain from them (`dev`, `prod`, `test` would chain dev → prod → test).
 
+## Crash-safe sync
+
+- Only **creates** (POST) are journaled: PATCH, DELETE, MDH rows and pulls
+  already converge on a re-run, a create does not (a lost id means a duplicate).
+  `src/state/journal.rs` writes an op into the lockfile's `pending` before each
+  POST and sets its `id` after the response; `commit` drops ops whose lockfile
+  entry now has that id. `src/cli/sync/recover.rs` finishes leftovers before
+  classify, never overwrites an existing local file, prompts on several
+  candidates and stops under `--yes`. A 502/503/504 on a journaled create runs
+  the matcher before each resend, up to the same five sends with backoff as any
+  other request.
+- The lockfile is **v4**; a v3 rdc refuses it on purpose, because v3 ignores
+  unknown fields and its next save would silently erase `pending`.
+- There is **no lease**. Exclusion is `EnvLock` on disk and the Web Lock
+  `rdc:<api_base>:<org_id>` in the browser. Two machines racing one env is an
+  accepted edge case; the Data Storage manifest's compare-and-swap makes the
+  loser's next save fail loudly.
+- The lockfile **never holds a create-body value**, only SHA-256 per field. For
+  hook `config` and engine `settings` (which the server fills in) it is one hash
+  per sent sub-key, and the matcher ignores sub-keys the server added. The
+  top-level `secrets` is never hashed, nor is a secret-named sub-key of hook
+  `config` / engine `settings`; secret-named keys anywhere else are hashed.
+- `StateStore`: `FsStateStore` is a no-op; `DataStorageStateStore` keeps blobs and
+  a CAS manifest in collection `__rdc_state`. The `__` prefix is deliberate: MDH
+  sync already skips such collections.
+- Tests: the fake-only crash matrix is `tests/live/support/fake/crash_matrix.rs`
+  (with `recover.rs`, `state_store.rs`); live scenarios are
+  `tests/live/scenarios/crash_recovery.rs`.
+
 ## Customer confidentiality
 
 - Never put customer names or customer-specific identifiers — org/division/region

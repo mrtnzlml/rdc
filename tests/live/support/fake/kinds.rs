@@ -114,6 +114,46 @@ fn hook_defaults(o: &mut Map<String, Value>, _c: &OrgCtx) {
     ensure(o, "queues", json!([]));
     ensure(o, "events", json!([]));
     ensure(o, "config", json!({}));
+    // Quirk `create_fills_defaults_into_nested_objects`.
+    if o.get("type") == Some(&json!("function"))
+        && let Some(Value::Object(config)) = o.get_mut("config")
+    {
+        for (k, v) in function_config_defaults() {
+            ensure(config, k, v);
+        }
+        // Quirk `hook_code_is_stored_without_trailing_whitespace`.
+        if let Some(Value::String(code)) = config.get_mut("code") {
+            let trimmed = code.trim_end().len();
+            code.truncate(trimmed);
+        }
+    }
+}
+
+/// What a real `POST /hooks` added to a function hook's `{runtime, code}`
+/// config, as `crash_recovery.rs::live_create_identity` printed it — minus
+/// its four numbers (`timeout_s: 30`, `max_polling_time_s: 300`,
+/// `retry_count: 4`, `memory_size_mb: 256`). `migrate` remaps every number
+/// in a hook body that equals a remapped object id
+/// (`cli::migrate::remap_object_ids`), and the fake's ids are small enough
+/// to collide with them, which a real org's are not. The keys kept are
+/// enough to make the stored config differ from the one sent.
+fn function_config_defaults() -> [(&'static str, Value); 5] {
+    [
+        ("schedule", json!({})),
+        ("app", Value::Null),
+        ("payload_logging_enabled", json!(false)),
+        ("retry_after_polling_failure", json!(true)),
+        ("third_party_library_pack", json!("default")),
+    ]
+}
+
+/// Quirk `create_fills_defaults_into_nested_objects`: a real `POST /engines`
+/// with `settings: {}` stored `{"use_case": "generic_ap"}`.
+fn engine_defaults(o: &mut Map<String, Value>, _c: &OrgCtx) {
+    ensure(o, "settings", json!({}));
+    if let Some(Value::Object(settings)) = o.get_mut("settings") {
+        ensure(settings, "use_case", json!("generic_ap"));
+    }
 }
 
 fn queues_owned(o: &mut Map<String, Value>, _c: &OrgCtx) {
@@ -131,7 +171,7 @@ pub const MODELLED: &[KindSpec] = &[
     KindSpec { path: "rules", creatable: true, detail_get: true, list_omits: &[], has_modified_at: true, defaults: queues_owned },
     KindSpec { path: "labels", creatable: true, detail_get: false, list_omits: &[], has_modified_at: true, defaults: org_owned },
     KindSpec { path: "email_templates", creatable: true, detail_get: true, list_omits: &[], has_modified_at: true, defaults: no_defaults },
-    KindSpec { path: "engines", creatable: true, detail_get: true, list_omits: &[], has_modified_at: true, defaults: no_defaults },
+    KindSpec { path: "engines", creatable: true, detail_get: true, list_omits: &[], has_modified_at: true, defaults: engine_defaults },
     KindSpec { path: "engine_fields", creatable: true, detail_get: true, list_omits: &[], has_modified_at: true, defaults: no_defaults },
     KindSpec { path: "saved_views", creatable: true, detail_get: true, list_omits: &[], has_modified_at: true, defaults: no_defaults },
     KindSpec { path: "workflows", creatable: false, detail_get: true, list_omits: &[], has_modified_at: true, defaults: no_defaults },

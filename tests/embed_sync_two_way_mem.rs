@@ -449,3 +449,119 @@ async fn watch_in_memory_relogs_in_after_a_401() {
     assert!(!root.exists(), "the watch touched the real disk");
     assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0, "the watch wrote under the tempdir");
 }
+
+/// The refresher's token is kept: once `stale` is revoked and the watch has
+/// re-logged in as `fresh`, later cycles send only `fresh` and never log in
+/// again, instead of 401ing on `stale` every time.
+#[tokio::test]
+async fn embedded_watch_reuses_the_refreshed_token() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let server = MockServer::start().await;
+    let revoked = Arc::new(AtomicBool::new(false));
+    let revoked_in_mock = revoked.clone();
+    let org_url = format!("{}/organizations/1", server.uri());
+    Mock::given(method("GET"))
+        .and(path("/organizations/1"))
+        .respond_with(move |req: &wiremock::Request| {
+            let stale = req.headers.get("authorization").map(|v| v.to_str().unwrap()) == Some("token stale");
+            if stale && revoked_in_mock.load(Ordering::SeqCst) {
+                ResponseTemplate::new(401).set_body_json(serde_json::json!({"detail": "Invalid token."}))
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": 1, "name": "test-org", "url": org_url
+                }))
+            }
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/auth/login"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"key": "fresh"})))
+        .mount(&server)
+        .await;
+    for kind in [
+        "workspaces", "queues", "schemas", "inboxes", "hooks", "rules", "labels", "engines",
+        "engine_fields", "workflows", "workflow_steps", "email_templates", "saved_views",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("/{}", kind)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [], "pagination": {"next": null, "total_pages": 1, "total": 0}
+            })))
+            .mount(&server)
+            .await;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("project");
+    let store = Arc::new(
+        MemStore::from_files(
+            root.clone(),
+            [
+                (
+                    "rdc.toml".to_string(),
+                    format!("[envs.test]\napi_base = \"{}\"\norg_id = 1\n", server.uri()).into_bytes(),
+                ),
+                (
+                    "secrets/test.secrets.json".to_string(),
+                    br#"{"username": "alice", "password": "pw"}"#.to_vec(),
+                ),
+            ],
+        )
+        .unwrap(),
+    );
+
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    // One message per finished cycle, so a trigger is never sent mid-cycle
+    // (where the loop would coalesce it away).
+    let (idle_tx, mut idle_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let cancel = CancelToken::new();
+    let log = SharedLog::default();
+    let api_base = server.uri();
+    let watch = watch_logged_in(
+        store.clone() as Arc<dyn Store>,
+        &root,
+        "test",
+        &api_base,
+        "stale".to_string(),
+        None,
+        Box::new(log.clone()),
+        Arc::new(NoAnswer),
+        cancel.clone(),
+        Some(Arc::new(move |_| {
+            let _ = idle_tx.send(());
+        })),
+        Some(rx),
+    );
+
+    let driver = async {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !String::from_utf8_lossy(&log.0.lock().unwrap()).contains("start envs/test") {
+            assert!(std::time::Instant::now() < deadline, "the watch never started");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        revoked.store(true, Ordering::SeqCst);
+        // Cycle 2 refreshes; cycles 3 and 4 must reuse the refreshed token.
+        while idle_rx.try_recv().is_ok() {}
+        for _ in 0..3 {
+            tx.send(CycleTrigger::Poll).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(20), idle_rx.recv())
+                .await
+                .expect("a cycle never finished");
+        }
+        cancel.cancel();
+    };
+
+    let (res, ()) = tokio::join!(watch, driver);
+    res.expect("watch stops cleanly");
+
+    let requests = server.received_requests().await.unwrap();
+    let logins = requests.iter().filter(|r| r.url.path() == "/auth/login").count();
+    assert_eq!(logins, 1, "only the first expiry logs in; later cycles keep the refreshed token");
+    let rejected = requests
+        .iter()
+        .filter(|r| r.headers.get("authorization").map(|v| v.to_str().unwrap()) == Some("token stale"))
+        .filter(|r| r.url.path() == "/organizations/1")
+        .count();
+    assert_eq!(rejected, 2, "the initial cycle and the one that expired; no later cycle sends the stale token");
+}

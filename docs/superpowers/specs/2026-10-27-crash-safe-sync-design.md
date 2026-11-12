@@ -95,7 +95,7 @@ that `pending` cannot still be running:
   `.rdc/state/<env>.lock`, released by the OS when the process dies) is held for
   the whole run, so a second run on the machine waits for the first.
 - **Browser:** the wasm `Project` holds a Web Lock (`navigator.locks`,
-  exclusive, named after the state key and env) for the whole sync or watch.
+  exclusive, named `rdc:<api_base>:<org_id>`) for the whole sync or watch.
   The browser releases it when the tab closes or crashes, so it plays the
   `EnvLock` role across the extension's tabs.
 
@@ -117,7 +117,10 @@ in the format for messages and diagnostics; there is no expiry field.
   each driver), drop the op.
 - **Op without `id`** (died while the POST was in flight): list the kind and
   take remote objects that no lockfile entry claims and whose
-  `IDENTITY_FIELDS[kind]` hashes match. With several, narrow by all `fields`.
+  `IDENTITY_FIELDS[kind]` hashes match. With several, narrow by all `fields`. For hook `config` and engine
+  `settings` the server fills in defaults, so they are hashed and matched per
+  sent sub-key (extra server sub-keys ignored; hook `config.code` is hashed
+  trimmed, as the server drops trailing whitespace).
   - 0 → drop the op; the normal `LocalCreate` POSTs it.
   - 1 → complete as above.
   - more → interactive: prompt with one choice per candidate id plus `[a]bort`;
@@ -153,18 +156,18 @@ the project tree.
 - **`FsStateStore`** (CLI, desktop, the wasm default): both methods are
   no-ops; files are already written atomically on disk. The CLI's behaviour is
   therefore unchanged; `EnvLock` stays.
-- **`DataStorageStateStore`** (browser): one collection (default `rdc_state`).
+- **`DataStorageStateStore`** (browser): one collection (`__rdc_state`; the `__` prefix keeps it out of MDH sync).
   - Blob documents `{_id: "<key>/<env>/blob/<sha256>/<n>", text}`, content
     split into chunks of at most `chunk_bytes`. Content must be UTF-8.
   - One manifest `{_id: "<key>/<env>", rev, files: {"<relpath>": {"sha256", "chunks"}}}`.
-  - `hydrate`: read the manifest and its blobs, write them into the vfs.
+  - `hydrate`: read the manifest and its blobs, write them into the vfs; it refuses a manifest naming a path outside this env's state files.
   - `checkpoint`: upload the missing blobs (`replace_one` upsert by `_id`,
     idempotent), then `replace_one` the manifest filtered on
     `{_id, rev: N}` with `rev: N+1`. A filter that matches nothing → error
     "the state of env '<env>' was changed by another run"; the run stops. The
     first manifest is created with `insert_many` of one document; a duplicate
-    key means another run won. After a successful manifest write, delete the
-    blobs under `<key>/<env>/blob/` that it no longer references.
+    key means another run won. After a successful manifest write, delete only the
+    blobs the previous manifest referenced and the new one does not (`known − next`).
   - `key` is supplied by the host (the extension knows its org/project).
 
 The wasm `Project` gets `useDataStorageState(options)`; without it the
@@ -181,17 +184,18 @@ in-memory behaviour is today's.
    waits (or is refused) instead of running alongside.
 5. A 502/503/504 on a create runs the matcher before resending.
 6. New wasm API `useDataStorageState`.
+7. The lockfile never carries a create-body value; hook `config` and engine `settings` are journaled per sent sub-key.
 
 Everything else — the classification, prompts, pull output, the transcript,
 the byte content of env files and base cache — must be identical, pinned by the
 existing suite passing unchanged except for version literals.
 
-## Open facts to settle against the test org
+## Open facts (settled against the test org)
 
-- Data Storage `replace_one` response: does it report matched/modified counts?
-  The filtered-manifest CAS depends on it.
-- Data Storage document size limit; sets `chunk_bytes` (start at 512 KiB).
-- Data Storage collection-name rules for `rdc_state`.
-- Whether the session token can write Data Storage in an org.
-- Per-kind `IDENTITY_FIELDS` and which create-body fields the server rewrites
-  (the fake org's `quirks.rs` records known ones).
+- `replace_one` reports `matched_count`, `modified_count`, `upserted_id`; a stale `{_id, rev}` filter matches 0 and writes nothing, so the CAS works.
+- Document size limit is MongoDB's 16 MiB; `chunk_bytes` stays 524288.
+- Collection `__rdc_state` is created implicitly by the first write and is listed like any other; only the MDH mirror hides it.
+- The session token can write Data Storage.
+- Dotted manifest keys (`.rdc/state/<env>.lock.json`) are accepted as field names and read back byte-equal.
+- A duplicate `_id` on `insert_many` answers 400 and leaves the existing document unchanged.
+- Server rewrites on create: hook `config` gains defaults and its `code` loses trailing whitespace; engine `settings: {}` becomes `{"use_case": ...}`; every other kind echoes sent fields unchanged. Store-extension and webhook hooks were not covered.

@@ -664,3 +664,62 @@ async fn recovery_adopts_the_templates_a_queue_provisioned() {
     assert_eq!(recorded, fake.state().ids("email_templates"), "every template is recorded once");
     assert!(lf.objects["email_templates"].keys().all(|k| k.starts_with(&format!("{prefix}ws/{prefix}invoices/"))));
 }
+
+/// A run whose create of `hook` (a body with `config`) failed unapplied
+/// leaves its op pending with no id. Then someone makes, by hand, a hook
+/// with the same name, queues and events but `config` `theirs`. Recovery
+/// must not adopt it: the next push would overwrite its config.
+async fn recovery_leaves_a_namesake_hook_alone(ours: serde_json::Value, theirs: serde_json::Value, sidecar: Option<&str>) {
+    let fake = FakeOrg::start().await;
+    let project = ProjectFixture::init(&fake.config(), &["test"]).expect("init");
+    let mut hook = json!({
+        "id": 0, "url": "", "name": "check", "events": ["annotation_content"], "queues": [], "active": true,
+    });
+    hook.as_object_mut().unwrap().extend(ours.as_object().unwrap().clone());
+    project.write_json("envs/test/hooks/check.json", &hook);
+    if let Some(code) = sidecar {
+        std::fs::write(project.path().join("envs/test/hooks/check.py"), code).unwrap();
+    }
+    fake.fail_nth_create("hooks", 1, 500, false);
+    assert!(!project.run_rdc(&["sync", "test", "--yes"]).status.success());
+    assert!(fake.state().ids("hooks").is_empty(), "the failed create left nothing");
+
+    let mut by_hand = hook.clone();
+    let obj = by_hand.as_object_mut().unwrap();
+    obj.remove("id");
+    obj.remove("url");
+    obj.extend(theirs.as_object().unwrap().clone());
+    let made = fake.state().create("hooks", by_hand).expect("the hand-made hook");
+    let made_id = made["id"].as_u64().unwrap();
+
+    let paths = rdc::paths::Paths::for_env(project.path(), "test");
+    let mut lf = rdc::state::Lockfile::load(&paths.lockfile()).unwrap();
+    lf.api_base = fake.api_base();
+    let client = rdc::api::RossumClient::new(fake.api_base(), "fake-token".into()).unwrap();
+    let log = rdc::log::Log::new(rdc::cli::resolve::ColorMode::Plain);
+    rdc::cli::sync::recover::recover(&paths, &mut lf, &client, false, false, &log).await.expect("recovery");
+
+    let adopted = lf.objects.get("hooks").and_then(|m| m.get("check")).map(|e| e.id);
+    assert_ne!(adopted, Some(made_id), "the hand-made hook was adopted");
+    assert_eq!(fake.state().get("hooks", made_id).unwrap()["config"], made["config"], "its config is untouched");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_does_not_adopt_a_same_name_hook_with_other_code() {
+    recovery_leaves_a_namesake_hook_alone(
+        json!({ "type": "function", "config": { "runtime": "python3.12" } }),
+        json!({ "config": { "runtime": "python3.12", "code": "def rossum_hook_request_handler(p):\n    return {'by': 'hand'}\n" } }),
+        Some("def rossum_hook_request_handler(p):\n    return {}\n"),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_does_not_adopt_a_same_name_webhook_with_another_url() {
+    recovery_leaves_a_namesake_hook_alone(
+        json!({ "type": "webhook", "config": { "url": "https://ours.invalid/hook" } }),
+        json!({ "config": { "url": "https://theirs.invalid/hook" } }),
+        None,
+    )
+    .await;
+}

@@ -77,6 +77,21 @@ pub const IDENTITY_FIELDS: &[(&str, &[&str])] = &[
     ("engine_fields", &["name", "engine"]),
 ];
 
+/// Top-level object fields a create's response does not echo as sent: the
+/// server fills defaults into them. Seen live
+/// (`tests/live/scenarios/crash_recovery.rs`, `live_create_identity`): a
+/// function hook's `config` gains `timeout_s`, `retry_count`,
+/// `memory_size_mb` and more; an engine's `settings: {}` comes back
+/// `{"use_case": "generic_ap"}`. [`create_fields`] journals such a field one
+/// sub-key at a time, and a candidate must carry every sub-key the body sent,
+/// unchanged; the sub-keys the server adds are not compared.
+pub const SERVER_FILLED_FIELDS: &[(&str, &[&str])] = &[("hooks", &["config"]), ("engines", &["settings"])];
+
+/// The [`SERVER_FILLED_FIELDS`] row for `kind`; empty for any other kind.
+pub fn server_filled_fields(kind: &str) -> &'static [&'static str] {
+    SERVER_FILLED_FIELDS.iter().find(|(k, _)| *k == kind).map_or(&[], |(_, f)| *f)
+}
+
 /// The [`IDENTITY_FIELDS`] row for `kind`, if it is a kind rdc creates.
 pub fn identity_fields(kind: &str) -> Option<&'static [&'static str]> {
     IDENTITY_FIELDS.iter().find(|(k, _)| *k == kind).map(|(_, f)| *f)
@@ -94,6 +109,11 @@ tokio::task_local! {
 /// worker thread, and the item must travel with the task, not the thread.
 pub fn item<F: Future>(kind: &str, slug: &str, f: F) -> impl Future<Output = F::Output> {
     ITEM.scope((kind.to_owned(), slug.to_owned()), f)
+}
+
+/// The `(kind, slug)` of the [`item`] in scope, if any.
+pub fn current_item() -> Option<(String, String)> {
+    ITEM.try_with(Clone::clone).ok()
 }
 
 /// The identifying fields of a create body: one SHA-256 hex per top-level key,
@@ -124,6 +144,55 @@ pub fn match_fields(body: &Value) -> BTreeMap<String, String> {
             (k.clone(), crate::state::raw_content_hash(&bytes))
         })
         .collect()
+}
+
+/// [`match_fields`] for a `kind` create body, with each of the kind's
+/// [`SERVER_FILLED_FIELDS`] that is an object split into one hash per
+/// sub-key, under `<field>.<sub-key>`, in place of the field's own hash. A
+/// sub-key whose name says it holds a secret is not hashed (see
+/// [`match_fields`] on `secrets`). Both sides of a create match go through
+/// this: the body when the create starts, each listed object when one is
+/// looked for.
+pub fn create_fields(kind: &str, body: &Value) -> BTreeMap<String, String> {
+    let mut out = match_fields(body);
+    let filled = server_filled_fields(kind);
+    if filled.is_empty() {
+        return out;
+    }
+    let bytes = serde_json::to_vec(body).expect("a serde_json::Value always serializes");
+    let canonical = crate::snapshot::noise::canonicalize_for_hash(&bytes, &Lockfile::default());
+    let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(&canonical) else {
+        return out;
+    };
+    for field in filled {
+        let Some(Value::Object(sub)) = map.get(*field) else { continue };
+        out.remove(*field);
+        for (k, v) in sub.iter().filter(|(k, _)| !names_a_secret(k)) {
+            let trimmed;
+            let v = match v {
+                Value::String(text) if TRIMMED_SUB_KEYS.contains(&(kind, *field, k.as_str())) => {
+                    trimmed = Value::String(text.trim_end().to_string());
+                    &trimmed
+                }
+                _ => v,
+            };
+            let bytes = serde_json::to_vec(v).expect("a serde_json::Value always serializes");
+            out.insert(format!("{field}.{k}"), crate::state::raw_content_hash(&bytes));
+        }
+    }
+    out
+}
+
+/// Sub-keys of a [`SERVER_FILLED_FIELDS`] field the server stores with
+/// trailing whitespace removed, so [`create_fields`] hashes them trimmed.
+/// Seen live: a function hook's code sent ending in `\n` came back without
+/// it (`tests/live/scenarios/crash_recovery.rs`, `live_create_identity`).
+const TRIMMED_SUB_KEYS: &[(&str, &str, &str)] = &[("hooks", "config", "code")];
+
+/// Whether a key's name says its value is a credential.
+fn names_a_secret(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    ["secret", "password", "token", "api_key", "credential"].iter().any(|s| key.contains(s))
 }
 
 /// Unix seconds from the system clock: the production `now` for
@@ -201,9 +270,9 @@ impl Journal {
         st.next_seq += 1;
         st.ops.push(CreateIntent {
             seq,
+            fields: create_fields(&kind, body),
             kind,
             slug,
-            fields: match_fields(body),
             started_at_unix: (self.now)(),
             id: None,
         });
@@ -401,6 +470,18 @@ mod tests {
         j.abandon(a).await.unwrap();
         let p = last(&seen).pending.unwrap();
         assert_eq!(p.ops.iter().map(|o| o.slug.as_str()).collect::<Vec<_>>(), ["b"]);
+    }
+
+    #[test]
+    fn a_server_filled_field_is_journaled_per_sub_key_without_secrets() {
+        let body = json!({"name": "h", "config": {"code": "x", "url": "u", "secret": "s", "api_key": "k"}});
+        let fields = create_fields("hooks", &body);
+        let stored = json!({"name": "h", "config": {"code": "x\n", "url": "u", "timeout_s": 30}});
+        assert_eq!(create_fields("hooks", &stored)["config.code"], fields["config.code"], "code is compared trimmed");
+        let keys: Vec<&str> = fields.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["config.code", "config.url", "name"]);
+        assert_eq!(fields["name"], match_fields(&body)["name"]);
+        assert_eq!(create_fields("queues", &body), match_fields(&body), "only the listed kinds are split");
     }
 
     #[tokio::test]

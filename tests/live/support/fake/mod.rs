@@ -130,11 +130,14 @@ impl FakeOrg {
         let gone = dead.clone();
         Mock::given(any())
             .respond_with(move |req: &Request| {
+                let mut st = handler.lock().unwrap_or_else(|p| p.into_inner());
+                let mut overrides = overrides.lock().unwrap_or_else(|p| p.into_inner());
+                // Checked under the state lock, which the crash below also
+                // holds while it sets `gone`: a request that was waiting on
+                // the lock when the crash fired sees it and is not applied.
                 if gone.load(Ordering::SeqCst) {
                     return never();
                 }
-                let mut st = handler.lock().unwrap_or_else(|p| p.into_inner());
-                let mut overrides = overrides.lock().unwrap_or_else(|p| p.into_inner());
                 let fired = {
                     let mut staged = staged.lock().unwrap_or_else(|p| p.into_inner());
                     let hit = staged.as_mut().is_some_and(|c| c.at.hit(req));

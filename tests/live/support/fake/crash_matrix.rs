@@ -418,6 +418,13 @@ async fn hook_secret_never_reaches_lockfile() {
             }
         }
         assert_one_object_per_slug(&fake, project.path(), &ctx);
+        // The secret did reach the server, so the absence above is not vacuous.
+        let hooks: Vec<Value> = {
+            let st = fake.state();
+            st.ids("hooks").into_iter().filter_map(|id| st.get("hooks", id)).collect()
+        };
+        let hook = hooks.iter().find(|h| h["name"] == json!(name)).unwrap_or_else(|| panic!("{ctx}: no hook {name}"));
+        assert_eq!(hook["secrets"]["api_key"], json!(SECRET), "{ctx}: the fake never received the secret");
     }
 }
 

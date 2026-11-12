@@ -172,7 +172,7 @@ mod body_trace {
     }
 }
 
-const MAX_ATTEMPTS: u32 = 5;
+pub(crate) const MAX_ATTEMPTS: u32 = 5;
 const MAX_SLEEP_SECS: u64 = 60;
 
 /// Send a request, retrying with backoff on 429 / 502 / 503 / 504. Caller
@@ -319,7 +319,7 @@ fn retriable_reason(status: StatusCode) -> Option<&'static str> {
     }
 }
 
-fn retry_after(resp: &Response) -> Option<Duration> {
+pub(crate) fn retry_after(resp: &Response) -> Option<Duration> {
     let header = resp.headers().get("Retry-After")?.to_str().ok()?;
     // Rossum sends seconds as an integer; some APIs send HTTP-date too,
     // but we only need the seconds form here.
@@ -359,7 +359,7 @@ fn is_retriable_transport(_err: &anyhow::Error) -> bool {
     false
 }
 
-fn backoff(attempt: u32) -> Duration {
+pub(crate) fn backoff(attempt: u32) -> Duration {
     // 1s, 2s, 4s, 8s, 16s — capped at 60s.
     let secs = 1u64.checked_shl(attempt).unwrap_or(MAX_SLEEP_SECS);
     Duration::from_secs(secs.min(MAX_SLEEP_SECS))

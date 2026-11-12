@@ -572,10 +572,12 @@ impl RossumClient {
     /// it; on anything else its fate is unknown and it stays for recovery.
     ///
     /// A 502/503/504 is not re-sent blind: the server may have applied the
-    /// create and lost only the answer. The client first looks for it: an
-    /// unclaimed object matching the identity fields AND agreeing on every
-    /// other field both sides have. One is the result, none means re-send
-    /// once, several means stop and name them.
+    /// create and lost only the answer. Before each re-send — up to
+    /// `MAX_ATTEMPTS` sends in all, with the same backoff as any other
+    /// request — the client looks for it: an unclaimed object matching the
+    /// identity fields AND agreeing on every other field both sides have.
+    /// One is the result, none means re-send, several means stop and name
+    /// them. The last gateway error is returned as is.
     async fn post_journaled<TResp>(
         &self,
         journal: &Journal,
@@ -592,9 +594,14 @@ impl RossumClient {
         // `/hooks/create` (the store install) creates a hook too.
         let kind = path.trim_start_matches('/').split('/').next().unwrap_or_default();
         let mut resp = self.send_create(url, body, progress.clone()).await?;
-        let status = resp.status();
-        if matches!(status.as_u16(), 502..=504) {
-            let fields = crate::state::journal::match_fields(body);
+        let mut attempt = 0;
+        while matches!(resp.status().as_u16(), 502..=504) && attempt + 1 < retry::MAX_ATTEMPTS {
+            let status = resp.status();
+            // Wait first, so the search sees whatever the server applied
+            // late, as close to the re-send as it can be.
+            crate::rt::sleep(retry::retry_after(&resp).unwrap_or_else(|| retry::backoff(attempt))).await;
+            attempt += 1;
+            let fields = crate::state::journal::create_fields(kind, body);
             let claimed = journal.claimed(kind).await;
             let mut found =
                 self.find_create_match(kind, &fields, &claimed, progress.clone()).await?;
@@ -632,9 +639,16 @@ impl RossumClient {
         };
         let created: Value =
             resp.json().await.with_context(|| format!("decoding POST response from {url}"))?;
-        if let Some(id) = created.get("id").and_then(Value::as_u64) {
-            journal.finish(seq, id).await?;
-        }
+        // Without an id the op cannot be finished; it stays pending, so the
+        // next run's recovery can still find the object by its fields.
+        let Some(id) = created.get("id").and_then(Value::as_u64) else {
+            let slug = crate::state::journal::current_item().map(|(_, slug)| slug).unwrap_or_default();
+            anyhow::bail!(
+                "POST {url} answered {status} with no id, so the {kind} '{slug}' it created \
+                 cannot be recorded; the next run's recovery will look for it"
+            );
+        };
+        journal.finish(seq, id).await?;
         serde_json::from_value(created).with_context(|| format!("decoding POST response from {url}"))
     }
 
@@ -662,7 +676,10 @@ impl RossumClient {
     /// The `kind` objects, as listed, that a create whose body hashed to
     /// `fields` may have made: not in `claimed`, equal to `fields` on every
     /// [`IDENTITY_FIELDS`](crate::state::journal::IDENTITY_FIELDS) key the body
-    /// had, and agreeing on every other field both sides have. The identity
+    /// had, and agreeing on every other field both sides have. A sub-key of a
+    /// [`SERVER_FILLED_FIELDS`](crate::state::journal::SERVER_FILLED_FIELDS)
+    /// field the body sent must be on the candidate, unchanged; the sub-keys
+    /// the server adds are not compared. The identity
     /// keys only select; the full agreement accepts — on `name` alone (labels,
     /// workspaces, schemas, engines) an unrelated object could match.
     ///
@@ -676,7 +693,7 @@ impl RossumClient {
         claimed: &std::collections::HashSet<u64>,
         progress: ProgressHandle,
     ) -> Result<Vec<serde_json::Value>> {
-        use crate::state::journal::{identity_fields, match_fields};
+        use crate::state::journal::{create_fields, identity_fields, server_filled_fields};
         let identity = identity_fields(kind)
             .with_context(|| format!("no identity fields for '{kind}'; it cannot be matched"))?;
         let listed: Vec<serde_json::Value> = self.list_paginated(&format!("/{kind}"), progress).await?;
@@ -684,9 +701,9 @@ impl RossumClient {
             .into_iter()
             .filter(|v| v["id"].as_u64().is_some_and(|id| !claimed.contains(&id)))
             .filter(|v| {
-                let remote = match_fields(v);
+                let remote = create_fields(kind, v);
                 identity.iter().filter_map(|k| fields.get(*k).map(|h| (k, h))).all(|(k, h)| remote.get(*k) == Some(h))
-                    && agrees(fields, &remote)
+                    && agrees(fields, &remote, server_filled_fields(kind))
             })
             .collect())
     }
@@ -728,13 +745,21 @@ impl RossumClient {
     }
 }
 
-/// True when `ours` and `theirs` (both [`match_fields`](crate::state::journal::match_fields)
-/// hashes) agree on every key both have.
+/// True when `ours` and `theirs` (both [`create_fields`](crate::state::journal::create_fields)
+/// hashes) agree on every key both have, and `theirs` has every sub-key
+/// `ours` has of a `filled` field.
 fn agrees(
     ours: &std::collections::BTreeMap<String, String>,
     theirs: &std::collections::BTreeMap<String, String>,
+    filled: &[&str],
 ) -> bool {
-    ours.iter().all(|(k, h)| theirs.get(k).is_none_or(|t| t == h))
+    ours.iter().all(|(k, h)| {
+        let sub_key = k.split_once('.').is_some_and(|(field, _)| filled.contains(&field));
+        match theirs.get(k) {
+            Some(t) => t == h,
+            None => !sub_key,
+        }
+    })
 }
 
 /// Exchange username/password for an API token via

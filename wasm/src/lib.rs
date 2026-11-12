@@ -1360,6 +1360,9 @@ mod state_tests {
             mount_world(&server, Some("t2")).await;
             control.trigger();
             idles.recv().await;
+            // A later cycle keeps `t2` instead of 401ing on `t1` again.
+            control.trigger();
+            idles.recv().await;
             control.stop();
         };
         let (watched, ()) = tokio::join!(fut, drive);
@@ -1367,6 +1370,11 @@ mod state_tests {
 
         let requests = server.received_requests().await.unwrap();
         let relogin = requests.iter().position(|r| r.url.path() == "/auth/login").expect("a re-login");
+        assert_eq!(
+            requests.iter().filter(|r| r.url.path() == "/auth/login").count(),
+            1,
+            "a cycle after the retry must not log in again"
+        );
         let after = state_requests(&requests[relogin..]);
         assert!(!after.is_empty(), "the retried cycle reached the state collection");
         for r in after {

@@ -20,6 +20,9 @@ use wiremock::{Request, ResponseTemplate};
 
 use super::{body_of, json_response, TOKEN};
 
+/// The largest document `replace_one` stores (MongoDB's BSON cap).
+const MAX_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
+
 /// Where Data Storage lives on the fake's host.
 pub const PREFIX: &str = "/svc/data-storage/api/v1/";
 
@@ -200,6 +203,12 @@ fn route(ds: &mut DataStorage, verb: &str, body: &Value) -> Answer {
             check(filter)?;
             let replacement = body.get("replacement").and_then(Value::as_object).ok_or_else(|| bad("replacement is required"))?;
             let upsert = body.pointer("/options/upsert").and_then(Value::as_bool).unwrap_or(false);
+            // Quirk `data_storage_document_is_capped_at_16_mib`: the real
+            // cap is on the BSON document; its JSON length is close enough
+            // for the sizes a probe sends.
+            if serde_json::to_vec(replacement).map_or(0, |b| b.len()) > MAX_DOCUMENT_BYTES {
+                return Err(bad(format!("Resulting document after update is larger than {MAX_DOCUMENT_BYTES}")));
+            }
             let docs = ds.collections.get(&name).map(|c| c.docs.as_slice()).unwrap_or_default();
             let mut hit = None;
             for (i, d) in docs.iter().enumerate() {

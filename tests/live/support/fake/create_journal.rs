@@ -280,3 +280,124 @@ async fn gateway_error_does_not_adopt_a_same_name_object_with_other_fields() {
     assert_eq!(color(mine), json!("#ff8800"), "the recorded label is the one rdc sent");
     assert_eq!(lf.pending, None);
 }
+
+/// The first `n` label creates answer 502 without applying; the first one
+/// carries no `Retry-After`, so the client must back off on its own, and the
+/// rest say `Retry-After: 0` to keep the test fast.
+fn fail_first_label_creates(fake: &FakeOrg, n: usize, apply_on: Option<usize>) {
+    let mut seen = 0;
+    fake.intercept(move |st, req| {
+        if req.method.as_str() != "POST" || req.url.path() != "/api/v1/labels" {
+            return None;
+        }
+        seen += 1;
+        if seen > n {
+            return None;
+        }
+        if apply_on == Some(seen) {
+            st.create("labels", body_of(req)).expect("the injected create applies");
+        }
+        let resp = json_response(502, &json!({ "detail": "injected by the test" }));
+        Some(if seen == 1 { resp } else { resp.insert_header("Retry-After", "0") })
+    });
+}
+
+/// Indexes of the label POSTs in `seen`, asserting a label search sits
+/// between each two.
+fn label_posts_each_preceded_by_a_search(seen: &[Seen]) -> Vec<usize> {
+    let posts: Vec<usize> =
+        (0..seen.len()).filter(|&i| seen[i].method == "POST" && seen[i].path == "/api/v1/labels").collect();
+    for w in posts.windows(2) {
+        assert!(
+            seen[w[0]..w[1]].iter().any(|s| s.method == "GET" && s.path == "/api/v1/labels"),
+            "a resend was not preceded by a search for the object"
+        );
+    }
+    posts
+}
+
+/// Four gateway errors before the create applies, then success: the create
+/// is sent `MAX_ATTEMPTS` (5) times, as any other request is retried, with a
+/// backoff and a search for the object before each resend, and makes one
+/// object.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_errors_are_retried_with_backoff_up_to_max_attempts() {
+    let fake = FakeOrg::start().await;
+    let project = one_label_project(&fake);
+    let times: Arc<Mutex<Vec<std::time::Instant>>> = Arc::default();
+    let sink = times.clone();
+    fake.intercept(move |_, req| {
+        if req.method.as_str() == "POST" && req.url.path() == "/api/v1/labels" {
+            sink.lock().unwrap().push(std::time::Instant::now());
+        }
+        None
+    });
+    let seen = observe(&fake, project.path());
+    fail_first_label_creates(&fake, 4, None);
+
+    assert_ok(&project.run_rdc(&["sync", "test"]));
+
+    let posts = label_posts_each_preceded_by_a_search(&seen.lock().unwrap());
+    assert_eq!(posts.len(), 5, "four failed POSTs, then the one that applied");
+    let times = times.lock().unwrap();
+    assert!(
+        times[1] - times[0] >= std::time::Duration::from_secs(1),
+        "no backoff after a 502 without Retry-After: {:?}",
+        times[1] - times[0]
+    );
+    let ids = fake.state().ids("labels");
+    assert_eq!(ids.len(), 1, "exactly one label: {ids:?}");
+    let lf = load_lockfile(project.path(), "test").expect("lockfile");
+    assert_eq!(lf.objects["labels"]["priority"].id, ids[0]);
+    assert_eq!(lf.pending, None);
+}
+
+/// The second send applies but its answer is a 502 too: the search before
+/// the third send finds the object and adopts it, so there is no third POST.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_apply_is_adopted_on_a_later_attempt() {
+    let fake = FakeOrg::start().await;
+    let project = one_label_project(&fake);
+    let seen = observe(&fake, project.path());
+    fail_first_label_creates(&fake, 2, Some(2));
+
+    assert_ok(&project.run_rdc(&["sync", "test"]));
+
+    let seen = seen.lock().unwrap();
+    let posts = label_posts_each_preceded_by_a_search(&seen);
+    assert_eq!(posts.len(), 2, "the object was adopted, not created a third time");
+    assert!(
+        seen[posts[1]..].iter().any(|s| s.method == "GET" && s.path == "/api/v1/labels"),
+        "the adoption was not found by a search"
+    );
+    let ids = fake.state().ids("labels");
+    assert_eq!(ids.len(), 1, "exactly one label: {ids:?}");
+    let lf = load_lockfile(project.path(), "test").expect("lockfile");
+    assert_eq!(lf.objects["labels"]["priority"].id, ids[0]);
+    assert_eq!(lf.pending, None);
+}
+
+/// A create the server accepted but answered without an id cannot be
+/// recorded: the run fails naming the kind and slug, and the op stays for
+/// the next run's recovery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_create_answer_without_an_id_is_an_error() {
+    let fake = FakeOrg::start().await;
+    let project = one_label_project(&fake);
+    fake.intercept(|st, req| {
+        if req.method.as_str() != "POST" || req.url.path() != "/api/v1/labels" {
+            return None;
+        }
+        let mut created = st.create("labels", body_of(req)).expect("the create applies");
+        created.as_object_mut().unwrap().remove("id");
+        Some(json_response(201, &created))
+    });
+
+    let out = project.run_rdc(&["sync", "test"]);
+    assert!(!out.status.success(), "an answer without an id fails the run");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("labels 'priority'") && stderr.contains("201"), "{stderr}");
+    let lf = load_lockfile(project.path(), "test").expect("lockfile");
+    let ops = lf.pending.expect("the op stays for recovery").ops;
+    assert_eq!((ops[0].kind.as_str(), ops[0].slug.as_str(), ops[0].id), ("labels", "priority", None));
+}
