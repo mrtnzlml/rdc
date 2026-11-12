@@ -7,6 +7,7 @@
 //! "nothing should happen the second time" becomes an assertion rather than
 //! something a human notices in a customer env.
 
+pub mod data_storage;
 pub mod graph;
 pub mod kinds;
 pub mod quirks;
@@ -154,6 +155,13 @@ impl FakeOrg {
         FakeOrg { server, inner, intercepts, crash, dead, org_id }
     }
 
+    /// Serve Data Storage (`/svc/data-storage/api/v1/...`) from an empty
+    /// in-memory store ([`data_storage`]). Off by default: every Data Storage
+    /// path is a 404 until a test calls this.
+    pub fn enable_data_storage(&self) {
+        self.state().data_storage.get_or_insert_with(Default::default);
+    }
+
     /// Add an [`Intercept`]. See its doc for the order and the opt-in.
     pub fn intercept(
         &self,
@@ -276,6 +284,11 @@ fn never() -> ResponseTemplate {
 /// router.
 fn serve(st: &mut OrgState, overrides: &mut [Intercept], req: &Request) -> ResponseTemplate {
     if let Some(out) = overrides.iter_mut().find_map(|f| f(st, req)) {
+        return out;
+    }
+    // Before the tick below: a Data Storage request is not a sighting of a
+    // queue the core API is still deleting.
+    if let Some(out) = data_storage::serve(st.data_storage.as_mut(), req) {
         return out;
     }
     // Snapshot BEFORE routing: if THIS request is itself a queue
@@ -472,3 +485,5 @@ mod recover;
 mod crash;
 #[cfg(test)]
 mod crash_matrix;
+#[cfg(test)]
+mod state_store;

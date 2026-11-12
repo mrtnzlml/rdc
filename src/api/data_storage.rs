@@ -8,7 +8,8 @@
 //! implemented, but only the SYNCHRONOUS ones — `data/find`,
 //! `data/insert_many`, `data/delete_many`, `data/replace_one`,
 //! `data/aggregate` — and only for datasets the snapshot flags
-//! `"data": "manual"`. `data/bulk_write` is deliberately absent: it answers
+//! `"data": "manual"` and for the collection that holds the sync state
+//! (`crate::state::data_storage_store`). `data/bulk_write` is deliberately absent: it answers
 //! 202 with an EMPTY `message`, so it carries no operation id and its
 //! completion cannot be observed. rdc never touches the rows of a dataset that
 //! is not flagged manual.
@@ -83,12 +84,29 @@ struct ReplaceResult {
     matched_count: usize,
 }
 
+/// What `data/replace_one` reports, from [`DataStorageClient::replace_where`].
+/// `matched_count` is required (a compare-and-swap reads 0 as "lost"); the
+/// other two are taken as 0 / `None` when absent.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ReplaceOutcome {
+    pub matched_count: usize,
+    #[serde(default)]
+    pub modified_count: usize,
+    #[serde(default)]
+    pub upserted_id: Option<Value>,
+}
+
 impl DataStorageClient {
     pub fn new(base_url: String, token: String) -> Result<Self> {
         let http = crate::api::build_http_client()?;
         let limiter = (!crate::api::is_loopback_base(&base_url))
             .then(|| Arc::new(RateLimiter::rossum_data_storage()));
         Ok(Self { base_url, token, http, limiter })
+    }
+
+    /// Send `token` from now on (a refreshed one, after a 401).
+    pub fn set_token(&mut self, token: String) {
+        self.token = token;
     }
 
     /// True when this client talks to a loopback mock rather than the real
@@ -278,6 +296,47 @@ impl DataStorageClient {
             )
             .await?;
         Ok(result.matched_count)
+    }
+
+    /// `POST /v1/data/replace_one` with any `filter` and `options.upsert`.
+    /// The state store's writes: an upsert by `_id` for a blob, and a
+    /// compare-and-swap on `{_id, rev}` for its manifest. [`Self::replace_one`]
+    /// stays the MDH row push's `_id`-only, no-upsert form.
+    pub async fn replace_where(
+        &self,
+        collection: &str,
+        filter: &Value,
+        replacement: &Value,
+        upsert: bool,
+        progress: ProgressHandle,
+    ) -> Result<ReplaceOutcome> {
+        self.post_envelope(
+            "/v1/data/replace_one",
+            json!({
+                "collectionName": collection,
+                "filter": filter,
+                "replacement": replacement,
+                "options": { "upsert": upsert },
+                "waitForFullWrite": true,
+            }),
+            progress,
+        )
+        .await
+    }
+
+    /// `POST /v1/data/find` with `query` and, when given, `projection`.
+    pub async fn find(
+        &self,
+        collection: &str,
+        query: &Value,
+        projection: Option<&Value>,
+        progress: ProgressHandle,
+    ) -> Result<Vec<Value>> {
+        let mut body = json!({ "collectionName": collection, "query": query });
+        if let Some(p) = projection {
+            body["projection"] = p.clone();
+        }
+        self.post_envelope("/v1/data/find", body, progress).await
     }
 
     /// `POST /v1/indexes/list` with `{collectionName, nameOnly: false}` —
@@ -785,6 +844,107 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(matched, 1);
+    }
+
+    /// `find` sends the filter and projection as given and returns the documents.
+    #[tokio::test]
+    async fn find_posts_query_and_projection() {
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data/find"))
+            .and(body_json(json!({
+                "collectionName": "state",
+                "query": { "_id": { "$in": ["a", "b"] } },
+                "projection": { "_id": 1 }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "code": "ok", "message": "", "result": [{ "_id": "a" }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = DataStorageClient::new(server.uri(), "TOKEN".into()).unwrap();
+        let rows = client
+            .find("state", &json!({ "_id": { "$in": ["a", "b"] } }), Some(&json!({ "_id": 1 })), None)
+            .await
+            .unwrap();
+        assert_eq!(rows, vec![json!({ "_id": "a" })]);
+    }
+
+    /// `replace_where` sends any filter plus `options.upsert` and returns all
+    /// three counts; an absent `modified_count` / `upserted_id` reads as
+    /// 0 / `None`, an absent `matched_count` is a decode error.
+    #[tokio::test]
+    async fn replace_where_posts_filter_and_upsert_and_returns_the_counts() {
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data/replace_one"))
+            .and(body_json(json!({
+                "collectionName": "state",
+                "filter": { "_id": "k/dev", "rev": 3 },
+                "replacement": { "rev": 4 },
+                "options": { "upsert": true },
+                "waitForFullWrite": true
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "code": "ok", "message": "",
+                "result": { "raw_result": {}, "matched_count": 0, "modified_count": 0, "upserted_id": "k/dev" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data/replace_one"))
+            .and(body_json(json!({
+                "collectionName": "state",
+                "filter": { "_id": "k/dev" },
+                "replacement": { "rev": 1 },
+                "options": { "upsert": false },
+                "waitForFullWrite": true
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "code": "ok", "message": "", "result": { "matched_count": 1 }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/data/replace_one"))
+            .and(body_json(json!({
+                "collectionName": "state",
+                "filter": { "_id": "bad" },
+                "replacement": {},
+                "options": { "upsert": false },
+                "waitForFullWrite": true
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "code": "ok", "message": "", "result": { "modified_count": 1 }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DataStorageClient::new(server.uri(), "TOKEN".into()).unwrap();
+        let out = client
+            .replace_where("state", &json!({ "_id": "k/dev", "rev": 3 }), &json!({ "rev": 4 }), true, None)
+            .await
+            .unwrap();
+        assert_eq!(out, ReplaceOutcome { matched_count: 0, modified_count: 0, upserted_id: Some(json!("k/dev")) });
+        let out = client
+            .replace_where("state", &json!({ "_id": "k/dev" }), &json!({ "rev": 1 }), false, None)
+            .await
+            .unwrap();
+        assert_eq!(out, ReplaceOutcome { matched_count: 1, modified_count: 0, upserted_id: None });
+        client
+            .replace_where("state", &json!({ "_id": "bad" }), &json!({}), false, None)
+            .await
+            .expect_err("a result without matched_count is a contract break");
     }
 
     /// Spec D1: every Data Storage request goes through the client's own

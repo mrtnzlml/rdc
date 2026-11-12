@@ -10,6 +10,7 @@
 
 use anyhow::{Result, anyhow};
 use rdc::cli::sync::embed;
+use rdc::state::store::{FsStateStore, StateStore};
 use rdc::vfs::{MemStore, Store};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -378,6 +379,98 @@ pub fn log_and_route(
     (Box::new(sink), Arc::new(Route { ask, log_buf: buf, cancel }))
 }
 
+// ---------------------------------------------------------------- state and locks
+
+/// `useDataStorageState`'s chunk size when `chunkBytes` is left out.
+pub const DEFAULT_CHUNK_BYTES: usize = 512 * 1024;
+
+fn default_chunk_bytes() -> usize {
+    DEFAULT_CHUNK_BYTES
+}
+
+/// `useDataStorageState`'s options. There is no collection to choose: the
+/// state always lives in [`rdc::state::data_storage_store::STATE_COLLECTION`],
+/// which a sync never mirrors as an MDH dataset.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DataStorageStateOptions {
+    /// Names the project's state; the host knows its org and project.
+    pub key: String,
+    #[serde(default = "default_chunk_bytes")]
+    pub chunk_bytes: usize,
+}
+
+/// A held env lock; dropping it releases the lock.
+pub type HeldLock = Box<dyn Send>;
+
+/// The browser's `EnvLock`: exclusive named locks shared by every tab of the
+/// origin, held for a whole sync or watch. On wasm32 it is the Web Locks API
+/// (`bindings::WebLocks`); natively, [`MemLocks`].
+pub trait EnvLocks: Send + Sync {
+    /// Take `name` if it is free: `None` when another holder has it. Never
+    /// waits for it. An error means no lock can be taken here at all.
+    fn acquire(&self, name: String) -> rdc::rt::BoxFuture<'static, Result<Option<HeldLock>>>;
+}
+
+/// [`EnvLocks`] in this process's memory: the native default, and the tests'
+/// stand-in for the browser's lock manager. Clones share the held set.
+#[derive(Clone, Default)]
+pub struct MemLocks(Arc<Mutex<HashSet<String>>>);
+
+struct MemHeld {
+    held: Arc<Mutex<HashSet<String>>>,
+    name: String,
+}
+
+impl Drop for MemHeld {
+    fn drop(&mut self) {
+        self.held.lock().unwrap().remove(&self.name);
+    }
+}
+
+impl EnvLocks for MemLocks {
+    fn acquire(&self, name: String) -> rdc::rt::BoxFuture<'static, Result<Option<HeldLock>>> {
+        let free = self.0.lock().unwrap().insert(name.clone());
+        let held = free.then(|| Box::new(MemHeld { held: self.0.clone(), name }) as HeldLock);
+        Box::pin(async move { Ok(held) })
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn default_locks() -> Arc<dyn EnvLocks> {
+    Arc::new(bindings::WebLocks)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn default_locks() -> Arc<dyn EnvLocks> {
+    Arc::new(MemLocks::default())
+}
+
+/// The Web Lock of a remote org: `rdc:<api_base>:<org_id>`, `api_base` as in
+/// `rdc.toml` without a trailing slash. Named after the org, not the project
+/// or the state key, so every tab that syncs one org excludes every other.
+fn lock_name(api_base: &str, org_id: u64) -> String {
+    format!("rdc:{}:{org_id}", api_base.trim_end_matches('/'))
+}
+
+/// `useDataStorageState`'s option names must all be known: an option rdc
+/// does not read must not look as if it were applied.
+pub fn check_state_option_keys(keys: impl IntoIterator<Item = String>) -> Result<()> {
+    for k in keys {
+        match k.as_str() {
+            "key" | "chunkBytes" => {}
+            "collection" => {
+                return Err(anyhow!(
+                    "unknown option 'collection': the state collection is fixed ({})",
+                    rdc::state::data_storage_store::STATE_COLLECTION
+                ));
+            }
+            _ => return Err(anyhow!("unknown option '{k}'")),
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------- the project
 
 /// Marks an env as busy with a sync or watch; dropping it frees the env.
@@ -428,6 +521,10 @@ pub struct ProjectCore {
     root: PathBuf,
     name: Arc<Mutex<String>>,
     busy: Arc<Mutex<HashSet<String>>>,
+    locks: Arc<dyn EnvLocks>,
+    /// Set by [`Self::use_data_storage_state`]; `None` keeps the state in
+    /// the tree.
+    state: Arc<Mutex<Option<DataStorageStateOptions>>>,
 }
 
 impl ProjectCore {
@@ -437,7 +534,38 @@ impl ProjectCore {
             root: PathBuf::from(ROOT),
             name: Arc::new(Mutex::new(name)),
             busy: Arc::default(),
+            locks: default_locks(),
+            state: Arc::default(),
         }
+    }
+
+    /// The same project over another lock manager.
+    pub fn with_locks(mut self, locks: Arc<dyn EnvLocks>) -> Self {
+        self.locks = locks;
+        self
+    }
+
+    /// Keep each env's sync state (`.rdc/state/<env>.*`, `.rdc/conflicts/<env>/`)
+    /// in Data Storage under `key` from the next `sync` or `watch` on.
+    pub fn use_data_storage_state(&self, opts: DataStorageStateOptions) -> Result<()> {
+        if opts.key.trim().is_empty() {
+            return Err(anyhow!("useDataStorageState: `key` must not be empty."));
+        }
+        *self.state.lock().unwrap() = Some(opts);
+        Ok(())
+    }
+
+    fn state_options(&self) -> Option<DataStorageStateOptions> {
+        self.state.lock().unwrap().clone()
+    }
+
+    /// Hold the lock of the org `env` syncs with, or fail when another tab
+    /// holds it.
+    async fn lock_env(&self, env: &str, api_base: &str, org_id: u64) -> Result<HeldLock> {
+        self.locks
+            .acquire(lock_name(api_base, org_id))
+            .await?
+            .ok_or_else(|| anyhow!("env '{env}' is already being synced in another tab"))
     }
 
     /// An existing project, from its files keyed relative to the root.
@@ -609,14 +737,20 @@ impl ProjectCore {
         route: Arc<dyn embed::PromptRoute>,
     ) -> Result<CycleOutcome> {
         let _claim = self.claim(&env)?;
+        let state_opts = self.state_options();
         let (api_base, org_id) = self.env_config(&env)?;
+        let _lock = self.lock_env(&env, &api_base, org_id).await?;
         let root = self.root.clone();
         let store = self.store();
         let o = rdc::vfs::scope(store.clone(), async {
             rdc::cli::init::write_scaffold_files(&root, &env, &api_base, org_id)?;
             let token = rdc::secrets::resolve_token(&root, &env, &api_base).await?;
-            embed::with_route(route, embed::sync_logged_in(store.clone(), &root, &env, &token, opts.into(), log))
-                .await
+            let state = state_store(state_opts, &api_base, org_id, &token)?;
+            embed::with_route(
+                route,
+                embed::sync_logged_in_with_state(store.clone(), state, &root, &env, &token, opts.into(), log),
+            )
+            .await
         })
         .await?;
         let file_count = self.run(|root| embed::count_files(&rdc::paths::Paths::for_env(root, env.as_str()).env_root()));
@@ -645,12 +779,14 @@ impl ProjectCore {
         cancel: rdc::cli::sync::watch::CancelToken,
     ) -> Result<(WatchControl, impl Future<Output = Result<()>> + 'static)> {
         let claim = self.claim(&env)?;
+        let state_opts = self.state_options();
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let control = WatchControl { triggers: tx, cancel: cancel.clone() };
         let this = self.clone();
         let fut = async move {
             let _claim = claim;
             let (api_base, org_id) = this.env_config(&env)?;
+            let _lock = this.lock_env(&env, &api_base, org_id).await?;
             let root = this.root.clone();
             let store = this.store();
             let token = rdc::vfs::scope(store.clone(), async {
@@ -658,8 +794,9 @@ impl ProjectCore {
                 rdc::secrets::resolve_token(&root, &env, &api_base).await
             })
             .await?;
-            embed::watch_logged_in(
-                store, &root, &env, &api_base, token, poll, log, route, cancel, on_idle, Some(rx),
+            let state = state_store(state_opts, &api_base, org_id, &token)?;
+            embed::watch_logged_in_with_state(
+                store, state, &root, &env, &api_base, token, poll, log, route, cancel, on_idle, Some(rx),
             )
             .await
         };
@@ -670,6 +807,27 @@ impl ProjectCore {
     pub fn message(&self, e: &anyhow::Error) -> String {
         user_message(e)
     }
+}
+
+/// Where a run keeps `env`'s sync state: Data Storage, on the env's cluster
+/// with the run's token, when `opts` is set; else the tree itself.
+fn state_store(
+    opts: Option<DataStorageStateOptions>,
+    api_base: &str,
+    org_id: u64,
+    token: &str,
+) -> Result<Arc<dyn StateStore>> {
+    let Some(o) = opts else {
+        return Ok(Arc::new(FsStateStore));
+    };
+    let base = rdc::config::EnvConfig { api_base: api_base.to_string(), org_id }.data_storage_base();
+    let client = rdc::api::DataStorageClient::new(base, token.to_string())?;
+    Ok(Arc::new(rdc::state::data_storage_store::DataStorageStateStore::new(
+        client,
+        rdc::state::data_storage_store::STATE_COLLECTION.to_string(),
+        o.key,
+        o.chunk_bytes,
+    )))
 }
 
 /// `e` as the host should see it: paths relative to the tree, the virtual
@@ -882,5 +1040,342 @@ mod tests {
         // The calls free the env again, so a later sync can claim it.
         p.rename_env("dev", "test").unwrap();
         assert!(p.claim("test").is_ok() && p.claim("dev").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+    use rdc::cli::sync::watch::CancelToken;
+    use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockBuilder, MockServer, ResponseTemplate};
+
+    const DS: &str = "/svc/data-storage/api/v1";
+
+    /// `m`, only for requests carrying `token` when one is given. The API
+    /// sends `token <t>`, Data Storage `Bearer <t>`.
+    fn with_token(m: MockBuilder, token: Option<&str>, scheme: &str) -> MockBuilder {
+        match token {
+            Some(t) => m.and(header("authorization", format!("{scheme} {t}").as_str())),
+            None => m,
+        }
+    }
+
+    /// An empty org and an empty Data Storage (no manifest yet, every write
+    /// accepted), answering only `token` when one is given.
+    async fn mount_world(server: &MockServer, token: Option<&str>) {
+        with_token(Mock::given(method("GET")).and(path("/organizations/1")), token, "token")
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 1, "name": "test-org", "url": format!("{}/organizations/1", server.uri())
+            })))
+            .mount(server)
+            .await;
+        for kind in [
+            "workspaces", "queues", "schemas", "inboxes", "hooks", "rules", "labels", "engines",
+            "engine_fields", "workflows", "workflow_steps", "email_templates", "saved_views",
+        ] {
+            with_token(Mock::given(method("GET")).and(path(format!("/{kind}"))), token, "token")
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [], "pagination": {"next": null, "total_pages": 1, "total": 0}
+                })))
+                .mount(server)
+                .await;
+        }
+        with_token(Mock::given(method("POST")).and(path(format!("{DS}/data/find"))), token, "Bearer")
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code": "ok", "message": "", "result": []})))
+            .mount(server)
+            .await;
+        with_token(Mock::given(method("POST")).and(path(format!("{DS}/data/replace_one"))), token, "Bearer")
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": "ok", "message": "", "result": {"matched_count": 0, "modified_count": 0, "upserted_id": "x"}
+            })))
+            .mount(server)
+            .await;
+        with_token(Mock::given(method("POST")).and(path(format!("{DS}/data/insert_many"))), token, "Bearer")
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code": "ok", "message": ""})))
+            .mount(server)
+            .await;
+    }
+
+    fn token_env(server: &MockServer) -> EnvInput {
+        EnvInput {
+            name: "dev".into(),
+            api_base: server.uri(),
+            org_id: 1,
+            auth_kind: AuthKind::Token,
+            token: Some("tok".into()),
+            username: None,
+            password: None,
+        }
+    }
+
+    fn project_on(server: &MockServer, locks: &MemLocks) -> ProjectCore {
+        ProjectCore::create("acme", &token_env(server)).unwrap().with_locks(Arc::new(locks.clone()))
+    }
+
+    /// The lock every tab syncing `server`'s org 1 takes.
+    fn lock_of(server: &MockServer) -> String {
+        format!("rdc:{}:1", server.uri())
+    }
+
+    fn quiet_route() -> Arc<dyn embed::PromptRoute> {
+        log_and_route(|_| {}, Box::new(|_| Box::pin(async { None })), None).1
+    }
+
+    async fn sync(p: &ProjectCore, env: &str) -> Result<CycleOutcome> {
+        let opts = SyncOptions { interactive: false, no_push: true, ..SyncOptions::default() };
+        p.clone().sync(env.into(), opts, Box::new(std::io::sink()), quiet_route()).await
+    }
+
+    /// A watch of `dev` without polling: its log lines, and one message per
+    /// completed cycle after the initial reconcile.
+    #[allow(clippy::type_complexity)]
+    fn start_watch(
+        p: &ProjectCore,
+    ) -> (WatchControl, impl Future<Output = Result<()>>, UnboundedReceiver<String>, UnboundedReceiver<()>) {
+        let (line_tx, lines) = unbounded_channel();
+        let (idle_tx, idles) = unbounded_channel();
+        let cancel = CancelToken::new();
+        let (log, route) = log_and_route(
+            move |l| {
+                let _ = line_tx.send(l.to_string());
+            },
+            Box::new(|_| Box::pin(async { None })),
+            Some(cancel.clone()),
+        );
+        let on_idle: Arc<dyn Fn(Option<u64>) + Send + Sync> = Arc::new(move |_| {
+            let _ = idle_tx.send(());
+        });
+        let (control, fut) = p.watch("dev".into(), None, log, route, Some(on_idle), cancel).unwrap();
+        (control, fut, lines, idles)
+    }
+
+    /// Wait for the watch's initial reconcile to end.
+    async fn started(lines: &mut UnboundedReceiver<String>) {
+        while let Some(l) = lines.recv().await {
+            if l.contains("start envs/dev") {
+                return;
+            }
+        }
+        panic!("the watch ended before it started");
+    }
+
+    fn state_requests(requests: &[wiremock::Request]) -> Vec<&wiremock::Request> {
+        requests
+            .iter()
+            .filter(|r| {
+                serde_json::from_slice::<serde_json::Value>(&r.body)
+                    .is_ok_and(|b| b["collectionName"] == rdc::state::data_storage_store::STATE_COLLECTION)
+            })
+            .collect()
+    }
+
+    fn ds_state(key: &str) -> DataStorageStateOptions {
+        DataStorageStateOptions { key: key.into(), chunk_bytes: DEFAULT_CHUNK_BYTES }
+    }
+
+    #[tokio::test]
+    async fn sync_uses_data_storage_state_when_set() {
+        let server = MockServer::start().await;
+        mount_world(&server, None).await;
+        let p = project_on(&server, &MemLocks::default());
+        p.use_data_storage_state(ds_state("acme-key")).unwrap();
+
+        sync(&p, "dev").await.expect("the sync succeeds");
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(!state_requests(&requests).is_empty(), "no request reached the state collection");
+        let manifest = requests
+            .iter()
+            .filter(|r| r.url.path() == format!("{DS}/data/insert_many"))
+            .filter_map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
+            .find(|b| b["documents"][0]["_id"] == "acme-key/dev")
+            .expect("the run published a manifest for acme-key/dev");
+        assert!(
+            manifest["documents"][0]["files"].get(".rdc/state/dev.lock.json").is_some(),
+            "the lockfile is in the manifest: {manifest}"
+        );
+    }
+
+    #[test]
+    fn data_storage_state_options_default_the_chunk_size_and_need_a_key() {
+        let o: DataStorageStateOptions = serde_json::from_value(serde_json::json!({"key": "k"})).unwrap();
+        assert_eq!((o.key.as_str(), o.chunk_bytes), ("k", 524_288));
+        let o: DataStorageStateOptions =
+            serde_json::from_value(serde_json::json!({"key": "k", "chunkBytes": 10})).unwrap();
+        assert_eq!(o.chunk_bytes, 10);
+        let p = ProjectCore::open(Vec::new()).unwrap();
+        assert!(p.use_data_storage_state(ds_state(" ")).is_err(), "an empty key is refused");
+    }
+
+    #[test]
+    fn an_unknown_state_option_is_refused() {
+        let keys = |ks: &[&str]| check_state_option_keys(ks.iter().map(|k| k.to_string()));
+        assert!(keys(&["key", "chunkBytes"]).is_ok());
+        assert_eq!(
+            keys(&["key", "collection"]).unwrap_err().to_string(),
+            "unknown option 'collection': the state collection is fixed (__rdc_state)"
+        );
+        assert_eq!(keys(&["key", "chunk_bytes"]).unwrap_err().to_string(), "unknown option 'chunk_bytes'");
+    }
+
+    #[tokio::test]
+    async fn default_stays_in_memory() {
+        let server = MockServer::start().await;
+        mount_world(&server, None).await;
+        let p = project_on(&server, &MemLocks::default());
+
+        sync(&p, "dev").await.expect("the sync succeeds");
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(state_requests(&requests).is_empty(), "the state collection was touched");
+        assert!(p.files().contains_key(".rdc/state/dev.lock.json"), "the state stays in the tree");
+    }
+
+    #[tokio::test]
+    async fn a_lock_held_in_another_tab_refuses_the_sync_and_the_watch() {
+        let server = MockServer::start().await;
+        mount_world(&server, None).await;
+        let locks = MemLocks::default();
+        let p = project_on(&server, &locks);
+        p.use_data_storage_state(ds_state("acme-key")).unwrap();
+        // Another tab: its own project over the same lock manager.
+        let held = locks.acquire(lock_of(&server)).await.unwrap().expect("free");
+
+        let err = sync(&p, "dev").await.expect_err("the env is locked elsewhere");
+        assert_eq!(err.to_string(), "env 'dev' is already being synced in another tab");
+        assert!(server.received_requests().await.unwrap().is_empty(), "nothing ran");
+
+        let (_control, fut, _lines, _idles) = start_watch(&p);
+        let err = fut.await.expect_err("the watch is refused too");
+        assert_eq!(err.to_string(), "env 'dev' is already being synced in another tab");
+        drop(held);
+    }
+
+    #[test]
+    fn the_lock_is_named_after_the_remote_org() {
+        assert_eq!(lock_name("https://d.test/api/v1/", 7), "rdc:https://d.test/api/v1:7");
+        assert_ne!(lock_name("https://d.test/api/v1", 7), lock_name("https://d.test/api/v1", 8));
+    }
+
+    #[tokio::test]
+    async fn a_data_storage_tab_and_a_plain_tab_on_one_org_exclude_each_other() {
+        let server = MockServer::start().await;
+        mount_world(&server, None).await;
+        let locks = MemLocks::default();
+        let with_state = project_on(&server, &locks);
+        with_state.use_data_storage_state(ds_state("acme-key")).unwrap();
+        let plain = ProjectCore::open(with_state.files()).unwrap().with_locks(Arc::new(locks.clone()));
+
+        // Hold the plain tab's sync open at its first request.
+        let (_control, fut, mut lines, _idles) = start_watch(&plain);
+        let probe = async {
+            started(&mut lines).await;
+            let err = sync(&with_state, "dev").await.expect_err("the plain tab holds the org");
+            assert_eq!(err.to_string(), "env 'dev' is already being synced in another tab");
+            _control.stop();
+        };
+        let (watched, ()) = tokio::join!(fut, probe);
+        watched.expect("the watch stops cleanly");
+        sync(&with_state, "dev").await.expect("free again once the watch ended");
+
+        // Another org on the same cluster is another lock.
+        let mut other = token_env(&server);
+        other.name = "prod".into();
+        other.org_id = 2;
+        plain.add_env(&other).unwrap();
+        let held = locks.acquire(lock_of(&server)).await.unwrap().expect("free");
+        assert!(locks.acquire(lock_name(&server.uri(), 2)).await.unwrap().is_some(), "org 2 is not org 1");
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn the_lock_is_released_after_a_sync_resolves_and_after_it_rejects() {
+        let server = MockServer::start().await;
+        mount_world(&server, None).await;
+        let locks = MemLocks::default();
+        let p = project_on(&server, &locks);
+
+        sync(&p, "dev").await.expect("the sync succeeds");
+        assert!(locks.acquire(lock_of(&server)).await.unwrap().is_some(), "released after resolve");
+
+        // Fails after the lock is taken: the env has no credentials left.
+        for key in p.files().into_keys().filter(|k| k.starts_with("secrets/")) {
+            p.delete_file(&key).unwrap();
+        }
+        sync(&p, "dev").await.expect_err("the sync fails");
+        assert!(locks.acquire(lock_of(&server)).await.unwrap().is_some(), "released after reject");
+    }
+
+    #[tokio::test]
+    async fn a_watch_releases_its_lock_after_stop() {
+        let server = MockServer::start().await;
+        mount_world(&server, None).await;
+        let locks = MemLocks::default();
+        let p = project_on(&server, &locks);
+        let (control, fut, mut lines, _idles) = start_watch(&p);
+        let probe = async {
+            started(&mut lines).await;
+            assert!(locks.acquire(lock_of(&server)).await.unwrap().is_none(), "held while watching");
+            control.stop();
+        };
+        let (watched, ()) = tokio::join!(fut, probe);
+        watched.expect("the watch stops cleanly");
+        assert!(locks.acquire(lock_of(&server)).await.unwrap().is_some(), "released after stop");
+    }
+
+    #[tokio::test]
+    async fn a_watch_with_data_storage_state_survives_a_401() {
+        let server = MockServer::start().await;
+        let login = |key: &str| {
+            Mock::given(method("POST"))
+                .and(path("/auth/login"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "key": key })))
+        };
+        login("t1").mount(&server).await;
+        mount_world(&server, Some("t1")).await;
+        let env = EnvInput {
+            auth_kind: AuthKind::Password,
+            token: None,
+            username: Some("u".into()),
+            password: Some("p".into()),
+            ..token_env(&server)
+        };
+        let p = ProjectCore::create("acme", &env).unwrap().with_locks(Arc::new(MemLocks::default()));
+        p.use_data_storage_state(ds_state("acme-key")).unwrap();
+
+        let (control, fut, mut lines, mut idles) = start_watch(&p);
+        let drive = async {
+            started(&mut lines).await;
+            // `t1` is revoked: it now gets 401 everywhere; a re-login hands out `t2`.
+            server.reset().await;
+            for revoked in ["token t1", "Bearer t1"] {
+                Mock::given(header("authorization", revoked))
+                    .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({"detail": "expired"})))
+                    .mount(&server)
+                    .await;
+            }
+            login("t2").mount(&server).await;
+            mount_world(&server, Some("t2")).await;
+            control.trigger();
+            idles.recv().await;
+            control.stop();
+        };
+        let (watched, ()) = tokio::join!(fut, drive);
+        watched.expect("the watch survives the 401");
+
+        let requests = server.received_requests().await.unwrap();
+        let relogin = requests.iter().position(|r| r.url.path() == "/auth/login").expect("a re-login");
+        let after = state_requests(&requests[relogin..]);
+        assert!(!after.is_empty(), "the retried cycle reached the state collection");
+        for r in after {
+            assert_eq!(
+                r.headers.get("authorization").and_then(|v| v.to_str().ok()),
+                Some("Bearer t2"),
+                "{} after the re-login",
+                r.url.path()
+            );
+        }
     }
 }

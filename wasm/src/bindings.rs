@@ -2,9 +2,10 @@
 //! calls out. No logic of its own beyond the conversions.
 
 use crate::{
-    AskFn, EditProjectInput, EnvInput, Prompt, ProjectCore, SyncOptions, WatchControl,
-    log_and_route,
+    AskFn, DataStorageStateOptions, check_state_option_keys, EditProjectInput, EnvInput, EnvLocks, HeldLock, Prompt,
+    ProjectCore, SyncOptions, WatchControl, log_and_route,
 };
+use anyhow::anyhow;
 use serde::Serialize;
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;
@@ -65,11 +66,85 @@ export type PromptKind =
   | "conflict" | "remoteDelete" | "bulkConfirm" | "deleteGate" | "deleteDrift"
   | "mdhIndexDrop" | "mdhRowDelete" | "unknown";
 export interface Prompt { kind: PromptKind; question: string; choices: { key: string; label: string }[]; }
+export interface DataStorageStateOptions { key: string; chunkBytes?: number; }
 export interface CycleOutcome {
   itemsPushed: number; itemsPulled: number; conflicts: number;
   remoteDeletesResolved: number; fileCount: number;
 }
 "#;
+
+// ---------------------------------------------------------------- Web Locks
+
+// The two members of `LockManager` this needs, bound by hand: web-sys has
+// them only behind `--cfg=web_sys_unstable_apis`.
+#[wasm_bindgen]
+extern "C" {
+    type LockManager;
+    #[wasm_bindgen(method)]
+    fn request(this: &LockManager, name: &str, options: &JsValue, callback: &JsValue) -> js_sys::Promise;
+}
+
+/// [`EnvLocks`] over `navigator.locks`: an exclusive lock, requested with
+/// `ifAvailable`, so a lock another tab holds is refused, never waited for.
+/// The lock is held until the callback's promise settles, which happens
+/// when the [`HeldLock`] is dropped, or when the tab goes away.
+pub struct WebLocks;
+
+/// Resolves the promise the lock callback returned, which frees the lock.
+struct WebHeld(WasmOnly<js_sys::Function>);
+
+impl Drop for WebHeld {
+    fn drop(&mut self) {
+        let _ = self.0.get().call0(&JsValue::NULL);
+    }
+}
+
+fn lock_manager() -> Option<LockManager> {
+    let navigator = js_sys::Reflect::get(&js_sys::global(), &"navigator".into()).ok()?;
+    if !navigator.is_object() {
+        return None;
+    }
+    let locks = js_sys::Reflect::get(&navigator, &"locks".into()).ok()?;
+    locks.is_object().then(|| locks.unchecked_into())
+}
+
+impl EnvLocks for WebLocks {
+    fn acquire(&self, name: String) -> rdc::rt::BoxFuture<'static, anyhow::Result<Option<HeldLock>>> {
+        Box::pin(async move {
+            let locks = lock_manager().ok_or_else(|| anyhow!("Web Locks are not available in this context"))?;
+            let mut release = None;
+            let held = js_sys::Promise::new(&mut |resolve, _| release = Some(resolve));
+            let mut grant = None;
+            let granted = js_sys::Promise::new(&mut |resolve, _| grant = Some(resolve));
+            let (release, grant) = (release.expect("called at once"), grant.expect("called at once"));
+            // `null` when another holder has the lock: report it and return
+            // at once. Otherwise return `held`, which keeps the lock until
+            // `release` is called.
+            let callback = Closure::once_into_js(move |lock: JsValue| -> JsValue {
+                let _ = grant.call1(&JsValue::NULL, &JsValue::from_bool(!lock.is_null()));
+                if lock.is_null() { JsValue::UNDEFINED } else { held.into() }
+            });
+            let options = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&options, &"mode".into(), &"exclusive".into());
+            let _ = js_sys::Reflect::set(&options, &"ifAvailable".into(), &JsValue::TRUE);
+            let request = locks.request(&name, &options, &callback);
+            // The request rejects without calling back (an invalid name, a
+            // document without an origin): its error is the answer then.
+            let granted = match futures::future::select(JsFuture::from(granted), JsFuture::from(request)).await {
+                futures::future::Either::Left((g, _)) => g,
+                futures::future::Either::Right((Err(e), _)) => Err(e),
+                futures::future::Either::Right((Ok(_), pending)) => pending.await,
+            };
+            let granted = granted.map_err(|e| anyhow!("taking the lock {name}: {}", js_error(&e)))?;
+            Ok(granted.is_truthy().then(|| Box::new(WebHeld(WasmOnly(release))) as HeldLock))
+        })
+    }
+}
+
+/// A thrown JS value as text.
+fn js_error(e: &JsValue) -> String {
+    e.dyn_ref::<js_sys::Error>().map_or_else(|| format!("{e:?}"), |e| String::from(e.message()))
+}
 
 fn to_js<T: Serialize>(v: &T) -> Result<JsValue, JsError> {
     v.serialize(&serde_wasm_bindgen::Serializer::new().serialize_missing_as_null(true))
@@ -216,8 +291,25 @@ impl Project {
         to_js(&self.core.rename_env(&old_name, &new_name).map_err(|e| self.err(e))?)
     }
 
+    /// Keep each env's sync state in Data Storage under `key` (collection
+    /// `__rdc_state`) from the next `sync` or `watch` on. Throws on an empty
+    /// key or an unknown option (`collection` included: it is fixed).
+    #[wasm_bindgen(js_name = useDataStorageState)]
+    pub fn use_data_storage_state(
+        &self,
+        #[wasm_bindgen(unchecked_param_type = "DataStorageStateOptions")] opts: JsValue,
+    ) -> Result<(), JsError> {
+        if opts.is_object() {
+            let keys: Vec<String> =
+                js_sys::Object::keys(opts.unchecked_ref::<js_sys::Object>()).iter().filter_map(|k| k.as_string()).collect();
+            check_state_option_keys(keys).map_err(|e| self.err(e))?;
+        }
+        let opts: DataStorageStateOptions = from_js(opts)?;
+        self.core.use_data_storage_state(opts).map_err(|e| self.err(e))
+    }
+
     /// One reconciliation cycle of `env`. Rejects when `env` is already
-    /// being synced or watched.
+    /// being synced or watched, here or in another tab (its Web Lock).
     #[wasm_bindgen(unchecked_return_type = "Promise<CycleOutcome>")]
     pub fn sync(
         &self,
@@ -241,7 +333,8 @@ impl Project {
     }
 
     /// Watch `env` until `stop()`. Throws when `env` is already being synced
-    /// or watched.
+    /// or watched by this project; `done()` rejects when another tab holds
+    /// its Web Lock.
     pub fn watch(
         &self,
         env: String,

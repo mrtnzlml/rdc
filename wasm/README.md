@@ -52,6 +52,7 @@ export class Project {
   addEnv(input: EnvInput): ProjectSummary;
   removeEnv(env: string): ProjectSummary | null;
   renameEnv(oldName: string, newName: string): RenameEnvResult;
+  useDataStorageState(opts: { key: string; chunkBytes?: number }): void;
   sync(env: string, opts: SyncOptions, onPrompt: (p: Prompt) => Promise<string | null>,
        onLog: (line: string) => void): Promise<CycleOutcome>;
   watch(env: string, pollSecs: number | null, onPrompt: (p: Prompt) => Promise<string | null>,
@@ -84,5 +85,33 @@ bridge's DTOs in camelCase. Differences from the desktop app:
 - **One sync or watch per env**: a second call on a busy env is rejected (the
   on-disk `EnvLock` does not apply in memory). `renameEnv` and `removeEnv`
   of a busy env are rejected too.
+- **Web Lock**: `sync` and `watch` hold an exclusive Web Lock for their whole
+  run, the browser's `EnvLock`. It is named after the remote org, not the
+  project or the state key: `rdc:<api_base>:<org_id>`, with `api_base` as in
+  `rdc.toml` without a trailing slash. So every tab that syncs one org
+  excludes every other, whether it keeps its state in Data Storage or not;
+  another org is another lock. It is requested with `ifAvailable`, so a lock
+  another tab holds is not waited for: `sync` rejects, and a watch's `done()`
+  rejects, with `env '<env>' is already being synced in another tab`. The lock
+  is released when the run settles, either way, and by the browser when the
+  tab closes or crashes. Where `navigator.locks` is missing, `sync` and
+  `watch` reject with `Web Locks are not available in this context` instead
+  of running unlocked.
+- **Sync state in Data Storage**: by default an env's sync state
+  (`.rdc/state/<env>.lock.json`, `.rdc/state/<env>.base/`,
+  `.rdc/conflicts/<env>/`) lives in the tree like any file. After
+  `useDataStorageState({ key, chunkBytes })` the next `sync` or `watch` keeps
+  it in Rossum Data Storage instead, in the collection `__rdc_state` (fixed;
+  rdc never syncs it as an MDH dataset), under the host-chosen `key` (for
+  example the org and project). The run reads the state from Data Storage
+  before it starts and saves it there after every lockfile write, with the
+  env's cluster and the token each cycle uses (a watch's refreshed token
+  after a 401 included). `chunkBytes` (default `524288`) bounds one stored
+  document. Any other option throws; `collection` too, since the collection
+  is fixed. Those `.rdc/state` and `.rdc/conflicts` keys
+  then come from Data Storage: the copies in `new Project(files)` or seen via
+  `onChange` are not authoritative. Once Data Storage holds a state for the
+  env, each run replaces the tree's copies with it; before that, the first
+  run uploads whatever state the tree has.
 - **Watch** has no file watcher. It polls on `pollSecs`, and `trigger()` runs a
   cycle as a local file change would; call it after `writeFile`.

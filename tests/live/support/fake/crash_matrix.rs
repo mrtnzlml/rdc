@@ -538,6 +538,15 @@ mod mem {
 
     /// Six labels on the env and in memory, recorded.
     async fn synced_labels(fake: &FakeOrg, run_id: &RunId) -> (ProjectFixture, Arc<MemStore>, std::path::PathBuf) {
+        synced_labels_with(fake, run_id, fs()).await
+    }
+
+    /// [`synced_labels`], with `state` the first sync's state store.
+    async fn synced_labels_with(
+        fake: &FakeOrg,
+        run_id: &RunId,
+        state: Arc<dyn StateStore>,
+    ) -> (ProjectFixture, Arc<MemStore>, std::path::PathBuf) {
         let project = ProjectFixture::init(&fake.config(), &["test"]).expect("init");
         let org_url = fake.state().org_url();
         for i in 1..=6 {
@@ -548,7 +557,7 @@ mod mem {
             );
         }
         let (store, root) = in_memory(&project);
-        sync(&store, &root, yes(false), fs()).await.expect("the first sync");
+        sync(&store, &root, yes(false), state).await.expect("the first sync");
         (project, store, root)
     }
 
@@ -594,5 +603,346 @@ mod mem {
 
         finish_and_check(&fake, &store, &root, true, "in memory: mid delete phase").await;
         assert_eq!(fake.state().ids("labels").len(), 3, "the kept labels are left");
+    }
+
+    // The same crashes with the state in the fake's Data Storage
+    // (`DataStorageStateStore`): every run is a reloaded tab, a fresh
+    // `MemStore` holding the env tree and none of the state, which the run's
+    // hydrate brings back. What survives a crash is what Data Storage holds.
+    mod data_storage {
+        use super::*;
+        use rdc::state::data_storage_store::DataStorageStateStore;
+
+        const STATE_PREFIXES: &[&str] = &[".rdc/state/test.lock.json", ".rdc/state/test.base/", ".rdc/conflicts/test/"];
+
+        fn state_store(fake: &FakeOrg) -> Arc<DataStorageStateStore> {
+            let base = rdc::config::EnvConfig { api_base: fake.api_base(), org_id: 1 }.data_storage_base();
+            let client = rdc::api::DataStorageClient::new(base, TOKEN.into()).unwrap();
+            Arc::new(DataStorageStateStore::new(client, rdc::state::data_storage_store::STATE_COLLECTION.into(), "acme/main".into(), 4096))
+        }
+
+        /// A reloaded tab: `tab`'s files without the env's state.
+        fn reload(tab: &MemStore, root: &std::path::Path) -> Arc<MemStore> {
+            let files = tab.files().into_iter().filter(|(k, _)| !STATE_PREFIXES.iter().any(|p| k.starts_with(p)));
+            Arc::new(MemStore::from_files(root.to_path_buf(), files).unwrap())
+        }
+
+        /// Never returns from the first checkpoint whose lockfile `when`
+        /// accepts; with `publish` that checkpoint first reached Data Storage.
+        struct CrashAt {
+            inner: Arc<DataStorageStateStore>,
+            when: Box<dyn Fn(&rdc::state::Lockfile) -> bool + Send + Sync>,
+            publish: bool,
+            armed: std::sync::atomic::AtomicBool,
+            fired: Arc<tokio::sync::Notify>,
+        }
+
+        impl StateStore for CrashAt {
+            fn hydrate<'a>(&'a self, paths: &'a rdc::paths::Paths) -> rdc::rt::BoxFuture<'a, anyhow::Result<()>> {
+                self.inner.hydrate(paths)
+            }
+            fn take_warnings(&self) -> Vec<String> {
+                self.inner.take_warnings()
+            }
+            fn checkpoint<'a>(&'a self, paths: &'a rdc::paths::Paths) -> rdc::rt::BoxFuture<'a, anyhow::Result<()>> {
+                let lf = rdc::state::Lockfile::load(&paths.lockfile()).expect("the lockfile just saved parses");
+                if !(self.armed.load(Ordering::SeqCst) && (self.when)(&lf)) {
+                    return self.inner.checkpoint(paths);
+                }
+                self.armed.store(false, Ordering::SeqCst);
+                Box::pin(async move {
+                    if self.publish {
+                        self.inner.checkpoint(paths).await?;
+                    }
+                    self.fired.notify_one();
+                    std::future::pending().await
+                })
+            }
+        }
+
+        /// Run 2 and run 3, each in a reloaded tab; run 3 changes nothing
+        /// and finds exactly the state run 2 left.
+        async fn finish_and_check(fake: &FakeOrg, crashed: &MemStore, root: &std::path::Path, allow_deletes: bool, ctx: &str) {
+            after_crash(fake).await;
+            let second = reload(crashed, root);
+            sync(&second, root, yes(allow_deletes), state_store(fake)).await.unwrap_or_else(|e| panic!("{ctx}: run 2: {e:#}"));
+            let third = reload(&second, root);
+            let out = sync(&third, root, yes(allow_deletes), state_store(fake)).await.unwrap_or_else(|e| panic!("{ctx}: run 3: {e:#}"));
+            assert_eq!(
+                (out.items_pushed, out.items_pulled, out.conflicts, out.remote_deletes_resolved),
+                (0, 0, 0, 0),
+                "{ctx}: run 3 found work"
+            );
+            let (before, after) = (second.files(), third.files());
+            let moved: Vec<&String> = after.keys().chain(before.keys()).filter(|k| before.get(*k) != after.get(*k)).collect();
+            assert!(moved.is_empty(), "{ctx}: run 3 did not start from run 2's state, or rewrote {moved:?}");
+            let mirrored: Vec<&String> = after.keys().filter(|k| k.contains("/mdh/")).collect();
+            assert!(mirrored.is_empty(), "{ctx}: the state's collection was synced as a dataset: {mirrored:?}");
+            let lf = lockfile(&third);
+            assert_eq!(lf.pending, None, "{ctx}: the journal is settled");
+            assert!(!root.exists(), "{ctx}: a run wrote to the disk");
+            for kind in KINDS {
+                let mut remote = fake.state().ids(kind);
+                remote.sort();
+                let mut recorded: Vec<u64> = lf.objects.get(*kind).map(|m| m.values().map(|e| e.id).collect()).unwrap_or_default();
+                recorded.sort();
+                assert_eq!(remote, recorded, "{ctx}: {kind} on the env vs. recorded slugs");
+            }
+        }
+
+        async fn create_case(site: Site, point: Point) {
+            let ctx = format!("in memory, state in Data Storage: {} {point:?}", site.path);
+            let fake = FakeOrg::start().await;
+            fake.enable_data_storage();
+            let run_id = RunId::new();
+            let project = snapshot_project(&fake, &run_id);
+            let (tab, root) = in_memory(&project);
+            let name = format!("{}{}", run_id.list_prefix(), site.name);
+            match point {
+                Point::BeforeBeginPersist | Point::AfterFinishPersist => {
+                    let crash = Arc::new(CrashAt {
+                        inner: state_store(&fake),
+                        when: match point {
+                            Point::BeforeBeginPersist => Box::new(begun(site.kind, &name)),
+                            _ => Box::new(finished(site.kind, &name)),
+                        },
+                        publish: matches!(point, Point::AfterFinishPersist),
+                        armed: true.into(),
+                        fired: Arc::default(),
+                    });
+                    until_crash(sync(&tab, &root, yes(false), crash.clone()), &crash.fired).await;
+                }
+                Point::BeforeApply | Point::AfterApplyBeforeResponse => {
+                    let at = match point {
+                        Point::BeforeApply => CrashPoint::BeforeApply,
+                        _ => CrashPoint::AfterApplyBeforeResponse,
+                    };
+                    let fired = fake.crash_on(post_named(site.path, &name), 1, at);
+                    until_crash(sync(&tab, &root, yes(false), state_store(&fake)), &fired).await;
+                }
+            }
+            finish_and_check(&fake, &tab, &root, false, &ctx).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn workspace_before_begin_persist() {
+            create_case(WORKSPACE, Point::BeforeBeginPersist).await
+        }
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn hook_before_apply() {
+            create_case(HOOK, Point::BeforeApply).await
+        }
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn store_hook_after_apply() {
+            create_case(STORE_HOOK, Point::AfterApplyBeforeResponse).await
+        }
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn email_template_after_finish_persist() {
+            create_case(EMAIL_TEMPLATE, Point::AfterFinishPersist).await
+        }
+
+        /// Six labels on the env, recorded in Data Storage; the returned tab
+        /// is reloaded, so it holds no state.
+        async fn synced_labels(fake: &FakeOrg, run_id: &RunId) -> (ProjectFixture, Arc<MemStore>, std::path::PathBuf) {
+            fake.enable_data_storage();
+            let (project, first, root) = super::synced_labels_with(fake, run_id, state_store(fake)).await;
+            (project, reload(&first, &root), root)
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn mid_update_batch() {
+            let fake = FakeOrg::start().await;
+            let run_id = RunId::new();
+            let (_project, tab, root) = synced_labels(&fake, &run_id).await;
+            rdc::vfs::scope_sync(tab.clone() as Arc<dyn Store>, || {
+                for i in 1..=6 {
+                    let path = root.join(label_path(&run_id, i));
+                    let mut label: Value = serde_json::from_slice(&rdc::vfs::read(&path).unwrap()).unwrap();
+                    label["color"] = json!("#00ff00");
+                    rdc::vfs::write(&path, format!("{}\n", serde_json::to_string_pretty(&label).unwrap())).unwrap();
+                }
+            });
+            let is_patch = |req: &Request| req.method.as_str() == "PATCH" && req.url.path().starts_with("/api/v1/labels/");
+            let fired = fake.crash_on(Box::new(is_patch), 2, CrashPoint::AfterApplyBeforeResponse);
+
+            until_crash(sync(&tab, &root, yes(false), state_store(&fake)), &fired).await;
+
+            finish_and_check(&fake, &tab, &root, false, "in memory, state in Data Storage: mid update batch").await;
+            let st = fake.state();
+            for id in st.ids("labels") {
+                assert_eq!(st.get("labels", id).unwrap()["color"], "#00ff00", "label {id} got its edit");
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn mid_delete_phase() {
+            let fake = FakeOrg::start().await;
+            let run_id = RunId::new();
+            let (_project, tab, root) = synced_labels(&fake, &run_id).await;
+            rdc::vfs::scope_sync(tab.clone() as Arc<dyn Store>, || {
+                for i in 1..=3 {
+                    rdc::vfs::remove_file(root.join(label_path(&run_id, i))).unwrap();
+                }
+            });
+            let is_delete = |req: &Request| req.method.as_str() == "DELETE" && req.url.path().starts_with("/api/v1/labels/");
+            let fired = fake.crash_on(Box::new(is_delete), 2, CrashPoint::AfterApplyBeforeResponse);
+
+            until_crash(sync(&tab, &root, yes(true), state_store(&fake)), &fired).await;
+
+            finish_and_check(&fake, &tab, &root, true, "in memory, state in Data Storage: mid delete phase").await;
+            assert_eq!(fake.state().ids("labels").len(), 3, "the kept labels are left");
+        }
+    }
+}
+
+// MDH: a dataset's collection, its indexes and its rows are not journaled —
+// a collection and an index are identified by name, a keyed row by its
+// `_id` — so a crash anywhere there is finished by the next sync re-reading
+// the env. These cases prove it against the fake's Data Storage.
+
+mod mdh {
+    use super::*;
+
+    fn write_text(project: &ProjectFixture, rel: &str, text: &str) {
+        let path = project.path().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// `rows` as `data.jsonl` text, one object per line.
+    fn jsonl(rows: &[Value]) -> String {
+        rows.iter().map(|r| format!("{r}\n")).collect()
+    }
+
+    fn rows(ids: std::ops::RangeInclusive<u32>, code: &str) -> Vec<Value> {
+        ids.map(|i| json!({ "_id": format!("r{i}"), "code": format!("{code}{i}") })).collect()
+    }
+
+    /// A project with one local-only manual dataset `<prefix>lookup`: its
+    /// `regular` indexes, no search index, and `rows`. Data Storage is on.
+    fn mdh_project(fake: &FakeOrg, run_id: &RunId, regular: Value, rows: &[Value]) -> (ProjectFixture, String) {
+        fake.enable_data_storage();
+        let project = ProjectFixture::init(&fake.config(), &["test"]).expect("init");
+        let name = format!("{}lookup", run_id.list_prefix());
+        let dir = format!("envs/test/mdh/{name}");
+        project.write_json(&format!("{dir}/collection.json"), &json!({ "name": name, "data": "manual" }));
+        project.write_json(&format!("{dir}/indexes.json"), &json!({ "regular": regular, "search": [] }));
+        write_text(&project, &format!("{dir}/data.jsonl"), &jsonl(rows));
+        (project, name)
+    }
+
+    /// The env holds exactly one collection, `name`, whose rows are `want`.
+    fn assert_one_collection(fake: &FakeOrg, name: &str, want: &[Value], ctx: &str) {
+        let st = fake.state();
+        let ds = st.data_storage.as_ref().unwrap();
+        assert_eq!(ds.collections.keys().collect::<Vec<_>>(), vec![name], "{ctx}: collections on the env");
+        let mut have = ds.docs(name);
+        have.sort_by_key(|r| r["_id"].to_string());
+        let mut want = want.to_vec();
+        want.sort_by_key(|r| r["_id"].to_string());
+        assert_eq!(have, want, "{ctx}: the rows on the env");
+    }
+
+    fn is(verb: &'static str) -> RequestMatch {
+        Box::new(move |req: &Request| req.url.path().ends_with(verb))
+    }
+
+    async fn create_case(regular: Value, verb: &'static str, point: CrashPoint) {
+        let ctx = format!("mdh {verb} {point:?}");
+        let fake = FakeOrg::start().await;
+        let run_id = RunId::new();
+        let want = rows(1..=3, "c");
+        let (project, name) = mdh_project(&fake, &run_id, regular.clone(), &want);
+        let fired = fake.crash_on(is(verb), 1, point);
+
+        until_crash(sync_in_process(project.path(), TOKEN, yes(false), fs()), &fired).await;
+
+        finish_and_check(&fake, &project, &run_id.list_prefix(), &[], &ctx).await;
+        assert_one_collection(&fake, &name, &want, &ctx);
+        let indexes: Vec<Value> = fake.state().data_storage.as_ref().unwrap().collections[&name]
+            .indexes
+            .iter()
+            .map(|ix| json!({ "key": ix["key"], "name": ix["name"] }))
+            .collect();
+        assert_eq!(Value::Array(indexes), regular, "{ctx}: each index once");
+    }
+
+    /// The control: the same dataset, never interrupted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn uninterrupted_dataset_converges() {
+        let fake = FakeOrg::start().await;
+        let run_id = RunId::new();
+        let want = rows(1..=3, "c");
+        let (project, name) = mdh_project(&fake, &run_id, json!([{ "key": { "code": 1 }, "name": "code_idx" }]), &want);
+        finish_and_check(&fake, &project, &run_id.list_prefix(), &[], "mdh uninterrupted").await;
+        assert_one_collection(&fake, &name, &want, "mdh uninterrupted");
+    }
+
+    /// A user collection named like the state store's, without its `__`, is
+    /// an ordinary dataset: created, synced, and quiet the next time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_user_collection_named_rdc_state_syncs() {
+        let fake = FakeOrg::start().await;
+        fake.enable_data_storage();
+        let project = ProjectFixture::init(&fake.config(), &["test"]).expect("init");
+        let want = rows(1..=2, "c");
+        project.write_json("envs/test/mdh/rdc-state/collection.json", &json!({ "name": "rdc_state", "data": "manual" }));
+        project.write_json("envs/test/mdh/rdc-state/indexes.json", &json!({ "regular": [], "search": [] }));
+        write_text(&project, "envs/test/mdh/rdc-state/data.jsonl", &jsonl(&want));
+        finish_and_check(&fake, &project, "rdc-state", &[], "user rdc_state").await;
+        assert_one_collection(&fake, "rdc_state", &want, "user rdc_state");
+    }
+
+    /// An index-less dataset: its collection is created explicitly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collection_create_before_apply() {
+        create_case(json!([]), "/collections/create", CrashPoint::BeforeApply).await
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collection_create_after_apply() {
+        create_case(json!([]), "/collections/create", CrashPoint::AfterApplyBeforeResponse).await
+    }
+
+    /// A dataset with an index: the index create brings its collection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_create_before_apply() {
+        create_case(json!([{ "key": { "code": 1 }, "name": "code_idx" }]), "/indexes/create", CrashPoint::BeforeApply).await
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_create_after_apply() {
+        create_case(json!([{ "key": { "code": 1 }, "name": "code_idx" }]), "/indexes/create", CrashPoint::AfterApplyBeforeResponse)
+            .await
+    }
+
+    /// A synced dataset of six rows; the edit replaces two, deletes one and
+    /// adds two. The run dies after the `nth` request to `verb` was applied.
+    async fn row_push_case(verb: &'static str, nth: usize) {
+        let ctx = format!("mdh rows, {verb} #{nth} applied");
+        let fake = FakeOrg::start().await;
+        let run_id = RunId::new();
+        let (project, name) = mdh_project(&fake, &run_id, json!([]), &rows(1..=6, "c"));
+        assert_ok(&project.run_rdc(&["sync", "test", "--yes"]), "the first sync");
+
+        let mut want = rows(1..=6, "c");
+        want[0]["code"] = json!("edited1");
+        want[1]["code"] = json!("edited2");
+        want.remove(5);
+        want.extend(rows(7..=8, "n"));
+        write_text(&project, &format!("envs/test/mdh/{name}/data.jsonl"), &jsonl(&want));
+        let fired = fake.crash_on(is(verb), nth, CrashPoint::AfterApplyBeforeResponse);
+
+        until_crash(sync_in_process(project.path(), TOKEN, yes(true), fs()), &fired).await;
+
+        finish_and_check(&fake, &project, &run_id.list_prefix(), &["--allow-deletes"], &ctx).await;
+        assert_one_collection(&fake, &name, &want, &ctx);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rows_mid_replace() {
+        row_push_case("/data/replace_one", 2).await
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rows_after_insert() {
+        row_push_case("/data/insert_many", 1).await
     }
 }

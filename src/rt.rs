@@ -13,8 +13,8 @@ pub type BoxFuture<'a, T> = futures::future::BoxFuture<'a, T>;
 pub type BoxFuture<'a, T> = futures::future::LocalBoxFuture<'a, T>;
 
 /// Run `f` detached on the runtime. Task-locals do not follow a spawn, so
-/// the caller's current store and prompt route, when set, are re-scoped
-/// around `f`.
+/// the caller's current store, state store and prompt route, when set, are
+/// re-scoped around `f`.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn spawn<F: Future<Output = ()> + Send + 'static>(f: F) {
     tokio::spawn(rescope(Box::pin(f)));
@@ -29,6 +29,9 @@ pub fn spawn<F: Future<Output = ()> + 'static>(f: F) {
 fn rescope(mut f: BoxFuture<'static, ()>) -> BoxFuture<'static, ()> {
     if let Some(route) = crate::cli::stdin_coord::current_route() {
         f = Box::pin(crate::cli::stdin_coord::with_route(route, f));
+    }
+    if let Some(state) = crate::state::store::scoped() {
+        f = Box::pin(crate::state::store::scope(state, f));
     }
     if let Some(store) = crate::vfs::current() {
         f = Box::pin(crate::vfs::scope(store, f));
@@ -52,3 +55,36 @@ pub async fn sleep(d: Duration) {
 pub type Instant = tokio::time::Instant;
 #[cfg(target_arch = "wasm32")]
 pub type Instant = web_time::Instant;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::paths::Paths;
+    use crate::state::store::{self, StateStore};
+    use anyhow::Result;
+    use std::sync::Arc;
+
+    struct Marker;
+    impl StateStore for Marker {
+        fn hydrate<'a>(&'a self, _: &'a Paths) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn checkpoint<'a>(&'a self, _: &'a Paths) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_spawned_task_sees_the_scoped_state_store() {
+        let marker: Arc<dyn StateStore> = Arc::new(Marker);
+        let want = Arc::as_ptr(&marker) as *const ();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        store::scope(marker.clone(), async move {
+            spawn(async move {
+                let _ = tx.send(Arc::as_ptr(&store::current()) as *const () as usize);
+            });
+        })
+        .await;
+        assert_eq!(rx.await.unwrap(), want as usize, "the spawned task runs on the caller's state store");
+    }
+}

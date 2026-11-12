@@ -1,4 +1,5 @@
 pub mod base_cache;
+pub mod data_storage_store;
 pub mod journal;
 pub mod lockfile;
 pub mod store;

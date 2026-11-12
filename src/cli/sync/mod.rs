@@ -229,6 +229,9 @@ pub(crate) async fn run_cycle(
     paths.ensure_no_symlinks()?;
 
     let state = crate::state::store::current();
+    if let Some(token) = &token_override {
+        state.use_token(token);
+    }
     state
         .hydrate(&paths)
         .await
@@ -245,9 +248,6 @@ pub(crate) async fn run_cycle(
     if !recoverable {
         lockfile.pending = None;
     }
-    // Every lockfile save from here on goes through the journal, which
-    // checkpoints the state store after it.
-    let journal = crate::state::store::journal_for(&paths, lockfile.clone(), state);
 
     let _title = if dry_run {
         format!("rdc sync {env} (dry run)")
@@ -265,6 +265,9 @@ pub(crate) async fn run_cycle(
     let renderer_was_supplied = renderer.is_some();
     let progress: Arc<Log> =
         renderer.unwrap_or_else(|| Log::new(crate::cli::resolve::detect_color_mode()));
+    // Every lockfile save from here on goes through the journal, which
+    // checkpoints the state store after it.
+    let journal = crate::state::store::journal_for(&paths, lockfile.clone(), state, progress.clone());
     let started = web_time::Instant::now();
 
     // Recovery of a crashed run's journal, before the offline pre-flight: the scan

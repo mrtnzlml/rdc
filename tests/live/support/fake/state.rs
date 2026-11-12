@@ -77,6 +77,9 @@ pub struct OrgState {
     /// `409` until the queue is purged (observed live 2026-09-24).
     draining_schemas: BTreeMap<u64, String>,
     org: Value,
+    /// The org's Data Storage, `None` (every path a 404) unless a test
+    /// enables it ([`super::FakeOrg::enable_data_storage`]).
+    pub data_storage: Option<super::data_storage::DataStorage>,
 }
 
 impl OrgState {
@@ -100,6 +103,7 @@ impl OrgState {
             pending_delete: BTreeMap::new(),
             draining_schemas: BTreeMap::new(),
             org,
+            data_storage: None,
         }
     }
 
