@@ -10,6 +10,7 @@
 
 use anyhow::{Result, anyhow};
 use rdc::cli::sync::embed;
+use rdc::state::store::{FsStateStore, StateStore};
 use rdc::vfs::{MemStore, Store};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -193,7 +194,7 @@ impl From<SyncOptions> for embed::EmbedSyncOptions {
 }
 
 /// One cycle's result: the core's counts, plus the desktop `Done` phase's
-/// file count.
+/// file count, a dry run's plan and what the cycle did not write.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CycleOutcome {
@@ -202,6 +203,336 @@ pub struct CycleOutcome {
     pub conflicts: usize,
     pub remote_deletes_resolved: usize,
     pub file_count: u64,
+    /// Set only by a dry run.
+    pub plan: Option<SyncPlan>,
+    pub skipped: Vec<SkippedItem>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PlanDirection {
+    Push,
+    Pull,
+    Both,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PlanChange {
+    Create,
+    Update,
+    Delete,
+    Conflict,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PlanPrompt {
+    DeleteGate,
+    Conflict,
+    RemoteDelete,
+}
+
+/// One row of a dry run's plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PlanItem {
+    pub kind: String,
+    pub slug: String,
+    pub direction: PlanDirection,
+    pub change: PlanChange,
+    pub prompt: Option<PlanPrompt>,
+    pub note: Option<String>,
+}
+
+/// A crashed run's create the dry run's recovery settled: `id` to adopt, or
+/// `null` when it made nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PlanRecovery {
+    pub kind: String,
+    pub slug: String,
+    pub id: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SyncPlan {
+    pub items: Vec<PlanItem>,
+    pub recovered: Vec<PlanRecovery>,
+    pub problems: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SkipReason {
+    DeleteGateDeclined,
+    DeleteDriftSkipped,
+    PushDriftSkipped,
+    ConflictSkipped,
+    RemoteDeleteSkipped,
+    MdhIndexDropDeclined,
+    MdhRowDeleteDeclined,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SkippedItem {
+    pub kind: String,
+    pub slug: String,
+    pub reason: SkipReason,
+}
+
+// No catch-all arms below, as for `kind_of`: a new core variant must fail to
+// compile here rather than reach the host mislabelled.
+impl From<rdc::cli::sync::plan::SyncPlan> for SyncPlan {
+    fn from(p: rdc::cli::sync::plan::SyncPlan) -> Self {
+        use rdc::cli::sync::plan as core;
+        let items = p
+            .items
+            .into_iter()
+            .map(|i| PlanItem {
+                kind: i.kind,
+                slug: i.slug,
+                direction: match i.direction {
+                    core::PlanDirection::Push => PlanDirection::Push,
+                    core::PlanDirection::Pull => PlanDirection::Pull,
+                    core::PlanDirection::Both => PlanDirection::Both,
+                },
+                change: match i.change {
+                    core::PlanChange::Create => PlanChange::Create,
+                    core::PlanChange::Update => PlanChange::Update,
+                    core::PlanChange::Delete => PlanChange::Delete,
+                    core::PlanChange::Conflict => PlanChange::Conflict,
+                },
+                prompt: i.prompt.map(|p| match p {
+                    core::PlanPrompt::DeleteGate => PlanPrompt::DeleteGate,
+                    core::PlanPrompt::Conflict => PlanPrompt::Conflict,
+                    core::PlanPrompt::RemoteDelete => PlanPrompt::RemoteDelete,
+                }),
+                note: i.note,
+            })
+            .collect();
+        let recovered =
+            p.recovered.into_iter().map(|r| PlanRecovery { kind: r.kind, slug: r.slug, id: r.id }).collect();
+        Self { items, recovered, problems: p.problems }
+    }
+}
+
+impl From<rdc::cli::sync::plan::SkippedItem> for SkippedItem {
+    fn from(i: rdc::cli::sync::plan::SkippedItem) -> Self {
+        use rdc::cli::sync::plan::SkipReason as R;
+        Self {
+            kind: i.kind,
+            slug: i.slug,
+            reason: match i.reason {
+                R::DeleteGateDeclined => SkipReason::DeleteGateDeclined,
+                R::DeleteDriftSkipped => SkipReason::DeleteDriftSkipped,
+                R::PushDriftSkipped => SkipReason::PushDriftSkipped,
+                R::ConflictSkipped => SkipReason::ConflictSkipped,
+                R::RemoteDeleteSkipped => SkipReason::RemoteDeleteSkipped,
+                R::MdhIndexDropDeclined => SkipReason::MdhIndexDropDeclined,
+                R::MdhRowDeleteDeclined => SkipReason::MdhRowDeleteDeclined,
+            },
+        }
+    }
+}
+
+/// A `--carry` group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CarryGroup {
+    ScoreThresholds,
+    EmailPrefixes,
+    Automation,
+    All,
+}
+
+impl From<CarryGroup> for embed::CarryGroup {
+    fn from(g: CarryGroup) -> Self {
+        match g {
+            CarryGroup::ScoreThresholds => embed::CarryGroup::ScoreThresholds,
+            CarryGroup::EmailPrefixes => embed::CarryGroup::EmailPrefixes,
+            CarryGroup::Automation => embed::CarryGroup::Automation,
+            CarryGroup::All => embed::CarryGroup::All,
+        }
+    }
+}
+
+/// `migrate`'s options: `rdc migrate`'s flags. Every field may be left out;
+/// the defaults are an unflagged `rdc migrate`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+pub struct MigrateOptions {
+    pub dry_run: bool,
+    pub mirror: bool,
+    /// Needs `mirror`, as `--allow-recreate` needs `--mirror`.
+    pub allow_recreate: bool,
+    pub only: Vec<String>,
+    pub carry: Vec<CarryGroup>,
+}
+
+/// `migrate`'s option names must all be known, as `useDataStorageState`'s.
+pub fn check_migrate_option_keys(keys: impl IntoIterator<Item = String>) -> Result<()> {
+    for k in keys {
+        match k.as_str() {
+            "dryRun" | "mirror" | "allowRecreate" | "only" | "carry" => {}
+            _ => return Err(anyhow!("unknown option '{k}'")),
+        }
+    }
+    Ok(())
+}
+
+impl TryFrom<MigrateOptions> for embed::EmbedMigrateOptions {
+    type Error = anyhow::Error;
+    fn try_from(o: MigrateOptions) -> Result<Self> {
+        if o.allow_recreate && !o.mirror {
+            return Err(anyhow!("migrate: `allowRecreate` needs `mirror`."));
+        }
+        let groups: Vec<embed::CarryGroup> = o.carry.into_iter().map(Into::into).collect();
+        Ok(Self {
+            mirror: if o.mirror {
+                embed::MirrorMode::Mirror { allow_recreate: o.allow_recreate }
+            } else {
+                embed::MirrorMode::Additive
+            },
+            dry_run: o.dry_run,
+            only: o.only,
+            carry: embed::Carry::from_groups(&groups),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FileChange {
+    Create,
+    Update,
+    Unchanged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ObjectChange {
+    Create,
+    Update,
+    Unchanged,
+    Delete,
+}
+
+/// One file a migrate considered, by project key, and the target object it
+/// belongs to (`kind`/`slug` as the sync plan and `skipped` name it; `null`
+/// for a file of no object).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MigrateFile {
+    pub source: String,
+    pub target: String,
+    pub change: FileChange,
+    pub kind: Option<String>,
+    pub slug: Option<String>,
+}
+
+/// One target object, by its target slug, and what this run did to its
+/// files in the target tree (`cli::migrate::ObjectChange`): `create` = the
+/// tree had no file for it, `update` = its files changed, `unchanged`,
+/// `delete` = `mirror` removed it. Not what the next `sync` sends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MigrateObject {
+    pub kind: String,
+    pub slug: String,
+    pub change: ObjectChange,
+}
+
+/// A target file `mirror` pruned, by project key, and the object it belonged
+/// to, as [`MigrateFile`] names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MigratePruned {
+    pub target: String,
+    pub kind: Option<String>,
+    pub slug: Option<String>,
+}
+
+/// What a migrate changed, or under `dryRun` would change. Paths are
+/// project keys (`envs/<env>/...`), as `files()` names them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrateResult {
+    pub dry_run: bool,
+    pub source: String,
+    pub target: String,
+    pub files: Vec<MigrateFile>,
+    pub objects: Vec<MigrateObject>,
+    pub pruned: Vec<MigratePruned>,
+    pub pruned_dirs: Vec<String>,
+    pub skipped: Vec<String>,
+    pub warnings: Vec<String>,
+    pub creates: usize,
+    pub updates: usize,
+    pub unchanged: usize,
+    pub deletes: usize,
+    pub files_changed: usize,
+    pub renamed: usize,
+}
+
+/// `rel` (relative to `envs/<env>/`) as a project key.
+fn env_key(env: &str, rel: &Path) -> String {
+    let parts: Vec<String> = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+    format!("envs/{env}/{}", parts.join("/"))
+}
+
+impl MigrateResult {
+    fn from_report(src: &str, tgt: &str, r: embed::MigrateReport) -> Self {
+        let objects: Vec<MigrateObject> = r
+            .objects
+            .into_iter()
+            .map(|o| MigrateObject {
+                kind: o.kind,
+                slug: o.slug,
+                change: match o.change {
+                    embed::ObjectChange::Create => ObjectChange::Create,
+                    embed::ObjectChange::Update => ObjectChange::Update,
+                    embed::ObjectChange::Unchanged => ObjectChange::Unchanged,
+                    embed::ObjectChange::Delete => ObjectChange::Delete,
+                },
+            })
+            .collect();
+        let count = |c: ObjectChange| objects.iter().filter(|o| o.change == c).count();
+        Self {
+            dry_run: r.dry_run,
+            source: src.to_string(),
+            target: tgt.to_string(),
+            files: r
+                .files
+                .iter()
+                .map(|f| MigrateFile {
+                    source: env_key(src, &f.source),
+                    target: env_key(tgt, &f.target),
+                    change: match f.change {
+                        embed::FileOutcome::Created => FileChange::Create,
+                        embed::FileOutcome::Updated => FileChange::Update,
+                        embed::FileOutcome::Unchanged => FileChange::Unchanged,
+                    },
+                    kind: f.object.as_ref().map(|(k, _)| k.clone()),
+                    slug: f.object.as_ref().map(|(_, s)| s.clone()),
+                })
+                .collect(),
+            creates: count(ObjectChange::Create),
+            updates: count(ObjectChange::Update),
+            unchanged: count(ObjectChange::Unchanged),
+            deletes: count(ObjectChange::Delete),
+            objects,
+            pruned: r
+                .pruned
+                .iter()
+                .map(|p| MigratePruned {
+                    target: env_key(tgt, &p.target),
+                    kind: p.object.as_ref().map(|(k, _)| k.clone()),
+                    slug: p.object.as_ref().map(|(_, s)| s.clone()),
+                })
+                .collect(),
+            pruned_dirs: r.pruned_dirs.iter().map(|p| env_key(tgt, p)).collect(),
+            skipped: r.skipped.iter().map(|p| env_key(src, p)).collect(),
+            warnings: r.warnings,
+            files_changed: r.files_changed,
+            renamed: r.renamed,
+        }
+    }
 }
 
 /// The desktop's `PromptKindDto`.
@@ -215,6 +546,9 @@ pub enum PromptKind {
     DeleteDrift,
     MdhIndexDrop,
     MdhRowDelete,
+    /// Which of several remote objects a crashed run's create made. Its
+    /// `question` is the whole question.
+    RecoverCreate,
     /// A prompt whose site never announced. Should be unreachable; render
     /// it as an explicit "unrecognised prompt", not as a normal dialog.
     Unknown,
@@ -233,6 +567,7 @@ fn kind_of(k: embed::PromptKind) -> PromptKind {
         K::DeleteDrift => PromptKind::DeleteDrift,
         K::MdhIndexDrop => PromptKind::MdhIndexDrop,
         K::MdhRowDelete => PromptKind::MdhRowDelete,
+        K::RecoverCreate => PromptKind::RecoverCreate,
         K::Unknown => PromptKind::Unknown,
     }
 }
@@ -262,9 +597,15 @@ fn offer(prompt: &embed::Prompt) -> (Prompt, HashSet<char>) {
     let offered: Vec<embed::PromptKey> =
         prompt.keys.iter().filter(|k| !matches!(k.key, 'e' | 'h')).cloned().collect();
     let allowed = offered.iter().map(|k| k.key).collect();
+    // A recovery prompt carries its whole question; every other kind's is the
+    // menu line, rebuilt from the keys offered here.
+    let question = match prompt.kind {
+        embed::PromptKind::RecoverCreate => prompt.question.clone(),
+        _ => embed::menu_one_line(&offered),
+    };
     let dto = Prompt {
         kind: kind_of(prompt.kind),
-        question: embed::menu_one_line(&offered),
+        question,
         choices: offered
             .iter()
             .map(|k| PromptChoice { key: k.key.to_string(), label: k.label.clone() })
@@ -378,6 +719,99 @@ pub fn log_and_route(
     (Box::new(sink), Arc::new(Route { ask, log_buf: buf, cancel }))
 }
 
+// ---------------------------------------------------------------- state and locks
+
+/// `useDataStorageState`'s chunk size when `chunkBytes` is left out.
+pub const DEFAULT_CHUNK_BYTES: usize = 512 * 1024;
+
+fn default_chunk_bytes() -> usize {
+    DEFAULT_CHUNK_BYTES
+}
+
+fn default_collection() -> String {
+    rdc::state::data_storage_store::STATE_COLLECTION.to_string()
+}
+
+/// `useDataStorageState`'s options. A sync never mirrors `collection` as an
+/// MDH dataset, whatever its name.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DataStorageStateOptions {
+    /// Names the project's state; the host knows its org and project.
+    pub key: String,
+    /// The Data Storage collection, in each env's own org; default
+    /// [`rdc::state::data_storage_store::STATE_COLLECTION`].
+    #[serde(default = "default_collection")]
+    pub collection: String,
+    #[serde(default = "default_chunk_bytes")]
+    pub chunk_bytes: usize,
+}
+
+/// A held env lock; dropping it releases the lock.
+pub type HeldLock = Box<dyn Send>;
+
+/// The browser's `EnvLock`: exclusive named locks shared by every tab of the
+/// origin, held for a whole sync or watch. On wasm32 it is the Web Locks API
+/// (`bindings::WebLocks`); natively, [`MemLocks`].
+pub trait EnvLocks: Send + Sync {
+    /// Take `name` if it is free: `None` when another holder has it. Never
+    /// waits for it. An error means no lock can be taken here at all.
+    fn acquire(&self, name: String) -> rdc::rt::BoxFuture<'static, Result<Option<HeldLock>>>;
+}
+
+/// [`EnvLocks`] in this process's memory: the native default, and the tests'
+/// stand-in for the browser's lock manager. Clones share the held set.
+#[derive(Clone, Default)]
+pub struct MemLocks(Arc<Mutex<HashSet<String>>>);
+
+struct MemHeld {
+    held: Arc<Mutex<HashSet<String>>>,
+    name: String,
+}
+
+impl Drop for MemHeld {
+    fn drop(&mut self) {
+        self.held.lock().unwrap().remove(&self.name);
+    }
+}
+
+impl EnvLocks for MemLocks {
+    fn acquire(&self, name: String) -> rdc::rt::BoxFuture<'static, Result<Option<HeldLock>>> {
+        let free = self.0.lock().unwrap().insert(name.clone());
+        let held = free.then(|| Box::new(MemHeld { held: self.0.clone(), name }) as HeldLock);
+        Box::pin(async move { Ok(held) })
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn default_locks() -> Arc<dyn EnvLocks> {
+    Arc::new(bindings::WebLocks)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn default_locks() -> Arc<dyn EnvLocks> {
+    Arc::new(MemLocks::default())
+}
+
+/// The Web Lock of a remote org: `rdc:<api_base>:<org_id>`, `api_base` as in
+/// `rdc.toml` without a trailing slash. Named after the org, not the project
+/// or the state key, so every tab that syncs one org excludes every other.
+fn lock_name(api_base: &str, org_id: u64) -> String {
+    format!("rdc:{}:{org_id}", api_base.trim_end_matches('/'))
+}
+
+/// `useDataStorageState`'s option names must all be known: an option rdc
+/// does not read must not look as if it were applied.
+pub fn check_state_option_keys(keys: impl IntoIterator<Item = String>) -> Result<()> {
+    for k in keys {
+        match k.as_str() {
+            "key" | "collection" | "chunkBytes" => {}
+            _ => return Err(anyhow!("unknown option '{k}'")),
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------- the project
 
 /// Marks an env as busy with a sync or watch; dropping it frees the env.
@@ -428,6 +862,23 @@ pub struct ProjectCore {
     root: PathBuf,
     name: Arc<Mutex<String>>,
     busy: Arc<Mutex<HashSet<String>>>,
+    locks: Arc<dyn EnvLocks>,
+    /// Set by [`Self::use_data_storage_state`]; `None` keeps the state in
+    /// the tree.
+    state: Arc<Mutex<Option<DataStorageStateOptions>>>,
+    /// Per env, the Data Storage store its runs use, kept for the project's
+    /// life: it remembers the manifest the tree last agreed with, which
+    /// decides what its next hydrate keeps (see `DataStorageStateStore`).
+    stores: Arc<Mutex<BTreeMap<String, CachedStore>>>,
+}
+
+/// A store and what it was built for; another key, collection, chunk size or
+/// org is another store.
+struct CachedStore {
+    opts: DataStorageStateOptions,
+    api_base: String,
+    org_id: u64,
+    store: Arc<rdc::state::data_storage_store::DataStorageStateStore>,
 }
 
 impl ProjectCore {
@@ -437,7 +888,81 @@ impl ProjectCore {
             root: PathBuf::from(ROOT),
             name: Arc::new(Mutex::new(name)),
             busy: Arc::default(),
+            locks: default_locks(),
+            state: Arc::default(),
+            stores: Arc::default(),
         }
+    }
+
+    /// The same project over another lock manager.
+    pub fn with_locks(mut self, locks: Arc<dyn EnvLocks>) -> Self {
+        self.locks = locks;
+        self
+    }
+
+    /// Keep each env's sync state (`.rdc/state/<env>.*`, `.rdc/conflicts/<env>/`)
+    /// in Data Storage under `key` from the next `sync` or `watch` on.
+    pub fn use_data_storage_state(&self, opts: DataStorageStateOptions) -> Result<()> {
+        if opts.key.trim().is_empty() {
+            return Err(anyhow!("useDataStorageState: `key` must not be empty."));
+        }
+        if opts.collection.trim().is_empty() {
+            return Err(anyhow!("useDataStorageState: `collection` must not be empty."));
+        }
+        *self.state.lock().unwrap() = Some(opts);
+        Ok(())
+    }
+
+    /// Where a run keeps `env`'s state: Data Storage, on the env's cluster
+    /// with the run's token, when `opts` is set; else the tree itself.
+    fn state_store(
+        &self,
+        opts: Option<DataStorageStateOptions>,
+        env: &str,
+        api_base: &str,
+        org_id: u64,
+        token: &str,
+    ) -> Result<Arc<dyn StateStore>> {
+        let Some(o) = opts else {
+            return Ok(Arc::new(FsStateStore));
+        };
+        let mut stores = self.stores.lock().unwrap();
+        if let Some(c) = stores.get(env)
+            && c.opts == o
+            && c.api_base == api_base
+            && c.org_id == org_id
+        {
+            c.store.use_token(token);
+            return Ok(c.store.clone());
+        }
+        let base = rdc::config::EnvConfig { api_base: api_base.to_string(), org_id }.data_storage_base();
+        let client = rdc::api::DataStorageClient::new(base, token.to_string())?;
+        let store = Arc::new(rdc::state::data_storage_store::DataStorageStateStore::new(
+            client,
+            o.collection.clone(),
+            o.key.clone(),
+            o.chunk_bytes,
+        ));
+        stores.insert(env.to_string(), CachedStore { opts: o, api_base: api_base.to_string(), org_id, store: store.clone() });
+        Ok(store)
+    }
+
+    /// A renamed or removed env's store remembers a tree that is gone.
+    fn forget_store(&self, env: &str) {
+        self.stores.lock().unwrap().remove(env);
+    }
+
+    fn state_options(&self) -> Option<DataStorageStateOptions> {
+        self.state.lock().unwrap().clone()
+    }
+
+    /// Hold the lock of the org `env` syncs with, or fail when another tab
+    /// holds it.
+    async fn lock_env(&self, env: &str, api_base: &str, org_id: u64) -> Result<HeldLock> {
+        self.locks
+            .acquire(lock_name(api_base, org_id))
+            .await?
+            .ok_or_else(|| anyhow!("env '{env}' is already being synced in another tab"))
     }
 
     /// An existing project, from its files keyed relative to the root.
@@ -557,6 +1082,7 @@ impl ProjectCore {
     /// refuses it; in memory nothing else would).
     pub fn remove_env(&self, env: &str) -> Result<Option<ProjectSummary>> {
         let _claim = self.claim(env)?;
+        self.forget_store(env);
         match self.run(|root| embed::remove_env(root, env))? {
             embed::RemovedEnv::Removed => self.summary().map(Some),
             embed::RemovedEnv::LastEnv => {
@@ -574,6 +1100,9 @@ impl ProjectCore {
     pub fn rename_env(&self, old: &str, new: &str) -> Result<RenameEnvResult> {
         let _claim = if new.trim() == old { None } else { Some(self.claim(old)?) };
         let report = self.run(|root| embed::rename_env(root, old, new))?;
+        if new.trim() != old {
+            self.forget_store(old);
+        }
         Ok(RenameEnvResult {
             project: self.summary()?,
             follow_ups: report.follow_ups,
@@ -609,14 +1138,20 @@ impl ProjectCore {
         route: Arc<dyn embed::PromptRoute>,
     ) -> Result<CycleOutcome> {
         let _claim = self.claim(&env)?;
+        let state_opts = self.state_options();
         let (api_base, org_id) = self.env_config(&env)?;
+        let _lock = self.lock_env(&env, &api_base, org_id).await?;
         let root = self.root.clone();
         let store = self.store();
         let o = rdc::vfs::scope(store.clone(), async {
             rdc::cli::init::write_scaffold_files(&root, &env, &api_base, org_id)?;
             let token = rdc::secrets::resolve_token(&root, &env, &api_base).await?;
-            embed::with_route(route, embed::sync_logged_in(store.clone(), &root, &env, &token, opts.into(), log))
-                .await
+            let state = self.state_store(state_opts, &env, &api_base, org_id, &token)?;
+            embed::with_route(
+                route,
+                embed::sync_logged_in_with_state(store.clone(), state, &root, &env, &token, opts.into(), log),
+            )
+            .await
         })
         .await?;
         let file_count = self.run(|root| embed::count_files(&rdc::paths::Paths::for_env(root, env.as_str()).env_root()));
@@ -626,7 +1161,52 @@ impl ProjectCore {
             conflicts: o.conflicts,
             remote_deletes_resolved: o.remote_deletes_resolved,
             file_count,
+            plan: o.plan.map(Into::into),
+            skipped: o.skipped.into_iter().map(Into::into).collect(),
         })
+    }
+
+    /// `rdc migrate <src> <tgt>` on the tree (`cli::migrate::run_at`), its
+    /// log on `log`.
+    ///
+    /// Both envs are claimed for the run. With Data Storage state on, each
+    /// env's state is loaded from its own org first, the target org's Web
+    /// Lock is held throughout, and the target's state is saved after the
+    /// run (not under `dryRun`).
+    pub async fn migrate(
+        self,
+        src: String,
+        tgt: String,
+        opts: MigrateOptions,
+        log: Box<dyn Write + Send>,
+    ) -> Result<MigrateResult> {
+        let opts = embed::EmbedMigrateOptions::try_from(opts)?;
+        // The same env twice is `run_at`'s error to give, not a busy env.
+        let _claims = if src == tgt { None } else { Some((self.claim(&src)?, self.claim(&tgt)?)) };
+        let root = self.root.clone();
+        let store = self.store();
+        let mut lock = None;
+        let (src_state, tgt_state): (Arc<dyn StateStore>, Arc<dyn StateStore>) = match self.state_options() {
+            Some(o) if src != tgt => {
+                let (src_base, src_org) = self.env_config(&src)?;
+                let (tgt_base, tgt_org) = self.env_config(&tgt)?;
+                lock = Some(self.lock_env(&tgt, &tgt_base, tgt_org).await?);
+                let (src_token, tgt_token) = rdc::vfs::scope(store.clone(), async {
+                    let s = rdc::secrets::resolve_token(&root, &src, &src_base).await?;
+                    let t = rdc::secrets::resolve_token(&root, &tgt, &tgt_base).await?;
+                    Ok::<_, anyhow::Error>((s, t))
+                })
+                .await?;
+                (
+                    self.state_store(Some(o.clone()), &src, &src_base, src_org, &src_token)?,
+                    self.state_store(Some(o), &tgt, &tgt_base, tgt_org, &tgt_token)?,
+                )
+            }
+            _ => (Arc::new(FsStateStore), Arc::new(FsStateStore)),
+        };
+        let report = embed::migrate_logged_in(store, src_state, tgt_state, &root, &src, &tgt, opts, log).await?;
+        drop(lock);
+        Ok(MigrateResult::from_report(&src, &tgt, report))
     }
 
     /// The desktop's `watch_env`. The env is claimed now, so a second call
@@ -645,12 +1225,14 @@ impl ProjectCore {
         cancel: rdc::cli::sync::watch::CancelToken,
     ) -> Result<(WatchControl, impl Future<Output = Result<()>> + 'static)> {
         let claim = self.claim(&env)?;
+        let state_opts = self.state_options();
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let control = WatchControl { triggers: tx, cancel: cancel.clone() };
         let this = self.clone();
         let fut = async move {
             let _claim = claim;
             let (api_base, org_id) = this.env_config(&env)?;
+            let _lock = this.lock_env(&env, &api_base, org_id).await?;
             let root = this.root.clone();
             let store = this.store();
             let token = rdc::vfs::scope(store.clone(), async {
@@ -658,8 +1240,9 @@ impl ProjectCore {
                 rdc::secrets::resolve_token(&root, &env, &api_base).await
             })
             .await?;
-            embed::watch_logged_in(
-                store, &root, &env, &api_base, token, poll, log, route, cancel, on_idle, Some(rx),
+            let state = this.state_store(state_opts, &env, &api_base, org_id, &token)?;
+            embed::watch_logged_in_with_state(
+                store, state, &root, &env, &api_base, token, poll, log, route, cancel, on_idle, Some(rx),
             )
             .await
         };
@@ -785,6 +1368,21 @@ mod tests {
     }
 
     #[test]
+    fn a_recovery_prompt_keeps_its_whole_question() {
+        let prompt = embed::Prompt {
+            kind: embed::PromptKind::RecoverCreate,
+            question: "labels/a: an unfinished run's create may have made any of 2 labels (ids 7, 9). Which one did it create?".into(),
+            keys: vec![embed::PromptKey::new('1', "it is id 7"), embed::PromptKey::new('2', "it is id 9"), embed::PromptKey::new('a', "abort the sync")],
+        };
+        let (dto, allowed) = offer(&prompt);
+        assert_eq!(dto.kind, PromptKind::RecoverCreate);
+        assert_eq!(dto.question, prompt.question);
+        assert_eq!(dto.choices.iter().map(|c| c.key.as_str()).collect::<Vec<_>>(), vec!["1", "2", "a"]);
+        assert_eq!(accept(Some("2".into()), &allowed), Some("2".into()));
+        assert_eq!(serde_json::to_value(PromptKind::RecoverCreate).unwrap(), "recoverCreate");
+    }
+
+    #[test]
     fn prompts_never_offer_or_accept_e_or_h() {
         let (dto, allowed) = offer(&sample_prompt());
         assert_eq!(dto.kind, PromptKind::DeleteGate);
@@ -882,5 +1480,676 @@ mod tests {
         // The calls free the env again, so a later sync can claim it.
         p.rename_env("dev", "test").unwrap();
         assert!(p.claim("test").is_ok() && p.claim("dev").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+    use rdc::cli::sync::watch::CancelToken;
+    use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockBuilder, MockServer, ResponseTemplate};
+
+    const DS: &str = "/svc/data-storage/api/v1";
+
+    /// `m`, only for requests carrying `token` when one is given. The API
+    /// sends `token <t>`, Data Storage `Bearer <t>`.
+    fn with_token(m: MockBuilder, token: Option<&str>, scheme: &str) -> MockBuilder {
+        match token {
+            Some(t) => m.and(header("authorization", format!("{scheme} {t}").as_str())),
+            None => m,
+        }
+    }
+
+    /// An empty org and an empty Data Storage (no manifest is ever found,
+    /// every write accepted and every compare-and-swap matched), answering
+    /// only `token` when one is given.
+    async fn mount_world(server: &MockServer, token: Option<&str>) {
+        with_token(Mock::given(method("GET")).and(path("/organizations/1")), token, "token")
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 1, "name": "test-org", "url": format!("{}/organizations/1", server.uri())
+            })))
+            .mount(server)
+            .await;
+        for kind in [
+            "workspaces", "queues", "schemas", "inboxes", "hooks", "rules", "labels", "engines",
+            "engine_fields", "workflows", "workflow_steps", "email_templates", "saved_views",
+        ] {
+            with_token(Mock::given(method("GET")).and(path(format!("/{kind}"))), token, "token")
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [], "pagination": {"next": null, "total_pages": 1, "total": 0}
+                })))
+                .mount(server)
+                .await;
+        }
+        with_token(Mock::given(method("POST")).and(path(format!("{DS}/data/find"))), token, "Bearer")
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code": "ok", "message": "", "result": []})))
+            .mount(server)
+            .await;
+        with_token(Mock::given(method("POST")).and(path(format!("{DS}/data/replace_one"))), token, "Bearer")
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": "ok", "message": "", "result": {"matched_count": 1, "modified_count": 1, "upserted_id": null}
+            })))
+            .mount(server)
+            .await;
+        with_token(Mock::given(method("POST")).and(path(format!("{DS}/data/insert_many"))), token, "Bearer")
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code": "ok", "message": ""})))
+            .mount(server)
+            .await;
+    }
+
+    /// The org endpoints of [`mount_world`] over a Data Storage that keeps
+    /// what it is sent: manifests and blobs are found again, and a stale
+    /// compare-and-swap matches nothing. The collections are returned.
+    async fn mount_world_with_storage(server: &MockServer) -> Arc<Mutex<BTreeMap<String, Vec<serde_json::Value>>>> {
+        use serde_json::{Value, json};
+        let store: Arc<Mutex<BTreeMap<String, Vec<Value>>>> = Arc::default();
+        let ok = |result: Value| ResponseTemplate::new(200).set_body_json(json!({ "code": "ok", "message": "", "result": result }));
+        // Top-level equality, or `{"$in": [...]}`.
+        fn matches(doc: &Value, filter: &Value) -> bool {
+            filter.as_object().is_some_and(|f| {
+                f.iter().all(|(k, want)| match want.get("$in").and_then(Value::as_array) {
+                    Some(any) => any.contains(&doc[k]),
+                    None => &doc[k] == want,
+                })
+            })
+        }
+        let db = store.clone();
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::path_regex(format!("^{DS}/data/")))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&req.body).unwrap();
+                let name = body["collectionName"].as_str().unwrap().to_string();
+                let mut db = db.lock().unwrap();
+                let docs = db.entry(name).or_default();
+                match req.url.path().rsplit('/').next().unwrap() {
+                    "find" => ok(Value::Array(docs.iter().filter(|d| matches(d, &body["query"])).cloned().collect())),
+                    "insert_many" => {
+                        let new = body["documents"].as_array().unwrap();
+                        if new.iter().any(|n| docs.iter().any(|d| d["_id"] == n["_id"])) {
+                            return ResponseTemplate::new(400).set_body_json(json!({ "code": "error", "message": "duplicate key" }));
+                        }
+                        docs.extend(new.iter().cloned());
+                        ok(Value::Null)
+                    }
+                    "replace_one" => {
+                        let mut doc = body["replacement"].clone();
+                        if let Some(i) = docs.iter().position(|d| matches(d, &body["filter"])) {
+                            doc["_id"] = docs[i]["_id"].clone();
+                            docs[i] = doc;
+                            ok(json!({ "matched_count": 1, "modified_count": 1, "upserted_id": null }))
+                        } else if body["options"]["upsert"] == true {
+                            doc["_id"] = body["filter"]["_id"].clone();
+                            docs.push(doc);
+                            ok(json!({ "matched_count": 0, "modified_count": 0, "upserted_id": body["filter"]["_id"] }))
+                        } else {
+                            ok(json!({ "matched_count": 0, "modified_count": 0, "upserted_id": null }))
+                        }
+                    }
+                    "delete_many" => {
+                        docs.retain(|d| !matches(d, &body["filter"]));
+                        ok(json!({ "deleted_count": 0 }))
+                    }
+                    other => panic!("unexpected Data Storage call {other}"),
+                }
+            })
+            .mount(server)
+            .await;
+        mount_world(server, None).await;
+        store
+    }
+
+    fn token_env(server: &MockServer) -> EnvInput {
+        EnvInput {
+            name: "dev".into(),
+            api_base: server.uri(),
+            org_id: 1,
+            auth_kind: AuthKind::Token,
+            token: Some("tok".into()),
+            username: None,
+            password: None,
+        }
+    }
+
+    fn project_on(server: &MockServer, locks: &MemLocks) -> ProjectCore {
+        ProjectCore::create("acme", &token_env(server)).unwrap().with_locks(Arc::new(locks.clone()))
+    }
+
+    /// The lock every tab syncing `server`'s org 1 takes.
+    fn lock_of(server: &MockServer) -> String {
+        format!("rdc:{}:1", server.uri())
+    }
+
+    fn quiet_route() -> Arc<dyn embed::PromptRoute> {
+        log_and_route(|_| {}, Box::new(|_| Box::pin(async { None })), None).1
+    }
+
+    async fn sync(p: &ProjectCore, env: &str) -> Result<CycleOutcome> {
+        let opts = SyncOptions { interactive: false, no_push: true, ..SyncOptions::default() };
+        p.clone().sync(env.into(), opts, Box::new(std::io::sink()), quiet_route()).await
+    }
+
+    /// A watch of `dev` without polling: its log lines, and one message per
+    /// completed cycle after the initial reconcile.
+    #[allow(clippy::type_complexity)]
+    fn start_watch(
+        p: &ProjectCore,
+    ) -> (WatchControl, impl Future<Output = Result<()>>, UnboundedReceiver<String>, UnboundedReceiver<()>) {
+        let (line_tx, lines) = unbounded_channel();
+        let (idle_tx, idles) = unbounded_channel();
+        let cancel = CancelToken::new();
+        let (log, route) = log_and_route(
+            move |l| {
+                let _ = line_tx.send(l.to_string());
+            },
+            Box::new(|_| Box::pin(async { None })),
+            Some(cancel.clone()),
+        );
+        let on_idle: Arc<dyn Fn(Option<u64>) + Send + Sync> = Arc::new(move |_| {
+            let _ = idle_tx.send(());
+        });
+        let (control, fut) = p.watch("dev".into(), None, log, route, Some(on_idle), cancel).unwrap();
+        (control, fut, lines, idles)
+    }
+
+    /// Wait for the watch's initial reconcile to end.
+    async fn started(lines: &mut UnboundedReceiver<String>) {
+        while let Some(l) = lines.recv().await {
+            if l.contains("start envs/dev") {
+                return;
+            }
+        }
+        panic!("the watch ended before it started");
+    }
+
+    fn state_requests(requests: &[wiremock::Request]) -> Vec<&wiremock::Request> {
+        requests_to(requests, rdc::state::data_storage_store::STATE_COLLECTION)
+    }
+
+    fn requests_to<'a>(requests: &'a [wiremock::Request], collection: &str) -> Vec<&'a wiremock::Request> {
+        requests
+            .iter()
+            .filter(|r| serde_json::from_slice::<serde_json::Value>(&r.body).is_ok_and(|b| b["collectionName"] == collection))
+            .collect()
+    }
+
+    /// The state writes among `requests`: blob and manifest saves.
+    fn state_writes<'a>(requests: &'a [wiremock::Request], collection: &str) -> Vec<&'a wiremock::Request> {
+        requests_to(requests, collection).into_iter().filter(|r| !r.url.path().ends_with("/data/find")).collect()
+    }
+
+    /// `acme` with envs `dev` and `prod`, both on `server`'s org 1; `dev`
+    /// holds two labels and `prod` one of its own. Both are read once.
+    async fn two_envs(server: &MockServer, locks: &MemLocks) -> ProjectCore {
+        let p = project_on(server, locks);
+        p.add_env(&EnvInput { name: "prod".into(), ..token_env(server) }).unwrap();
+        sync(&p, "dev").await.expect("reading dev");
+        sync(&p, "prod").await.expect("reading prod");
+        let org = format!("{}/organizations/1", server.uri());
+        for (key, name) in [("envs/dev/labels/a.json", "a"), ("envs/dev/labels/b.json", "b"), ("envs/prod/labels/c.json", "c")] {
+            let body = serde_json::json!({ "name": name, "organization": org });
+            p.write_file(key, format!("{}\n", serde_json::to_string_pretty(&body).unwrap()).as_bytes()).unwrap();
+        }
+        p
+    }
+
+    async fn migrate(p: &ProjectCore, opts: MigrateOptions) -> (Result<MigrateResult>, Vec<String>) {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let sink = lines.clone();
+        let (log, _route) = log_and_route(move |l| sink.lock().unwrap().push(l.to_string()), Box::new(|_| Box::pin(async { None })), None);
+        let out = p.clone().migrate("dev".into(), "prod".into(), opts, log).await;
+        let lines = lines.lock().unwrap().clone();
+        (out, lines)
+    }
+
+    #[tokio::test]
+    async fn migrate_mirrors_and_reports_the_plan_on_its_log() {
+        let server = MockServer::start().await;
+        mount_world(&server, None).await;
+        let p = two_envs(&server, &MemLocks::default()).await;
+
+        let (out, lines) = migrate(&p, MigrateOptions { mirror: true, ..MigrateOptions::default() }).await;
+        let r = out.expect("the migrate");
+        assert!(!r.dry_run);
+        assert_eq!((r.source.as_str(), r.target.as_str()), ("dev", "prod"));
+        let objects: Vec<(&str, &str, ObjectChange)> =
+            r.objects.iter().map(|o| (o.kind.as_str(), o.slug.as_str(), o.change)).collect();
+        assert_eq!(
+            objects,
+            vec![("labels", "a", ObjectChange::Create), ("labels", "b", ObjectChange::Create), ("labels", "c", ObjectChange::Delete)]
+        );
+        assert_eq!((r.creates, r.updates, r.deletes), (2, 0, 1));
+        assert_eq!(
+            serde_json::to_value(&r.pruned).unwrap(),
+            serde_json::json!([{ "target": "envs/prod/labels/c.json", "kind": "labels", "slug": "c" }])
+        );
+        assert!(r.files.iter().any(|f| f.source == "envs/dev/labels/a.json"
+            && f.target == "envs/prod/labels/a.json"
+            && f.change == FileChange::Create));
+        let a = serde_json::to_value(r.files.iter().find(|f| f.target == "envs/prod/labels/a.json").unwrap()).unwrap();
+        assert_eq!((&a["kind"], &a["slug"]), (&serde_json::json!("labels"), &serde_json::json!("a")));
+        let files = p.files();
+        assert!(files.contains_key("envs/prod/labels/a.json") && !files.contains_key("envs/prod/labels/c.json"));
+        assert!(lines.iter().any(|l| l.contains("migrated envs/dev -> envs/prod")), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.is_empty()));
+        // The claims are released: the envs sync again.
+        assert!(p.claim("dev").is_ok() && p.claim("prod").is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_migrate_writes_nothing_anywhere() {
+        let server = MockServer::start().await;
+        mount_world(&server, None).await;
+        let p = two_envs(&server, &MemLocks::default()).await;
+        p.use_data_storage_state(DataStorageStateOptions { collection: "_SA_EXTENSION__rdc_state".into(), ..ds_state("acme-key") }).unwrap();
+        sync(&p, "prod").await.expect("prod's state is in Data Storage");
+        let before = p.files();
+        server.reset().await;
+        mount_world(&server, None).await;
+
+        let (out, lines) = migrate(&p, MigrateOptions { dry_run: true, mirror: true, ..MigrateOptions::default() }).await;
+        let r = out.expect("the dry run");
+        assert!(r.dry_run && r.deletes == 1 && r.creates == 2, "{r:?}");
+        assert!(lines.iter().any(|l| l.contains("would migrate")), "{lines:?}");
+        assert_eq!(p.files(), before, "the tree is unchanged");
+        let requests = server.received_requests().await.unwrap();
+        assert!(!requests_to(&requests, "_SA_EXTENSION__rdc_state").is_empty(), "both envs' state was read");
+        assert!(state_writes(&requests, "_SA_EXTENSION__rdc_state").is_empty(), "nothing was saved");
+    }
+
+    #[tokio::test]
+    async fn migrate_saves_the_target_in_the_configured_collection() {
+        let server = MockServer::start().await;
+        mount_world(&server, None).await;
+        let p = two_envs(&server, &MemLocks::default()).await;
+        p.use_data_storage_state(DataStorageStateOptions { collection: "_SA_EXTENSION__rdc_state".into(), ..ds_state("acme-key") }).unwrap();
+        server.reset().await;
+        mount_world(&server, None).await;
+
+        migrate(&p, MigrateOptions::default()).await.0.expect("the migrate");
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(state_requests(&requests).is_empty(), "the default collection was not used");
+        let manifest = requests
+            .iter()
+            .filter(|r| r.url.path().ends_with("/data/insert_many"))
+            .filter_map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
+            .find(|b| b["collectionName"] == "_SA_EXTENSION__rdc_state" && b["documents"][0]["_id"] == "acme-key/prod")
+            .expect("the target's manifest was saved");
+        assert!(manifest["documents"][0]["files"].get("envs/prod/labels/a.json").is_some(), "{manifest}");
+    }
+
+    #[tokio::test]
+    async fn migrate_takes_the_targets_lock_and_the_envs_claims() {
+        let server = MockServer::start().await;
+        mount_world(&server, None).await;
+        let locks = MemLocks::default();
+        let p = two_envs(&server, &locks).await;
+
+        let claim = p.claim("dev").unwrap();
+        let err = migrate(&p, MigrateOptions::default()).await.0.expect_err("dev is busy");
+        assert!(err.to_string().contains("\"dev\" is already being synced or watched"), "{err}");
+        drop(claim);
+
+        p.use_data_storage_state(ds_state("acme-key")).unwrap();
+        let held = locks.acquire(lock_of(&server)).await.unwrap().expect("free");
+        let err = migrate(&p, MigrateOptions::default()).await.0.expect_err("the org is locked elsewhere");
+        assert_eq!(err.to_string(), "env 'prod' is already being synced in another tab");
+        drop(held);
+        migrate(&p, MigrateOptions::default()).await.0.expect("free again");
+        assert!(locks.acquire(lock_of(&server)).await.unwrap().is_some(), "released after the run");
+    }
+
+    #[tokio::test]
+    async fn migrate_only_promotes_the_selection() {
+        let server = MockServer::start().await;
+        mount_world(&server, None).await;
+        let p = two_envs(&server, &MemLocks::default()).await;
+        let r = migrate(&p, MigrateOptions { only: vec!["labels/b".into()], ..MigrateOptions::default() }).await.0.unwrap();
+        assert_eq!(r.objects.iter().map(|o| o.slug.as_str()).collect::<Vec<_>>(), vec!["b"]);
+        assert!(!p.files().contains_key("envs/prod/labels/a.json"));
+    }
+
+    /// The project keeps one store per env, so its second sync knows the
+    /// manifest its first one saved and keeps the host's edit made between
+    /// them. A store per call would see a "first" hydrate and put the saved
+    /// tree back over the edit.
+    #[tokio::test]
+    async fn a_projects_second_sync_keeps_the_hosts_edit() {
+        let server = MockServer::start().await;
+        let db = mount_world_with_storage(&server).await;
+        let p = project_on(&server, &MemLocks::default());
+        p.use_data_storage_state(ds_state("acme-key")).unwrap();
+        sync(&p, "dev").await.expect("loading dev");
+        assert!(db.lock().unwrap()["__rdc_state"].iter().any(|d| d["_id"] == "acme-key/dev"), "a manifest was saved");
+
+        p.write_file("envs/dev/overlay.toml", b"version = 1\n# the host's edit\n").unwrap();
+        p.write_file("envs/dev/labels/new.json", b"{}\n").unwrap();
+        sync(&p, "dev").await.expect("the second sync");
+        let files = p.files();
+        assert_eq!(files["envs/dev/overlay.toml"], b"version = 1\n# the host's edit\n");
+        assert!(files.contains_key("envs/dev/labels/new.json"));
+
+        // A new project (a reopened tab) gets the edit back from Data Storage.
+        let reopened = ProjectCore::open(files.into_iter().filter(|(k, _)| k == "rdc.toml" || k.starts_with("secrets/")))
+            .unwrap()
+            .with_locks(Arc::new(MemLocks::default()));
+        reopened.use_data_storage_state(ds_state("acme-key")).unwrap();
+        sync(&reopened, "dev").await.expect("the reopened tab's sync");
+        assert_eq!(reopened.files()["envs/dev/overlay.toml"], b"version = 1\n# the host's edit\n");
+    }
+
+    /// A dry-run migrate saves nothing, but in a new project its loading of
+    /// the envs is a first hydrate: the tree's `envs/<env>/` becomes the
+    /// saved one, as for any first run.
+    #[tokio::test]
+    async fn a_dry_run_migrate_in_a_new_project_loads_the_saved_trees() {
+        let server = MockServer::start().await;
+        let db = mount_world_with_storage(&server).await;
+        let first = two_envs(&server, &MemLocks::default()).await;
+        first.use_data_storage_state(ds_state("acme-key")).unwrap();
+        sync(&first, "dev").await.unwrap();
+        sync(&first, "prod").await.unwrap();
+        let saved = db.lock().unwrap().clone();
+
+        let mut files = first.files();
+        files.insert("envs/prod/labels/stray.json".into(), b"{}\n".to_vec());
+        files.insert("envs/prod/labels/c.json".into(), b"{\"name\": \"edited before loading\"}\n".to_vec());
+        let reopened = ProjectCore::open(files).unwrap().with_locks(Arc::new(MemLocks::default()));
+        reopened.use_data_storage_state(ds_state("acme-key")).unwrap();
+        let r = migrate(&reopened, MigrateOptions { dry_run: true, ..MigrateOptions::default() }).await.0.unwrap();
+        assert!(r.dry_run);
+        let after = reopened.files();
+        assert!(!after.contains_key("envs/prod/labels/stray.json"), "a file the saved tree lacks is removed");
+        assert_eq!(after["envs/prod/labels/c.json"], first.files()["envs/prod/labels/c.json"], "the saved version is back");
+        assert_eq!(*db.lock().unwrap(), saved, "nothing was saved");
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_sync_returns_its_plan_as_camel_case() {
+        let server = MockServer::start().await;
+        mount_world(&server, None).await;
+        let p = two_envs(&server, &MemLocks::default()).await;
+        let opts = SyncOptions { interactive: false, dry_run: true, ..SyncOptions::default() };
+        let o = p.clone().sync("dev".into(), opts, Box::new(std::io::sink()), quiet_route()).await.unwrap();
+        let v = serde_json::to_value(&o).unwrap();
+        let items = v["plan"]["items"].as_array().expect("a plan");
+        assert!(
+            items.contains(&serde_json::json!({
+                "kind": "labels", "slug": "a", "direction": "push", "change": "create", "prompt": null, "note": null
+            })),
+            "{v}"
+        );
+        assert_eq!(v["plan"]["recovered"], serde_json::json!([]));
+        assert_eq!(v["skipped"], serde_json::json!([]));
+        let plain = p.clone().sync("dev".into(), SyncOptions { interactive: false, no_push: true, ..SyncOptions::default() },
+            Box::new(std::io::sink()), quiet_route()).await.unwrap();
+        assert!(plain.plan.is_none());
+        let names: Vec<String> = [
+            rdc::cli::sync::plan::SkipReason::DeleteGateDeclined,
+            rdc::cli::sync::plan::SkipReason::MdhRowDeleteDeclined,
+        ]
+        .into_iter()
+        .map(|r| {
+            let item: SkippedItem = rdc::cli::sync::plan::SkippedItem { kind: "k".into(), slug: "s".into(), reason: r }.into();
+            serde_json::to_value(item).unwrap()["reason"].as_str().unwrap().to_string()
+        })
+        .collect();
+        assert_eq!(names, vec!["deleteGateDeclined", "mdhRowDeleteDeclined"]);
+    }
+
+    #[test]
+    fn migrate_options_map_onto_the_cli_flags() {
+        let o: MigrateOptions = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(o, MigrateOptions::default());
+        let o: MigrateOptions = serde_json::from_value(serde_json::json!({
+            "dryRun": true, "mirror": true, "allowRecreate": true, "only": ["hooks/*"], "carry": ["emailPrefixes", "automation"]
+        }))
+        .unwrap();
+        let e = embed::EmbedMigrateOptions::try_from(o).unwrap();
+        assert_eq!(e.mirror, embed::MirrorMode::Mirror { allow_recreate: true });
+        assert!(e.dry_run);
+        assert_eq!(e.only, vec!["hooks/*"]);
+        assert_eq!(e.carry, embed::Carry { score_thresholds: false, email_prefixes: true, automation: true });
+        let all: MigrateOptions = serde_json::from_value(serde_json::json!({ "carry": ["all"] })).unwrap();
+        assert_eq!(
+            embed::EmbedMigrateOptions::try_from(all).unwrap().carry,
+            embed::Carry { score_thresholds: true, email_prefixes: true, automation: true }
+        );
+
+        let lone = MigrateOptions { allow_recreate: true, ..MigrateOptions::default() };
+        assert_eq!(embed::EmbedMigrateOptions::try_from(lone).unwrap_err().to_string(), "migrate: `allowRecreate` needs `mirror`.");
+        assert!(serde_json::from_value::<MigrateOptions>(serde_json::json!({ "carry": ["thresholds"] })).is_err());
+        assert!(serde_json::from_value::<MigrateOptions>(serde_json::json!({ "dry_run": true })).is_err());
+        let keys = |ks: &[&str]| check_migrate_option_keys(ks.iter().map(|k| k.to_string()));
+        assert!(keys(&["dryRun", "mirror", "allowRecreate", "only", "carry"]).is_ok());
+        assert_eq!(keys(&["mirror", "prune"]).unwrap_err().to_string(), "unknown option 'prune'");
+    }
+
+    fn ds_state(key: &str) -> DataStorageStateOptions {
+        DataStorageStateOptions { key: key.into(), collection: default_collection(), chunk_bytes: DEFAULT_CHUNK_BYTES }
+    }
+
+    #[tokio::test]
+    async fn sync_uses_data_storage_state_when_set() {
+        let server = MockServer::start().await;
+        mount_world(&server, None).await;
+        let p = project_on(&server, &MemLocks::default());
+        p.use_data_storage_state(ds_state("acme-key")).unwrap();
+
+        sync(&p, "dev").await.expect("the sync succeeds");
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(!state_requests(&requests).is_empty(), "no request reached the state collection");
+        // The first manifest is the tree the run starts from; the last one
+        // carries the lockfile and the env tree.
+        let manifests: Vec<serde_json::Value> = requests
+            .iter()
+            .filter_map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
+            .filter_map(|b| {
+                if b["documents"][0]["_id"] == "acme-key/dev" {
+                    Some(b["documents"][0].clone())
+                } else if b["filter"]["_id"] == "acme-key/dev" {
+                    Some(b["replacement"].clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let manifest = manifests.last().expect("the run published a manifest for acme-key/dev");
+        assert!(manifest["files"].get(".rdc/state/dev.lock.json").is_some(), "the lockfile is in the manifest: {manifest}");
+        assert!(manifest["files"].get("envs/dev/_index.md").is_some(), "so is the env tree: {manifest}");
+    }
+
+    #[test]
+    fn data_storage_state_options_default_the_chunk_size_and_need_a_key() {
+        let o: DataStorageStateOptions = serde_json::from_value(serde_json::json!({"key": "k"})).unwrap();
+        assert_eq!((o.key.as_str(), o.chunk_bytes), ("k", 524_288));
+        assert_eq!(o.collection, "__rdc_state");
+        let o: DataStorageStateOptions =
+            serde_json::from_value(serde_json::json!({"key": "k", "collection": "_SA_EXTENSION__rdc_state"})).unwrap();
+        assert_eq!(o.collection, "_SA_EXTENSION__rdc_state");
+        let p = ProjectCore::open(Vec::new()).unwrap();
+        assert!(p.use_data_storage_state(DataStorageStateOptions { collection: " ".into(), ..ds_state("k") }).is_err());
+        let o: DataStorageStateOptions =
+            serde_json::from_value(serde_json::json!({"key": "k", "chunkBytes": 10})).unwrap();
+        assert_eq!(o.chunk_bytes, 10);
+        let p = ProjectCore::open(Vec::new()).unwrap();
+        assert!(p.use_data_storage_state(ds_state(" ")).is_err(), "an empty key is refused");
+    }
+
+    #[test]
+    fn an_unknown_state_option_is_refused() {
+        let keys = |ks: &[&str]| check_state_option_keys(ks.iter().map(|k| k.to_string()));
+        assert!(keys(&["key", "chunkBytes", "collection"]).is_ok());
+        assert_eq!(keys(&["key", "chunk_bytes"]).unwrap_err().to_string(), "unknown option 'chunk_bytes'");
+    }
+
+    #[tokio::test]
+    async fn default_stays_in_memory() {
+        let server = MockServer::start().await;
+        mount_world(&server, None).await;
+        let p = project_on(&server, &MemLocks::default());
+
+        sync(&p, "dev").await.expect("the sync succeeds");
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(state_requests(&requests).is_empty(), "the state collection was touched");
+        assert!(p.files().contains_key(".rdc/state/dev.lock.json"), "the state stays in the tree");
+    }
+
+    #[tokio::test]
+    async fn a_lock_held_in_another_tab_refuses_the_sync_and_the_watch() {
+        let server = MockServer::start().await;
+        mount_world(&server, None).await;
+        let locks = MemLocks::default();
+        let p = project_on(&server, &locks);
+        p.use_data_storage_state(ds_state("acme-key")).unwrap();
+        // Another tab: its own project over the same lock manager.
+        let held = locks.acquire(lock_of(&server)).await.unwrap().expect("free");
+
+        let err = sync(&p, "dev").await.expect_err("the env is locked elsewhere");
+        assert_eq!(err.to_string(), "env 'dev' is already being synced in another tab");
+        assert!(server.received_requests().await.unwrap().is_empty(), "nothing ran");
+
+        let (_control, fut, _lines, _idles) = start_watch(&p);
+        let err = fut.await.expect_err("the watch is refused too");
+        assert_eq!(err.to_string(), "env 'dev' is already being synced in another tab");
+        drop(held);
+    }
+
+    #[test]
+    fn the_lock_is_named_after_the_remote_org() {
+        assert_eq!(lock_name("https://d.test/api/v1/", 7), "rdc:https://d.test/api/v1:7");
+        assert_ne!(lock_name("https://d.test/api/v1", 7), lock_name("https://d.test/api/v1", 8));
+    }
+
+    #[tokio::test]
+    async fn a_data_storage_tab_and_a_plain_tab_on_one_org_exclude_each_other() {
+        let server = MockServer::start().await;
+        mount_world(&server, None).await;
+        let locks = MemLocks::default();
+        let with_state = project_on(&server, &locks);
+        with_state.use_data_storage_state(ds_state("acme-key")).unwrap();
+        let plain = ProjectCore::open(with_state.files()).unwrap().with_locks(Arc::new(locks.clone()));
+
+        // Hold the plain tab's sync open at its first request.
+        let (_control, fut, mut lines, _idles) = start_watch(&plain);
+        let probe = async {
+            started(&mut lines).await;
+            let err = sync(&with_state, "dev").await.expect_err("the plain tab holds the org");
+            assert_eq!(err.to_string(), "env 'dev' is already being synced in another tab");
+            _control.stop();
+        };
+        let (watched, ()) = tokio::join!(fut, probe);
+        watched.expect("the watch stops cleanly");
+        sync(&with_state, "dev").await.expect("free again once the watch ended");
+
+        // Another org on the same cluster is another lock.
+        let mut other = token_env(&server);
+        other.name = "prod".into();
+        other.org_id = 2;
+        plain.add_env(&other).unwrap();
+        let held = locks.acquire(lock_of(&server)).await.unwrap().expect("free");
+        assert!(locks.acquire(lock_name(&server.uri(), 2)).await.unwrap().is_some(), "org 2 is not org 1");
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn the_lock_is_released_after_a_sync_resolves_and_after_it_rejects() {
+        let server = MockServer::start().await;
+        mount_world(&server, None).await;
+        let locks = MemLocks::default();
+        let p = project_on(&server, &locks);
+
+        sync(&p, "dev").await.expect("the sync succeeds");
+        assert!(locks.acquire(lock_of(&server)).await.unwrap().is_some(), "released after resolve");
+
+        // Fails after the lock is taken: the env has no credentials left.
+        for key in p.files().into_keys().filter(|k| k.starts_with("secrets/")) {
+            p.delete_file(&key).unwrap();
+        }
+        sync(&p, "dev").await.expect_err("the sync fails");
+        assert!(locks.acquire(lock_of(&server)).await.unwrap().is_some(), "released after reject");
+    }
+
+    #[tokio::test]
+    async fn a_watch_releases_its_lock_after_stop() {
+        let server = MockServer::start().await;
+        mount_world(&server, None).await;
+        let locks = MemLocks::default();
+        let p = project_on(&server, &locks);
+        let (control, fut, mut lines, _idles) = start_watch(&p);
+        let probe = async {
+            started(&mut lines).await;
+            assert!(locks.acquire(lock_of(&server)).await.unwrap().is_none(), "held while watching");
+            control.stop();
+        };
+        let (watched, ()) = tokio::join!(fut, probe);
+        watched.expect("the watch stops cleanly");
+        assert!(locks.acquire(lock_of(&server)).await.unwrap().is_some(), "released after stop");
+    }
+
+    #[tokio::test]
+    async fn a_watch_with_data_storage_state_survives_a_401() {
+        let server = MockServer::start().await;
+        let login = |key: &str| {
+            Mock::given(method("POST"))
+                .and(path("/auth/login"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "key": key })))
+        };
+        login("t1").mount(&server).await;
+        mount_world(&server, Some("t1")).await;
+        let env = EnvInput {
+            auth_kind: AuthKind::Password,
+            token: None,
+            username: Some("u".into()),
+            password: Some("p".into()),
+            ..token_env(&server)
+        };
+        let p = ProjectCore::create("acme", &env).unwrap().with_locks(Arc::new(MemLocks::default()));
+        p.use_data_storage_state(ds_state("acme-key")).unwrap();
+
+        let (control, fut, mut lines, mut idles) = start_watch(&p);
+        let drive = async {
+            started(&mut lines).await;
+            // `t1` is revoked: it now gets 401 everywhere; a re-login hands out `t2`.
+            server.reset().await;
+            for revoked in ["token t1", "Bearer t1"] {
+                Mock::given(header("authorization", revoked))
+                    .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({"detail": "expired"})))
+                    .mount(&server)
+                    .await;
+            }
+            login("t2").mount(&server).await;
+            mount_world(&server, Some("t2")).await;
+            control.trigger();
+            idles.recv().await;
+            // A later cycle keeps `t2` instead of 401ing on `t1` again.
+            control.trigger();
+            idles.recv().await;
+            control.stop();
+        };
+        let (watched, ()) = tokio::join!(fut, drive);
+        watched.expect("the watch survives the 401");
+
+        let requests = server.received_requests().await.unwrap();
+        let relogin = requests.iter().position(|r| r.url.path() == "/auth/login").expect("a re-login");
+        assert_eq!(
+            requests.iter().filter(|r| r.url.path() == "/auth/login").count(),
+            1,
+            "a cycle after the retry must not log in again"
+        );
+        let after = state_requests(&requests[relogin..]);
+        assert!(!after.is_empty(), "the retried cycle reached the state collection");
+        for r in after {
+            assert_eq!(
+                r.headers.get("authorization").and_then(|v| v.to_str().ok()),
+                Some("Bearer t2"),
+                "{} after the re-login",
+                r.url.path()
+            );
+        }
     }
 }

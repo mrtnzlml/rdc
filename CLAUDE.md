@@ -155,6 +155,81 @@ Project-specific instructions for working in this repo.
   markers. `rdc.toml` stores envs in a `BTreeMap`, so init cannot derive a
   promotion chain from them (`dev`, `prod`, `test` would chain dev → prod → test).
 
+## Crash-safe sync
+
+- Only **creates** (POST) are journaled: PATCH, DELETE, MDH rows and pulls
+  already converge on a re-run, a create does not (a lost id means a duplicate).
+  `src/state/journal.rs` writes an op into the lockfile's `pending` before each
+  POST and sets its `id` after the response; `commit` drops ops whose lockfile
+  entry now has that id. `src/cli/sync/recover.rs` finishes leftovers before
+  classify, never overwrites an existing local file, prompts on several
+  candidates and stops under `--yes`. A 502/503/504 on a journaled create runs
+  the matcher before each resend, up to the same five sends with backoff as any
+  other request.
+- The lockfile is **v4**; a v3 rdc refuses it on purpose, because v3 ignores
+  unknown fields and its next save would silently erase `pending`.
+- There is **no lease**. Exclusion is `EnvLock` on disk and the Web Lock
+  `rdc:<api_base>:<org_id>` in the browser. Two machines racing one env is an
+  accepted edge case; the Data Storage manifest's compare-and-swap makes the
+  loser's next save fail loudly.
+- The lockfile **never holds a create-body value**, only SHA-256 per field. For
+  hook `config` and engine `settings` (which the server fills in) it is one hash
+  per sent sub-key, and the matcher ignores sub-keys the server added. The
+  top-level `secrets` is never hashed, nor is a secret-named sub-key of hook
+  `config` / engine `settings`; secret-named keys anywhere else are hashed.
+- `StateStore`: `FsStateStore` is a no-op; `DataStorageStateStore` keeps blobs and
+  a CAS manifest per env in the env's own org, in a host-chosen collection
+  (default `__rdc_state`). Blob ids carry the chunk size
+  (`<sha256>/<chunk_bytes>/<n>`): without it, two stores with different chunk
+  sizes on one key corrupted the state for good. The manifest holds the state
+  **and `envs/<env>/**`**:
+  without the tree, a closed tab came back with every object reading as a local
+  delete. `run_cycle` checkpoints when a run starts and after `_index.md` (only
+  a warning when that one fails) as well as at every journal persist; all three are no-ops on disk, so the CLI is
+  unchanged, but a test store counts them.
+- Hydrate (`plan_hydrate`): the state files are always the manifest's; the env
+  tree is the manifest's on a store's **first** hydrate, the tree's own when the
+  manifest is still the one the store last saw, and a three-way merge (refusing
+  a file both sides changed) otherwise. So the store must live as long as the
+  tab's `Project` (`wasm/` caches one per env); a store per run would wipe the
+  host's edits on every sync.
+- `is_internal_collection` is true for `__` names, for the Chrome extension's
+  `_SA_EXTENSION__*` names (**on every surface, the CLI included** — an owner
+  decision of 2026-11-03 and a deliberate CLI behaviour change), and for the
+  collection of the task's scoped state store. Every MDH path goes through it
+  (listing, `local_only_dataset_slugs`) or through migrate's own skip
+  (`state_datasets`, which skips `_SA_EXTENSION__*` and the scoped collection
+  on the source and keeps `--mirror` from pruning them on the target, but
+  still copies other `__` datasets, as before). rdc has no collection drop,
+  so no path can delete such a collection.
+- A tree that pulled an `_SA_EXTENSION__*` dataset before the rule: the next
+  sync removes it locally **only if the env lists at least one other dataset**
+  (the stage-4 orphan prune is gated on a non-empty listing so an MDH outage
+  cannot mass-delete); an edited one is deferred with a `-deleted` marker; on
+  an env with no other dataset it stays in the tree and lockfile, inert. No
+  sync writes to it, `--allow-deletes` or not
+  (`tests/live/support/fake/extension_collections.rs`).
+- `CycleOutcome.plan` (dry run only) and `.skipped` (`cli::sync::plan`): the
+  plan is assembled in `run_cycle`'s dry-run branch from what it already
+  computes, never a second pass, and the log stays byte-identical; skipped
+  items are `plan::record`ed at each site that decides not to write, into a
+  task-local collector around one cycle. A new skip site must record too.
+- `.rdc/mapping.toml`, `rdc.toml` and `secrets/` are **host-owned** in the
+  browser, never in Data Storage: the mapping is project-level and each env's
+  state lives in another org, so two copies would have no correct merge. See
+  `docs/superpowers/specs/2026-11-03-wasm-migrate-design.md`.
+- `cli::migrate::run_at` is a wrapper over `run_at_logged`, which returns a
+  `MigrateReport` (its `ObjectChange` describes the target **tree**, not what
+  the next sync sends; its files and objects are named by `sync_identity`,
+  the identity the sync plan and `skipped` use — keep the two in step,
+  `fake/migrate_identity.rs` checks it); `embed::migrate_logged_in` is the embedders' migrate (hydrate
+  both envs, run, checkpoint the target). Keep the report built from what
+  `run_at_logged` already computes, never a second pass.
+- Tests: the fake-only crash matrix is `tests/live/support/fake/crash_matrix.rs`
+  (with `recover.rs`, `state_store.rs`, and `browser_migrate.rs` for the closed
+  tab across two orgs); live scenarios are
+  `tests/live/scenarios/crash_recovery.rs`.
+
 ## Customer confidentiality
 
 - Never put customer names or customer-specific identifiers — org/division/region

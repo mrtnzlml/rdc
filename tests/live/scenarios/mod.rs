@@ -5,6 +5,7 @@ pub mod cli_prompts;
 pub mod cli_surface;
 pub mod collisions;
 pub mod conflicts_deletes;
+pub mod crash_recovery;
 pub mod cross_refs;
 pub mod deploy_flow;
 pub mod email_templates;

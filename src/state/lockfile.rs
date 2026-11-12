@@ -10,7 +10,11 @@ use std::path::Path;
 /// from `id` + the env's `api_base` (see [`Lockfile::url_for_slug`]). The
 /// slug remains the portable identity; `id` is the single source of truth
 /// for the live URL.
-pub const LOCKFILE_VERSION: u32 = 3;
+///
+/// v4 added the optional top-level `pending` create journal (see
+/// [`crate::state::journal::Pending`]). Older versions load unchanged and are
+/// migrated by bumping the version; the field is absent until a run writes it.
+pub const LOCKFILE_VERSION: u32 = 4;
 
 /// rdc lockfile contents. One file per environment, stored at
 /// `.rdc/state/<env>.lock.json`. Records the slug↔ID mapping plus
@@ -38,6 +42,10 @@ pub struct Lockfile {
     /// falls back to this map; see [`Lockfile::depart`].
     #[serde(skip)]
     pub departed: BTreeMap<String, BTreeMap<String, u64>>,
+    /// Journal of creates a sync has started but not yet recorded. `None`
+    /// (and absent from the file) whenever no run is in flight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<crate::state::journal::Pending>,
 }
 
 /// One row in the lockfile.
@@ -86,6 +94,7 @@ impl Default for Lockfile {
             api_base: String::new(),
             objects: BTreeMap::new(),
             departed: BTreeMap::new(),
+            pending: None,
         }
     }
 }
@@ -137,7 +146,7 @@ fn split_endpoint_id(url: &str) -> Option<(&str, u64)> {
 
 impl Lockfile {
     /// Load a lockfile from disk, returning the default value if the file
-    /// does not exist. v1 and v2 lockfiles are silently migrated to v3:
+    /// does not exist. v1, v2 and v3 lockfiles are silently migrated to v4:
     /// the legacy per-object `url` field is dropped (serde ignores it —
     /// there is no `#[serde(deny_unknown_fields)]`), the URL is now derived
     /// from `id` + `api_base`, and `api_base` defaults to `""` until a
@@ -152,8 +161,9 @@ impl Lockfile {
             serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
 
         match lf.version {
-            1 | 2 => {
-                // v1/v2 → v3: same top-level shape. v2's per-object `url`
+            1..=3 => {
+                // v1/v2/v3 → v4: same top-level shape (v3 → v4 only adds the
+                // optional `pending`, which defaults to `None`). v2's per-object `url`
                 // field is silently dropped (no `deny_unknown_fields`), the
                 // URL is now derived, and `api_base` defaults to `""` until
                 // the caller sets it. Just bump the version field.
@@ -447,6 +457,57 @@ mod tests {
     }
 
     #[test]
+    fn v3_migrates_to_v4_without_pending() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("dev.lock.json");
+        std::fs::write(&path, r#"{"version":3,"api_base":"https://x/api/v1","objects":{}}"#).unwrap();
+        let lf = Lockfile::load(&path).unwrap();
+        assert_eq!(lf.version, 4);
+        assert_eq!(lf.pending, None);
+    }
+
+    #[test]
+    fn v5_is_refused_with_upgrade_hint() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("dev.lock.json");
+        std::fs::write(&path, r#"{"version":5,"objects":{}}"#).unwrap();
+        let err = format!("{:#}", Lockfile::load(&path).unwrap_err());
+        assert!(err.contains("Run `rdc upgrade`"), "got: {err}");
+    }
+
+    #[test]
+    fn pending_round_trips() {
+        use crate::state::journal::{CreateIntent, Pending};
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("dev.lock.json");
+        let lf = Lockfile {
+            pending: Some(Pending {
+                run: "run-1".into(),
+                ops: vec![CreateIntent {
+                    seq: 0,
+                    kind: "hooks".into(),
+                    slug: "my-hook".into(),
+                    fields: BTreeMap::from([("name".to_string(), "My hook".to_string())]),
+                    started_at_unix: 1_699_999_000,
+                    id: Some(42),
+                }],
+            }),
+            ..Lockfile::default()
+        };
+        lf.save(&path).unwrap();
+        assert_eq!(Lockfile::load(&path).unwrap(), lf);
+    }
+
+    #[test]
+    fn no_pending_serializes_without_the_key() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("dev.lock.json");
+        Lockfile::default().save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("pending"), "got: {text}");
+    }
+
+    #[test]
     fn round_trip_v3() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("dev.lock.json");
@@ -566,7 +627,7 @@ mod tests {
         std::fs::write(
             &path,
             r#"{
-  "version": 3,
+  "version": 4,
   "api_base": "https://api.elis.rossum.ai/v1",
   "objects": {
     "queues": {

@@ -212,6 +212,7 @@ pub async fn push_dataset(
                 plan.drop_search.extend(diff.pending_search_deletes.iter().cloned());
             } else {
                 skipped = true;
+                crate::cli::sync::plan::record("mdh", slug, crate::cli::sync::plan::SkipReason::MdhIndexDropDeclined);
                 progress.event(
                     Action::Skip,
                     &format!("mdh/{slug} {pending} index deletion(s) skipped"),

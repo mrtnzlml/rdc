@@ -79,46 +79,16 @@ pub async fn push(
             // universal server field `strip_for_create` removes regardless,
             // so it must never trip this guard. See `ensure_no_residual_refs`.
             ensure_no_residual_refs(slug, &payload)?;
-            let result = client
-                .create_saved_view(&payload, Some(progress.clone()))
+            client.observe_lockfile(lockfile).await;
+            let result = crate::state::journal::item(
+                "saved_views",
+                slug,
+                client.create_saved_view(&payload, Some(progress.clone())),
+            )
                 .await
                 .with_context(|| format!("POST /saved_views (creating '{slug}')"));
             let created = result?;
-            let codec = crate::snapshot::codec::codec("saved_views").unwrap();
-            let created_art = codec
-                .disk_bytes(&serde_json::to_value(&created).context("serializing created saved view")?)
-                .context("codec disk_bytes for created saved view")?;
-            // Register the new saved view's id NOW so its own `url` portabilizes to
-            // `rdc://`. Concrete env URLs must never touch disk, even transiently
-            // (an interrupted sync whose portabilize post-pass never runs would
-            // freeze them into the snapshot).
-            lockfile.upsert(
-                "saved_views",
-                slug,
-                ObjectEntry {
-                    id: created.id,
-                    modified_at: created.modified_at().map(|s| s.to_string()),
-                    modified_by: created.modified_by().map(|s| s.to_string()),
-                    content_hash: None,
-                    secrets_hash: None,
-                },
-            );
-            let created_bytes =
-                crate::cli::pull::common::portabilize_proposed(&created_art.json, lockfile);
-            let created_hash = combined_hash(&created_bytes, &created_art.sidecars, lockfile);
-            crate::state::base_cache::write_disk_and_cache(paths, path, &created_bytes)
-                .with_context(|| format!("writing post-create canonical form for '{slug}'"))?;
-            lockfile.upsert(
-                "saved_views",
-                slug,
-                ObjectEntry {
-                    id: created.id,
-                    modified_at: created.modified_at().map(|s| s.to_string()),
-                    modified_by: created.modified_by().map(|s| s.to_string()),
-                    content_hash: Some(created_hash),
-                    secrets_hash: None,
-                },
-            );
+            complete_create(paths, lockfile, slug, path, &created)?;
             progress.event(Action::Post, &format!("saved_view/{slug} id={}", created.id));
             pushed += 1;
             continue;
@@ -143,6 +113,67 @@ pub async fn push(
     skipped += batched_skipped;
 
     Ok((pushed, skipped))
+}
+
+/// The canonical form of a created saved view, with its id registered in
+/// `lockfile` first so its own refs portabilize: the bytes a successful POST
+/// writes and the entry it records. Writes nothing. Shared by
+/// [`complete_create`] and `cli::sync::recover`.
+pub(crate) fn created_form(
+    lockfile: &mut Lockfile,
+    slug: &str,
+    created: &crate::model::SavedView,
+) -> Result<super::CreatedForm> {
+    let codec = crate::snapshot::codec::codec("saved_views").unwrap();
+    let created_art = codec
+        .disk_bytes(&serde_json::to_value(created).context("serializing created saved view")?)
+        .context("codec disk_bytes for created saved view")?;
+    // Register the new saved view's id NOW so its own `url` portabilizes to
+    // `rdc://`. Concrete env URLs must never touch disk, even transiently
+    // (an interrupted sync whose portabilize post-pass never runs would
+    // freeze them into the snapshot).
+    lockfile.upsert(
+        "saved_views",
+        slug,
+        ObjectEntry {
+            id: created.id,
+            modified_at: created.modified_at().map(|s| s.to_string()),
+            modified_by: created.modified_by().map(|s| s.to_string()),
+            content_hash: None,
+            secrets_hash: None,
+        },
+    );
+    let created_bytes =
+        crate::cli::pull::common::portabilize_proposed(&created_art.json, lockfile);
+    let created_hash = combined_hash(&created_bytes, &created_art.sidecars, lockfile);
+    Ok(super::CreatedForm {
+        entry: ObjectEntry {
+            id: created.id,
+            modified_at: created.modified_at().map(|s| s.to_string()),
+            modified_by: created.modified_by().map(|s| s.to_string()),
+            content_hash: Some(created_hash),
+            secrets_hash: None,
+        },
+        json: created_bytes,
+        sidecar: (),
+    })
+}
+
+/// Record a created saved view and write its canonical form: the lockfile entry
+/// and the env-tree files (with their base-cache copies), exactly as a
+/// successful POST leaves them.
+pub(crate) fn complete_create(
+    paths: &Paths,
+    lockfile: &mut Lockfile,
+    slug: &str,
+    path: &std::path::Path,
+    created: &crate::model::SavedView,
+) -> Result<()> {
+    let form = created_form(lockfile, slug, created)?;
+    crate::state::base_cache::write_disk_and_cache(paths, path, &form.json)
+        .with_context(|| format!("writing post-create canonical form for '{slug}'"))?;
+    lockfile.upsert("saved_views", slug, form.entry);
+    Ok(())
 }
 
 /// Fan out one maximal run of consecutive saved view UPDATES, then apply the results.

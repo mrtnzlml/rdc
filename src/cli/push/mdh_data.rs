@@ -231,6 +231,7 @@ pub async fn push_dataset_data(
             if !prompt_confirm_row_deletes(progress, collection_name, pending).await? {
                 deletes = &[];
                 skipped = true;
+                crate::cli::sync::plan::record("mdh", slug, crate::cli::sync::plan::SkipReason::MdhRowDeleteDeclined);
                 progress.event(
                     Action::Skip,
                     &format!(

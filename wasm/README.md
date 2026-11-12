@@ -10,7 +10,8 @@ and the desktop app unchanged.
 
 The API covers what the desktop app does (`desktop/rust/src/api/rdc.rs`):
 create and validate a project; edit, add, rename and remove an env; sync one
-env; watch envs; answer the prompts a sync raises.
+env; watch envs; answer the prompts a sync raises. It also runs `rdc migrate`
+between two envs, which the desktop app leaves to GitLab CI.
 
 ## Layout
 
@@ -52,8 +53,11 @@ export class Project {
   addEnv(input: EnvInput): ProjectSummary;
   removeEnv(env: string): ProjectSummary | null;
   renameEnv(oldName: string, newName: string): RenameEnvResult;
+  useDataStorageState(opts: { key: string; collection?: string; chunkBytes?: number }): void;
   sync(env: string, opts: SyncOptions, onPrompt: (p: Prompt) => Promise<string | null>,
        onLog: (line: string) => void): Promise<CycleOutcome>;
+  migrate(src: string, tgt: string, opts: MigrateOptions | null | undefined,
+          onLog: (line: string) => void): Promise<MigrateResult>;
   watch(env: string, pollSecs: number | null, onPrompt: (p: Prompt) => Promise<string | null>,
         onLog: (line: string) => void, onIdle: (nextSecs: number | null) => void): WatchHandle;
 }
@@ -80,9 +84,110 @@ bridge's DTOs in camelCase. Differences from the desktop app:
   desktop app trashes the folder).
 - **Prompts**: `[e]` and `[h]` are never offered. An answer that is not one of
   `choices` — or a rejected promise — counts as `null` (skip / no).
-  `WatchHandle.stop()` answers a pending prompt with `null`.
+  `WatchHandle.stop()` answers a pending prompt with `null`. `question` is
+  the choices on one line, except for `recoverCreate` (several objects on the
+  env match a create a closed tab or crashed run left unfinished), whose
+  `question` is the whole question; its choices are one digit per candidate
+  and `a` (abort the sync).
 - **One sync or watch per env**: a second call on a busy env is rejected (the
   on-disk `EnvLock` does not apply in memory). `renameEnv` and `removeEnv`
   of a busy env are rejected too.
+- **Web Lock**: `sync` and `watch` hold an exclusive Web Lock for their whole
+  run, the browser's `EnvLock`. It is named after the remote org, not the
+  project or the state key: `rdc:<api_base>:<org_id>`, with `api_base` as in
+  `rdc.toml` without a trailing slash. So every tab that syncs one org
+  excludes every other, whether it keeps its state in Data Storage or not;
+  another org is another lock. It is requested with `ifAvailable`, so a lock
+  another tab holds is not waited for: `sync` rejects, and a watch's `done()`
+  rejects, with `env '<env>' is already being synced in another tab`. The lock
+  is released when the run settles, either way, and by the browser when the
+  tab closes or crashes. Where `navigator.locks` is missing, `sync` and
+  `watch` reject with `Web Locks are not available in this context` instead
+  of running unlocked.
+- **Sync state in Data Storage**: by default an env's sync state
+  (`.rdc/state/<env>.lock.json`, `.rdc/state/<env>.base/`,
+  `.rdc/conflicts/<env>/`) and its tree (`envs/<env>/`) live only in the
+  in-memory tree. After `useDataStorageState({ key, collection, chunkBytes })`
+  the next `sync`, `watch` or `migrate` also keeps them in Rossum Data
+  Storage, in the env's own org: one manifest per env, `<key>/<env>`, in
+  `collection` (default `__rdc_state`). `key` is the host's choice (for
+  example the project). `chunkBytes` (default `524288`) bounds one stored
+  document. Any other option throws, as does an empty `key` or `collection`.
+  rdc never syncs, migrates or creates `collection` as an MDH dataset,
+  whatever its name. Every file must be UTF-8.
+  - **When it is saved**: when a run starts (not under `dryRun`), after every
+    lockfile write of a sync (before and after each create, and at its end),
+    after `_index.md` (a failure there is a warning: the save before it
+    already holds the state and the tree), and after a `migrate` (not under
+    `dryRun`). Each save is one
+    compare-and-swap, so the state and the tree in Data Storage are always
+    from the same moment; a save another tab or device got in first fails
+    the run with `the state of env '<env>' was changed by another run`.
+  - **When it is loaded**: at the start of every run of the env. The state
+    files are always the saved ones. For `envs/<env>/`: the first run of an
+    env in a `Project` takes the saved tree whole (files are written, files
+    it does not name are removed), so after a closed tab the tree comes back
+    with its state and nothing reads as a local delete. Later runs of the
+    same `Project` keep the tree's own changes (the host's edits, migrate's
+    output), and take what another tab or device saved since for files this
+    tab did not change; a file both changed refuses the run and names the
+    files. Edits written into `envs/<env>/` before an env's first run in a
+    `Project` are therefore replaced: load the env first (a `sync` with
+    `noPush`), then edit. An edit reaches Data Storage when the next run
+    starts.
+  - **What it does not keep**: `rdc.toml`, `secrets/`, `.rdc/mapping.toml`
+    (and legacy `.rdc/map/`) are the host's to keep, as before; rdc reports
+    every write to them through `onChange`. The scaffold (`.gitlab-ci.yml`,
+    `README.md`, `CLAUDE.md`, the testkit) is written again by every `sync`.
+    See `docs/superpowers/specs/2026-11-03-wasm-migrate-design.md` for why.
+- **Migrate**: `migrate(src, tgt, opts, onLog)` runs `rdc migrate` on the tree
+  (`cli::migrate::run_at`). `opts` — `dryRun`, `mirror`, `allowRecreate`
+  (needs `mirror`), `only` (selectors) and `carry` (`"scoreThresholds"`,
+  `"emailPrefixes"`, `"automation"`, `"all"`) — are the CLI's flags; any other
+  option throws. It claims both envs, as a sync claims one. With Data Storage
+  state on, it loads both envs' state first, holds the target org's Web Lock,
+  and saves the target after (not under `dryRun`). `onLog` gets the CLI's
+  output. The result is the plan: every file considered (`files`, with
+  `source` and `target` keys, `"create"` / `"update"` / `"unchanged"`, and
+  the `kind` and `slug` of the target object it belongs to — the same
+  identity a `sync`'s `plan` and `skipped` use, so a file the host edits maps
+  to what a later sync reports; sidecars (`.py`, `.js`, `formulas/*.py`)
+  name their hook, rule or schema, every file of `mdh/<slug>/` names
+  `mdh`/`<slug>`, a workflow step `workflow_steps`/`<workflow>/<step>`;
+  `null` for a file of no object),
+  every target object (`objects`, by target slug, with what this run did to
+  its files in the target tree: `"create"` = the tree had no file for it,
+  `"update"` = its files changed, `"unchanged"`, `"delete"` = `mirror`
+  removed it). This is the tree, not the env: what the next `sync` sends
+  also depends on the target's lockfile and the org (an object deleted
+  locally but still on the env shows as `"create"`, and the sync does not
+  create it again),
+  the `pruned` files (each `{ target, kind, slug }`, the same identity as a
+  file's) and `prunedDirs`, the `skipped` email templates, the
+  `warnings` it logged, and their counts. `mirror` never prunes a folder of
+  a collection rdc skips (`__*`, `_SA_EXTENSION__*`, the state collection).
+  A `dryRun` saves nothing, but its loading of the two envs is a run like
+  any other: in a new `Project` it is the envs' first run, so `envs/<env>/`
+  becomes the saved tree there, as described above. A refusal (recreate guard, a
+  dangling overlay key, an unresolvable saved-view ref) rejects with rdc's
+  message. Then `sync(tgt, ...)` pushes it.
+- **`CycleOutcome.plan`**: a `sync` with `dryRun` returns what it would do as
+  data, besides the log: `items` (one per object, in the log's order:
+  `kind`, `slug`, `direction` `"push"` / `"pull"` / `"both"` for a conflict,
+  `change` `"create"` / `"update"` / `"delete"` / `"conflict"`, `prompt` —
+  `"deleteGate"`, `"conflict"` or `"remoteDelete"` when an interactive run
+  would ask, `null` when `allowDeletes` or `conflict` waives it — and the log
+  row's `note`; MDH datasets have kind `"mdh"` and no prompt), `recovered`
+  (creates a crashed run left, which the dry run's recovery found: `id` to
+  adopt, or `null`), and `problems` (every line of the dry run's blocks:
+  parse errors, field limits, ...). Any other run returns `plan: null`.
+  Recovery itself is not predicted: a dry run runs it, and an ambiguous one
+  asks then (`recoverCreate`).
+- **`CycleOutcome.skipped`**: what the cycle did not write, and why: one
+  `{ kind, slug, reason }` per object, `reason` one of
+  `"deleteGateDeclined"`, `"deleteDriftSkipped"`, `"pushDriftSkipped"`,
+  `"conflictSkipped"`, `"remoteDeleteSkipped"`, `"mdhIndexDropDeclined"`,
+  `"mdhRowDeleteDeclined"`. An unanswered prompt counts as declined. Empty
+  for a dry run.
 - **Watch** has no file watcher. It polls on `pollSecs`, and `trigger()` runs a
   cycle as a local file change would; call it after `writeFile`.

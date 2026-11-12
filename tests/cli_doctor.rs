@@ -242,7 +242,7 @@ fn doctor_records_a_rename_so_the_next_promotion_renames_instead_of_recreating()
         write(
             root.join(format!(".rdc/state/{env}.lock.json")),
             serde_json::json!({
-                "version": 3,
+                "version": 4,
                 "api_base": format!("https://{env}.example/api/v1"),
                 "objects": {
                     "workspaces": { "main": { "id": base, "modified_at": null } },
@@ -340,7 +340,7 @@ fn doctor_dry_run_records_no_mapping_row() {
         std::fs::write(
             root.join(format!(".rdc/state/{env}.lock.json")),
             serde_json::to_vec_pretty(&serde_json::json!({
-                "version": 3,
+                "version": 4,
                 "api_base": format!("https://{env}.example/api/v1"),
                 "objects": { "hooks": { "old-hook": { "id": id, "modified_at": null } } },
             }))

@@ -13,6 +13,7 @@
 
 use crate::cli::resolve::ConflictStrategy;
 use crate::cli::sync::CycleOutcome;
+use crate::state::store::{FsStateStore, StateStore};
 use crate::vfs::Store;
 use crate::log::Log;
 use anyhow::Result;
@@ -106,7 +107,27 @@ pub async fn sync_logged_in(
     opts: EmbedSyncOptions,
     log_sink: Box<dyn std::io::Write + Send>,
 ) -> Result<CycleOutcome> {
-    crate::vfs::scope(store, sync_logged(root, env, token, opts, log_sink)).await
+    sync_logged_in_with_state(store, Arc::new(FsStateStore), root, env, token, opts, log_sink).await
+}
+
+/// [`sync_logged_in`] with the env's sync state kept in `state`: the run
+/// hydrates from it before reading the lockfile and checkpoints into it after
+/// every lockfile persist.
+pub async fn sync_logged_in_with_state(
+    store: Arc<dyn Store>,
+    state: Arc<dyn StateStore>,
+    root: &Path,
+    env: &str,
+    token: &str,
+    opts: EmbedSyncOptions,
+    log_sink: Box<dyn std::io::Write + Send>,
+) -> Result<CycleOutcome> {
+    crate::vfs::scope(
+        store,
+        // Boxed for the same reason as in `watch_logged_in_with_state`.
+        crate::state::store::scope(state, Box::pin(sync_logged(root, env, token, opts, log_sink))),
+    )
+    .await
 }
 
 /// [`watch_logged`] on a project held by `store`. `triggers` is the host's
@@ -126,9 +147,49 @@ pub async fn watch_logged_in(
     on_idle: Option<Arc<dyn Fn(Option<u64>) + Send + Sync>>,
     triggers: Option<tokio::sync::mpsc::Receiver<CycleTrigger>>,
 ) -> Result<()> {
+    watch_logged_in_with_state(
+        store,
+        Arc::new(FsStateStore),
+        root,
+        env,
+        api_base,
+        token,
+        poll,
+        log_sink,
+        route,
+        cancel,
+        on_idle,
+        triggers,
+    )
+    .await
+}
+
+/// [`watch_logged_in`] with the env's sync state kept in `state`, as
+/// [`sync_logged_in_with_state`] does for one cycle.
+pub async fn watch_logged_in_with_state(
+    store: Arc<dyn Store>,
+    state: Arc<dyn StateStore>,
+    root: &Path,
+    env: &str,
+    api_base: &str,
+    token: String,
+    poll: Option<Duration>,
+    log_sink: Box<dyn std::io::Write + Send>,
+    route: Arc<dyn PromptRoute>,
+    cancel: crate::cli::sync::watch::CancelToken,
+    on_idle: Option<Arc<dyn Fn(Option<u64>) + Send + Sync>>,
+    triggers: Option<tokio::sync::mpsc::Receiver<CycleTrigger>>,
+) -> Result<()> {
     crate::vfs::scope(
         store,
-        watch_inner(root, env, api_base, token, poll, log_sink, route, cancel, on_idle, triggers),
+        // Boxed: the watch future is large, and one more by-value layer
+        // around it overflows a test thread's stack in debug builds.
+        crate::state::store::scope(
+            state,
+            Box::pin(watch_inner(
+                root, env, api_base, token, poll, log_sink, route, cancel, on_idle, triggers,
+            )),
+        ),
     )
     .await
 }
@@ -240,6 +301,73 @@ pub(crate) fn watch_logged_config<'a>(
         no_bell: true, // a terminal BEL means nothing in a GUI process
         on_idle,
     }
+}
+
+// ------------------------------------------------------------ migrate
+
+pub use crate::cli::migrate::{
+    Carry, CarryGroup, FileOutcome, MigrateReport, MigratedFile, MigratedObject, MirrorMode, ObjectChange, PrunedFile,
+};
+
+/// How an embedder wants one `rdc migrate` run: its flags.
+#[derive(Debug, Clone)]
+pub struct EmbedMigrateOptions {
+    pub mirror: MirrorMode,
+    pub dry_run: bool,
+    pub only: Vec<String>,
+    pub carry: Carry,
+}
+
+impl Default for EmbedMigrateOptions {
+    /// An unflagged `rdc migrate`.
+    fn default() -> Self {
+        Self { mirror: MirrorMode::Additive, dry_run: false, only: Vec::new(), carry: Carry::NONE }
+    }
+}
+
+/// `rdc migrate <src> <tgt>` on the project held by `store`, logging into
+/// `log_sink` as [`sync_logged`] does, and returning what it changed.
+///
+/// Each env's state comes from its store first (migrate reads both
+/// lockfiles and both trees), and the target's store makes the run's writes
+/// durable after it (not under `dry_run`, which writes nothing). Taking the
+/// envs' locks is the caller's: migrate runs no lock of its own on disk.
+#[allow(clippy::too_many_arguments)]
+pub async fn migrate_logged_in(
+    store: Arc<dyn Store>,
+    src_state: Arc<dyn StateStore>,
+    tgt_state: Arc<dyn StateStore>,
+    root: &Path,
+    src: &str,
+    tgt: &str,
+    opts: EmbedMigrateOptions,
+    log_sink: Box<dyn std::io::Write + Send>,
+) -> Result<MigrateReport> {
+    use anyhow::Context as _;
+    let log = Log::for_sink(crate::cli::resolve::ColorMode::Color, log_sink);
+    crate::vfs::scope(store, async move {
+        // The checks `run_at` makes before it reads anything, made before
+        // the stores are read too.
+        crate::cli::migrate::check_envs(root, src, tgt)?;
+        let (src_paths, tgt_paths) = (crate::paths::Paths::for_env(root, src), crate::paths::Paths::for_env(root, tgt));
+        src_state.hydrate(&src_paths).await.with_context(|| format!("loading env '{src}'"))?;
+        tgt_state.hydrate(&tgt_paths).await.with_context(|| format!("loading env '{tgt}'"))?;
+        let mut report = crate::state::store::scope(tgt_state.clone(), async {
+            crate::cli::migrate::run_at_logged(
+                root, src, tgt, opts.mirror, opts.dry_run, opts.only, opts.carry, log.clone(),
+            )
+        })
+        .await?;
+        if !opts.dry_run {
+            tgt_state.checkpoint(&tgt_paths).await.with_context(|| format!("saving env '{tgt}'"))?;
+            for w in tgt_state.take_warnings() {
+                log.event(crate::log::Action::Warn, &w);
+                report.warnings.push(w);
+            }
+        }
+        Ok(report)
+    })
+    .await
 }
 
 // ------------------------------------------------------------ project and env management

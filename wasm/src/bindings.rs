@@ -2,9 +2,10 @@
 //! calls out. No logic of its own beyond the conversions.
 
 use crate::{
-    AskFn, EditProjectInput, EnvInput, Prompt, ProjectCore, SyncOptions, WatchControl,
-    log_and_route,
+    AskFn, DataStorageStateOptions, check_migrate_option_keys, check_state_option_keys, EditProjectInput, EnvInput,
+    EnvLocks, HeldLock, MigrateOptions, Prompt, ProjectCore, SyncOptions, WatchControl, log_and_route,
 };
+use anyhow::anyhow;
 use serde::Serialize;
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;
@@ -63,13 +64,120 @@ export interface SyncOptions {
 }
 export type PromptKind =
   | "conflict" | "remoteDelete" | "bulkConfirm" | "deleteGate" | "deleteDrift"
-  | "mdhIndexDrop" | "mdhRowDelete" | "unknown";
+  | "mdhIndexDrop" | "mdhRowDelete" | "recoverCreate" | "unknown";
 export interface Prompt { kind: PromptKind; question: string; choices: { key: string; label: string }[]; }
+export interface DataStorageStateOptions { key: string; collection?: string; chunkBytes?: number; }
+export type CarryGroup = "scoreThresholds" | "emailPrefixes" | "automation" | "all";
+export interface MigrateOptions {
+  dryRun?: boolean; mirror?: boolean; allowRecreate?: boolean; only?: string[]; carry?: CarryGroup[];
+}
+export type FileChange = "create" | "update" | "unchanged";
+export type ObjectChange = "create" | "update" | "unchanged" | "delete";
+export interface MigrateFile {
+  source: string; target: string; change: FileChange;
+  kind: string | null; slug: string | null;
+}
+export interface MigrateObject { kind: string; slug: string; change: ObjectChange; }
+export interface MigratePruned { target: string; kind: string | null; slug: string | null; }
+export interface MigrateResult {
+  dryRun: boolean; source: string; target: string;
+  files: MigrateFile[]; objects: MigrateObject[];
+  pruned: MigratePruned[]; prunedDirs: string[]; skipped: string[]; warnings: string[];
+  creates: number; updates: number; unchanged: number; deletes: number;
+  filesChanged: number; renamed: number;
+}
+export type PlanDirection = "push" | "pull" | "both";
+export type PlanChange = "create" | "update" | "delete" | "conflict";
+export type PlanPrompt = "deleteGate" | "conflict" | "remoteDelete";
+export interface PlanItem {
+  kind: string; slug: string; direction: PlanDirection; change: PlanChange;
+  prompt: PlanPrompt | null; note: string | null;
+}
+export interface PlanRecovery { kind: string; slug: string; id: number | null; }
+export interface SyncPlan { items: PlanItem[]; recovered: PlanRecovery[]; problems: string[]; }
+export type SkipReason =
+  | "deleteGateDeclined" | "deleteDriftSkipped" | "pushDriftSkipped" | "conflictSkipped"
+  | "remoteDeleteSkipped" | "mdhIndexDropDeclined" | "mdhRowDeleteDeclined";
+export interface SkippedItem { kind: string; slug: string; reason: SkipReason; }
 export interface CycleOutcome {
   itemsPushed: number; itemsPulled: number; conflicts: number;
   remoteDeletesResolved: number; fileCount: number;
+  plan: SyncPlan | null; skipped: SkippedItem[];
 }
 "#;
+
+// ---------------------------------------------------------------- Web Locks
+
+// The two members of `LockManager` this needs, bound by hand: web-sys has
+// them only behind `--cfg=web_sys_unstable_apis`.
+#[wasm_bindgen]
+extern "C" {
+    type LockManager;
+    #[wasm_bindgen(method)]
+    fn request(this: &LockManager, name: &str, options: &JsValue, callback: &JsValue) -> js_sys::Promise;
+}
+
+/// [`EnvLocks`] over `navigator.locks`: an exclusive lock, requested with
+/// `ifAvailable`, so a lock another tab holds is refused, never waited for.
+/// The lock is held until the callback's promise settles, which happens
+/// when the [`HeldLock`] is dropped, or when the tab goes away.
+pub struct WebLocks;
+
+/// Resolves the promise the lock callback returned, which frees the lock.
+struct WebHeld(WasmOnly<js_sys::Function>);
+
+impl Drop for WebHeld {
+    fn drop(&mut self) {
+        let _ = self.0.get().call0(&JsValue::NULL);
+    }
+}
+
+fn lock_manager() -> Option<LockManager> {
+    let navigator = js_sys::Reflect::get(&js_sys::global(), &"navigator".into()).ok()?;
+    if !navigator.is_object() {
+        return None;
+    }
+    let locks = js_sys::Reflect::get(&navigator, &"locks".into()).ok()?;
+    locks.is_object().then(|| locks.unchecked_into())
+}
+
+impl EnvLocks for WebLocks {
+    fn acquire(&self, name: String) -> rdc::rt::BoxFuture<'static, anyhow::Result<Option<HeldLock>>> {
+        Box::pin(async move {
+            let locks = lock_manager().ok_or_else(|| anyhow!("Web Locks are not available in this context"))?;
+            let mut release = None;
+            let held = js_sys::Promise::new(&mut |resolve, _| release = Some(resolve));
+            let mut grant = None;
+            let granted = js_sys::Promise::new(&mut |resolve, _| grant = Some(resolve));
+            let (release, grant) = (release.expect("called at once"), grant.expect("called at once"));
+            // `null` when another holder has the lock: report it and return
+            // at once. Otherwise return `held`, which keeps the lock until
+            // `release` is called.
+            let callback = Closure::once_into_js(move |lock: JsValue| -> JsValue {
+                let _ = grant.call1(&JsValue::NULL, &JsValue::from_bool(!lock.is_null()));
+                if lock.is_null() { JsValue::UNDEFINED } else { held.into() }
+            });
+            let options = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&options, &"mode".into(), &"exclusive".into());
+            let _ = js_sys::Reflect::set(&options, &"ifAvailable".into(), &JsValue::TRUE);
+            let request = locks.request(&name, &options, &callback);
+            // The request rejects without calling back (an invalid name, a
+            // document without an origin): its error is the answer then.
+            let granted = match futures::future::select(JsFuture::from(granted), JsFuture::from(request)).await {
+                futures::future::Either::Left((g, _)) => g,
+                futures::future::Either::Right((Err(e), _)) => Err(e),
+                futures::future::Either::Right((Ok(_), pending)) => pending.await,
+            };
+            let granted = granted.map_err(|e| anyhow!("taking the lock {name}: {}", js_error(&e)))?;
+            Ok(granted.is_truthy().then(|| Box::new(WebHeld(WasmOnly(release))) as HeldLock))
+        })
+    }
+}
+
+/// A thrown JS value as text.
+fn js_error(e: &JsValue) -> String {
+    e.dyn_ref::<js_sys::Error>().map_or_else(|| format!("{e:?}"), |e| String::from(e.message()))
+}
 
 fn to_js<T: Serialize>(v: &T) -> Result<JsValue, JsError> {
     v.serialize(&serde_wasm_bindgen::Serializer::new().serialize_missing_as_null(true))
@@ -216,8 +324,26 @@ impl Project {
         to_js(&self.core.rename_env(&old_name, &new_name).map_err(|e| self.err(e))?)
     }
 
+    /// Keep each env's sync state and tree in Data Storage under `key`, in
+    /// `collection` (default `__rdc_state`) of the env's own org, from the
+    /// next `sync`, `watch` or `migrate` on. Throws on an empty key or
+    /// collection, or an unknown option.
+    #[wasm_bindgen(js_name = useDataStorageState)]
+    pub fn use_data_storage_state(
+        &self,
+        #[wasm_bindgen(unchecked_param_type = "DataStorageStateOptions")] opts: JsValue,
+    ) -> Result<(), JsError> {
+        if opts.is_object() {
+            let keys: Vec<String> =
+                js_sys::Object::keys(opts.unchecked_ref::<js_sys::Object>()).iter().filter_map(|k| k.as_string()).collect();
+            check_state_option_keys(keys).map_err(|e| self.err(e))?;
+        }
+        let opts: DataStorageStateOptions = from_js(opts)?;
+        self.core.use_data_storage_state(opts).map_err(|e| self.err(e))
+    }
+
     /// One reconciliation cycle of `env`. Rejects when `env` is already
-    /// being synced or watched.
+    /// being synced or watched, here or in another tab (its Web Lock).
     #[wasm_bindgen(unchecked_return_type = "Promise<CycleOutcome>")]
     pub fn sync(
         &self,
@@ -240,8 +366,44 @@ impl Project {
         }))
     }
 
+    /// `rdc migrate src tgt` on the tree. Resolves with what it changed (or,
+    /// under `dryRun`, would change). Throws on an unknown option or
+    /// `allowRecreate` without `mirror`; rejects when either env is busy here
+    /// or, with Data Storage state on, the target's org is locked in another
+    /// tab.
+    #[wasm_bindgen(unchecked_return_type = "Promise<MigrateResult>")]
+    pub fn migrate(
+        &self,
+        src: String,
+        tgt: String,
+        #[wasm_bindgen(unchecked_param_type = "MigrateOptions | null | undefined")] opts: JsValue,
+        #[wasm_bindgen(js_name = onLog, unchecked_param_type = "(line: string) => void")]
+        on_log: js_sys::Function,
+    ) -> Result<js_sys::Promise, JsError> {
+        let opts: MigrateOptions = if opts.is_undefined() || opts.is_null() {
+            MigrateOptions::default()
+        } else {
+            if opts.is_object() {
+                let keys: Vec<String> =
+                    js_sys::Object::keys(opts.unchecked_ref::<js_sys::Object>()).iter().filter_map(|k| k.as_string()).collect();
+                check_migrate_option_keys(keys).map_err(|e| self.err(e))?;
+            }
+            from_js(opts)?
+        };
+        // Migrate asks nothing; the route only carries the log's line buffer.
+        let (log, _route) = log_and_route(log_fn(on_log), Box::new(|_| Box::pin(async { None })), None);
+        let core = self.core.clone();
+        Ok(future_to_promise(async move {
+            match core.clone().migrate(src, tgt, opts, log).await {
+                Ok(r) => Ok(to_js(&r)?),
+                Err(e) => Err(JsError::new(&core.message(&e)).into()),
+            }
+        }))
+    }
+
     /// Watch `env` until `stop()`. Throws when `env` is already being synced
-    /// or watched.
+    /// or watched by this project; `done()` rejects when another tab holds
+    /// its Web Lock.
     pub fn watch(
         &self,
         env: String,

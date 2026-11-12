@@ -50,7 +50,7 @@ fn load_or_migrate_mapping(
     src_paths: &crate::paths::Paths,
     known_envs: &BTreeSet<String>,
     dry_run: bool,
-    log: &crate::log::Log,
+    log: &Notes,
 ) -> Result<GenericMapping> {
     let generic_path = src_paths.mapping_file();
     // A file with no rows — the stub `rdc init` scaffolds — records nothing, so
@@ -196,7 +196,7 @@ fn load_or_migrate_mapping(
 
 /// Log each `GenericMapping::validate` warning (e.g. a row referencing an env
 /// no longer in `rdc.toml`) via `log`, one event per warning.
-fn log_mapping_warnings(log: &crate::log::Log, warnings: &[String]) {
+fn log_mapping_warnings(log: &Notes, warnings: &[String]) {
     for w in warnings {
         log.event(crate::log::Action::Warn, w);
     }
@@ -1325,7 +1325,7 @@ fn collect_schema_ids(value: &serde_json::Value, out: &mut std::collections::BTr
 /// rather than the size of the snapshot: a target already holding these exact
 /// bytes is [`FileOutcome::Unchanged`] and nothing is written.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum FileOutcome {
+pub enum FileOutcome {
     /// No file at the target path.
     Created,
     /// A file at the target path held different bytes.
@@ -3147,6 +3147,122 @@ impl MirrorMode {
     }
 }
 
+/// The run's log, which also keeps the text of every warning for the
+/// [`MigrateReport`].
+pub(crate) struct Notes {
+    log: std::sync::Arc<crate::log::Log>,
+    warnings: std::sync::Mutex<Vec<String>>,
+}
+
+impl Notes {
+    fn new(log: std::sync::Arc<crate::log::Log>) -> Self {
+        Self { log, warnings: Default::default() }
+    }
+
+    fn event(&self, action: crate::log::Action, message: &str) {
+        if action == crate::log::Action::Warn {
+            self.warnings.lock().unwrap_or_else(|p| p.into_inner()).push(message.to_string());
+        }
+        self.log.event(action, message);
+    }
+}
+
+/// What this run did to a target object's files: the per-object tally the
+/// summary counts, plus a prune. It describes the target TREE, not the env:
+/// what the next `sync` sends depends on the target's lockfile and the org
+/// too (an object whose file was deleted locally but is still recorded is
+/// `Create` here, and the sync PATCHes or leaves it).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ObjectChange {
+    /// The target tree had no primary file for it before this run.
+    Create,
+    /// It had one, and at least one of its files changed.
+    Update,
+    /// Every one of its files was already byte-identical.
+    Unchanged,
+    /// `--mirror` removed its primary file from the target tree.
+    Delete,
+}
+
+/// One file a migrate considered. Paths are relative to the env roots.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct MigratedFile {
+    pub source: PathBuf,
+    pub target: PathBuf,
+    pub change: FileOutcome,
+    /// The target object the file belongs to, as [`sync_identity`] names it;
+    /// `None` for a file of no object.
+    pub object: Option<(String, String)>,
+}
+
+/// The object a target file belongs to, by the identity the sync plan and
+/// its skipped items use: the lockfile's `(kind, slug)`, with `"mdh"` for a
+/// dataset. The flag says whether the file is the object's primary one (its
+/// absence makes the object new). Wider than the object tally whose
+/// workflow tally the CLI's summary line keeps: a workflow step is an object
+/// of its own here, as it is to sync.
+pub fn sync_identity(rel: &Path) -> Option<(&'static str, String, bool)> {
+    let comps = comps_of(rel);
+    let leaf = comps.last()?;
+    match comps.first().map(String::as_str) {
+        Some("workflows") if comps.len() == 3 && leaf == "workflow.json" => {
+            return Some(("workflows", comps[1].clone(), true));
+        }
+        Some("workflows") if comps.len() == 4 && comps[2] == "steps" => {
+            return leaf
+                .strip_suffix(".json")
+                .map(|step| ("workflow_steps", format!("{}/{step}", comps[1]), true));
+        }
+        Some("workflows") => return None,
+        Some("mdh") if comps.len() >= 3 => return Some(("mdh", comps[1].clone(), leaf == "indexes.json")),
+        _ => {}
+    }
+    if let Some((kind, slug)) = classify(rel) {
+        return Some((kind, slug, true));
+    }
+    classify_for_selection(rel).map(|(kind, slug)| (kind, slug, false))
+}
+
+/// One target file `--mirror` pruned. The path is relative to the target
+/// env root; `object` as in [`MigratedFile`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PrunedFile {
+    pub target: PathBuf,
+    pub object: Option<(String, String)>,
+}
+
+/// One target object a migrate touched, by its target slug.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct MigratedObject {
+    pub kind: String,
+    pub slug: String,
+    pub change: ObjectChange,
+}
+
+/// What one migrate changed, or under `dry_run` would change: the per-file
+/// and per-object outcomes the summary lines count. Paths are relative to the
+/// env roots (`envs/<src>/`, `envs/<tgt>/`).
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct MigrateReport {
+    pub dry_run: bool,
+    /// Every file considered, in source path order.
+    pub files: Vec<MigratedFile>,
+    /// Sorted by `(kind, slug)`.
+    pub objects: Vec<MigratedObject>,
+    /// Target files pruned by `--mirror`, with their objects.
+    pub pruned: Vec<PrunedFile>,
+    /// Target directories `--mirror` emptied and removed.
+    pub pruned_dirs: Vec<PathBuf>,
+    /// Source files left out: un-creatable duplicate unique email templates.
+    pub skipped: Vec<PathBuf>,
+    /// The text of every warning the run logged.
+    pub warnings: Vec<String>,
+    /// Files whose bytes changed (or would).
+    pub files_changed: usize,
+    /// Files whose path the mapping changed.
+    pub renamed: usize,
+}
+
 /// `--mirror` additionally deletes target-only objects (files present in tgt
 /// but not produced by the migration). `--dry-run` prints the plan and writes
 /// nothing. `--only <selector>` narrows the operation to matching
@@ -3176,7 +3292,12 @@ pub fn run_at(
     only: Vec<String>,
     carry: Carry,
 ) -> Result<()> {
-    let mirror = mirror_mode.is_mirror();
+    let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode());
+    run_at_logged(cwd, src, tgt, mirror_mode, dry_run, only, carry, log).map(drop)
+}
+
+/// The project config, once `src` and `tgt` are two envs it defines.
+pub(crate) fn check_envs(cwd: &Path, src: &str, tgt: &str) -> Result<crate::config::ProjectConfig> {
     if src == tgt {
         anyhow::bail!(
             "src and tgt envs are the same ('{src}'). Use two different envs for `rdc migrate`."
@@ -3187,6 +3308,24 @@ pub fn run_at(
     let project_cfg = crate::config::ProjectConfig::load(&cwd.join("rdc.toml"))?;
     project_cfg.env_or_err(src)?;
     project_cfg.env_or_err(tgt)?;
+    Ok(project_cfg)
+}
+
+/// [`run_at`], logging to `log`, and returning what it changed. The
+/// embedders' entry point (`cli::sync::embed::migrate_logged_in`).
+#[allow(clippy::too_many_arguments)]
+pub fn run_at_logged(
+    cwd: &Path,
+    src: &str,
+    tgt: &str,
+    mirror_mode: MirrorMode,
+    dry_run: bool,
+    only: Vec<String>,
+    carry: Carry,
+    log: std::sync::Arc<crate::log::Log>,
+) -> Result<MigrateReport> {
+    let mirror = mirror_mode.is_mirror();
+    let project_cfg = check_envs(cwd, src, tgt)?;
 
     let src_paths = crate::paths::Paths::for_env(cwd, src);
     let tgt_paths = crate::paths::Paths::for_env(cwd, tgt);
@@ -3214,7 +3353,8 @@ pub fn run_at(
         );
     }
 
-    let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode());
+    let log = Notes::new(log);
+    let mut report = MigrateReport { dry_run, ..MigrateReport::default() };
 
     let known_envs: std::collections::BTreeSet<String> =
         project_cfg.envs.keys().cloned().collect();
@@ -3253,7 +3393,18 @@ pub fn run_at(
         tgt_env_cfg.org_id
     );
 
-    let files = enumerate_files(&src_root, src)?;
+    let mut files = enumerate_files(&src_root, src)?;
+    // A dataset that mirrors a collection holding sync state — the rdc Chrome
+    // extension's (`_SA_EXTENSION__*`) or the scoped state store's — is never
+    // promoted, should a tree pulled before they were skipped still carry
+    // one. Other `__` datasets are copied as before.
+    for slug in state_datasets(&src_root) {
+        log.event(
+            crate::log::Action::Info,
+            &format!("skipping mdh/{slug}: its collection holds sync state, not configuration"),
+        );
+        files.retain(|rel| comps_of(rel).get(..2) != Some(&["mdh".to_string(), slug.clone()][..]));
+    }
 
     // Guardrail: warn (don't abort) when an oriented mapping row's SOURCE slug
     // has no matching object on disk in '<src>'. This restores the check the
@@ -3294,6 +3445,7 @@ pub fn run_at(
     // (and let `--mirror` prune stale copies of them from the target tree).
     let tgt_lockfile = crate::state::Lockfile::load(&tgt_paths.lockfile()).unwrap_or_default();
     let unique_tpl_skips = unique_template_skips(&files, &src_root, &mapping, &tgt_lockfile);
+    report.skipped = unique_tpl_skips.iter().cloned().collect();
     if !unique_tpl_skips.is_empty() {
         let listing: Vec<String> = unique_tpl_skips
             .iter()
@@ -3373,11 +3525,16 @@ pub fn run_at(
     // remapped, subtracted from the target tree, and every path the write loop
     // adds to that tree is by construction one the migration produces — which
     // is exactly what `mirror_prune_paths` filters out.
-    let prune_plan: Vec<PathBuf> = if mirror {
+    let mut prune_plan: Vec<PathBuf> = if mirror {
         mirror_prune_paths(&src_root, src, &tgt_root, tgt, &mapping, &unique_tpl_skips)?
     } else {
         Vec::new()
     };
+    // Nor is a target folder mirroring such a collection pruned: no sync would
+    // delete it on the env, so the plan must not say one does.
+    for slug in state_datasets(&tgt_root) {
+        prune_plan.retain(|rel| comps_of(rel).get(..2) != Some(&["mdh".to_string(), slug.clone()][..]));
+    }
     if mirror && !mirror_mode.allows_recreate() {
         let produced = produced_paths(&src_root, src, &mapping, &unique_tpl_skips)?;
         let pairs = recreate_pairs(
@@ -3402,6 +3559,9 @@ pub fn run_at(
     let mut written = 0usize;
     let mut renamed = 0usize;
     let mut obj_status: BTreeMap<(&'static str, String), ObjStatus> = BTreeMap::new();
+    // The report's tally, by the sync identity (see `sync_identity`); the CLI's
+    // summary line keeps `obj_status`.
+    let mut report_status: BTreeMap<(&'static str, String), ObjStatus> = BTreeMap::new();
     let mut id_hits: Vec<(String, u64, u64)> = Vec::new();
     let mut carried_prefixes: Vec<(String, String)> = Vec::new();
     let mut missing_schema_ids: Vec<String> = Vec::new();
@@ -3520,6 +3680,23 @@ pub fn run_at(
         if outcome != FileOutcome::Unchanged {
             written += 1;
         }
+        let identity = sync_identity(&dst_rel);
+        report.files.push(MigratedFile {
+            source: rel.clone(),
+            target: dst_rel.clone(),
+            change: outcome,
+            object: identity.as_ref().map(|(k, s, _)| (k.to_string(), s.clone())),
+        });
+        if let Some((kind, slug, primary)) = identity {
+            let slot = report_status.entry((kind, slug)).or_insert(ObjStatus::Unchanged);
+            if *slot != ObjStatus::Created {
+                *slot = match (primary, outcome) {
+                    (true, FileOutcome::Created) => ObjStatus::Created,
+                    (_, FileOutcome::Unchanged) => *slot,
+                    _ => ObjStatus::Updated,
+                };
+            }
+        }
         // Report the id rewrites this file needed. Silent remapping would be the
         // very thing that made the original bug invisible, so each one is named.
         if id_hits.len() > hits_before {
@@ -3587,6 +3764,9 @@ pub fn run_at(
         pruned_rels = prune.clone();
         for rel in &prune {
             pruned += 1;
+            if let Some((kind, slug, true)) = sync_identity(rel) {
+                report.objects.push(MigratedObject { kind: kind.to_string(), slug, change: ObjectChange::Delete });
+            }
             if dry_run {
                 log.event(
                     crate::log::Action::Delete,
@@ -3619,6 +3799,7 @@ pub fn run_at(
                 crate::log::Action::Delete,
                 &format!("prune dir {}", rel.display()),
             );
+            report.pruned_dirs.push(rel);
         }
     }
 
@@ -3722,6 +3903,26 @@ pub fn run_at(
         }
     }
 
+    report.pruned = pruned_rels
+        .iter()
+        .map(|rel| PrunedFile {
+            target: rel.clone(),
+            object: sync_identity(rel).map(|(k, s, _)| (k.to_string(), s)),
+        })
+        .collect();
+    report.files_changed = written;
+    report.renamed = renamed;
+    report.objects.extend(report_status.iter().map(|((kind, slug), status)| MigratedObject {
+        kind: kind.to_string(),
+        slug: slug.clone(),
+        change: match status {
+            ObjStatus::Created => ObjectChange::Create,
+            ObjStatus::Updated => ObjectChange::Update,
+            ObjStatus::Unchanged => ObjectChange::Unchanged,
+        },
+    }));
+    report.objects.sort_by(|a, b| (&a.kind, &a.slug).cmp(&(&b.kind, &b.slug)));
+
     let verb = if dry_run { "would migrate" } else { "migrated" };
     log.event(
         crate::log::Action::Done,
@@ -3750,7 +3951,27 @@ pub fn run_at(
         );
     }
 
-    Ok(())
+    report.warnings = std::mem::take(&mut *log.warnings.lock().unwrap_or_else(|p| p.into_inner()));
+    Ok(report)
+}
+
+/// The source dataset slugs whose `collection.json` names a collection that
+/// holds sync state: the Chrome extension's, or the scoped state store's.
+fn state_datasets(src_root: &Path) -> Vec<String> {
+    use crate::cli::pull::mdh::{is_extension_collection, is_scoped_state_collection, read_collection_name};
+    let Ok(entries) = crate::vfs::read_dir(src_root.join("mdh")) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = entries
+        .into_iter()
+        .filter(|e| {
+            read_collection_name(&e.path())
+                .is_some_and(|n| is_extension_collection(&n) || is_scoped_state_collection(&n))
+        })
+        .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+        .collect();
+    out.sort();
+    out
 }
 
 /// Remap a snapshot-relative path's structured slug components to their
@@ -3992,7 +4213,7 @@ mod tests {
         std::fs::write(&unknown_path, b"not valid mapping toml, never parsed").unwrap();
 
         let known_envs: BTreeSet<String> = BTreeSet::from(["dev".to_string(), "test".to_string()]);
-        let log = crate::log::Log::new(crate::cli::resolve::ColorMode::Plain);
+        let log = Notes::new(crate::log::Log::new(crate::cli::resolve::ColorMode::Plain));
 
         let generic = load_or_migrate_mapping(&paths, &known_envs, false, &log).unwrap();
         assert!(!generic.is_empty(), "the known-pair edge should have been converted");
@@ -7232,5 +7453,188 @@ If they are unrelated, run it again with --allow-recreate."
                 created: "vendor-invoices".into(),
             }]
         );
+    }
+
+    // ---- the report `run_at_logged` returns (the embedders' plan screen)
+
+    fn quiet() -> std::sync::Arc<crate::log::Log> {
+        crate::log::Log::for_sink(crate::cli::resolve::ColorMode::Plain, Box::new(std::io::sink()))
+    }
+
+    /// dev holds labels `a` and `b`; prod holds a different `b` and an extra
+    /// `c`. Both are pulled (lockfiles present).
+    fn report_project() -> tempfile::TempDir {
+        let project = saved_view_project();
+        let root = project.path();
+        let label = |name: &str, color: &str| {
+            serde_json::json!({ "name": name, "color": color, "organization": "https://dev.example/api/v1/organizations/1" })
+        };
+        write_snapshot_json(&root.join("envs/dev/labels/a.json"), &label("a", "#111111"));
+        write_snapshot_json(&root.join("envs/dev/labels/b.json"), &label("b", "#222222"));
+        write_snapshot_json(&root.join("envs/prod/labels/b.json"), &label("b", "#999999"));
+        write_snapshot_json(&root.join("envs/prod/labels/c.json"), &label("c", "#333333"));
+        for env in ["dev", "prod"] {
+            crate::state::Lockfile::default()
+                .save(&crate::paths::Paths::for_env(root, env).lockfile())
+                .unwrap();
+        }
+        project
+    }
+
+    fn changes(report: &MigrateReport) -> Vec<(String, String, ObjectChange)> {
+        report.objects.iter().map(|o| (o.kind.clone(), o.slug.clone(), o.change)).collect()
+    }
+
+    #[test]
+    fn the_report_names_every_file_object_and_prune() {
+        let project = report_project();
+        let root = project.path();
+        let mirror = MirrorMode::Mirror { allow_recreate: false };
+        let report = run_at_logged(root, "dev", "prod", mirror, false, vec![], Carry::NONE, quiet()).unwrap();
+
+        assert!(!report.dry_run);
+        let files: Vec<(PathBuf, PathBuf, FileOutcome)> =
+            report.files.iter().map(|f| (f.source.clone(), f.target.clone(), f.change)).collect();
+        assert_eq!(
+            files,
+            vec![
+                (PathBuf::from("labels/a.json"), PathBuf::from("labels/a.json"), FileOutcome::Created),
+                (PathBuf::from("labels/b.json"), PathBuf::from("labels/b.json"), FileOutcome::Updated),
+            ]
+        );
+        assert_eq!(
+            changes(&report),
+            vec![
+                ("labels".into(), "a".into(), ObjectChange::Create),
+                ("labels".into(), "b".into(), ObjectChange::Update),
+                ("labels".into(), "c".into(), ObjectChange::Delete),
+            ]
+        );
+        assert_eq!(
+            report.pruned,
+            vec![PrunedFile { target: PathBuf::from("labels/c.json"), object: Some(("labels".into(), "c".into())) }]
+        );
+        assert_eq!((report.files_changed, report.renamed), (2, 0));
+        assert!(!root.join("envs/prod/labels/c.json").exists(), "the prune happened");
+
+        // The same run again changes nothing.
+        let again = run_at_logged(root, "dev", "prod", mirror, false, vec![], Carry::NONE, quiet()).unwrap();
+        assert!(again.objects.iter().all(|o| o.change == ObjectChange::Unchanged), "{:?}", again.objects);
+        assert_eq!(again.files_changed, 0);
+    }
+
+    #[test]
+    fn a_dry_run_reports_the_same_plan_and_writes_nothing() {
+        let project = report_project();
+        let root = project.path();
+        let before = std::fs::read(root.join("envs/prod/labels/b.json")).unwrap();
+        let mirror = MirrorMode::Mirror { allow_recreate: false };
+        let dry = run_at_logged(root, "dev", "prod", mirror, true, vec![], Carry::NONE, quiet()).unwrap();
+        assert!(dry.dry_run);
+        assert_eq!(std::fs::read(root.join("envs/prod/labels/b.json")).unwrap(), before);
+        assert!(!root.join("envs/prod/labels/a.json").exists());
+        assert!(root.join("envs/prod/labels/c.json").exists());
+        let real = run_at_logged(root, "dev", "prod", mirror, false, vec![], Carry::NONE, quiet()).unwrap();
+        assert_eq!((dry.files, dry.objects, dry.pruned), (real.files, real.objects, real.pruned));
+    }
+
+    #[test]
+    fn the_report_carries_the_warnings_and_respects_only() {
+        let project = report_project();
+        let root = project.path();
+        write_snapshot_json(&root.join("envs/dev/organization.json"), &serde_json::json!({ "settings": {} }));
+        let report = run_at_logged(root, "dev", "prod", MirrorMode::Additive, true, vec![], Carry::NONE, quiet()).unwrap();
+        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+        assert!(report.warnings[0].contains("organization.json does not exist yet"), "{:?}", report.warnings);
+        let only =
+            run_at_logged(root, "dev", "prod", MirrorMode::Additive, true, vec!["labels/a".into()], Carry::NONE, quiet())
+                .unwrap();
+        assert_eq!(changes(&only), vec![("labels".into(), "a".into(), ObjectChange::Create)]);
+        assert!(only.warnings.is_empty(), "{:?}", only.warnings);
+    }
+
+    /// A state store configured with a collection of its own name.
+    struct NamedState;
+    impl crate::state::store::StateStore for NamedState {
+        fn hydrate<'a>(&'a self, _: &'a crate::paths::Paths) -> crate::rt::BoxFuture<'a, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn checkpoint<'a>(&'a self, _: &'a crate::paths::Paths) -> crate::rt::BoxFuture<'a, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn collection(&self) -> Option<String> {
+            Some("rdc_browser_state".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_state_collections_dataset_is_never_promoted() {
+        let project = report_project();
+        let root = project.path().to_path_buf();
+        let dataset = |slug: &str, name: &str| {
+            let dir = root.join("envs/dev/mdh").join(slug);
+            write_snapshot_json(&dir.join("collection.json"), &serde_json::json!({ "name": name }));
+            write_snapshot_json(&dir.join("indexes.json"), &serde_json::json!({ "regular": [], "search": [] }));
+            root.join("envs/prod/mdh").join(slug).join("indexes.json")
+        };
+        let target = dataset("rdc-browser-state", "rdc_browser_state");
+        let extension = dataset("sa-extension-rdc-state", "_SA_EXTENSION__rdc_state");
+        let internal = dataset("tmp-x", "__tmp_x");
+
+        let scoped = crate::state::store::scope(std::sync::Arc::new(NamedState), async {
+            run_at_logged(&root, "dev", "prod", MirrorMode::Additive, false, vec![], Carry::NONE, quiet()).unwrap()
+        })
+        .await;
+        assert!(!target.exists(), "the state's dataset was copied");
+        assert!(!extension.exists(), "the extension's dataset was copied");
+        let mdh: Vec<&str> = scoped.objects.iter().filter(|o| o.kind == "mdh").map(|o| o.slug.as_str()).collect();
+        assert_eq!(mdh, vec!["tmp-x"], "other `__` datasets are copied as before");
+        assert!(internal.exists());
+
+        // Unscoped (the CLI): the extension's dataset is still skipped; a
+        // plain-named one is an ordinary dataset, as before.
+        run_at_logged(&root, "dev", "prod", MirrorMode::Additive, false, vec![], Carry::NONE, quiet()).unwrap();
+        assert!(target.exists());
+        assert!(!extension.exists(), "the CLI skips the extension's dataset too");
+    }
+
+    /// `--mirror` never prunes a target folder mirroring a skipped
+    /// collection: sync would never delete it on the env, so the plan must
+    /// not say it does.
+    #[test]
+    fn a_mirror_leaves_a_target_folder_of_a_skipped_collection_alone() {
+        let project = report_project();
+        let root = project.path();
+        let dir = root.join("envs/prod/mdh/sa-extension-rdc-state");
+        write_snapshot_json(&dir.join("collection.json"), &serde_json::json!({ "name": "_SA_EXTENSION__rdc_state" }));
+        write_snapshot_json(&dir.join("indexes.json"), &serde_json::json!({ "regular": [], "search": [] }));
+        let mirror = MirrorMode::Mirror { allow_recreate: false };
+        let r = run_at_logged(root, "dev", "prod", mirror, false, vec![], Carry::NONE, quiet()).unwrap();
+        assert!(r.objects.iter().all(|o| o.kind != "mdh"), "{:?}", r.objects);
+        assert!(r.pruned.iter().all(|p| !p.target.starts_with("mdh")), "{:?}", r.pruned);
+        assert!(dir.join("indexes.json").exists() && dir.join("collection.json").exists());
+    }
+
+    #[test]
+    fn sync_identity_names_every_file_by_its_object() {
+        let id = |p: &str| sync_identity(Path::new(p)).map(|(k, s, primary)| (k.to_string(), s, primary));
+        let some = |k: &str, s: &str, p: bool| Some((k.to_string(), s.to_string(), p));
+        assert_eq!(id("hooks/a.json"), some("hooks", "a", true));
+        assert_eq!(id("hooks/a.py"), some("hooks", "a", false));
+        assert_eq!(id("hooks/a.js"), some("hooks", "a", false));
+        assert_eq!(id("rules/r.py"), some("rules", "r", false));
+        assert_eq!(id("workspaces/w/queues/q/formulas/total.py"), some("schemas", "q", false));
+        assert_eq!(id("workspaces/w/queues/q/schema.json"), some("schemas", "q", true));
+        assert_eq!(id("workspaces/w/queues/q/email-templates/t.json"), some("email_templates", "w/q/t", true));
+        assert_eq!(id("engines/e/fields/f.json"), some("engine_fields", "e/f", true));
+        assert_eq!(id("mdh/v/indexes.json"), some("mdh", "v", true));
+        assert_eq!(id("mdh/v/data.jsonl"), some("mdh", "v", false));
+        assert_eq!(id("mdh/v/collection.json"), some("mdh", "v", false));
+        assert_eq!(id("workflows/w/workflow.json"), some("workflows", "w", true));
+        assert_eq!(id("workflows/w/steps/s.json"), some("workflow_steps", "w/s", true));
+        assert_eq!(id("organization.json"), some("organization", "self", true));
+        for none in ["overlay.toml", "_index.md", "workflows/w/notes.md", "README.md"] {
+            assert_eq!(id(none), None, "{none}");
+        }
     }
 }

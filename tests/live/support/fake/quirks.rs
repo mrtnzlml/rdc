@@ -1159,6 +1159,107 @@ pub const QUIRKS: &[Quirk] = &[
             proven_by: "deploy_flow.rs::live_deploy_flow",
         },
     },
+    Quirk {
+        name: "create_fills_defaults_into_nested_objects",
+        // A create's response does not echo every top-level field as sent:
+        // the server fills defaults INTO the nested object. Observed by
+        // `live_create_identity` on the hand-written graph: a function
+        // hook's `config` `{runtime, code}` comes back with `schedule`,
+        // `app`, `payload_logging_enabled`, `timeout_s`,
+        // `max_polling_time_s`, `retry_count`, `retry_after_polling_failure`,
+        // `third_party_library_pack` and `memory_size_mb` added; an engine's
+        // `settings: {}` comes back `{"use_case": "generic_ap"}`; a schema's
+        // `content` changes too (observed and printed, not asserted or
+        // modelled: the listing the matcher reads omits it). Every other
+        // kind the graph creates (workspace, queue, inbox, label, rule,
+        // email template, engine field, saved view) echoed every sent field
+        // unchanged; the scenario asserts exactly this per-kind set. Modelled
+        // in `kinds::hook_defaults` (non-numeric keys only; see
+        // `function_config_defaults`) and `kinds::engine_defaults`. rdc's
+        // answer is `state::journal::SERVER_FILLED_FIELDS`: such a field is
+        // journaled per sub-key, and a candidate must carry every sub-key the
+        // body sent, unchanged.
+        provenance: Provenance::Modelled {
+            proven_by: "crash_recovery.rs::live_create_identity",
+        },
+    },
+    Quirk {
+        name: "hook_code_is_stored_without_trailing_whitespace",
+        // A function hook created with `config.code` ending in `\n` (every
+        // `.py` sidecar does) is stored without it: `live_create_identity`
+        // fails unless the create matcher compares `config.code` trimmed
+        // (`state::journal::TRIMMED_SUB_KEYS`). Modelled on create only, in
+        // `kinds::hook_defaults`; whether a PATCH trims too is not observed.
+        provenance: Provenance::Modelled {
+            proven_by: "crash_recovery.rs::live_create_identity",
+        },
+    },
+    Quirk {
+        name: "data_storage_replace_one_reports_counts_and_upserts",
+        // `data/replace_one` answers `matched_count`, `modified_count` and
+        // `upserted_id` (next to a `raw_result` the client ignores), and
+        // `options: {"upsert": true}` inserts under the filter's `_id`. A
+        // filter on `{_id, rev}` with a stale `rev` answers
+        // `matched_count: 0` and writes nothing: the manifest's
+        // compare-and-swap. Modelled in `data_storage.rs` (`update_result`).
+        provenance: Provenance::Modelled {
+            proven_by: "crash_recovery.rs::live_data_storage_facts",
+        },
+    },
+    Quirk {
+        name: "data_storage_document_is_capped_at_16_mib",
+        // `replace_one` refuses a document over MongoDB's BSON cap with
+        // `400 "Resulting document after update is larger than 16777216"`.
+        // A hand binary search found a `text` of 16,777,150 bytes accepted
+        // and 16,777,216 refused, so the state store's 512 KiB chunk is far
+        // under it; the scenario pins 2 MiB accepted and 16 MiB refused.
+        // Modelled in `data_storage.rs` on the JSON length.
+        provenance: Provenance::Modelled {
+            proven_by: "crash_recovery.rs::live_data_storage_facts",
+        },
+    },
+    Quirk {
+        name: "data_storage_collection_is_created_on_first_write_and_listed",
+        // What the cited scenario asserts on every run: a write to the state
+        // collection, `__rdc_state`, succeeds without creating it first, and
+        // `collections/list` then lists it like any other (the org lists
+        // other `__` collections too); only the sync's MDH mirror skips it.
+        // The same writes prove a session token can write Data Storage.
+        // "Created on first write" was observed ONCE, on 2026-10-29: the
+        // collection was absent before the first manual probe and an upsert
+        // created it. It now exists in that org, so no later run can see the
+        // creation again; the name says what that one observation showed.
+        provenance: Provenance::Modelled {
+            proven_by: "crash_recovery.rs::live_data_storage_facts",
+        },
+    },
+    Quirk {
+        name: "data_storage_dotted_field_names_round_trip",
+        // Field names with dots and slashes (a manifest's
+        // `.rdc/state/<env>.lock.json` keys) are accepted by `insert_many`
+        // and `replace_one` and come back from `find` byte-equal.
+        provenance: Provenance::Modelled {
+            proven_by: "crash_recovery.rs::live_data_storage_facts",
+        },
+    },
+    Quirk {
+        name: "data_storage_duplicate_id_is_a_400_batch_error",
+        // `insert_many` with an `_id` that exists answers
+        // `400 {"code": "error", "message": "batch op errors occurred"}` and
+        // leaves the existing document as it was.
+        provenance: Provenance::Modelled {
+            proven_by: "crash_recovery.rs::live_data_storage_facts",
+        },
+    },
+    Quirk {
+        name: "data_storage_find_takes_an_escaped_regex_prefix_and_a_projection",
+        // `find` with `{"_id": {"$regex": "^<prefix, non-alphanumerics
+        // backslash-escaped>"}}` and projection `{"_id": 1}` returns exactly
+        // the documents under that prefix, each as `{_id}` only.
+        provenance: Provenance::Modelled {
+            proven_by: "crash_recovery.rs::live_data_storage_facts",
+        },
+    },
 ];
 
 /// The five typed defaults `POST /queues` materializes.

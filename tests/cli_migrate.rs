@@ -777,7 +777,7 @@ fn migrate_inbox_byte_deterministic_across_create_then_update() {
     write(
         &root.join(".rdc/state/test.lock.json"),
         &serde_json::json!({
-            "version": 3,
+            "version": 4,
             "api_base": "https://test.example/api/v1",
             "objects": {}
         }),
@@ -2010,7 +2010,7 @@ fn write_tgt_lockfile(root: &std::path::Path, env: &str, keys: &[&str]) {
         );
     }
     let lf = serde_json::json!({
-        "version": 3,
+        "version": 4,
         "api_base": "https://prod.example/api/v1",
         "objects": { "email_templates": templates },
     });
@@ -2965,7 +2965,7 @@ fn write_lockfile(root: &std::path::Path, env: &str, entries: &[(&str, &str, u64
     write(
         &root.join(format!(".rdc/state/{env}.lock.json")),
         &serde_json::json!({
-            "version": 3,
+            "version": 4,
             "api_base": "https://prod.example/api/v1",
             "objects": objects,
         }),

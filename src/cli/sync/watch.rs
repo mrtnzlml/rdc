@@ -507,6 +507,10 @@ pub(crate) async fn event_loop(
         None => std::env::current_dir()?,
     };
     let paths = crate::paths::Paths::for_env(&cwd, cfg.env);
+    // The newest token a refresher handed back. An embedder's refresher
+    // returns `Some`, so later cycles must use it; the CLI's returns `None`
+    // and `run_cycle` re-reads the secrets file instead.
+    let mut token = cfg.token.clone();
 
     loop {
         tokio::select! {
@@ -580,7 +584,7 @@ pub(crate) async fn event_loop(
                 }
                 let _outcome = match crate::cli::sync::run_cycle(
                     cfg.env, cfg.interactive, false, cfg.allow_deletes, cfg.no_push, cfg.no_pull,
-                    None, renderer.clone(), cfg.cwd, cfg.token.clone(), true,
+                    None, renderer.clone(), cfg.cwd, token.clone(), true,
                 ).await {
                     Ok(o) => o,
                     Err(e) if crate::api::anyhow_has_status(&e, 401) => {
@@ -594,10 +598,12 @@ pub(crate) async fn event_loop(
                             eprintln!("auth: token expired");
                         }
                         let fresh = refresher(cfg.env.to_string()).await?;
-                        let token = fresh.or_else(|| cfg.token.clone());
+                        if fresh.is_some() {
+                            token = fresh;
+                        }
                         crate::cli::sync::run_cycle(
                             cfg.env, cfg.interactive, false, cfg.allow_deletes, cfg.no_push, cfg.no_pull,
-                            None, renderer.clone(), cfg.cwd, token, true,
+                            None, renderer.clone(), cfg.cwd, token.clone(), true,
                         ).await?
                     }
                     Err(e) if is_transient_network_error(&e) => {
@@ -1341,5 +1347,117 @@ mod tests {
         let e = anyhow::anyhow!("something totally else");
         assert!(!is_transient_network_error(&e));
         assert!(!is_local_parse_error(&e));
+    }
+
+    /// The CLI's refresher returns `Ok(None)` after writing the new token to
+    /// `secrets/<env>.secrets.json`; the loop must not pin a token itself, so
+    /// every later cycle re-reads that file.
+    #[tokio::test]
+    async fn a_refresher_returning_none_leaves_each_cycle_to_reread_the_secrets_file() {
+        use std::sync::atomic::AtomicUsize;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let org_url = format!("{}/organizations/1", server.uri());
+        Mock::given(method("GET"))
+            .and(path("/organizations/1"))
+            .respond_with(move |req: &wiremock::Request| {
+                if req.headers.get("authorization").map(|v| v.to_str().unwrap()) == Some("token t1") {
+                    ResponseTemplate::new(401).set_body_json(serde_json::json!({"detail": "Invalid token."}))
+                } else {
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"id": 1, "name": "test-org", "url": org_url}))
+                }
+            })
+            .mount(&server)
+            .await;
+        for kind in [
+            "workspaces", "queues", "schemas", "inboxes", "hooks", "rules", "labels", "engines",
+            "engine_fields", "workflows", "workflow_steps", "email_templates", "saved_views",
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/{kind}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [], "pagination": {"next": null, "total_pages": 1, "total": 0}
+                })))
+                .mount(&server)
+                .await;
+        }
+
+        let project = tempfile::tempdir().unwrap();
+        let secrets = project.path().join("secrets/test.secrets.json");
+        std::fs::create_dir_all(secrets.parent().unwrap()).unwrap();
+        std::fs::write(&secrets, r#"{"api_token":"t1"}"#).unwrap();
+        std::fs::write(
+            project.path().join("rdc.toml"),
+            format!("[envs.test]\napi_base = \"{}\"\norg_id = 1\n", server.uri()),
+        )
+        .unwrap();
+
+        let (tx, rx) = mpsc::channel::<CycleTrigger>(8);
+        let cancel = CancelToken::new();
+        let (idle_tx, mut idle_rx) = mpsc::unbounded_channel::<()>();
+        let cfg = WatchConfig {
+            env: "test",
+            cwd: Some(project.path()),
+            token: None,
+            interactive: false,
+            allow_deletes: false,
+            no_push: false,
+            no_pull: false,
+            poll: None,
+            verbose: false,
+            no_bell: true,
+            on_idle: Some(Arc::new(move |_| {
+                let _ = idle_tx.send(());
+            })),
+        };
+        let refreshed = Arc::new(AtomicUsize::new(0));
+        let (refreshed_in, secrets_in) = (refreshed.clone(), secrets.clone());
+        let refresher: TokenRefresher = Arc::new(move |_: String| -> BoxFuture<'static, Result<Option<String>>> {
+            let (refreshed, secrets) = (refreshed_in.clone(), secrets_in.clone());
+            Box::pin(async move {
+                refreshed.fetch_add(1, Ordering::SeqCst);
+                std::fs::write(secrets, r#"{"api_token":"t2"}"#)?;
+                Ok(None)
+            })
+        });
+        let looped = event_loop(
+            &cfg,
+            rx,
+            cancel.clone(),
+            None,
+            project.path().join("envs/test"),
+            None,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(tokio::sync::Notify::new()),
+            &refresher,
+        );
+        let driver = async {
+            for _ in 0..3 {
+                tx.send(CycleTrigger::Poll).await.unwrap();
+                tokio::time::timeout(Duration::from_secs(20), idle_rx.recv())
+                    .await
+                    .expect("a cycle never finished");
+            }
+            cancel.cancel();
+        };
+        let (res, ()) = tokio::join!(looped, driver);
+        res.expect("the loop stops cleanly");
+
+        assert_eq!(refreshed.load(Ordering::SeqCst), 1, "only the first cycle hit the expired token");
+        let tokens: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|r| r.headers.get("authorization").map(|v| v.to_str().unwrap().rsplit(' ').next().unwrap().to_string()))
+            .collect();
+        let first_t2 = tokens.iter().position(|t| t == "t2").expect("the refreshed token was used");
+        assert!(
+            tokens[first_t2..].iter().all(|t| t == "t2"),
+            "later cycles read `t2` from the secrets file: {tokens:?}"
+        );
     }
 }

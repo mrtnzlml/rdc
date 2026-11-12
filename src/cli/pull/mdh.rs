@@ -92,8 +92,27 @@ pub(crate) fn manifest_bytes_merged(existing: Option<&[u8]>, name: &str) -> Resu
 /// not found` every time (observed live 2026-09-25). None of them is project
 /// configuration, and mirroring one would let `migrate` create it in another
 /// env, so rdc lists, pulls and creates none of them.
+///
+/// The rdc Chrome extension's collections (prefix [`EXTENSION_PREFIX`]) are
+/// skipped the same way, on every surface, the CLI included: they hold its
+/// sync state, never project configuration. And the collection the task's
+/// [`crate::state::store::StateStore`] keeps the sync state in counts too,
+/// whatever its name.
 pub(crate) fn is_internal_collection(name: &str) -> bool {
-    name.starts_with("__")
+    name.starts_with("__") || is_extension_collection(name) || is_scoped_state_collection(name)
+}
+
+/// The prefix of the rdc Chrome extension's Data Storage collections.
+pub(crate) const EXTENSION_PREFIX: &str = "_SA_EXTENSION__";
+
+/// Whether `name` is one of the Chrome extension's collections.
+pub(crate) fn is_extension_collection(name: &str) -> bool {
+    name.starts_with(EXTENSION_PREFIX)
+}
+
+/// Whether `name` is the collection of the state store this task is scoped to.
+pub(crate) fn is_scoped_state_collection(name: &str) -> bool {
+    crate::state::store::scoped().and_then(|s| s.collection()).is_some_and(|c| c == name)
 }
 
 /// Read a dataset's collection name from its manifest. Returns `None` when
@@ -176,6 +195,8 @@ pub(crate) struct MdhPlanItem {
     pub verb: crate::cli::change_view::RowVerb,
     /// Trailing detail for the row's note column, e.g. `new` or `data PATCH`.
     pub note: Option<String>,
+    /// What the row does to the dataset, for the structured dry-run plan.
+    pub change: crate::cli::sync::plan::PlanChange,
 }
 
 #[cfg(test)]
@@ -258,6 +279,7 @@ pub(crate) fn plan_mdh(
                     slug: slug.to_string(),
                     verb: crate::cli::change_view::RowVerb::Patch,
                     note: None,
+                    change: crate::cli::sync::plan::PlanChange::Update,
                 });
             }
         }
@@ -294,6 +316,7 @@ pub(crate) fn plan_mdh(
                     slug: slug.to_string(),
                     verb: crate::cli::change_view::RowVerb::Patch,
                     note: Some("data".to_string()),
+                    change: crate::cli::sync::plan::PlanChange::Update,
                 });
             }
         }
@@ -310,6 +333,7 @@ pub(crate) fn plan_mdh(
                 slug: slug.to_string(),
                     verb: crate::cli::change_view::RowVerb::Post,
                     note: None,
+                change: crate::cli::sync::plan::PlanChange::Create,
             });
         }
     }
@@ -323,6 +347,7 @@ pub(crate) fn plan_mdh(
                 slug: slug.to_string(),
                     verb: crate::cli::change_view::RowVerb::Pull,
                     note: Some("new".to_string()),
+                change: crate::cli::sync::plan::PlanChange::Create,
             });
         }
     }
@@ -346,6 +371,7 @@ pub(crate) fn plan_mdh(
                 slug: slug.to_string(),
                     verb: crate::cli::change_view::RowVerb::Pull,
                     note: Some("data (new)".to_string()),
+                change: crate::cli::sync::plan::PlanChange::Create,
             });
         }
     }
@@ -363,6 +389,7 @@ pub(crate) fn plan_mdh(
                     slug: slug.to_string(),
                     verb: crate::cli::change_view::RowVerb::Pull,
                     note: Some("delete local; deleted on env".to_string()),
+                    change: crate::cli::sync::plan::PlanChange::Delete,
                 });
             }
         }
@@ -397,6 +424,7 @@ fn index_edit_item(
             slug: slug.to_string(),
                     verb: crate::cli::change_view::RowVerb::Pull,
                     note: Some("index update".to_string()),
+            change: crate::cli::sync::plan::PlanChange::Update,
         }),
         // NoChange: local already matches remote. KeepLocal / Conflict: the
         // local file diverged — a push or the resolver owns those, not a pull.
@@ -499,6 +527,7 @@ pub(crate) async fn plan_mdh_index_edits(
                         slug: slug.to_string(),
                     verb: crate::cli::change_view::RowVerb::Pull,
                     note: Some("data (update)".to_string()),
+                        change: crate::cli::sync::plan::PlanChange::Update,
                     });
                 }
             }
@@ -1334,6 +1363,44 @@ mod tests {
         }
         let remote = BTreeSet::new();
         assert_eq!(local_only_dataset_slugs(mdh.path(), &remote, &BTreeMap::new()).unwrap(), vec!["vendors".to_string()]);
+    }
+
+    /// A state store whose collection has no `__` prefix, as a browser host
+    /// may configure.
+    struct NamedState;
+    impl crate::state::store::StateStore for NamedState {
+        fn hydrate<'a>(&'a self, _: &'a crate::paths::Paths) -> crate::rt::BoxFuture<'a, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn checkpoint<'a>(&'a self, _: &'a crate::paths::Paths) -> crate::rt::BoxFuture<'a, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn collection(&self) -> Option<String> {
+            Some("rdc_browser_state".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_scoped_state_collection_is_internal_and_never_created() {
+        let name = "rdc_browser_state";
+        assert!(!is_internal_collection(name), "unscoped, a plain name is a dataset");
+        assert!(is_internal_collection("_SA_EXTENSION__rdc_state"), "the extension's prefix always is internal");
+        assert!(!is_internal_collection("SA_EXTENSION__x") && !is_internal_collection("_SA_EXTENSION_x"));
+        let mdh = tempfile::TempDir::new().unwrap();
+        for (slug, coll) in [("state", name), ("vendors", "vendors")] {
+            let dir = mdh.path().join(slug);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("indexes.json"), "{}").unwrap();
+            std::fs::write(dir.join(COLLECTION_MANIFEST), format!("{{\"name\": \"{coll}\"}}")).unwrap();
+        }
+        crate::state::store::scope(Arc::new(NamedState), async {
+            assert!(is_internal_collection(name));
+            assert!(is_internal_collection("__tmp_x"));
+            assert!(!is_internal_collection("vendors"));
+            let remote = BTreeSet::new();
+            assert_eq!(local_only_dataset_slugs(mdh.path(), &remote, &BTreeMap::new()).unwrap(), vec!["vendors".to_string()]);
+        })
+        .await;
     }
 
     #[test]

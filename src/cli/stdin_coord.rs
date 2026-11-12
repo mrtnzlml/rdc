@@ -60,6 +60,10 @@ pub enum PromptKind {
     DeleteDrift,
     MdhIndexDrop,
     MdhRowDelete,
+    /// Several remote objects match a create an unfinished run journaled
+    /// (`sync::recover`): which one is it. Its `question` is the whole
+    /// question, not the menu line.
+    RecoverCreate,
     /// A coordinated read whose site never called `announce`. Should be
     /// unreachable in a correctly wired build — every resolver announces
     /// before it reads — so it exists to make a missed announce loud (a
@@ -72,7 +76,8 @@ pub enum PromptKind {
 ///
 /// `question` is the choices on ONE line, trailing `"> "` and all
 /// (`change_view::menu_one_line`) — for a consumer that renders a question
-/// plus its own buttons. The terminal shows the same choices wrapped over
+/// plus its own buttons. [`PromptKind::RecoverCreate`] is the exception: its
+/// `question` is the question itself, which no log line carries whole. The terminal shows the same choices wrapped over
 /// several lines (`change_view::render_menu`); both are built from `keys`,
 /// so they cannot drift apart.
 #[derive(Debug, Clone, PartialEq, Eq)]

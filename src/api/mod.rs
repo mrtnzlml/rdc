@@ -16,6 +16,7 @@ use crate::api::retry::ProgressHandle;
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::Deserialize;
+use crate::state::journal::Journal;
 use std::sync::Arc;
 
 static CORE_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -41,7 +42,9 @@ fn note_core_write() {
 /// Rossum API client. Holds a base URL (e.g. `https://X.rossum.app/api/v1`)
 /// and a static API token. Pagination is followed transparently for `list_*`
 /// methods; PATCH and POST calls go through shared `patch_json`/`post_json`
-/// helpers which retry on 429 / 502 / 503 / 504 via `retry::send_with_retry`.
+/// helpers which retry on 429 / 502 / 503 / 504 via `retry::send_with_retry`
+/// — except a journaled create, which never re-sends a gateway error blind
+/// (see `post_journaled`).
 pub struct RossumClient {
     base_url: String,
     token: String,
@@ -55,6 +58,9 @@ pub struct RossumClient {
     /// `None` when [`is_loopback_base`] says this client talks to a local
     /// mock, which enforces no policy to respect.
     limiter: Option<Arc<RateLimiter>>,
+    /// The sync's create journal, when the client pushes for one. See
+    /// [`RossumClient::with_journal`].
+    journal: Option<Journal>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,7 +138,26 @@ impl RossumClient {
         let http = build_http_client()?;
         let limiter =
             (!is_loopback_base(&base_url)).then(|| Arc::new(RateLimiter::rossum_core_api()));
-        Ok(Self { base_url, token, http, limiter })
+        Ok(Self { base_url, token, http, limiter, journal: None })
+    }
+
+    /// This client with the sync's create journal attached.
+    pub fn with_journal(self, journal: Journal) -> Self {
+        Self { journal: Some(journal), ..self }
+    }
+
+    /// The journal attached by [`RossumClient::with_journal`], if any.
+    pub fn journal(&self) -> Option<&Journal> {
+        self.journal.as_ref()
+    }
+
+    /// Tell the journal, if any, which ids the driver's `lockfile` already
+    /// holds, so a create's gateway guard never adopts one of them. Called
+    /// by each driver right before its create; persists nothing.
+    pub async fn observe_lockfile(&self, lockfile: &crate::state::Lockfile) {
+        if let Some(journal) = &self.journal {
+            journal.observe(lockfile).await;
+        }
     }
 
     // --- list endpoints (paginated) -----------------------------------
@@ -518,6 +543,13 @@ impl RossumClient {
         // portable ref (it 400s opaquely as "Invalid hyperlink - No URL match").
         ensure_no_residual_refs(path, body)?;
         let url = format!("{}{}", self.base_url, path);
+        // A create inside a driver's `journal::item` is journaled; anything
+        // else (no journal, or a direct call) goes out exactly as before.
+        if let Some(journal) = &self.journal
+            && let Some(seq) = journal.begin(body).await?
+        {
+            return self.post_journaled(journal, seq, path, &url, body, progress).await;
+        }
         note_core_write();
         let resp = retry::send_with_retry(
             || self.http
@@ -532,6 +564,202 @@ impl RossumClient {
         resp.json::<TResp>().await
             .with_context(|| format!("decoding POST response from {url}"))
     }
+}
+
+impl RossumClient {
+    /// The journaled create: op `seq` is already persisted. On success the
+    /// op gets the new id; on a 4xx it is dropped, since the server refused
+    /// it; on anything else its fate is unknown and it stays for recovery.
+    ///
+    /// A 502/503/504 is not re-sent blind: the server may have applied the
+    /// create and lost only the answer. Before each re-send — up to
+    /// `MAX_ATTEMPTS` sends in all, with the same backoff as any other
+    /// request — the client looks for it: an unclaimed object matching the
+    /// identity fields AND agreeing on every other field both sides have.
+    /// One is the result, none means re-send, several means stop and name
+    /// them. The last gateway error is returned as is.
+    async fn post_journaled<TResp>(
+        &self,
+        journal: &Journal,
+        seq: u64,
+        path: &str,
+        url: &str,
+        body: &serde_json::Value,
+        progress: ProgressHandle,
+    ) -> Result<TResp>
+    where
+        TResp: serde::de::DeserializeOwned,
+    {
+        use serde_json::Value;
+        // `/hooks/create` (the store install) creates a hook too.
+        let kind = path.trim_start_matches('/').split('/').next().unwrap_or_default();
+        let mut resp = self.send_create(url, body, progress.clone()).await?;
+        let mut attempt = 0;
+        while matches!(resp.status().as_u16(), 502..=504) && attempt + 1 < retry::MAX_ATTEMPTS {
+            let status = resp.status();
+            // Wait first, so the search sees whatever the server applied
+            // late, as close to the re-send as it can be.
+            crate::rt::sleep(retry::retry_after(&resp).unwrap_or_else(|| retry::backoff(attempt))).await;
+            attempt += 1;
+            let fields = crate::state::journal::create_fields(kind, body);
+            let claimed = journal.claimed(kind).await;
+            let mut found =
+                self.find_create_match(kind, &fields, &claimed, progress.clone()).await?;
+            match found.len() {
+                0 => resp = self.send_create(url, body, progress.clone()).await?,
+                1 => {
+                    let listed = found.pop().expect("one candidate");
+                    let id = listed["id"].as_u64().expect("candidates have an id");
+                    let object = self.fetch_listed(kind, listed, progress).await?;
+                    journal.finish(seq, id).await?;
+                    return serde_json::from_value(object)
+                        .with_context(|| format!("decoding {kind}/{id}, matched after POST {url} answered {status}"));
+                }
+                _ => {
+                    let ids: Vec<String> =
+                        found.iter().filter_map(|v| v["id"].as_u64()).map(|id| id.to_string()).collect();
+                    anyhow::bail!(
+                        "POST {url} answered {status}, and {} existing {kind} match what it sent \
+                         (ids {}); rdc cannot tell which one this create made",
+                        ids.len(),
+                        ids.join(", ")
+                    );
+                }
+            }
+        }
+        let status = resp.status();
+        let resp = match ensure_success(resp).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                if status.is_client_error() {
+                    journal.abandon(seq).await?;
+                }
+                return Err(e);
+            }
+        };
+        let created: Value =
+            resp.json().await.with_context(|| format!("decoding POST response from {url}"))?;
+        // Without an id the op cannot be finished; it stays pending, so the
+        // next run's recovery can still find the object by its fields.
+        let Some(id) = created.get("id").and_then(Value::as_u64) else {
+            let slug = crate::state::journal::current_item().map(|(_, slug)| slug).unwrap_or_default();
+            anyhow::bail!(
+                "POST {url} answered {status} with no id, so the {kind} '{slug}' it created \
+                 cannot be recorded; the next run's recovery will look for it"
+            );
+        };
+        journal.finish(seq, id).await?;
+        serde_json::from_value(created).with_context(|| format!("decoding POST response from {url}"))
+    }
+
+    /// One create POST, with no gateway retries: see [`Self::post_journaled`].
+    async fn send_create(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+        progress: ProgressHandle,
+    ) -> Result<reqwest::Response> {
+        note_core_write();
+        retry::send_with_retry_opts(
+            || self.http
+                .post(url)
+                .header("Authorization", format!("token {}", self.token))
+                .json(body),
+            &format!("POST {url}"),
+            progress,
+            self.limiter.as_ref(),
+            retry::RetryOpts { gateway_5xx: false },
+        )
+        .await
+    }
+
+    /// The `kind` objects, as listed, that a create whose body hashed to
+    /// `fields` may have made: not in `claimed`, equal to `fields` on every
+    /// [`IDENTITY_FIELDS`](crate::state::journal::IDENTITY_FIELDS) key the body
+    /// had, and agreeing on every other field both sides have. A sub-key of a
+    /// [`SERVER_FILLED_FIELDS`](crate::state::journal::SERVER_FILLED_FIELDS)
+    /// field the body sent must be on the candidate, unchanged; the sub-keys
+    /// the server adds are not compared. The identity
+    /// keys only select; the full agreement accepts — on `name` alone (labels,
+    /// workspaces, schemas, engines) an unrelated object could match.
+    ///
+    /// The one matcher behind both the create guard in `post_journaled` and
+    /// sync recovery, so the two cannot disagree on what a lost create looks
+    /// like.
+    pub async fn find_create_match(
+        &self,
+        kind: &str,
+        fields: &std::collections::BTreeMap<String, String>,
+        claimed: &std::collections::HashSet<u64>,
+        progress: ProgressHandle,
+    ) -> Result<Vec<serde_json::Value>> {
+        use crate::state::journal::{create_fields, identity_fields, server_filled_fields};
+        let identity = identity_fields(kind)
+            .with_context(|| format!("no identity fields for '{kind}'; it cannot be matched"))?;
+        let listed: Vec<serde_json::Value> = self.list_paginated(&format!("/{kind}"), progress).await?;
+        Ok(listed
+            .into_iter()
+            .filter(|v| v["id"].as_u64().is_some_and(|id| !claimed.contains(&id)))
+            .filter(|v| {
+                let remote = create_fields(kind, v);
+                identity.iter().filter_map(|k| fields.get(*k).map(|h| (k, h))).all(|(k, h)| remote.get(*k) == Some(h))
+                    && agrees(fields, &remote, server_filled_fields(kind))
+            })
+            .collect())
+    }
+
+    /// The full object behind `listed`, an entry of a `kind` listing. The
+    /// list form can be partial (a schema's omits `content`), so it is
+    /// fetched — except labels, which have no detail endpoint.
+    pub async fn fetch_listed(
+        &self,
+        kind: &str,
+        listed: serde_json::Value,
+        progress: ProgressHandle,
+    ) -> Result<serde_json::Value> {
+        if kind == "labels" {
+            return Ok(listed);
+        }
+        let id = listed["id"].as_u64().with_context(|| format!("a listed {kind} has no id"))?;
+        self.get_json(&format!("{}/{kind}/{id}", self.base_url), progress).await
+    }
+
+    /// The `kind` object with `id`, or `None` when the env no longer has it
+    /// (a 404). Labels have no detail endpoint, so they are listed and
+    /// filtered instead.
+    pub async fn get_created(
+        &self,
+        kind: &str,
+        id: u64,
+        progress: ProgressHandle,
+    ) -> Result<Option<serde_json::Value>> {
+        if kind == "labels" {
+            let listed: Vec<serde_json::Value> = self.list_paginated("/labels", progress).await?;
+            return Ok(listed.into_iter().find(|v| v["id"].as_u64() == Some(id)));
+        }
+        match self.get_json(&format!("{}/{kind}/{id}", self.base_url), progress).await {
+            Ok(v) => Ok(Some(v)),
+            Err(e) if anyhow_has_status(&e, 404) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// True when `ours` and `theirs` (both [`create_fields`](crate::state::journal::create_fields)
+/// hashes) agree on every key both have, and `theirs` has every sub-key
+/// `ours` has of a `filled` field.
+fn agrees(
+    ours: &std::collections::BTreeMap<String, String>,
+    theirs: &std::collections::BTreeMap<String, String>,
+    filled: &[&str],
+) -> bool {
+    ours.iter().all(|(k, h)| {
+        let sub_key = k.split_once('.').is_some_and(|(field, _)| filled.contains(&field));
+        match theirs.get(k) {
+            Some(t) => t == h,
+            None => !sub_key,
+        }
+    })
 }
 
 /// Exchange username/password for an API token via

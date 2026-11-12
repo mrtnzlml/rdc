@@ -101,6 +101,8 @@ pub mod collision;
 pub mod embed;
 pub mod execute;
 pub mod lock;
+pub mod plan;
+pub mod recover;
 pub mod watch;
 
 use crate::api::RossumClient;
@@ -124,6 +126,10 @@ pub struct CycleOutcome {
     pub items_pulled: usize,
     pub conflicts: usize,
     pub remote_deletes_resolved: usize,
+    /// What a dry run would do; `None` for any other run.
+    pub plan: Option<plan::SyncPlan>,
+    /// What this cycle did not write, and why ([`plan::record`]).
+    pub skipped: Vec<plan::SkippedItem>,
 }
 
 /// Entry point for `rdc sync <env>`. Drives the unified pipeline:
@@ -209,6 +215,40 @@ pub(crate) async fn run_cycle(
     token_override: Option<String>,
     hold_unresolved: bool,
 ) -> Result<CycleOutcome> {
+    let (out, skipped) = plan::collect(Box::pin(run_cycle_inner(
+        env,
+        interactive,
+        dry_run,
+        allow_deletes,
+        no_push,
+        no_pull,
+        conflict_strategy,
+        renderer,
+        cwd_override,
+        token_override,
+        hold_unresolved,
+    )))
+    .await;
+    out.map(|mut o| {
+        o.skipped = skipped;
+        o
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_cycle_inner(
+    env: &str,
+    interactive: bool,
+    dry_run: bool,
+    allow_deletes: bool,
+    no_push: bool,
+    no_pull: bool,
+    conflict_strategy: Option<ConflictStrategy>,
+    renderer: Option<Arc<Log>>,
+    cwd_override: Option<&std::path::Path>,
+    token_override: Option<String>,
+    hold_unresolved: bool,
+) -> Result<CycleOutcome> {
     if no_push && no_pull {
         anyhow::bail!(
             "--no-push and --no-pull are mutually exclusive. \
@@ -227,11 +267,26 @@ pub(crate) async fn run_cycle(
     // Before any read or write: every later step trusts the tree has no links.
     paths.ensure_no_symlinks()?;
 
+    let state = crate::state::store::current();
+    if let Some(token) = &token_override {
+        state.use_token(token);
+    }
+    state
+        .hydrate(&paths)
+        .await
+        .with_context(|| format!("loading sync state for env '{env}'"))?;
     let mut lockfile = Lockfile::load(&paths.lockfile())?;
     // Set the env's api_base so the lockfile can DERIVE object URLs from
     // ids (push ref resolution, deploy cross-ref rewriting). Without this an
     // empty api_base makes `url_for_slug` return None and push refs fail loud.
     lockfile.api_base = env_cfg.api_base.clone();
+    // A journal with ops belongs to a run that is over: the caller holds the
+    // env lock, which that run held while it ran. It is recovered below,
+    // before anything is classified.
+    let recoverable = lockfile.pending.as_ref().is_some_and(|p| !p.ops.is_empty());
+    if !recoverable {
+        lockfile.pending = None;
+    }
 
     let _title = if dry_run {
         format!("rdc sync {env} (dry run)")
@@ -249,7 +304,32 @@ pub(crate) async fn run_cycle(
     let renderer_was_supplied = renderer.is_some();
     let progress: Arc<Log> =
         renderer.unwrap_or_else(|| Log::new(crate::cli::resolve::detect_color_mode()));
+    // Every lockfile save from here on goes through the journal, which
+    // checkpoints the state store after it.
+    let journal = crate::state::store::journal_for(&paths, lockfile.clone(), state.clone(), progress.clone());
     let started = web_time::Instant::now();
+
+    // Recovery of a crashed run's journal, before the offline pre-flight: the scan
+    // below must already see the creates it completes as recorded, or it
+    // would offer their local files as creates again. It needs the env, so
+    // the token is resolved here for such a run. It persists nothing itself;
+    // its one commit makes the recovered state durable before classify, and
+    // an error leaves the journal on disk as it was.
+    let mut token_override = token_override;
+    let mut recovery = recover::RecoveryReport::default();
+    if recoverable {
+        let token = match token_override.take() {
+            Some(t) => t,
+            None => resolve_token(&cwd, env, &env_cfg.api_base).await?,
+        };
+        let client = RossumClient::new(env_cfg.api_base.clone(), token.clone())
+            .context("constructing Rossum API client")?;
+        recovery = recover::recover(&paths, &mut lockfile, &client, interactive, dry_run, &progress).await?;
+        if !dry_run {
+            journal.commit(&lockfile).await?;
+        }
+        token_override = Some(token);
+    }
 
     // The two per-env files nobody finds on their own: `envs/<env>/overlay.toml`
     // and `secrets/<env>.hook-secrets.json`. Both are created-if-absent and
@@ -260,6 +340,13 @@ pub(crate) async fn run_cycle(
     if !dry_run {
         crate::cli::init::write_env_scaffolds(&cwd, env)?;
         crate::cli::init::write_mapping_scaffold(&cwd)?;
+        // The tree this run starts from, the host's edits included, is
+        // durable before the first remote write, as it is on disk: a store
+        // that keeps the env tree publishes it here. A no-op on disk.
+        state.checkpoint(&paths).await?;
+        for w in state.take_warnings() {
+            progress.event(Action::Warn, &w);
+        }
     }
 
     // Phase 0: offline pre-flight. Scanning the local tree needs nothing
@@ -327,7 +414,8 @@ pub(crate) async fn run_cycle(
         None => resolve_token(&cwd, env, &env_cfg.api_base).await?,
     };
     let client = RossumClient::new(env_cfg.api_base.clone(), token.clone())
-        .context("constructing Rossum API client")?;
+        .context("constructing Rossum API client")?
+        .with_journal(journal.clone());
 
     // Phase 1: list remote. Mirrors `pull::run`'s `PullCtx` construction
     // verbatim so the listing semantics are identical.
@@ -350,6 +438,9 @@ pub(crate) async fn run_cycle(
         )
         .await?
     };
+    // Everything listed here existed before this cycle's first create, so no
+    // lost create can be one of them, tracked or not.
+    journal.note_existing(catalog_ids(&catalog)).await;
 
     // Surface queue-slug collisions: two queue dirs sharing a slug across
     // workspaces collapse onto one lockfile entry, so one is re-pushed every
@@ -385,6 +476,7 @@ pub(crate) async fn run_cycle(
     // prefix on each section label.
     if dry_run {
         use crate::cli::sync::classify::SyncClass;
+        let mut problems: Vec<String> = Vec::new();
 
         // MDH bypasses the classifier, so its would-be writes are invisible
         // to the classified plan above. `plan_mdh` predicts the STRUCTURAL
@@ -576,6 +668,7 @@ pub(crate) async fn run_cycle(
                 let _ = writeln!(body, "- hooks/{slug} -- secret entry has no matching hook");
             }
             progress.block(&body);
+            problems.extend(body.lines().map(str::to_string));
         }
 
         if !parse_errors.is_empty() {
@@ -586,6 +679,7 @@ pub(crate) async fn run_cycle(
                 let _ = writeln!(body, "- {}/{} -- {}: {}", e.kind, e.slug, e.path.display(), e.error);
             }
             progress.block(&body);
+            problems.extend(body.lines().map(str::to_string));
         }
 
         if !limit_violations.is_empty() {
@@ -605,6 +699,7 @@ pub(crate) async fn run_cycle(
                 );
             }
             progress.block(&body);
+            problems.extend(body.lines().map(str::to_string));
         }
 
         if !missing_create_fields.is_empty() {
@@ -623,6 +718,7 @@ pub(crate) async fn run_cycle(
                 );
             }
             progress.block(&body);
+            problems.extend(body.lines().map(str::to_string));
         }
 
         if !settings_problems.is_empty() {
@@ -633,6 +729,7 @@ pub(crate) async fn run_cycle(
                 let _ = writeln!(body, "- {} -- {}: {}", path.display(), p.location, p.problem);
             }
             progress.block(&body);
+            problems.extend(body.lines().map(str::to_string));
         }
 
         if !unshared_views.is_empty() {
@@ -648,6 +745,7 @@ pub(crate) async fn run_cycle(
                 );
             }
             progress.block(&body);
+            problems.extend(body.lines().map(str::to_string));
         }
 
         if !engine_conflicts.is_empty() {
@@ -664,6 +762,7 @@ pub(crate) async fn run_cycle(
                 );
             }
             progress.block(&body);
+            problems.extend(body.lines().map(str::to_string));
         }
 
         if !missing_formulas.is_empty() {
@@ -680,6 +779,7 @@ pub(crate) async fn run_cycle(
                 );
             }
             progress.block(&body);
+            problems.extend(body.lines().map(str::to_string));
         }
 
         if !renderer_was_supplied {
@@ -707,7 +807,61 @@ pub(crate) async fn run_cycle(
                 ),
             );
         }
-        return Ok(CycleOutcome::default());
+        // The same items the rows above show, in the same order, as data.
+        use plan::{PlanChange as C, PlanDirection as D, PlanItem, PlanPrompt as P};
+        let item = |kind: &str, slug: &str, direction, change, prompt, note: Option<String>| PlanItem {
+            kind: kind.to_string(),
+            slug: slug.to_string(),
+            direction,
+            change,
+            prompt,
+            note,
+        };
+        let mut items: Vec<PlanItem> = Vec::new();
+        for it in &pull_items {
+            let (change, note) = match it.class {
+                SyncClass::RemoteCreate => (C::Create, Some("new".to_string())),
+                SyncClass::RemoteDelete => (C::Delete, Some("delete local; deleted on env".to_string())),
+                _ => (C::Update, None),
+            };
+            items.push(item(&it.kind, &it.slug, D::Pull, change, None, note));
+        }
+        items.extend(mdh_pull.iter().map(|i| item("mdh", &i.slug, D::Pull, i.change, None, i.note.clone())));
+        for it in &push_items {
+            let (change, prompt) = match it.class {
+                SyncClass::LocalEdit => (C::Update, None),
+                SyncClass::LocalCreate => (C::Create, None),
+                _ => (C::Delete, (!allow_deletes).then_some(P::DeleteGate)),
+            };
+            items.push(item(&it.kind, &it.slug, D::Push, change, prompt, None));
+        }
+        items.extend(mdh_push.iter().map(|i| item("mdh", &i.slug, D::Push, i.change, None, i.note.clone())));
+        items.extend(
+            secret_only.iter().map(|s| item("hooks", s, D::Push, C::Update, None, Some("secrets".to_string()))),
+        );
+        for it in &prompt_items {
+            let (prompt, tag) = match it.class {
+                SyncClass::BothDiverged => (P::Conflict, "both diverged"),
+                SyncClass::LocalEditRemoteDelete => (P::RemoteDelete, "local edit, deleted on env"),
+                _ => (P::RemoteDelete, "local delete, edited on env"),
+            };
+            let prompt = conflict_strategy.is_none().then_some(prompt);
+            items.push(item(&it.kind, &it.slug, D::Both, C::Conflict, prompt, Some(tag.to_string())));
+        }
+        let recovered = recovery
+            .completed
+            .iter()
+            .map(|(kind, slug, id)| plan::PlanRecovery { kind: kind.clone(), slug: slug.clone(), id: Some(*id) })
+            .chain(recovery.dropped.iter().map(|(kind, slug)| plan::PlanRecovery {
+                kind: kind.clone(),
+                slug: slug.clone(),
+                id: None,
+            }))
+            .collect();
+        return Ok(CycleOutcome {
+            plan: Some(plan::SyncPlan { items, recovered, problems }),
+            ..CycleOutcome::default()
+        });
     }
 
     // Phase 5: execute. The destructive-delete gate (`--allow-deletes`)
@@ -783,6 +937,8 @@ pub(crate) async fn run_cycle(
                 conflicts: main.conflicts + settled.conflicts,
                 remote_deletes_resolved: main.remote_deletes_resolved
                     + settled.remote_deletes_resolved,
+                plan: None,
+                skipped: Vec::new(),
             })
         }
         other => other,
@@ -792,13 +948,13 @@ pub(crate) async fn run_cycle(
         Err(e) => {
             // `execute::run` records each object in `lockfile` AS it commits
             // the write to the remote, but a mid-run error would otherwise skip
-            // the `lockfile.save` at the end of this function — discarding every
+            // the `journal.commit` at the end of this function — discarding every
             // record of what was already created/updated. A re-run would then
             // re-create those objects (duplicating them, since name isn't
             // unique) instead of resuming. Persist the partial progress
             // (best-effort) before propagating so the next sync sees the
             // committed objects and continues from there.
-            if let Err(save_err) = lockfile.save(&paths.lockfile()) {
+            if let Err(save_err) = journal.commit(&lockfile).await {
                 progress.event(
                     Action::Warn,
                     &format!("could not persist partial progress to the lockfile: {save_err:#}"),
@@ -820,9 +976,22 @@ pub(crate) async fn run_cycle(
     let _classified_after =
         from_catalog_scan_lockfile(&catalog, &changes_after, &tombstones_after, &lockfile)
             .unwrap_or_default();
-    lockfile.save(&paths.lockfile())?;
+    journal.commit(&lockfile).await?;
     crate::cli::index::generate(&paths, &lockfile)
         .with_context(|| format!("generating _index.md for env '{env}'"))?;
+    // `_index.md` is written after the commit; a store that keeps the env
+    // tree takes it too. A no-op on disk. Only a warning when it fails: the
+    // commit already saved the state and the tree, `_index.md` is derived,
+    // and the next run regenerates and saves it.
+    if let Err(e) = state.checkpoint(&paths).await {
+        progress.event(
+            Action::Warn,
+            &format!("the sync is done, but saving _index.md with the sync state failed: {e:#}"),
+        );
+    }
+    for w in state.take_warnings() {
+        progress.event(Action::Warn, &w);
+    }
 
     let elapsed = started.elapsed();
     let total_changed = outcome.items_pushed + outcome.items_pulled;
@@ -841,6 +1010,29 @@ pub(crate) async fn run_cycle(
         progress.event(Action::Idle, "envs match remote");
     }
     Ok(outcome)
+}
+
+/// The ids of `catalog`, per lockfile kind.
+fn catalog_ids(
+    catalog: &crate::cli::pull::common::RemoteCatalog,
+) -> std::collections::BTreeMap<String, std::collections::HashSet<u64>> {
+    let ids = |it: &mut dyn Iterator<Item = u64>| it.collect::<std::collections::HashSet<u64>>();
+    [
+        ("workspaces", ids(&mut catalog.workspaces.iter().map(|o| o.id))),
+        ("queues", ids(&mut catalog.queues.iter().map(|o| o.id))),
+        ("schemas", ids(&mut catalog.schemas_by_queue_id.values().map(|o| o.id))),
+        ("inboxes", ids(&mut catalog.inboxes_by_queue_id.values().map(|o| o.id))),
+        ("hooks", ids(&mut catalog.hooks.iter().map(|o| o.id))),
+        ("rules", ids(&mut catalog.rules.iter().map(|o| o.id))),
+        ("labels", ids(&mut catalog.labels.iter().map(|o| o.id))),
+        ("engines", ids(&mut catalog.engines.iter().map(|o| o.id))),
+        ("engine_fields", ids(&mut catalog.engine_fields.iter().map(|o| o.id))),
+        ("email_templates", ids(&mut catalog.email_templates.iter().map(|o| o.id))),
+        ("saved_views", ids(&mut catalog.saved_views.iter().map(|o| o.id))),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect()
 }
 
 /// Read the env back after a cycle that wrote to it, and pull what those

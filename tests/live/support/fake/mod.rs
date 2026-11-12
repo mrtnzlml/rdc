@@ -7,12 +7,14 @@
 //! "nothing should happen the second time" becomes an assertion rather than
 //! something a human notices in a customer env.
 
+pub mod data_storage;
 pub mod graph;
 pub mod kinds;
 pub mod quirks;
 pub mod state;
 pub mod validate;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde_json::Value;
@@ -26,9 +28,57 @@ use state::{ApiError, Deletion, ListQuery, OrgState};
 /// random one would make failures harder to read.
 const TOKEN: &str = "fake-token";
 
+/// A per-test override, run before `route()` on every request in the order
+/// added. The first one to answer `Some` replaces the router's answer; one
+/// that answers `None` only observes. Opt-in: a fake with none behaves
+/// exactly as the router says.
+pub type Intercept = Box<dyn FnMut(&mut OrgState, &Request) -> Option<ResponseTemplate> + Send>;
+
+/// Which requests a staged fault counts.
+pub type RequestMatch = Box<dyn Fn(&Request) -> bool + Send>;
+
+/// Where a staged crash ([`FakeOrg::crash_on`]) stops the request it fires on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CrashPoint {
+    /// The request reached the server, which did nothing with it.
+    BeforeApply,
+    /// The server applied the request; its answer never left.
+    AfterApplyBeforeResponse,
+}
+
+/// Counts the requests `matches` accepts and says when the `nth` (1-based)
+/// arrives — once.
+struct Nth {
+    matches: RequestMatch,
+    nth: usize,
+    seen: usize,
+}
+
+impl Nth {
+    fn hit(&mut self, req: &Request) -> bool {
+        if !(self.matches)(req) {
+            return false;
+        }
+        self.seen += 1;
+        self.seen == self.nth
+    }
+}
+
+/// A staged crash, armed until it fires.
+struct Crash {
+    at: Nth,
+    point: CrashPoint,
+    fired: Arc<tokio::sync::Notify>,
+}
+
 pub struct FakeOrg {
     server: MockServer,
     inner: Arc<Mutex<OrgState>>,
+    intercepts: Arc<Mutex<Vec<Intercept>>>,
+    crash: Arc<Mutex<Option<Crash>>>,
+    /// Set when a staged crash fires: the client is gone, so every later
+    /// request is held unanswered and unapplied until [`FakeOrg::revive`].
+    dead: Arc<AtomicBool>,
     org_id: u64,
 }
 
@@ -38,34 +88,151 @@ impl FakeOrg {
     }
 
     pub async fn start_with_org(org_id: u64) -> FakeOrg {
+        Self::start_with(org_id, None).await
+    }
+
+    /// A fake listening on loopback `port`, for a test that compares bytes
+    /// across two fakes: the api base (port included) is embedded in what
+    /// rdc writes, so the second fake must reuse the first one's port.
+    #[allow(dead_code)]
+    pub async fn start_on_port(port: u16) -> FakeOrg {
+        // The first fake's server shuts down in the background after its drop.
+        let mut tries = 0;
+        let listener = loop {
+            match std::net::TcpListener::bind(("127.0.0.1", port)) {
+                Ok(l) => break l,
+                Err(_) if tries < 100 => {
+                    tries += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                Err(e) => panic!("binding port {port} again: {e}"),
+            }
+        };
+        Self::start_with(1, Some(listener)).await
+    }
+
+    async fn start_with(org_id: u64, listener: Option<std::net::TcpListener>) -> FakeOrg {
         // Recording off: a sync makes hundreds of calls and no test here reads
         // the history back (order assertions use `RDC_TRACE_HTTP` instead).
-        let server = MockServer::builder()
-            .disable_request_recording()
-            .start()
-            .await;
+        let mut builder = MockServer::builder().disable_request_recording();
+        if let Some(listener) = listener {
+            builder = builder.listener(listener);
+        }
+        let server = builder.start().await;
         let api_base = format!("{}/api/v1", server.uri());
         let inner = Arc::new(Mutex::new(OrgState::new(api_base, org_id)));
+        let intercepts: Arc<Mutex<Vec<Intercept>>> = Arc::default();
+        let crash: Arc<Mutex<Option<Crash>>> = Arc::default();
+        let dead = Arc::new(AtomicBool::new(false));
         let handler = inner.clone();
+        let overrides = intercepts.clone();
+        let staged = crash.clone();
+        let gone = dead.clone();
         Mock::given(any())
             .respond_with(move |req: &Request| {
                 let mut st = handler.lock().unwrap_or_else(|p| p.into_inner());
-                // Snapshot BEFORE routing: if THIS request is itself a queue
-                // `DELETE`, `route()` below inserts its fresh grace entry
-                // during this very call — and that entry must not be
-                // charged by the tick that follows, or a 202 would be
-                // followed by zero more sightings instead of one. See
-                // `OrgState::tick_pending_from`.
-                let already_pending = st.pending_delete_ids();
-                let out = route(&mut st, req);
-                // Charge pending queue deletes for this request, so a 202 is
-                // followed by exactly one more sighting.
-                st.tick_pending_from(&already_pending);
-                out
+                let mut overrides = overrides.lock().unwrap_or_else(|p| p.into_inner());
+                // Checked under the state lock, which the crash below also
+                // holds while it sets `gone`: a request that was waiting on
+                // the lock when the crash fired sees it and is not applied.
+                if gone.load(Ordering::SeqCst) {
+                    return never();
+                }
+                let fired = {
+                    let mut staged = staged.lock().unwrap_or_else(|p| p.into_inner());
+                    let hit = staged.as_mut().is_some_and(|c| c.at.hit(req));
+                    if hit { staged.take() } else { None }
+                };
+                let Some(crash) = fired else {
+                    return serve(&mut st, &mut overrides, req);
+                };
+                if crash.point == CrashPoint::AfterApplyBeforeResponse {
+                    let _lost = serve(&mut st, &mut overrides, req);
+                }
+                gone.store(true, Ordering::SeqCst);
+                crash.fired.notify_one();
+                never()
             })
             .mount(&server)
             .await;
-        FakeOrg { server, inner, org_id }
+        FakeOrg { server, inner, intercepts, crash, dead, org_id }
+    }
+
+    /// Serve Data Storage (`/svc/data-storage/api/v1/...`) from an empty
+    /// in-memory store ([`data_storage`]). Off by default: every Data Storage
+    /// path is a 404 until a test calls this.
+    pub fn enable_data_storage(&self) {
+        self.state().data_storage.get_or_insert_with(Default::default);
+    }
+
+    /// Add an [`Intercept`]. See its doc for the order and the opt-in.
+    pub fn intercept(
+        &self,
+        f: impl FnMut(&mut OrgState, &Request) -> Option<ResponseTemplate> + Send + 'static,
+    ) {
+        self.intercepts.lock().unwrap_or_else(|p| p.into_inner()).push(Box::new(f));
+    }
+
+    /// Answer `status` to the `nth` (1-based) `POST /<kind>`, after creating
+    /// the object when `apply` is set — a response lost on the way back —
+    /// and without touching the store otherwise. Every other request goes
+    /// to the router.
+    pub fn fail_nth_create(&self, kind: &'static str, nth: usize, status: u16, apply: bool) {
+        let mut at = Nth { matches: request_to("POST", &format!("/api/v1/{kind}")), nth, seen: 0 };
+        self.intercept(move |st, req| {
+            if !at.hit(req) {
+                return None;
+            }
+            if apply {
+                st.create(kind, body_of(req)).expect("the injected create applies");
+            }
+            Some(json_response(status, &serde_json::json!({ "detail": "injected by the test" })))
+        });
+    }
+
+    /// Serve the store-extension install, `POST /hooks/create`, which the
+    /// router does not model: it creates the hook as a store extension.
+    pub fn serve_store_install(&self) {
+        self.intercept(|st, req| {
+            if req.method.as_str() != "POST" || req.url.path() != "/api/v1/hooks/create" {
+                return None;
+            }
+            let mut body = body_of(req);
+            body["extension_source"] = serde_json::json!("rossum_store");
+            body["type"] = serde_json::json!("webhook");
+            Some(match st.create("hooks", body) {
+                Ok(v) => json_response(201, &v),
+                Err(e) => err_response(e),
+            })
+        });
+    }
+
+    /// Crash the client at `point` of the `n`th (1-based) API write — any
+    /// non-`GET` under `/api/v1/` — as [`FakeOrg::crash_on`] does.
+    pub fn crash_after(&self, n: usize, point: CrashPoint) -> Arc<tokio::sync::Notify> {
+        self.crash_on(
+            Box::new(|req| req.method.as_str() != "GET" && req.url.path().starts_with("/api/v1/")),
+            n,
+            point,
+        )
+    }
+
+    /// Crash the client at `point` of the `n`th (1-based) request `matches`
+    /// accepts: the fake applies it or not, signals the returned `Notify`,
+    /// and never answers it — nor any later request, as for a client that is
+    /// gone, until [`FakeOrg::revive`]. The test drops the sync's future on
+    /// the signal: a closed tab or a killed process. Replaces any crash
+    /// staged before and not fired yet.
+    pub fn crash_on(&self, matches: RequestMatch, n: usize, point: CrashPoint) -> Arc<tokio::sync::Notify> {
+        let fired = Arc::new(tokio::sync::Notify::new());
+        *self.crash.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some(Crash { at: Nth { matches, nth: n, seen: 0 }, point, fired: fired.clone() });
+        fired
+    }
+
+    /// Serve requests again after a crash fired: the next run is a new client.
+    pub fn revive(&self) {
+        self.dead.store(false, Ordering::SeqCst);
     }
 
     pub fn api_base(&self) -> String {
@@ -103,6 +270,42 @@ impl FakeOrg {
     pub fn state(&self) -> MutexGuard<'_, OrgState> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }
+}
+
+/// Matches `method` requests to exactly `path`.
+pub fn request_to(method: &'static str, path: &str) -> RequestMatch {
+    let path = path.to_string();
+    Box::new(move |req| req.method.as_str() == method && req.url.path() == path)
+}
+
+/// An answer that never arrives: held for a day, long past any test.
+fn never() -> ResponseTemplate {
+    ResponseTemplate::new(503).set_delay(std::time::Duration::from_secs(24 * 3600))
+}
+
+/// The fake's answer to `req`: the first intercept that answers, else the
+/// router.
+fn serve(st: &mut OrgState, overrides: &mut [Intercept], req: &Request) -> ResponseTemplate {
+    if let Some(out) = overrides.iter_mut().find_map(|f| f(st, req)) {
+        return out;
+    }
+    // Before the tick below: a Data Storage request is not a sighting of a
+    // queue the core API is still deleting.
+    if let Some(out) = data_storage::serve(st.data_storage.as_mut(), req) {
+        return out;
+    }
+    // Snapshot BEFORE routing: if THIS request is itself a queue
+    // `DELETE`, `route()` below inserts its fresh grace entry
+    // during this very call — and that entry must not be
+    // charged by the tick that follows, or a 202 would be
+    // followed by zero more sightings instead of one. See
+    // `OrgState::tick_pending_from`.
+    let already_pending = st.pending_delete_ids();
+    let out = route(st, req);
+    // Charge pending queue deletes for this request, so a 202 is
+    // followed by exactly one more sighting.
+    st.tick_pending_from(&already_pending);
+    out
 }
 
 fn json_response(status: u16, body: &Value) -> ResponseTemplate {
@@ -277,3 +480,21 @@ fn route(st: &mut OrgState, req: &Request) -> ResponseTemplate {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod create_journal;
+#[cfg(test)]
+mod recover;
+#[cfg(test)]
+mod crash;
+#[cfg(test)]
+mod crash_matrix;
+#[cfg(test)]
+mod state_store;
+#[cfg(test)]
+mod browser_migrate;
+#[cfg(test)]
+mod extension_collections;
+#[cfg(test)]
+mod sync_plan;
+#[cfg(test)]
+mod migrate_identity;

@@ -172,7 +172,7 @@ mod body_trace {
     }
 }
 
-const MAX_ATTEMPTS: u32 = 5;
+pub(crate) const MAX_ATTEMPTS: u32 = 5;
 const MAX_SLEEP_SECS: u64 = 60;
 
 /// Send a request, retrying with backoff on 429 / 502 / 503 / 504. Caller
@@ -185,10 +185,33 @@ const MAX_SLEEP_SECS: u64 = 60;
 /// structured retry telemetry) and is otherwise unused — callers may pass
 /// `None`.
 pub async fn send_with_retry(
+    build: impl FnMut() -> reqwest::RequestBuilder,
+    desc: &str,
+    progress: ProgressHandle,
+    limiter: Option<&Arc<RateLimiter>>,
+) -> Result<Response> {
+    send_with_retry_opts(build, desc, progress, limiter, RetryOpts { gateway_5xx: true }).await
+}
+
+/// What [`send_with_retry_opts`] may retry beyond 429 and connect failures.
+#[derive(Debug, Clone, Copy)]
+pub struct RetryOpts {
+    /// Re-send on 502/503/504. A gateway error does not say whether the
+    /// server applied the request, so a journaled create passes `false`
+    /// and gets the response back to decide itself (see
+    /// `RossumClient::find_create_match`).
+    pub gateway_5xx: bool,
+}
+
+/// [`send_with_retry`] with the gateway retries chosen by `opts`. 429 and
+/// connect-class failures are always retried: the server did not apply the
+/// request.
+pub async fn send_with_retry_opts(
     mut build: impl FnMut() -> reqwest::RequestBuilder,
     desc: &str,
     progress: ProgressHandle,
     limiter: Option<&Arc<RateLimiter>>,
+    opts: RetryOpts,
 ) -> Result<Response> {
     // Retries up to MAX_ATTEMPTS - 1 times; the final pass falls through
     // to the post-loop send so the function always returns from one
@@ -205,6 +228,9 @@ pub async fn send_with_retry(
                 let Some(reason) = retriable_reason(resp.status()) else {
                     return Ok(resp);
                 };
+                if !opts.gateway_5xx && resp.status() != StatusCode::TOO_MANY_REQUESTS {
+                    return Ok(resp);
+                }
                 // Retries are an internal concern: a terminal failure after
                 // MAX_ATTEMPTS surfaces as an error from the final
                 // `build().send()` call below. No user-facing retry chatter.
@@ -293,7 +319,7 @@ fn retriable_reason(status: StatusCode) -> Option<&'static str> {
     }
 }
 
-fn retry_after(resp: &Response) -> Option<Duration> {
+pub(crate) fn retry_after(resp: &Response) -> Option<Duration> {
     let header = resp.headers().get("Retry-After")?.to_str().ok()?;
     // Rossum sends seconds as an integer; some APIs send HTTP-date too,
     // but we only need the seconds form here.
@@ -333,7 +359,7 @@ fn is_retriable_transport(_err: &anyhow::Error) -> bool {
     false
 }
 
-fn backoff(attempt: u32) -> Duration {
+pub(crate) fn backoff(attempt: u32) -> Duration {
     // 1s, 2s, 4s, 8s, 16s — capped at 60s.
     let secs = 1u64.checked_shl(attempt).unwrap_or(MAX_SLEEP_SECS);
     Duration::from_secs(secs.min(MAX_SLEEP_SECS))
@@ -421,6 +447,31 @@ mod tests {
         .unwrap_err();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(format!("{err:#}").contains("probe (attempt 1)"), "{err:#}");
+    }
+
+    /// A gateway error with `gateway_5xx: false` comes back from the first
+    /// attempt; a 429 is still retried (`Retry-After: 0` keeps it instant).
+    #[tokio::test]
+    async fn gateway_5xx_off_returns_the_first_gateway_error() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(any()).respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "0"))
+            .up_to_n_times(1).mount(&server).await;
+        Mock::given(any()).respond_with(ResponseTemplate::new(502)).mount(&server).await;
+        let client = reqwest::Client::new();
+        let resp = send_with_retry_opts(
+            || client.post(server.uri()),
+            "probe",
+            None,
+            None,
+            RetryOpts { gateway_5xx: false },
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(server.received_requests().await.unwrap().len(), 2, "one 429 retry, no 502 retry");
     }
 
     #[test]
