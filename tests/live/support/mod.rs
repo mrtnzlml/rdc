@@ -17,5 +17,6 @@ pub mod trace;
 pub mod snapshot;
 pub mod fake;
 pub mod crash;
+pub mod ds_state;
 #[cfg(unix)]
 pub mod pty;

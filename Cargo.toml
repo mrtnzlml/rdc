@@ -24,6 +24,9 @@ clap_complete = { version = "4", features = ["unstable-dynamic"] }
 deunicode = "1"
 getrandom = "0.4"
 futures = { version = "0.3", default-features = false, features = ["std"] }
+# Pure Rust (miniz_oxide), so the browser build has it too: the self-upgrade
+# archive natively, the sync-state snapshot (`state::snapshot`) everywhere.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 indexmap = { version = "2", features = ["serde"] }
 reqwest = { version = "0.13", features = ["json", "rustls"], default-features = false }
 serde = { version = "1", features = ["derive"] }
@@ -39,7 +42,6 @@ web-time = "1.1.0"
 # self-upgrade archive and the multi-threaded runtime. The browser build
 # (wasm32) never reaches them; see src/rt.rs and src/vfs.rs.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-flate2 = "1"
 fs4 = "1"
 inquire = { version = "0.9", default-features = false, features = ["crossterm"] }
 notify = "8"
@@ -57,6 +59,8 @@ wasm-bindgen-futures = "0.4.79"
 
 [dev-dependencies]
 assert_cmd = "2"
+# Test-only state backends store the snapshot as base64 in a JSON document.
+base64 = "0.22"
 http = "1"
 predicates = "3"
 pretty_assertions = "1"

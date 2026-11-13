@@ -3,7 +3,7 @@
 //! read `source` and `target` (`sync`, no push), `migrate source target`, then
 //! `sync target` to push.
 //!
-//! A tab is a `MemStore` and one `DataStorageStateStore` per env, kept for the
+//! A tab is a `MemStore` and one `SnapshotStateStore` per env, kept for the
 //! tab's life as the wasm `Project` keeps them. Closing it drops all of that;
 //! a reopened tab starts from `rdc.toml` alone. Nothing here touches the disk.
 
@@ -13,7 +13,8 @@ use rdc::cli::sync::embed::{
     migrate_logged_in, sync_logged_in_with_state, EmbedMigrateOptions, EmbedSyncOptions, MigrateReport, MirrorMode,
     ObjectChange,
 };
-use rdc::state::data_storage_store::DataStorageStateStore;
+use crate::support::ds_state::DsBackend;
+use rdc::state::snapshot_store::SnapshotStateStore;
 use rdc::state::store::StateStore;
 use rdc::vfs::{MemStore, Store};
 use serde_json::json;
@@ -21,8 +22,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 const TOKEN: &str = "fake-token";
-/// The extension's collection: no `__` prefix, so only the store's own
-/// configuration keeps it out of MDH sync.
+/// The extension's collection, where this test's host store keeps the state;
+/// its `_SA_EXTENSION__` prefix keeps it out of MDH sync.
 const COLLECTION: &str = "_SA_EXTENSION__rdc_state";
 const KEY: &str = "acme/main";
 const LABELS: [&str; 3] = ["alpha", "beta", "gamma"];
@@ -75,7 +76,7 @@ impl Orgs {
 struct Tab {
     root: PathBuf,
     mem: Arc<MemStore>,
-    stores: BTreeMap<&'static str, Arc<DataStorageStateStore>>,
+    stores: BTreeMap<&'static str, Arc<SnapshotStateStore>>,
 }
 
 impl Tab {
@@ -87,9 +88,7 @@ impl Tab {
             .into_iter()
             .map(|env| {
                 let fake = orgs.fake(env);
-                let base = rdc::config::EnvConfig { api_base: fake.api_base(), org_id: 1 }.data_storage_base();
-                let client = rdc::api::DataStorageClient::new(base, TOKEN.into()).unwrap();
-                (env, Arc::new(DataStorageStateStore::new(client, COLLECTION.into(), KEY.into(), 4096)))
+                (env, Arc::new(SnapshotStateStore::new(Arc::new(DsBackend::new(&fake.api_base(), TOKEN, COLLECTION, KEY)))))
             })
             .collect();
         Tab { root, mem, stores }
@@ -171,7 +170,7 @@ fn count_writes(fake: &FakeOrg) -> Arc<Mutex<Vec<String>>> {
 /// A target store whose first checkpoint never returns: the tab closed
 /// while that save was on its way, before it reached Data Storage.
 struct ClosesAtCheckpoint {
-    inner: Arc<DataStorageStateStore>,
+    inner: Arc<SnapshotStateStore>,
     fired: Arc<tokio::sync::Notify>,
 }
 
@@ -182,9 +181,6 @@ impl StateStore for ClosesAtCheckpoint {
     fn checkpoint<'a>(&'a self, _: &'a rdc::paths::Paths) -> rdc::rt::BoxFuture<'a, anyhow::Result<()>> {
         self.fired.notify_one();
         Box::pin(std::future::pending())
-    }
-    fn collection(&self) -> Option<String> {
-        self.inner.collection()
     }
 }
 
@@ -302,7 +298,13 @@ async fn a_reopened_tab_gets_the_tree_back_unchanged() {
 
     let second = Tab::open(&orgs);
     second.read("source").await;
+    let before = state_calls(&orgs.target);
     second.read("target").await;
+    let after = state_calls(&orgs.target);
+    assert_eq!(after.0 - before.0, 1, "loading the target is one find");
+    assert_eq!(after.1 - before.1, 0, "and nothing new is inserted");
+    assert!(after.2 - before.2 <= 3, "at most one compare-and-swap per save point: {}", after.2 - before.2);
+    assert_eq!(orgs.target.state().data_storage.as_ref().unwrap().docs(COLLECTION).len(), 1, "one document for the env");
     assert_eq!(second.env_files("source"), source, "the source env, state and tree");
     assert_eq!(second.env_files("target"), target, "the target env, state and tree");
     assert_settled(&orgs, &second, "reopened").await;
@@ -363,7 +365,7 @@ async fn a_migrate_whose_target_another_tab_changed_is_refused() {
     let st = orgs.target.state();
     let m = st.data_storage.as_ref().unwrap().doc(COLLECTION, &manifest_id).unwrap();
     assert!(
-        !m["files"].as_object().unwrap().keys().any(|k| k == "envs/target/labels/alpha.json"),
+        !super::data_storage::snapshot_files(&m).contains_key("envs/target/labels/alpha.json"),
         "the refused migrate's files were not published"
     );
 }
@@ -394,4 +396,12 @@ async fn a_bad_env_name_reads_no_state() {
     .unwrap_err();
     assert!(format!("{err:#}").contains("nope"), "{err:#}");
     assert_eq!(*requests.lock().unwrap(), 0, "no request was made");
+}
+
+/// `(find, insert_many, replace_one)` requests to the state collection so far.
+fn state_calls(fake: &FakeOrg) -> (usize, usize, usize) {
+    let st = fake.state();
+    let calls = &st.data_storage.as_ref().unwrap().calls;
+    let n = |verb: &str| calls.get(&(verb.to_string(), COLLECTION.to_string())).copied().unwrap_or(0);
+    (n("data/find"), n("data/insert_many"), n("data/replace_one"))
 }

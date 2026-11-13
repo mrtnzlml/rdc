@@ -53,7 +53,7 @@ export class Project {
   addEnv(input: EnvInput): ProjectSummary;
   removeEnv(env: string): ProjectSummary | null;
   renameEnv(oldName: string, newName: string): RenameEnvResult;
-  useDataStorageState(opts: { key: string; collection?: string; chunkBytes?: number }): void;
+  useStateStore(store: StateStore): void;
   sync(env: string, opts: SyncOptions, onPrompt: (p: Prompt) => Promise<string | null>,
        onLog: (line: string) => void): Promise<CycleOutcome>;
   migrate(src: string, tgt: string, opts: MigrateOptions | null | undefined,
@@ -92,11 +92,23 @@ bridge's DTOs in camelCase. Differences from the desktop app:
 - **One sync or watch per env**: a second call on a busy env is rejected (the
   on-disk `EnvLock` does not apply in memory). `renameEnv` and `removeEnv`
   of a busy env are rejected too.
+- **Syncs of different envs may run concurrently** in one `Project` (each
+  holds its own env and, on another org, its own Web Lock). What they share
+  is project-level: `.rdc/mapping.toml` (a sync that follows a hand rename
+  records a row there, and creates the commented stub if it is missing), the
+  scaffold (`.gitignore`, `.gitattributes`, `README.md`, `CLAUDE.md`,
+  `.gitlab-ci.yml`, the testkit), and reads of `rdc.toml` and of the other
+  envs' lockfiles. No update is lost: every read-modify-write of those files
+  is synchronous code with no `await` between the read and the write, and the
+  module runs on one thread, so another run cannot interleave inside it
+  (`concurrent_syncs_of_two_envs_keep_both_mapping_rows`). The one effect
+  across runs: a cycle may count another run's writes to the env API and do
+  one extra read-back of its own env (the settle pass), which changes nothing.
 - **Web Lock**: `sync` and `watch` hold an exclusive Web Lock for their whole
   run, the browser's `EnvLock`. It is named after the remote org, not the
   project or the state key: `rdc:<api_base>:<org_id>`, with `api_base` as in
   `rdc.toml` without a trailing slash. So every tab that syncs one org
-  excludes every other, whether it keeps its state in Data Storage or not;
+  excludes every other, whether it has a state store or not;
   another org is another lock. It is requested with `ifAvailable`, so a lock
   another tab holds is not waited for: `sync` rejects, and a watch's `done()`
   rejects, with `env '<env>' is already being synced in another tab`. The lock
@@ -104,25 +116,55 @@ bridge's DTOs in camelCase. Differences from the desktop app:
   tab closes or crashes. Where `navigator.locks` is missing, `sync` and
   `watch` reject with `Web Locks are not available in this context` instead
   of running unlocked.
-- **Sync state in Data Storage**: by default an env's sync state
+- **Sync state in a host store**: by default an env's sync state
   (`.rdc/state/<env>.lock.json`, `.rdc/state/<env>.base/`,
   `.rdc/conflicts/<env>/`) and its tree (`envs/<env>/`) live only in the
-  in-memory tree. After `useDataStorageState({ key, collection, chunkBytes })`
-  the next `sync`, `watch` or `migrate` also keeps them in Rossum Data
-  Storage, in the env's own org: one manifest per env, `<key>/<env>`, in
-  `collection` (default `__rdc_state`). `key` is the host's choice (for
-  example the project). `chunkBytes` (default `524288`) bounds one stored
-  document. Any other option throws, as does an empty `key` or `collection`.
-  rdc never syncs, migrates or creates `collection` as an MDH dataset,
-  whatever its name. Every file must be UTF-8.
+  in-memory tree. After `useStateStore(store)` the next `sync`, `watch` or
+  `migrate` also keeps them in the host's storage: one snapshot per env.
+  rdc does no storage I/O for it; the host does, through two callbacks:
+
+  ```ts
+  interface StoredState { rev: number; snapshot: Uint8Array; }
+  interface StateStore {
+    load(env: string): Promise<StoredState | null>;
+    save(env: string, snapshot: Uint8Array, expectedRev: number | null, nextRev: number): Promise<boolean>;
+  }
+  ```
+
+  `store` must be an object whose own members are exactly the functions
+  `load` and `save` (they are called with `store` as `this`); anything else
+  throws. Calling `useStateStore` again replaces the store and forgets what
+  this `Project` knew about each env's stored state.
+  - **`load(env)`** is called exactly once at the start of every run of the
+    env: each `sync`, each `watch` cycle, and a `migrate` once for each of its
+    two envs. Resolve `null` when nothing is stored for `env`, else the `rev`
+    and `snapshot` last saved.
+  - **`save(env, snapshot, expectedRev, nextRev)`** is called at each save
+    point (below), only when the env's files changed since the last load or
+    save. `expectedRev` is the `rev` the last `load` returned or the last
+    `save` wrote, `null` when nothing is stored yet; `nextRev` is
+    `expectedRev + 1` (`1` for the first). Store `snapshot` under `nextRev`
+    only if the stored rev is still `expectedRev` — **atomically** (with Data
+    Storage: `replace_one` filtered on `{_id, rev: expectedRev}`, and for the
+    first save an `insert`, where a duplicate key means another run won) —
+    and resolve `true`. Resolve `false` when the stored rev is not
+    `expectedRev`: rdc fails the run with `the state of env '<env>' was
+    changed by another run`. Resolve `true` only when `snapshot` is stored;
+    a write whose answer was lost is the host's to settle (read back and
+    compare) before it resolves.
+  - A throw or a rejected promise fails the load or save, and the run, with
+    the host's message.
+  - **`snapshot`** is rdc's opaque format (the gzip of a JSON map of the
+    env's files, identical contents stored once); store the bytes as they
+    are (base64 them for a JSON document). Its size limits are the host's
+    storage's: rdc checks none. One env measured at 5.2 MB of text was
+    0.47 MB gzipped. Every file must be UTF-8.
   - **When it is saved**: when a run starts (not under `dryRun`), after every
     lockfile write of a sync (before and after each create, and at its end),
     after `_index.md` (a failure there is a warning: the save before it
     already holds the state and the tree), and after a `migrate` (not under
-    `dryRun`). Each save is one
-    compare-and-swap, so the state and the tree in Data Storage are always
-    from the same moment; a save another tab or device got in first fails
-    the run with `the state of env '<env>' was changed by another run`.
+    `dryRun`). Each save is one compare-and-swap, so the stored state and
+    tree are always from the same moment.
   - **When it is loaded**: at the start of every run of the env. The state
     files are always the saved ones. For `envs/<env>/`: the first run of an
     env in a `Project` takes the saved tree whole (files are written, files
@@ -133,8 +175,8 @@ bridge's DTOs in camelCase. Differences from the desktop app:
     tab did not change; a file both changed refuses the run and names the
     files. Edits written into `envs/<env>/` before an env's first run in a
     `Project` are therefore replaced: load the env first (a `sync` with
-    `noPush`), then edit. An edit reaches Data Storage when the next run
-    starts.
+    `noPush`), then edit. An edit reaches the host's store when the next
+    run starts.
   - **What it does not keep**: `rdc.toml`, `secrets/`, `.rdc/mapping.toml`
     (and legacy `.rdc/map/`) are the host's to keep, as before; rdc reports
     every write to them through `onChange`. The scaffold (`.gitlab-ci.yml`,
@@ -144,8 +186,8 @@ bridge's DTOs in camelCase. Differences from the desktop app:
   (`cli::migrate::run_at`). `opts` — `dryRun`, `mirror`, `allowRecreate`
   (needs `mirror`), `only` (selectors) and `carry` (`"scoreThresholds"`,
   `"emailPrefixes"`, `"automation"`, `"all"`) — are the CLI's flags; any other
-  option throws. It claims both envs, as a sync claims one. With Data Storage
-  state on, it loads both envs' state first, holds the target org's Web Lock,
+  option throws. It claims both envs, as a sync claims one. With a state
+  store set, it loads both envs' state first, holds the target org's Web Lock,
   and saves the target after (not under `dryRun`). `onLog` gets the CLI's
   output. The result is the plan: every file considered (`files`, with
   `source` and `target` keys, `"create"` / `"update"` / `"unchanged"`, and
@@ -165,7 +207,7 @@ bridge's DTOs in camelCase. Differences from the desktop app:
   the `pruned` files (each `{ target, kind, slug }`, the same identity as a
   file's) and `prunedDirs`, the `skipped` email templates, the
   `warnings` it logged, and their counts. `mirror` never prunes a folder of
-  a collection rdc skips (`__*`, `_SA_EXTENSION__*`, the state collection).
+  a collection rdc skips (`__*`, `_SA_EXTENSION__*`).
   A `dryRun` saves nothing, but its loading of the two envs is a run like
   any other: in a new `Project` it is the envs' first run, so `envs/<env>/`
   becomes the saved tree there, as described above. A refusal (recreate guard, a

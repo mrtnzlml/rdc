@@ -16,13 +16,15 @@ store). The owner's four decisions are binding; the rest is decided here.
 ## Public API (the contract the extension builds against)
 
 ```ts
-export interface DataStorageStateOptions {
-  key: string;            // names the project's state; not empty
-  collection?: string;    // default "__rdc_state"; not empty
-  chunkBytes?: number;    // default 524288
+// Replaces useDataStorageState (removed 2026-11-12, see §0): the host stores
+// each env's state; rdc decides when and what.
+export interface StoredState { rev: number; snapshot: Uint8Array; }
+export interface StateStore {
+  load(env: string): Promise<StoredState | null>;
+  save(env: string, snapshot: Uint8Array, expectedRev: number | null, nextRev: number): Promise<boolean>;
 }
-// Throws on an empty key or collection, and on any other option name.
-useDataStorageState(opts: DataStorageStateOptions): void;
+// Throws unless `store` has exactly the functions `load` and `save`.
+useStateStore(store: StateStore): void;
 
 export type CarryGroup = "scoreThresholds" | "emailPrefixes" | "automation" | "all";
 export interface MigrateOptions {   // every field may be left out
@@ -84,6 +86,58 @@ output, one call per line, in rdc's colours (as `sync`'s `onLog` does).
 
 ## Decisions
 
+### 0. The host does the state's storage I/O (amended 2026-11-12)
+
+*Owner decision.* rdc no longer reads or writes Data Storage for the sync
+state. The original browser design says "the host owns persistence"
+(`2026-10-26-wasm-browser-design.md`, *Storage-agnostic* and the non-goal
+"browser-specific storage code in rdc"); a store that talked to Data
+Storage itself broke that, and tied rdc to one storage, one collection
+convention and its limits. The host now stores an opaque snapshot per env
+through two callbacks, and rdc keeps every decision about it.
+
+- **`load(env)`** — called exactly once at the start of every run of the env:
+  each `sync`, each `watch` cycle, and a `migrate` for each of its two envs.
+  (Every run reads it, not only a `Project`'s first: that is how a run sees
+  what another tab saved since.) Resolve `null` when nothing is stored, else
+  `{ rev, snapshot }` as last saved.
+- **`save(env, snapshot, expectedRev, nextRev)`** — called at each save point
+  (when a run starts, before and after each create, at a run's commit, after
+  `_index.md`, after a `migrate`; never under `dryRun`), only when the env's
+  files changed since the last load or save. `expectedRev` is the `rev` the
+  last `load` returned or the last `save` wrote (`null`: nothing stored yet);
+  `nextRev` is `expectedRev + 1` (`1` for the first). Store `snapshot` under
+  `nextRev` only if the stored rev is still `expectedRev` (`null`: nothing
+  stored), **atomically** — e.g. Data Storage `replace_one` filtered on
+  `{_id, rev: expectedRev}`, or `insert` for the first save, where a duplicate
+  key means another run won — and resolve `true`; resolve `false` when the
+  stored rev is not `expectedRev`. rdc then fails the run with "the state of
+  env '<env>' was changed by another run". Resolve `true` only when the
+  snapshot is stored; a write whose answer was lost is the host's to settle
+  (read back and compare) before it resolves.
+- A rejected promise or a throw fails the load or save, and the run, with the
+  host's message.
+- **`snapshot`** is rdc's opaque format: the gzip of the JSON
+  `{files: {path: index}, contents: [text]}`, raw bytes (`state::snapshot`).
+  The host encodes it for its storage (base64 for a JSON document). Its size
+  limits are the host's: rdc checks none.
+- rdc keeps: the save points, `plan_hydrate`'s three-way merge, the per-env
+  store cache (one per `Project`, dropped by `useStateStore`, `renameEnv`,
+  `removeEnv`), the path checks on load, the "changed by another run" error,
+  and the Web Lock.
+- Removed: `useDataStorageState` and its `key` / `collection` options,
+  `DataStorageStateStore`, `STATE_COLLECTION`, the scoped-store branch of
+  `is_internal_collection` (rdc knows no state collection; the `__` and
+  `_SA_EXTENSION__` rules stay), the Data Storage client methods only the
+  store used (`find`, `replace_where`), the 16 MiB check and the legacy-blob
+  handling. The native `StateStore` trait and `FsStateStore` are unchanged,
+  and so is the CLI.
+
+Sections §1 to §4 below describe the Data Storage store as built before this
+amendment; what they say about what is persisted, and about hydrate, still
+holds for the host-backed store, with "the manifest" read as "the stored
+snapshot".
+
 ### 1. The env tree is part of the Data Storage state
 
 *Owner decision.* The manifest `<key>/<env>` in the env's own org now names
@@ -123,10 +177,28 @@ Embedded tests that count checkpoints (`tests/embed_sync_mem.rs`) count these
 two too, and the crash-matrix case that crashed at "the first checkpoint"
 now names the commit by its lockfile.
 
-Costs, accepted: the manifest grows by about 100 bytes per env file, and every
-checkpoint walks and hashes the env tree (only changed contents are uploaded;
-blobs are addressed by their SHA-256). Content must be UTF-8, as before; a
-non-UTF-8 file under `envs/<env>/` fails the checkpoint and names the file.
+Costs, accepted: every checkpoint walks and hashes the env tree. Content must
+be UTF-8, as before; a non-UTF-8 file under `envs/<env>/` fails the
+checkpoint and names the file.
+
+*Amended 2026-11-12: one document per env.* The per-file blob documents were
+far too slow on a real org: one env took about 2,600 `replace_one` requests
+on its first save and about 330 `find` requests on every load. That env's
+1,318 unique files were 5.2 MB of text, 0.47 MB gzipped. So the store now
+keeps `{_id: "<key>/<env>", rev, snapshot}`, where `snapshot` is base64 of
+the gzip of `{files: {path: index}, contents: [text]}`: identical contents (a
+base copy and its env file) are stored once. A load is one `find` by `_id`;
+a save is one `replace_one` filtered on `{_id, rev: N}` writing `rev: N+1`
+(the first, one `insert_many`; a duplicate key means another run won). The
+CAS, its messages, the path checks, `plan_hydrate`, the store cache, the save
+points, the Web Lock and the `key`/`collection` options are unchanged. A
+snapshot over Data Storage's 16 MiB limit fails the save and names its size;
+nothing is split. With no blobs there is no clean-up and no chunk size:
+`chunkBytes` is gone (unreleased, and the extension never passed it).
+`flate2` is a shared dependency now (its pure-Rust `miniz_oxide` backend
+builds for wasm32). A document in the old blob format, written only by test
+runs, reads as no state with a warning, and the next save replaces it at its
+`rev`; its blob documents stay behind, unreferenced and harmless.
 
 ### 2. Hydrate: which side wins
 
@@ -153,15 +225,9 @@ one.
   files, before anything is written. To take the other run's version, open
   the project again without `envs/<env>/`.
 
-Only blobs of files hydrate writes are downloaded.
-
-Blob ids carry the chunk size: `<key>/<env>/blob/<sha256>/<chunk_bytes>/<n>`,
-and each manifest entry records its `chunk_bytes`. A file unchanged since the
-last manifest keeps that manifest's chunking. *Fixed after review*: with ids
-of `<sha256>/<n>`, a store with a larger chunk size found the first chunk of
-another store's file, published it as the whole file, and its clean-up
-deleted the other chunks — every later hydrate then failed on the hash. The
-format changed before any release, so no old manifest exists.
+(*Superseded 2026-11-12*: blob ids carried the chunk size after a review
+found that mixed chunk sizes on one key corrupted the state; the single
+snapshot document of §1 has neither blobs nor chunks.)
 
 So a host loads an env before it edits it: in a new `Project`, the first run
 of an env (a `sync` with `noPush` is enough) brings the tree back, and edits
@@ -202,7 +268,7 @@ files by hand.
 
 ### 4. A host-configurable state collection
 
-*Owner decision.* `useDataStorageState({ key, collection?, chunkBytes? })`,
+*Owner decision.* `useDataStorageState({ key, collection? })`,
 `collection` defaulting to `__rdc_state`. The extension passes
 `_SA_EXTENSION__rdc_state`, which does not start with `__`, so the existing
 "Rossum's own collection" rule no longer covers it.

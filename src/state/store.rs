@@ -34,12 +34,6 @@ pub trait StateStore: Send + Sync {
     /// after a 401, so a store that calls Rossum itself must not keep the
     /// token it was built with.
     fn use_token(&self, _token: &str) {}
-    /// The Data Storage collection this store keeps the state in, if any.
-    /// MDH sync never treats it as a dataset
-    /// (`cli::pull::mdh::is_internal_collection`).
-    fn collection(&self) -> Option<String> {
-        None
-    }
 }
 
 /// The state is the files on disk, written atomically already: both methods

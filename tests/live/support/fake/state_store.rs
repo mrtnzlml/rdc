@@ -1,32 +1,28 @@
-//! `DataStorageStateStore` against the fake's Data Storage: an env's sync
-//! state (lockfile, base cache, conflict shadows) and its tree survive a page
-//! that is gone, a second writer is refused, and a crash between the blobs
-//! and the manifest leaves the previous state whole.
+//! `SnapshotStateStore` over a host store kept in the fake's Data Storage
+//! (`support::ds_state`): an env's sync state (lockfile, base cache, conflict
+//! shadows) and its tree survive a page that is gone, with one `load` (one
+//! `find`) per hydrate and one `save` (one write) per changed checkpoint; a
+//! second writer is refused, and a crash before the write applies leaves the
+//! previous state whole.
 
 use super::crash::until_crash;
 use super::*;
-use rdc::api::DataStorageClient;
+use crate::support::ds_state::{DsBackend, COLLECTION};
 use rdc::paths::Paths;
-use rdc::state::data_storage_store::DataStorageStateStore;
+use rdc::state::snapshot_store::SnapshotStateStore;
 use rdc::state::store::StateStore;
 use rdc::vfs::{MemStore, Store};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-const COLLECTION: &str = rdc::state::data_storage_store::STATE_COLLECTION;
 const KEY: &str = "acme/main";
 const LOCKFILE: &str = ".rdc/state/test.lock.json";
 const BASE: &str = ".rdc/state/test.base/labels/priority.json";
 const SHADOW: &str = ".rdc/conflicts/test/labels/priority.json";
 
-fn client(fake: &FakeOrg) -> DataStorageClient {
-    let base = rdc::config::EnvConfig { api_base: fake.api_base(), org_id: 1 }.data_storage_base();
-    DataStorageClient::new(base, "fake-token".into()).unwrap()
-}
-
-fn store(fake: &FakeOrg, chunk_bytes: usize) -> DataStorageStateStore {
-    DataStorageStateStore::new(client(fake), COLLECTION.into(), KEY.into(), chunk_bytes)
+fn store(fake: &FakeOrg) -> SnapshotStateStore {
+    SnapshotStateStore::new(Arc::new(DsBackend::new(&fake.api_base(), "fake-token", COLLECTION, KEY)))
 }
 
 fn paths() -> Paths {
@@ -39,12 +35,12 @@ fn tab(files: &[(&str, &str)]) -> Arc<MemStore> {
     Arc::new(MemStore::from_files("/p".into(), files).unwrap())
 }
 
-async fn hydrate(state: &DataStorageStateStore, tab: &Arc<MemStore>) -> anyhow::Result<()> {
+async fn hydrate(state: &SnapshotStateStore, tab: &Arc<MemStore>) -> anyhow::Result<()> {
     let p = paths();
     rdc::vfs::scope(tab.clone() as Arc<dyn Store>, state.hydrate(&p)).await
 }
 
-async fn checkpoint(state: &DataStorageStateStore, tab: &Arc<MemStore>) -> anyhow::Result<()> {
+async fn checkpoint(state: &SnapshotStateStore, tab: &Arc<MemStore>) -> anyhow::Result<()> {
     let p = paths();
     rdc::vfs::scope(tab.clone() as Arc<dyn Store>, state.checkpoint(&p)).await
 }
@@ -65,19 +61,24 @@ fn manifest(fake: &FakeOrg) -> Option<Value> {
     fake.state().data_storage.as_ref().unwrap().doc(COLLECTION, &json!(format!("{KEY}/test")))
 }
 
-fn blob_ids(fake: &FakeOrg) -> Vec<String> {
-    let st = fake.state();
-    let mut ids: Vec<String> = st
-        .data_storage
-        .as_ref()
-        .unwrap()
-        .docs(COLLECTION)
-        .iter()
-        .filter_map(|d| d["_id"].as_str().map(str::to_string))
-        .filter(|id| id.starts_with(&format!("{KEY}/test/blob/")))
-        .collect();
-    ids.sort();
-    ids
+/// The files the stored document holds: its `snapshot` decoded.
+fn stored_files(fake: &FakeOrg) -> BTreeMap<String, String> {
+    super::data_storage::snapshot_files(&manifest(fake).expect("a stored document"))
+}
+
+/// `files` as a stored snapshot, encoded as the store does.
+fn snapshot_of(files: &[(&str, &str)]) -> String {
+    use std::io::Write;
+    let contents: Vec<&str> = files.iter().map(|(_, t)| *t).collect();
+    let index: serde_json::Map<String, Value> = files.iter().enumerate().map(|(i, (p, _))| (p.to_string(), json!(i))).collect();
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(&serde_json::to_vec(&json!({ "files": index, "contents": contents })).unwrap()).unwrap();
+    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, gz.finish().unwrap())
+}
+
+/// Data Storage requests of `verb` to the state collection so far.
+fn calls(fake: &FakeOrg, verb: &str) -> usize {
+    fake.state().data_storage.as_ref().unwrap().calls.get(&(verb.to_string(), COLLECTION.to_string())).copied().unwrap_or(0)
 }
 
 async fn ds_fake() -> FakeOrg {
@@ -98,7 +99,7 @@ async fn hydrate_then_checkpoint_round_trips() {
         (".rdc/state/test.lock", ""),
         ("rdc.toml", "[envs.test]\n"),
     ]);
-    let state = store(&fake, 512 * 1024);
+    let state = store(&fake);
     hydrate(&state, &first).await.unwrap();
     assert_eq!(manifest(&fake), None, "nothing is published by a hydrate");
     checkpoint(&state, &first).await.unwrap();
@@ -112,7 +113,7 @@ async fn hydrate_then_checkpoint_round_trips() {
         (".rdc/conflicts/test/labels/stale.json", "{}\n"),
         (".rdc/conflicts/dev/labels/other_env.json", "{}\n"),
     ]);
-    hydrate(&store(&fake, 512 * 1024), &second).await.unwrap();
+    hydrate(&store(&fake), &second).await.unwrap();
 
     let got = text_files(&second);
     let want: BTreeMap<String, String> = [
@@ -130,7 +131,8 @@ async fn hydrate_then_checkpoint_round_trips() {
     assert_eq!(got, want, "the state and the env tree are the manifest's; the env lock, rdc.toml and other envs are not kept");
     let m = manifest(&fake).unwrap();
     assert_eq!(m["rev"], 1);
-    assert_eq!(m["files"].as_object().unwrap().len(), 5);
+    assert_eq!(stored_files(&fake).len(), 5);
+    assert_eq!(fake.state().data_storage.as_ref().unwrap().docs(COLLECTION).len(), 1, "one document per env");
 }
 
 /// Later runs of the same store keep what the host changed in the env tree
@@ -139,7 +141,7 @@ async fn hydrate_then_checkpoint_round_trips() {
 async fn a_later_hydrate_keeps_the_hosts_edits() {
     let fake = ds_fake().await;
     let page = tab(&[(LOCKFILE, "v1\n"), ("envs/test/labels/a.json", "a1\n"), ("envs/test/labels/b.json", "b1\n")]);
-    let state = store(&fake, 1024);
+    let state = store(&fake);
     hydrate(&state, &page).await.unwrap();
     checkpoint(&state, &page).await.unwrap();
 
@@ -147,7 +149,7 @@ async fn a_later_hydrate_keeps_the_hosts_edits() {
     write(&page, "envs/test/labels/c.json", b"new\n");
     rdc::vfs::scope_sync(page.clone() as Arc<dyn Store>, || rdc::vfs::remove_file(Path::new("/p/envs/test/labels/b.json")).unwrap());
     write(&page, LOCKFILE, b"tampered\n");
-    let finds_before = finds(&fake);
+    let finds_before = calls(&fake, "data/find");
     hydrate(&state, &page).await.unwrap();
 
     let got = text_files(&page);
@@ -155,7 +157,7 @@ async fn a_later_hydrate_keeps_the_hosts_edits() {
     assert_eq!(got["envs/test/labels/c.json"], "new\n");
     assert!(!got.contains_key("envs/test/labels/b.json"), "a local delete stays a local delete");
     assert_eq!(got[LOCKFILE], "v1\n", "the state is the manifest's");
-    assert_eq!(finds(&fake) - finds_before, 2, "one manifest read, one read of the lockfile's blob");
+    assert_eq!(calls(&fake, "data/find") - finds_before, 1, "one read");
 }
 
 /// Two tabs on one env: what one publishes reaches the other, merged with
@@ -165,7 +167,7 @@ async fn another_tabs_publish_is_merged_three_ways() {
     let fake = ds_fake().await;
     let seed = [(LOCKFILE, "v1\n"), ("envs/test/labels/a.json", "a1\n"), ("envs/test/labels/b.json", "b1\n"), ("envs/test/labels/c.json", "c1\n")];
     let (a, b) = (tab(&seed), tab(&[]));
-    let (sa, sb) = (store(&fake, 1024), store(&fake, 1024));
+    let (sa, sb) = (store(&fake), store(&fake));
     hydrate(&sa, &a).await.unwrap();
     checkpoint(&sa, &a).await.unwrap();
     hydrate(&sb, &b).await.unwrap();
@@ -195,66 +197,26 @@ async fn another_tabs_publish_is_merged_three_ways() {
     assert_eq!(a.files(), before, "a refused hydrate writes nothing");
 }
 
-/// The store keeps the state in the collection it was given.
-#[tokio::test]
-async fn the_collection_is_the_configured_one() {
-    let fake = ds_fake().await;
-    let custom = "_SA_EXTENSION__rdc_state";
-    let state = DataStorageStateStore::new(client(&fake), custom.into(), KEY.into(), 1024);
-    let page = tab(&[(LOCKFILE, "v1\n"), ("envs/test/labels/a.json", "a1\n")]);
-    hydrate(&state, &page).await.unwrap();
-    checkpoint(&state, &page).await.unwrap();
-    let st = fake.state();
-    let ds = st.data_storage.as_ref().unwrap();
-    assert!(ds.doc(custom, &json!(format!("{KEY}/test"))).is_some(), "the manifest is in {custom}");
-    assert!(ds.docs(COLLECTION).is_empty(), "nothing went to the default collection");
-    assert_eq!(state.collection().as_deref(), Some(custom));
-}
-
-/// `data/find` requests the fake has answered so far.
-fn finds(fake: &FakeOrg) -> usize {
-    fake.state().data_storage.as_ref().unwrap().finds
-}
 
 #[tokio::test]
 async fn hydrate_without_a_manifest_keeps_local_state() {
     let fake = ds_fake().await;
     let local = tab(&[(LOCKFILE, "{}\n")]);
-    hydrate(&store(&fake, 1024), &local).await.unwrap();
+    hydrate(&store(&fake), &local).await.unwrap();
     assert_eq!(text_files(&local)[LOCKFILE], "{}\n");
 }
 
-#[tokio::test]
-async fn large_file_is_chunked() {
-    let fake = ds_fake().await;
-    // Multi-byte characters: a chunk boundary must never split one.
-    let big: String = "ab✓é".repeat(40);
-    let first = tab(&[(LOCKFILE, &big)]);
-    let state = store(&fake, 16);
-    hydrate(&state, &first).await.unwrap();
-    checkpoint(&state, &first).await.unwrap();
-
-    let ids = blob_ids(&fake);
-    assert!(ids.len() > big.len() / 16, "several blob documents: {}", ids.len());
-    for id in &ids {
-        let doc = fake.state().data_storage.as_ref().unwrap().doc(COLLECTION, &json!(id)).unwrap();
-        assert!(doc["text"].as_str().unwrap().len() <= 16, "{id} is over chunk_bytes");
-    }
-    let second = tab(&[]);
-    hydrate(&store(&fake, 16), &second).await.unwrap();
-    assert_eq!(text_files(&second)[LOCKFILE], big);
-}
 
 #[tokio::test]
 async fn second_writer_loses_the_cas() {
     let fake = ds_fake().await;
     let seed = tab(&[(LOCKFILE, "v1\n")]);
-    let s0 = store(&fake, 1024);
+    let s0 = store(&fake);
     hydrate(&s0, &seed).await.unwrap();
     checkpoint(&s0, &seed).await.unwrap();
 
     let (a, b) = (tab(&[]), tab(&[]));
-    let (sa, sb) = (store(&fake, 1024), store(&fake, 1024));
+    let (sa, sb) = (store(&fake), store(&fake));
     hydrate(&sa, &a).await.unwrap();
     hydrate(&sb, &b).await.unwrap();
     write(&a, LOCKFILE, b"from a\n");
@@ -270,7 +232,7 @@ async fn second_writer_loses_the_cas() {
     );
     assert_eq!(manifest(&fake).unwrap(), won, "the loser changed nothing");
     let fresh = tab(&[]);
-    hydrate(&store(&fake, 1024), &fresh).await.unwrap();
+    hydrate(&store(&fake), &fresh).await.unwrap();
     assert_eq!(text_files(&fresh)[LOCKFILE], "from a\n");
 }
 
@@ -278,7 +240,7 @@ async fn second_writer_loses_the_cas() {
 async fn first_manifest_race_has_one_winner() {
     let fake = ds_fake().await;
     let (a, b) = (tab(&[(LOCKFILE, "from a\n")]), tab(&[(LOCKFILE, "from b\n")]));
-    let (sa, sb) = (store(&fake, 1024), store(&fake, 1024));
+    let (sa, sb) = (store(&fake), store(&fake));
     hydrate(&sa, &a).await.unwrap();
     hydrate(&sb, &b).await.unwrap();
     checkpoint(&sa, &a).await.unwrap();
@@ -286,7 +248,7 @@ async fn first_manifest_race_has_one_winner() {
     assert!(format!("{err:#}").contains("changed by another run"), "{err:#}");
 
     let fresh = tab(&[]);
-    hydrate(&store(&fake, 1024), &fresh).await.unwrap();
+    hydrate(&store(&fake), &fresh).await.unwrap();
     assert_eq!(text_files(&fresh)[LOCKFILE], "from a\n");
     assert_eq!(manifest(&fake).unwrap()["rev"], 1);
 }
@@ -296,65 +258,14 @@ fn manifest_write(req: &Request) -> bool {
     req.url.path().ends_with("/data/replace_one") && body_of(req)["filter"].get("rev").is_some()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn crash_between_blobs_and_manifest_keeps_old_state() {
-    let fake = ds_fake().await;
-    let page = tab(&[(LOCKFILE, "v1\n"), (BASE, "base v1\n")]);
-    let state = store(&fake, 1024);
-    hydrate(&state, &page).await.unwrap();
-    checkpoint(&state, &page).await.unwrap();
-    let before = blob_ids(&fake);
 
-    write(&page, LOCKFILE, b"v2\n");
-    write(&page, BASE, b"base v2\n");
-    let fired = fake.crash_on(Box::new(manifest_write), 1, CrashPoint::BeforeApply);
-    until_crash(checkpoint(&state, &page), &fired).await;
-    fake.revive();
-    assert!(blob_ids(&fake).len() > before.len(), "the new blobs were uploaded");
-
-    let fresh = tab(&[]);
-    let next = store(&fake, 1024);
-    hydrate(&next, &fresh).await.unwrap();
-    let got = text_files(&fresh);
-    assert_eq!((got[LOCKFILE].as_str(), got[BASE].as_str()), ("v1\n", "base v1\n"), "the previous checkpoint, whole");
-
-    // The next checkpoint publishes; the dead run's blobs are left behind,
-    // unreferenced (only a replaced manifest's blobs are ever deleted).
-    write(&fresh, LOCKFILE, b"v3\n");
-    checkpoint(&next, &fresh).await.unwrap();
-    let v3 = format!("{KEY}/test/blob/{}/1024/0", rdc::state::raw_content_hash(b"v3\n"));
-    let v2 = format!("{KEY}/test/blob/{}/1024/0", rdc::state::raw_content_hash(b"v2\n"));
-    let left = blob_ids(&fake);
-    assert!(left.contains(&v3) && left.contains(&v2), "{left:?}");
-    assert!(!left.contains(&format!("{KEY}/test/blob/{}/1024/0", rdc::state::raw_content_hash(b"v1\n"))), "the replaced v1 lockfile blob is gone");
-}
-
-#[tokio::test]
-async fn unreferenced_blobs_are_collected() {
-    let fake = ds_fake().await;
-    let page = tab(&[(LOCKFILE, "v1\n"), (SHADOW, "shadow\n")]);
-    let state = store(&fake, 1024);
-    hydrate(&state, &page).await.unwrap();
-    checkpoint(&state, &page).await.unwrap();
-    assert_eq!(blob_ids(&fake).len(), 2);
-
-    write(&page, LOCKFILE, b"v2\n");
-    rdc::vfs::scope_sync(page.clone() as Arc<dyn Store>, || rdc::vfs::remove_file(Path::new("/p").join(SHADOW)).unwrap());
-    checkpoint(&state, &page).await.unwrap();
-
-    let sha = rdc::state::raw_content_hash(b"v2\n");
-    assert_eq!(blob_ids(&fake), vec![format!("{KEY}/test/blob/{sha}/1024/0")]);
-    let m = manifest(&fake).unwrap();
-    assert_eq!(m["rev"], 2);
-    assert_eq!(m["files"], json!({ LOCKFILE: { "sha256": sha, "chunk_bytes": 1024, "chunks": 1 } }));
-}
 
 #[tokio::test]
 async fn non_utf8_is_refused() {
     let fake = ds_fake().await;
     let page = tab(&[(LOCKFILE, "v1\n")]);
     write(&page, BASE, &[0x66, 0xff, 0x00]);
-    let state = store(&fake, 1024);
+    let state = store(&fake);
     hydrate(&state, &page).await.unwrap();
     let err = checkpoint(&state, &page).await.unwrap_err();
     assert!(format!("{err:#}").contains(BASE), "the error names the file: {err:#}");
@@ -367,7 +278,7 @@ async fn non_utf8_is_refused() {
 async fn a_failed_manifest_write_is_not_a_lost_race() {
     let fake = ds_fake().await;
     let page = tab(&[(LOCKFILE, "v1\n")]);
-    let state = store(&fake, 1024);
+    let state = store(&fake);
     hydrate(&state, &page).await.unwrap();
     checkpoint(&state, &page).await.unwrap();
     fake.intercept(|_, req| {
@@ -386,114 +297,18 @@ fn put(fake: &FakeOrg, doc: Value) {
     docs.push(doc);
 }
 
-/// `text` as a published one-chunk state file: its blob, and its manifest entry.
-fn one_chunk(text: &str) -> (Value, Value) {
-    let sha = rdc::state::raw_content_hash(text.as_bytes());
-    (json!({ "_id": format!("{KEY}/test/blob/{sha}/1024/0"), "text": text }), json!({ "sha256": sha, "chunk_bytes": 1024, "chunks": 1 }))
-}
 
-/// Another run publishes a later manifest between this run's publish and
-/// its clean-up: the clean-up deletes only what this run's replaced
-/// manifest referenced, never the later manifest's blobs.
-#[tokio::test]
-async fn cleanup_spares_blobs_of_a_later_manifest() {
-    let fake = ds_fake().await;
-    let page = tab(&[(LOCKFILE, "v1\n")]);
-    let state = store(&fake, 1024);
-    hydrate(&state, &page).await.unwrap();
-    checkpoint(&state, &page).await.unwrap();
 
-    let (later_blob, later_ref) = one_chunk("later\n");
-    let mut armed = true;
-    fake.intercept(move |st, req| {
-        if !(armed && manifest_write(req)) {
-            return None;
-        }
-        armed = false;
-        let out = super::data_storage::serve(st.data_storage.as_mut(), req);
-        let docs = &mut st.data_storage.as_mut().unwrap().collections.get_mut(COLLECTION).unwrap().docs;
-        docs.push(later_blob.clone());
-        let manifest = docs.iter_mut().find(|d| d["_id"] == format!("{KEY}/test")).unwrap();
-        *manifest = json!({ "_id": format!("{KEY}/test"), "rev": 3, "files": { LOCKFILE: later_ref.clone() } });
-        out
-    });
-    write(&page, LOCKFILE, b"v2\n");
-    checkpoint(&state, &page).await.unwrap();
 
-    let fresh = tab(&[]);
-    hydrate(&store(&fake, 1024), &fresh).await.unwrap();
-    assert_eq!(text_files(&fresh)[LOCKFILE], "later\n", "the later manifest is whole");
-    let v1 = format!("{KEY}/test/blob/{}/1024/0", rdc::state::raw_content_hash(b"v1\n"));
-    assert!(!blob_ids(&fake).contains(&v1), "the replaced manifest's blob is gone");
-}
-
-#[tokio::test]
-async fn cleanup_failure_only_warns() {
-    let fake = ds_fake().await;
-    let page = tab(&[(LOCKFILE, "v1\n")]);
-    let state = store(&fake, 1024);
-    hydrate(&state, &page).await.unwrap();
-    checkpoint(&state, &page).await.unwrap();
-    assert!(state.take_warnings().is_empty());
-    fake.intercept(|_, req| {
-        req.url.path().ends_with("/data/delete_many")
-            .then(|| ResponseTemplate::new(400).set_body_json(json!({ "code": "error", "message": "refused by the test" })))
-    });
-    write(&page, LOCKFILE, b"v2\n");
-    checkpoint(&state, &page).await.expect("a failed clean-up does not fail the checkpoint");
-
-    let warnings = state.take_warnings();
-    assert_eq!(warnings.len(), 1, "{warnings:?}");
-    assert!(warnings[0].contains("refused by the test"), "{warnings:?}");
-    let fresh = tab(&[]);
-    hydrate(&store(&fake, 1024), &fresh).await.unwrap();
-    assert_eq!(text_files(&fresh)[LOCKFILE], "v2\n");
-}
-
-/// A run publishes (and cleans up) between a hydrate's manifest read and
-/// its blob read: the hydrate reads the manifest again and gets the new state.
-#[tokio::test]
-async fn hydrate_retries_once_when_a_blob_vanishes() {
-    let fake = ds_fake().await;
-    let page = tab(&[(LOCKFILE, "v1\n")]);
-    let state = store(&fake, 1024);
-    hydrate(&state, &page).await.unwrap();
-    checkpoint(&state, &page).await.unwrap();
-    let at_v1 = fake.state().data_storage.as_ref().unwrap().docs(COLLECTION);
-    write(&page, LOCKFILE, b"v2\n");
-    checkpoint(&state, &page).await.unwrap();
-    let at_v2 = fake.state().data_storage.as_ref().unwrap().docs(COLLECTION);
-    fake.state().data_storage.as_mut().unwrap().collections.get_mut(COLLECTION).unwrap().docs = at_v1;
-
-    let is_blob_read = |req: &Request| req.url.path().ends_with("/data/find") && body_of(req)["query"]["_id"].get("$in").is_some();
-    let mut armed = true;
-    fake.intercept(move |st, req| {
-        if armed && is_blob_read(req) {
-            armed = false;
-            st.data_storage.as_mut().unwrap().collections.get_mut(COLLECTION).unwrap().docs = at_v2.clone();
-        }
-        None
-    });
-    let fresh = tab(&[]);
-    hydrate(&store(&fake, 1024), &fresh).await.unwrap();
-    assert_eq!(text_files(&fresh)[LOCKFILE], "v2\n");
-
-    // A blob that stays missing is an error after the one retry.
-    fake.state().data_storage.as_mut().unwrap().collections.get_mut(COLLECTION).unwrap().docs.retain(|d| d["_id"] == format!("{KEY}/test"));
-    let err = format!("{:#}", hydrate(&store(&fake, 1024), &tab(&[])).await.unwrap_err());
-    assert!(err.contains("is missing"), "{err}");
-}
 
 #[tokio::test]
 async fn hydrate_refuses_a_key_outside_the_state_prefixes() {
     for key in ["envs/dev/hooks/x.py", "rdc.toml", "../x", ".rdc/conflicts/test/../../envs/test/hooks/x.py", ".rdc/state/dev.lock.json"] {
         let fake = ds_fake().await;
-        let (blob, file) = one_chunk("print('planted')\n");
-        put(&fake, blob);
-        put(&fake, json!({ "_id": format!("{KEY}/test"), "rev": 1, "files": { key: file } }));
+        put(&fake, json!({ "_id": format!("{KEY}/test"), "rev": 1, "snapshot": snapshot_of(&[(key, "print('planted')\n")]) }));
         let page = tab(&[("envs/test/labels/a.json", "{}\n")]);
         let before = page.files();
-        let err = format!("{:#}", hydrate(&store(&fake, 1024), &page).await.unwrap_err());
+        let err = format!("{:#}", hydrate(&store(&fake), &page).await.unwrap_err());
         assert!(err.contains(key), "{key}: {err}");
         assert_eq!(page.files(), before, "{key}: nothing was written");
     }
@@ -505,7 +320,7 @@ async fn hydrate_refuses_a_key_outside_the_state_prefixes() {
 async fn a_lost_manifest_response_is_success() {
     let fake = ds_fake().await;
     let page = tab(&[(LOCKFILE, "v1\n")]);
-    let state = store(&fake, 1024);
+    let state = store(&fake);
     hydrate(&state, &page).await.unwrap();
     checkpoint(&state, &page).await.unwrap();
     fake.intercept(|st, req| {
@@ -519,7 +334,7 @@ async fn a_lost_manifest_response_is_success() {
     checkpoint(&state, &page).await.expect("the write applied: it is ours");
     assert_eq!(manifest(&fake).unwrap()["rev"], 2);
     let fresh = tab(&[]);
-    hydrate(&store(&fake, 1024), &fresh).await.unwrap();
+    hydrate(&store(&fake), &fresh).await.unwrap();
     assert_eq!(text_files(&fresh)[LOCKFILE], "v2\n");
 }
 
@@ -529,7 +344,7 @@ async fn a_lost_manifest_response_is_success() {
 async fn a_crash_after_the_manifest_write_applied_keeps_the_new_state() {
     let fake = ds_fake().await;
     let page = tab(&[(LOCKFILE, "v1\n")]);
-    let state = store(&fake, 1024);
+    let state = store(&fake);
     hydrate(&state, &page).await.unwrap();
     checkpoint(&state, &page).await.unwrap();
     write(&page, LOCKFILE, b"v2\n");
@@ -538,68 +353,53 @@ async fn a_crash_after_the_manifest_write_applied_keeps_the_new_state() {
     fake.revive();
 
     let fresh = tab(&[]);
-    hydrate(&store(&fake, 1024), &fresh).await.unwrap();
+    hydrate(&store(&fake), &fresh).await.unwrap();
     assert_eq!(text_files(&fresh)[LOCKFILE], "v2\n");
 }
 
-/// Two tabs on one key with different chunk sizes: a file one published in
-/// several chunks is never republished by the other as fewer chunks of the
-/// same ids, so no clean-up can delete chunks a manifest still needs.
+
+
+/// A load is one `find`, a save one `replace_one` (the first, one
+/// `insert_many`), whatever the env's size.
 #[tokio::test]
-async fn mixed_chunk_sizes_never_corrupt_the_state() {
+async fn a_load_is_one_find_and_a_save_one_write() {
     let fake = ds_fake().await;
-    let big: String = "0123456789".repeat(1000); // 10 KB
-    let small = store(&fake, 4096);
-    let a = tab(&[(LOCKFILE, "v1\n"), ("envs/test/mdh/x/data.jsonl", &big)]);
-    hydrate(&small, &a).await.unwrap();
-    checkpoint(&small, &a).await.unwrap();
-    assert_eq!(manifest(&fake).unwrap()["files"]["envs/test/mdh/x/data.jsonl"]["chunks"], 3);
-
-    // Tab b, a large chunk size: loads it, changes another file, saves.
-    let large = store(&fake, 524_288);
-    let b = tab(&[]);
-    hydrate(&large, &b).await.unwrap();
-    write(&b, LOCKFILE, b"v2\n");
-    checkpoint(&large, &b).await.unwrap();
-    // And back: tab a saves again from its own (stale) view, after reloading.
+    let many: Vec<(String, String)> =
+        (0..500).map(|i| (format!("envs/test/labels/l{i}.json"), format!("{{\"name\": \"l{i}\"}}\n"))).collect();
+    let mut files: Vec<(&str, &str)> = many.iter().map(|(p, t)| (p.as_str(), t.as_str())).collect();
+    files.push((LOCKFILE, "v1\n"));
+    let page = tab(&files);
+    let state = store(&fake);
+    hydrate(&state, &page).await.unwrap();
+    checkpoint(&state, &page).await.unwrap();
+    assert_eq!((calls(&fake, "data/find"), calls(&fake, "data/insert_many"), calls(&fake, "data/replace_one")), (1, 1, 0));
+    write(&page, LOCKFILE, b"v2\n");
+    checkpoint(&state, &page).await.unwrap();
+    assert_eq!((calls(&fake, "data/find"), calls(&fake, "data/insert_many"), calls(&fake, "data/replace_one")), (1, 1, 1));
     let fresh = tab(&[]);
-    let again = store(&fake, 4096);
-    hydrate(&again, &fresh).await.unwrap();
-    assert_eq!(text_files(&fresh)["envs/test/mdh/x/data.jsonl"], big);
-    write(&fresh, LOCKFILE, b"v3\n");
-    write(&fresh, "envs/test/mdh/x/data.jsonl", format!("{big}more\n").as_bytes());
-    checkpoint(&again, &fresh).await.unwrap();
-    write(&b, "envs/test/labels/b.json", b"{}\n");
-
-    for chunk in [16, 4096, 524_288] {
-        let reader = tab(&[]);
-        hydrate(&store(&fake, chunk), &reader).await.unwrap_or_else(|e| panic!("chunk {chunk}: {e:#}"));
-        assert_eq!(text_files(&reader)["envs/test/mdh/x/data.jsonl"], format!("{big}more\n"));
-        assert_eq!(text_files(&reader)[LOCKFILE], "v3\n");
-    }
+    hydrate(&store(&fake), &fresh).await.unwrap();
+    assert_eq!(calls(&fake, "data/find"), 2);
+    assert_eq!(text_files(&fresh).len(), 501);
 }
 
-/// A file published under one chunk size and unchanged since is not
-/// uploaded again by a store with another.
-#[tokio::test]
-async fn an_unchanged_file_keeps_its_blobs_across_chunk_sizes() {
-    let fake = ds_fake().await;
-    let big: String = "abcdefghij".repeat(1000);
-    let a = tab(&[(LOCKFILE, "v1\n"), ("envs/test/mdh/x/data.jsonl", &big)]);
-    let small = store(&fake, 4096);
-    hydrate(&small, &a).await.unwrap();
-    checkpoint(&small, &a).await.unwrap();
-    let blobs = blob_ids(&fake);
 
-    let large = store(&fake, 524_288);
-    let b = tab(&[]);
-    hydrate(&large, &b).await.unwrap();
-    write(&b, LOCKFILE, b"v2\n");
-    checkpoint(&large, &b).await.unwrap();
-    let after = blob_ids(&fake);
-    let kept: Vec<&String> = blobs.iter().filter(|id| !id.contains(&rdc::state::raw_content_hash(b"v1\n"))).collect();
-    assert!(kept.iter().all(|id| after.contains(id)), "the data file's blobs are reused: {after:?}");
+
+/// The run dies with its save on the wire, before it applied: the next
+/// hydrate finds the previous state, whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_crash_before_the_save_applied_keeps_the_old_state() {
+    let fake = ds_fake().await;
+    let page = tab(&[(LOCKFILE, "v1\n"), (BASE, "base v1\n")]);
+    let state = store(&fake);
+    hydrate(&state, &page).await.unwrap();
+    checkpoint(&state, &page).await.unwrap();
+    write(&page, LOCKFILE, b"v2\n");
+    write(&page, BASE, b"base v2\n");
+    let fired = fake.crash_on(Box::new(manifest_write), 1, CrashPoint::BeforeApply);
+    until_crash(checkpoint(&state, &page), &fired).await;
+    fake.revive();
     let fresh = tab(&[]);
-    hydrate(&store(&fake, 16), &fresh).await.unwrap();
-    assert_eq!(text_files(&fresh)["envs/test/mdh/x/data.jsonl"], big);
+    hydrate(&store(&fake), &fresh).await.unwrap();
+    let got = text_files(&fresh);
+    assert_eq!((got[LOCKFILE].as_str(), got[BASE].as_str()), ("v1\n", "base v1\n"));
 }

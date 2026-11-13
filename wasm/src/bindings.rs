@@ -2,8 +2,8 @@
 //! calls out. No logic of its own beyond the conversions.
 
 use crate::{
-    AskFn, DataStorageStateOptions, check_migrate_option_keys, check_state_option_keys, EditProjectInput, EnvInput,
-    EnvLocks, HeldLock, MigrateOptions, Prompt, ProjectCore, SyncOptions, WatchControl, log_and_route,
+    AskFn, check_migrate_option_keys, check_state_store_keys, EditProjectInput, EnvInput, EnvLocks, HeldLock,
+    MigrateOptions, Prompt, ProjectCore, SnapshotBackend, SyncOptions, WatchControl, log_and_route,
 };
 use anyhow::anyhow;
 use serde::Serialize;
@@ -66,7 +66,11 @@ export type PromptKind =
   | "conflict" | "remoteDelete" | "bulkConfirm" | "deleteGate" | "deleteDrift"
   | "mdhIndexDrop" | "mdhRowDelete" | "recoverCreate" | "unknown";
 export interface Prompt { kind: PromptKind; question: string; choices: { key: string; label: string }[]; }
-export interface DataStorageStateOptions { key: string; collection?: string; chunkBytes?: number; }
+export interface StoredState { rev: number; snapshot: Uint8Array; }
+export interface StateStore {
+  load(env: string): Promise<StoredState | null>;
+  save(env: string, snapshot: Uint8Array, expectedRev: number | null, nextRev: number): Promise<boolean>;
+}
 export type CarryGroup = "scoreThresholds" | "emailPrefixes" | "automation" | "all";
 export interface MigrateOptions {
   dryRun?: boolean; mirror?: boolean; allowRecreate?: boolean; only?: string[]; carry?: CarryGroup[];
@@ -186,6 +190,63 @@ fn to_js<T: Serialize>(v: &T) -> Result<JsValue, JsError> {
 
 fn from_js<T: serde::de::DeserializeOwned>(v: JsValue) -> Result<T, JsError> {
     serde_wasm_bindgen::from_value(v).map_err(|e| JsError::new(&e.to_string()))
+}
+
+/// The host's `StateStore`: its `load` and `save`, called with the object
+/// as `this`. A throw or a rejected promise is a failed load or save, with
+/// the host's message.
+struct JsStateStore {
+    this: WasmOnly<JsValue>,
+    load: WasmOnly<js_sys::Function>,
+    save: WasmOnly<js_sys::Function>,
+}
+
+/// The settled value of what a host callback returned (a value or a promise).
+async fn settle(called: Result<JsValue, JsValue>, what: &str) -> anyhow::Result<JsValue> {
+    let v = called.map_err(|e| anyhow!("{what}: {}", js_error(&e)))?;
+    JsFuture::from(js_sys::Promise::resolve(&v)).await.map_err(|e| anyhow!("{what}: {}", js_error(&e)))
+}
+
+impl SnapshotBackend for JsStateStore {
+    fn load<'a>(&'a self, env: &'a str) -> rdc::rt::BoxFuture<'a, anyhow::Result<rdc::state::snapshot_store::Stored>> {
+        let called = self.load.get().call1(self.this.get(), &JsValue::from_str(env));
+        Box::pin(async move {
+            let v = settle(called, "the state store's load failed").await?;
+            if v.is_null() || v.is_undefined() {
+                return Ok(None);
+            }
+            let rev = js_sys::Reflect::get(&v, &"rev".into())
+                .ok()
+                .and_then(|r| r.as_f64())
+                .filter(|r| *r >= 0.0 && r.fract() == 0.0)
+                .ok_or_else(|| anyhow!("the state store's load returned no whole `rev`"))?;
+            let snapshot = js_sys::Reflect::get(&v, &"snapshot".into())
+                .ok()
+                .filter(|s| s.is_instance_of::<js_sys::Uint8Array>())
+                .ok_or_else(|| anyhow!("the state store's load returned no `snapshot` Uint8Array"))?;
+            Ok(Some((rev as u64, js_sys::Uint8Array::new(&snapshot).to_vec())))
+        })
+    }
+
+    fn save<'a>(
+        &'a self,
+        env: &'a str,
+        snapshot: Vec<u8>,
+        expected_rev: Option<u64>,
+        next_rev: u64,
+    ) -> rdc::rt::BoxFuture<'a, anyhow::Result<bool>> {
+        let args = js_sys::Array::of4(
+            &JsValue::from_str(env),
+            &js_sys::Uint8Array::from(&snapshot[..]),
+            &expected_rev.map_or(JsValue::NULL, |r| JsValue::from_f64(r as f64)),
+            &JsValue::from_f64(next_rev as f64),
+        );
+        let called = self.save.get().apply(self.this.get(), &args);
+        Box::pin(async move {
+            let v = settle(called, "the state store's save failed").await?;
+            v.as_bool().ok_or_else(|| anyhow!("the state store's save did not resolve to a boolean"))
+        })
+    }
 }
 
 /// rdc's package version.
@@ -324,22 +385,32 @@ impl Project {
         to_js(&self.core.rename_env(&old_name, &new_name).map_err(|e| self.err(e))?)
     }
 
-    /// Keep each env's sync state and tree in Data Storage under `key`, in
-    /// `collection` (default `__rdc_state`) of the env's own org, from the
-    /// next `sync`, `watch` or `migrate` on. Throws on an empty key or
-    /// collection, or an unknown option.
-    #[wasm_bindgen(js_name = useDataStorageState)]
-    pub fn use_data_storage_state(
+    /// Keep each env's sync state and tree in the host's `store` from the
+    /// next `sync`, `watch` or `migrate` on (see `StateStore`). Throws unless
+    /// `store` is an object whose own members are exactly the functions
+    /// `load` and `save`.
+    #[wasm_bindgen(js_name = useStateStore)]
+    pub fn use_state_store(
         &self,
-        #[wasm_bindgen(unchecked_param_type = "DataStorageStateOptions")] opts: JsValue,
+        #[wasm_bindgen(unchecked_param_type = "StateStore")] store: JsValue,
     ) -> Result<(), JsError> {
-        if opts.is_object() {
-            let keys: Vec<String> =
-                js_sys::Object::keys(opts.unchecked_ref::<js_sys::Object>()).iter().filter_map(|k| k.as_string()).collect();
-            check_state_option_keys(keys).map_err(|e| self.err(e))?;
+        if !store.is_object() {
+            return Err(self.err(anyhow!("useStateStore: the store must be an object with `load` and `save`")));
         }
-        let opts: DataStorageStateOptions = from_js(opts)?;
-        self.core.use_data_storage_state(opts).map_err(|e| self.err(e))
+        let obj: &js_sys::Object = store.unchecked_ref();
+        let keys: Vec<(String, bool)> = js_sys::Object::keys(obj)
+            .iter()
+            .filter_map(|k| k.as_string())
+            .map(|k| {
+                let is_fn = js_sys::Reflect::get(obj, &JsValue::from_str(&k)).is_ok_and(|v| v.is_function());
+                (k, is_fn)
+            })
+            .collect();
+        check_state_store_keys(keys).map_err(|e| self.err(e))?;
+        let member = |k: &str| -> js_sys::Function { js_sys::Reflect::get(obj, &JsValue::from_str(k)).unwrap().unchecked_into() };
+        let backend = JsStateStore { this: WasmOnly(store.clone()), load: WasmOnly(member("load")), save: WasmOnly(member("save")) };
+        self.core.use_state_store(Arc::new(backend));
+        Ok(())
     }
 
     /// One reconciliation cycle of `env`. Rejects when `env` is already
@@ -369,7 +440,7 @@ impl Project {
     /// `rdc migrate src tgt` on the tree. Resolves with what it changed (or,
     /// under `dryRun`, would change). Throws on an unknown option or
     /// `allowRecreate` without `mirror`; rejects when either env is busy here
-    /// or, with Data Storage state on, the target's org is locked in another
+    /// or, with a state store set, the target's org is locked in another
     /// tab.
     #[wasm_bindgen(unchecked_return_type = "Promise<MigrateResult>")]
     pub fn migrate(

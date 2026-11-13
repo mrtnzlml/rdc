@@ -13,13 +13,17 @@
 //!   none → dropped, the local file is created as any new one; one →
 //!   completed; several → the user picks, or the sync stops naming them.
 //!
-//! Completing never overwrites a local env file. With the file present, the
+//! A local env file that still builds exactly the body the crashed run sent
+//! is completed as the driver completes it: rewritten with the server's
+//! object, which carries what the server filled in (a hand-written label's
+//! `organization`). Any other local file — edited after the crash, or of a
+//! kind whose body is more than the file — is never overwritten: the
 //! object's lockfile entry and base-cache copy are what the driver would have
 //! recorded, so the classifier sees the file as `Clean` or, if it differs
 //! from the server (an edit after the crash, a store extension installed but
-//! never PATCHed), as a `LocalEdit` the normal push sends. Without it (a
-//! clone that never had the file) there is nothing to overwrite, and the
-//! create is completed exactly as the driver does, file included.
+//! never PATCHed), as a `LocalEdit` the normal push sends. Without a file (a
+//! clone that never had it) the create is completed exactly as the driver
+//! does, file included.
 //!
 //! Recovery is deterministic, so two machines recovering the same journal
 //! record the same ids.
@@ -140,6 +144,11 @@ pub async fn recover(
         let id = object["id"].as_u64().with_context(|| format!("{kind} for '{slug}' has no id"))?;
         if !dry_run {
             match local_file(paths, kind, slug) {
+                // Still what was sent: complete as the driver does, so the
+                // file becomes the server's object (with what it filled in).
+                Some(path) if sent_unchanged(lockfile, kind, &op.fields, &path) => {
+                    complete(paths, lockfile, kind, slug, &path, object)?
+                }
                 Some(path) => adopt(paths, lockfile, kind, slug, &path, object)?,
                 None => {
                     let path = new_file_path(paths, lockfile, client, kind, slug, &object).await?;
@@ -380,6 +389,25 @@ fn complete(paths: &Paths, lockfile: &mut Lockfile, kind: &str, slug: &str, path
         "hooks" => push::hooks::complete_create(paths, lockfile, slug, path, &typed(kind, object)?, None),
         other => anyhow::bail!("an unfinished run journaled a create of '{other}', which rdc does not create"),
     }
+}
+
+/// Whether the local file at `path` still builds the create body the journal
+/// op recorded: read, refs resolved, stripped for create — the body the
+/// `labels`, `workspaces`, `inboxes`, `saved_views` and `engine_fields`
+/// drivers send — with every field hashing as the op's did. The other kinds'
+/// drivers build more than the file (a hook's code, a schema's formulas and
+/// queue-scoped completion, an engine's deferred refs, a queue's and a rule's
+/// own preparation), so their file is kept, as before.
+fn sent_unchanged(lockfile: &Lockfile, kind: &str, fields: &std::collections::BTreeMap<String, String>, path: &Path) -> bool {
+    // The drivers whose create body is the file and nothing more.
+    if !matches!(kind, "labels" | "workspaces" | "inboxes" | "saved_views" | "engine_fields") {
+        return false;
+    }
+    let Ok(bytes) = crate::vfs::read(path) else { return false };
+    let Ok(mut body) = serde_json::from_slice::<Value>(&bytes) else { return false };
+    crate::snapshot::refs::resolve_value(&mut body, lockfile);
+    crate::snapshot::create::strip_for_create(&mut body, kind);
+    &crate::state::journal::create_fields(kind, &body) == fields
 }
 
 /// `object` decoded into the model the `kind` create method returns.

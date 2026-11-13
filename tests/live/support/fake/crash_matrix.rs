@@ -189,6 +189,59 @@ create_cases! {
     SAVED_VIEW => saved_view_before_begin_persist, saved_view_before_apply, saved_view_after_apply, saved_view_after_finish_persist;
 }
 
+// A file written without a field the server fills on create (a hand-written
+// label or workspace with no `organization`): the create applies, its answer is lost, and recovery must complete it as the
+// driver would — the local file rewritten with the server's object — or the
+// next push reads the bare file as an edit and fails on the missing field.
+
+/// `site`'s snapshot file, with `field` removed.
+fn bare_file(project: &ProjectFixture, run_id: &RunId, site: &Site, field: &str) {
+    let prefix = run_id.list_prefix();
+    let rel = match site.kind {
+        "labels" => format!("envs/test/labels/{prefix}{}.json", site.name),
+        "workspaces" => format!("envs/test/workspaces/{prefix}{}/workspace.json", site.name),
+        other => panic!("no bare file for {other}"),
+    };
+    let mut v = project.read_json(&rel);
+    assert!(v.as_object_mut().unwrap().remove(field).is_some(), "{rel} had {field}");
+    project.write_json(&rel, &v);
+}
+
+async fn bare_case(site: Site, field: &str) {
+    let ctx = format!("{} without {field}, after apply", site.path);
+    let fake = FakeOrg::start().await;
+    let run_id = RunId::new();
+    let project = snapshot_project(&fake, &run_id);
+    bare_file(&project, &run_id, &site, field);
+    interrupt_create(&fake, &project, &run_id, &site, Point::AfterApplyBeforeResponse).await;
+    finish_and_check(&fake, &project, &run_id.list_prefix(), &[], &ctx).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn label_without_organization_after_apply() {
+    bare_case(LABEL, "organization").await
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_without_organization_after_apply() {
+    bare_case(WORKSPACE, "organization").await
+}
+/// A file edited after the crash is the user's: recovery records the object
+/// and keeps the file, and the next push sends the edit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_file_edited_after_the_crash_is_kept_and_pushed() {
+    let fake = FakeOrg::start().await;
+    let run_id = RunId::new();
+    let project = snapshot_project(&fake, &run_id);
+    interrupt_create(&fake, &project, &run_id, &LABEL, Point::AfterApplyBeforeResponse).await;
+    let rel = format!("envs/test/labels/{}priority.json", run_id.list_prefix());
+    let mut v = project.read_json(&rel);
+    v["color"] = json!("#123456");
+    project.write_json(&rel, &v);
+    finish_and_check(&fake, &project, &run_id.list_prefix(), &[], "edited after the crash").await;
+    let id = load_lockfile(project.path(), "test").unwrap().objects["labels"][&format!("{}priority", run_id.list_prefix())].id;
+    assert_eq!(fake.state().get("labels", id).unwrap()["color"], "#123456", "the edit reached the env");
+}
+
 // The queue's create never lands in these two, and its schema's did: the
 // next sync lists schemas only through their queues, so it reads the
 // recorded schema as deleted on the env and deletes the local file. Not a
@@ -615,21 +668,20 @@ mod mem {
         assert_eq!(fake.state().ids("labels").len(), 3, "the kept labels are left");
     }
 
-    // The same crashes with the state in the fake's Data Storage
-    // (`DataStorageStateStore`): every run is a reloaded tab, a fresh
+    // The same crashes with the state in a host store over the fake's Data
+    // Storage (`SnapshotStateStore` over `support::ds_state`): every run is a reloaded tab, a fresh
     // `MemStore` holding neither the env tree nor its state, which the run's
     // hydrate brings back. What survives a crash is what Data Storage holds.
     mod data_storage {
         use super::*;
-        use rdc::state::data_storage_store::DataStorageStateStore;
+        use crate::support::ds_state::{DsBackend, COLLECTION};
+        use rdc::state::snapshot_store::SnapshotStateStore;
 
         const STATE_PREFIXES: &[&str] =
             &[".rdc/state/test.lock.json", ".rdc/state/test.base/", ".rdc/conflicts/test/", "envs/test/"];
 
-        fn state_store(fake: &FakeOrg) -> Arc<DataStorageStateStore> {
-            let base = rdc::config::EnvConfig { api_base: fake.api_base(), org_id: 1 }.data_storage_base();
-            let client = rdc::api::DataStorageClient::new(base, TOKEN.into()).unwrap();
-            Arc::new(DataStorageStateStore::new(client, rdc::state::data_storage_store::STATE_COLLECTION.into(), "acme/main".into(), 4096))
+        fn state_store(fake: &FakeOrg) -> Arc<SnapshotStateStore> {
+            Arc::new(SnapshotStateStore::new(Arc::new(DsBackend::new(&fake.api_base(), TOKEN, COLLECTION, "acme/main"))))
         }
 
         /// A reloaded tab: `tab`'s files without the env's tree and state.
@@ -641,7 +693,7 @@ mod mem {
         /// Never returns from the first checkpoint whose lockfile `when`
         /// accepts; with `publish` that checkpoint first reached Data Storage.
         struct CrashAt {
-            inner: Arc<DataStorageStateStore>,
+            inner: Arc<SnapshotStateStore>,
             when: Box<dyn Fn(&rdc::state::Lockfile) -> bool + Send + Sync>,
             publish: bool,
             armed: std::sync::atomic::AtomicBool,
@@ -678,7 +730,16 @@ mod mem {
             let second = reload(crashed, root);
             sync(&second, root, yes(allow_deletes), state_store(fake)).await.unwrap_or_else(|e| panic!("{ctx}: run 2: {e:#}"));
             let third = reload(&second, root);
+            let calls = |fake: &FakeOrg| {
+                let st = fake.state();
+                let c = &st.data_storage.as_ref().unwrap().calls;
+                let n = |v: &str| c.get(&(v.to_string(), COLLECTION.to_string())).copied().unwrap_or(0);
+                (n("data/find"), n("data/insert_many") + n("data/replace_one"))
+            };
+            let before = calls(fake);
             let out = sync(&third, root, yes(allow_deletes), state_store(fake)).await.unwrap_or_else(|e| panic!("{ctx}: run 3: {e:#}"));
+            let after = calls(fake);
+            assert_eq!((after.0 - before.0, after.1 - before.1), (1, 0), "{ctx}: run 3 loads with one find and, changing nothing, saves nothing");
             assert_eq!(
                 (out.items_pushed, out.items_pulled, out.conflicts, out.remote_deletes_resolved),
                 (0, 0, 0, 0),

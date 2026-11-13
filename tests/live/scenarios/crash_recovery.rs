@@ -1,10 +1,13 @@
-//! Crash recovery and the Data Storage state store, against a real org.
+//! Crash recovery, and a host-kept state over Data Storage, against a real org.
 //!
 //! Four scenarios, each with its fake twin:
 //!
-//! - `data_storage_facts`: what the Data Storage state store assumes about
-//!   `data/replace_one`, `data/insert_many` and `data/find` (the spec's open
-//!   facts), probed in the state collection under a run-scoped key.
+//! - `data_storage_facts`: what a host store over Data Storage relies on —
+//!   the test-only one in `support::ds_state`, which these scenarios use, and
+//!   the fake's model of it (`fake::quirks`) — about `data/replace_one`,
+//!   `data/insert_many` and `data/find`, probed in a collection under a
+//!   run-scoped key. rdc itself no longer talks to Data Storage for the
+//!   state (2026-11-12): the host does.
 //! - `create_identity`: every create of a whole hand-written graph can be
 //!   found again from its journal entry alone, by the matcher the retry
 //!   guard and recovery share (`RossumClient::find_create_match`). A field
@@ -13,8 +16,9 @@
 //! - `crash_recovery`: a chain of syncs, each killed right after one create
 //!   was applied, then one that completes. The env converges with one object
 //!   per name.
-//! - `data_storage_state_crash`: the same kill with the state in Data
-//!   Storage and a fresh in-memory tree per run, as a reloaded browser tab.
+//! - `data_storage_state_crash`: the same kill with the state kept by a
+//!   test-only host store over Data Storage (`support::ds_state`) and a fresh
+//!   in-memory tree per run, as a reloaded browser tab.
 //!
 //! # How a run is killed
 //!
@@ -38,90 +42,15 @@ use crate::support::project::ProjectFixture;
 use crate::support::run_id::RunId;
 use crate::support::snapshot::write_snapshot;
 use crate::support::teardown::Teardown;
-use rdc::api::data_storage::ReplaceOutcome;
-use rdc::api::{DataStorageClient, RossumClient};
-use rdc::state::data_storage_store::{DataStorageStateStore, STATE_COLLECTION};
+use crate::support::ds_state::{DsBackend, COLLECTION};
+use rdc::api::RossumClient;
+use rdc::state::snapshot_store::SnapshotStateStore;
 use rdc::state::store::StateStore;
 use rdc::vfs::{MemStore, Store};
-use serde_json::{json, Value};
+use serde_json::json;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-/// The state store's chunk size in the browser build
-/// (`wasm/src/lib.rs::DEFAULT_CHUNK_BYTES`), which this file cannot import.
-const DEFAULT_CHUNK_BYTES: usize = 512 * 1024;
-
-fn ds_client(cfg: &LiveConfig) -> DataStorageClient {
-    let base = rdc::config::EnvConfig { api_base: cfg.api_base.clone(), org_id: cfg.org_id }.data_storage_base();
-    DataStorageClient::new(base, cfg.token.clone()).expect("a Data Storage client")
-}
-
-/// `^` and `s` with every non-alphanumeric char escaped: a prefix match.
-fn prefix_regex(s: &str) -> String {
-    let mut out = String::from("^");
-    for c in s.chars() {
-        if !c.is_ascii_alphanumeric() {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
-}
-
-/// Every `_id` in the state collection under `key/`.
-async fn ids_under(ds: &DataStorageClient, key: &str) -> Vec<String> {
-    let query = json!({ "_id": { "$regex": prefix_regex(&format!("{key}/")) } });
-    let docs = ds.find(STATE_COLLECTION, &query, Some(&json!({ "_id": 1 })), None).await.expect("find by prefix");
-    let mut ids: Vec<String> = docs.iter().filter_map(|d| d["_id"].as_str().map(str::to_string)).collect();
-    ids.sort();
-    ids
-}
-
-/// Deletes every state-collection document under `key/` on drop, panicking
-/// test or not. Only this run's key: other `_id`s are never touched.
-struct StateCleanup {
-    ds: DataStorageClient,
-    key: String,
-}
-
-impl StateCleanup {
-    async fn run(&self) -> usize {
-        let ids: Vec<Value> = ids_under(&self.ds, &self.key).await.into_iter().map(Value::from).collect();
-        if ids.is_empty() {
-            return 0;
-        }
-        self.ds.delete_many_by_ids(STATE_COLLECTION, &ids, None).await.expect("deleting this run's state documents")
-    }
-}
-
-impl Drop for StateCleanup {
-    fn drop(&mut self) {
-        // Same reason as `Teardown::drop`: no `block_on` inside the test's
-        // runtime, so clean up on a thread of its own.
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("a runtime");
-                rt.block_on(async {
-                    let ids: Vec<Value> = match self.ds.find(
-                        STATE_COLLECTION,
-                        &json!({ "_id": { "$regex": prefix_regex(&format!("{}/", self.key)) } }),
-                        Some(&json!({ "_id": 1 })),
-                        None,
-                    ).await {
-                        Ok(docs) => docs.into_iter().filter_map(|d| d.get("_id").cloned()).collect(),
-                        Err(e) => return eprintln!("state cleanup: listing failed: {e:#}"),
-                    };
-                    if !ids.is_empty()
-                        && let Err(e) = self.ds.delete_many_by_ids(STATE_COLLECTION, &ids, None).await
-                    {
-                        eprintln!("state cleanup: deleting failed: {e:#}");
-                    }
-                });
-            });
-        });
-    }
-}
 
 // ------------------------------------------------------------------ facts
 
@@ -142,96 +71,69 @@ async fn live_data_storage_facts() {
     data_storage_facts(&cfg).await;
 }
 
-/// The spec's open Data Storage facts, each asserted as the state store
-/// relies on it. Every document is under this run's key in the state
-/// collection, and is deleted again.
+/// The Data Storage facts a host store relies on. Every document is under
+/// this run's key in the test collection, and is deleted again.
 async fn data_storage_facts(cfg: &LiveConfig) {
     let run_id = RunId::new();
     let key = format!("{}facts", run_id.list_prefix());
-    let ds = ds_client(cfg);
-    let cleanup = StateCleanup { ds: ds_client(cfg), key: key.clone() };
+    let ds = DsBackend::new(&cfg.api_base, &cfg.token, COLLECTION, &key);
     let (prod, dev, size) = (format!("{key}/prod"), format!("{key}/dev"), format!("{key}/size"));
+    let ok = |r: std::result::Result<serde_json::Value, (u16, String)>, what: &str| r.unwrap_or_else(|e| panic!("{what}: {e:?}"));
+    let replace = |filter: serde_json::Value, doc: serde_json::Value, upsert: bool| {
+        json!({ "filter": filter, "replacement": doc, "options": { "upsert": upsert }, "waitForFullWrite": true })
+    };
+    let find = |query: serde_json::Value| json!({ "query": query });
 
-    // Manifest keys are relpaths with dots and slashes, used as field names.
-    let files_v1 = json!({
-        ".rdc/state/prod.lock.json": { "sha256": "a1", "chunks": 1 },
-        ".rdc/state/prod.base/labels/x.json": { "sha256": "b1", "chunks": 2 },
-    });
-    let files_v2 = json!({
-        ".rdc/state/prod.lock.json": { "sha256": "a2", "chunks": 1 },
-        ".rdc/conflicts/prod/hooks/y.py": { "sha256": "c2", "chunks": 1 },
-    });
+    // Field names may hold dots and slashes.
+    let v1 = json!({ ".rdc/state/prod.lock.json": "a1", ".rdc/state/prod.base/labels/x.json": "b1" });
+    let v2 = json!({ ".rdc/state/prod.lock.json": "a2" });
 
-    // The token writes Data Storage, and a write to the state collection
-    // creates it if it is not there yet. An upsert says what it inserted.
-    let up = ds
-        .replace_where(STATE_COLLECTION, &json!({ "_id": prod }), &json!({ "rev": 1, "files": files_v1 }), true, None)
-        .await
-        .expect("the token can write the state collection");
-    assert_eq!(up, ReplaceOutcome { matched_count: 0, modified_count: 0, upserted_id: Some(json!(prod)) });
+    // The token writes Data Storage, and a write creates the collection if it
+    // is not there yet. An upsert says what it inserted.
+    let up = ok(ds.post("data/replace_one", replace(json!({ "_id": prod }), json!({ "rev": 1, "files": v1 }), true)).await.unwrap(), "upsert");
+    assert_eq!((up["matched_count"].as_u64(), up["upserted_id"].clone()), (Some(0), json!(prod)));
 
     // A compare-and-swap on `{_id, rev}` reports a match, then a miss.
-    let hit = ds
-        .replace_where(STATE_COLLECTION, &json!({ "_id": prod, "rev": 1 }), &json!({ "rev": 2, "files": files_v2 }), false, None)
-        .await
-        .expect("the CAS write");
-    assert_eq!(hit, ReplaceOutcome { matched_count: 1, modified_count: 1, upserted_id: None });
-    let miss = ds
-        .replace_where(STATE_COLLECTION, &json!({ "_id": prod, "rev": 1 }), &json!({ "rev": 3, "files": {} }), false, None)
-        .await
-        .expect("the stale CAS write");
-    assert_eq!(miss, ReplaceOutcome { matched_count: 0, modified_count: 0, upserted_id: None });
+    let hit = ok(ds.post("data/replace_one", replace(json!({ "_id": prod, "rev": 1 }), json!({ "rev": 2, "files": v2 }), false)).await.unwrap(), "cas");
+    assert_eq!((hit["matched_count"].as_u64(), hit["modified_count"].as_u64()), (Some(1), Some(1)));
+    let miss = ok(ds.post("data/replace_one", replace(json!({ "_id": prod, "rev": 1 }), json!({ "rev": 3 }), false)).await.unwrap(), "stale cas");
+    assert_eq!(miss["matched_count"].as_u64(), Some(0));
 
-    // Dotted field names come back intact from `replace_one`...
-    let got = ds.find(STATE_COLLECTION, &json!({ "_id": prod }), None, None).await.expect("find the manifest");
-    assert_eq!(got, vec![json!({ "_id": prod, "rev": 2, "files": files_v2 })]);
-    // ...and from `insert_many`.
-    ds.insert_many(STATE_COLLECTION, &[json!({ "_id": dev, "rev": 1, "files": files_v1 })], None)
-        .await
-        .expect("insert a manifest with dotted keys");
-    let got = ds.find(STATE_COLLECTION, &json!({ "_id": dev }), None, None).await.expect("find it");
-    assert_eq!(got, vec![json!({ "_id": dev, "rev": 1, "files": files_v1 })]);
+    // Dotted field names come back intact from `replace_one`, and from
+    // `insert_many`.
+    let got = ok(ds.post("data/find", find(json!({ "_id": prod }))).await.unwrap(), "find");
+    assert_eq!(got, json!([{ "_id": prod, "rev": 2, "files": v2 }]));
+    ok(ds.post("data/insert_many", json!({ "documents": [{ "_id": dev, "rev": 1, "files": v1 }], "ordered": false })).await.unwrap(), "insert");
+    let got = ok(ds.post("data/find", find(json!({ "_id": dev }))).await.unwrap(), "find");
+    assert_eq!(got, json!([{ "_id": dev, "rev": 1, "files": v1 }]));
 
     // A duplicate `_id` on `insert_many` is HTTP 400 "batch op errors
     // occurred", and the existing document stays as it was.
-    let err = ds
-        .insert_many(STATE_COLLECTION, &[json!({ "_id": prod, "rev": 9 })], None)
-        .await
-        .expect_err("a duplicate _id is refused");
-    assert!(rdc::api::anyhow_has_status(&err, 400), "{err:#}");
-    assert!(format!("{err:#}").contains("batch op errors occurred"), "{err:#}");
-    let got = ds.find(STATE_COLLECTION, &json!({ "_id": prod }), None, None).await.expect("find the manifest");
+    let err = ds.post("data/insert_many", json!({ "documents": [{ "_id": prod, "rev": 9 }], "ordered": false })).await.unwrap().unwrap_err();
+    assert!(err.0 == 400 && err.1.contains("batch op errors occurred"), "{err:?}");
+    let got = ok(ds.post("data/find", find(json!({ "_id": prod }))).await.unwrap(), "find");
     assert_eq!(got[0]["rev"], 2, "the duplicate insert changed nothing");
 
     // A `$regex` prefix on `_id` with an `_id`-only projection finds exactly
     // this key's documents, as the clean-up reads them.
-    let docs = ds
-        .find(STATE_COLLECTION, &json!({ "_id": { "$regex": prefix_regex(&format!("{key}/")) } }), Some(&json!({ "_id": 1 })), None)
-        .await
-        .expect("find by prefix");
-    let mut docs: Vec<Value> = docs;
-    docs.sort_by_key(|d| d["_id"].as_str().unwrap_or_default().to_string());
-    assert_eq!(docs, vec![json!({ "_id": dev }), json!({ "_id": prod })]);
+    assert_eq!(ds.stored_ids().await.unwrap(), vec![dev.clone(), prod.clone()]);
 
-    // The state collection is listed like any other (its `__` prefix hides
-    // it from the sync's MDH mirror, not from the API).
-    let names: Vec<String> = ds.list_collections(None).await.expect("list collections").into_iter().map(|c| c.name).collect();
-    assert!(names.iter().any(|n| n == STATE_COLLECTION), "{STATE_COLLECTION} is listed: {names:?}");
+    // The collection is listed like any other (its `__` prefix hides it from
+    // the sync's MDH mirror, not from the API).
+    let base = rdc::config::EnvConfig { api_base: cfg.api_base.clone(), org_id: cfg.org_id }.data_storage_base();
+    let client = rdc::api::DataStorageClient::new(base, cfg.token.clone()).expect("a Data Storage client");
+    let names: Vec<String> = client.list_collections(None).await.expect("list collections").into_iter().map(|c| c.name).collect();
+    assert!(names.iter().any(|n| n == COLLECTION), "{COLLECTION} is listed: {names:?}");
 
-    // Document size: four default chunks fit; 16 MiB of text does not.
-    let fits = "a".repeat(4 * DEFAULT_CHUNK_BYTES);
-    ds.replace_where(STATE_COLLECTION, &json!({ "_id": size }), &json!({ "text": fits }), true, None)
-        .await
-        .expect("a 2 MiB text is stored");
+    // Document size: 2 MiB fits; 16 MiB of text does not.
+    let fits = "a".repeat(2 * 1024 * 1024);
+    ok(ds.post("data/replace_one", replace(json!({ "_id": size }), json!({ "text": fits }), true)).await.unwrap(), "2 MiB");
     let too_big = "a".repeat(16 * 1024 * 1024);
-    let err = ds
-        .replace_where(STATE_COLLECTION, &json!({ "_id": size }), &json!({ "text": too_big }), true, None)
-        .await
-        .expect_err("a 16 MiB text is refused");
-    assert!(format!("{err:#}").contains("larger than 16777216"), "{err:#}");
+    let err = ds.post("data/replace_one", replace(json!({ "_id": size }), json!({ "text": too_big }), true)).await.unwrap().unwrap_err();
+    assert!(err.1.contains("larger than 16777216"), "{err:?}");
 
-    assert_eq!(cleanup.run().await, 3, "the three documents are deleted");
-    assert!(ids_under(&ds, &key).await.is_empty());
+    assert_eq!(ds.delete_all().await.unwrap(), 3, "the three documents are deleted");
+    assert!(ds.stored_ids().await.unwrap().is_empty());
 }
 
 // -------------------------------------------------------- shared fixture
@@ -524,10 +426,9 @@ async fn data_storage_state_crash(cfg: &LiveConfig) {
     let teardown = Teardown::new(LiveClient::connect(cfg).expect("connect (teardown)"), run_id.clone());
     let prefix = run_id.list_prefix();
     let key = format!("{prefix}state");
-    let ds = ds_client(cfg);
-    let cleanup = StateCleanup { ds: ds_client(cfg), key: key.clone() };
+    let ds = DsBackend::new(&cfg.api_base, &cfg.token, COLLECTION, &key);
     let store = || -> Arc<dyn StateStore> {
-        Arc::new(DataStorageStateStore::new(ds_client(cfg), STATE_COLLECTION.into(), key.clone(), DEFAULT_CHUNK_BYTES))
+        Arc::new(SnapshotStateStore::new(Arc::new(DsBackend::new(&cfg.api_base, &cfg.token, COLLECTION, &key))))
     };
 
     let project = ProjectFixture::init(cfg, &["test"]).expect("init");
@@ -546,7 +447,7 @@ async fn data_storage_state_crash(cfg: &LiveConfig) {
     let crash = CrashStore::wrapping(store(), finished("labels", &names[1]), false);
     until_crash(sync_tab(&first, &root, &cfg.token, crash.clone()), &crash.fired).await;
     after_crash().await;
-    assert!(!ids_under(&ds, &key).await.is_empty(), "run 1 published state");
+    assert!(!ds.stored_ids().await.unwrap().is_empty(), "run 1 published state");
 
     let second = tab_of(first.files().into_iter().collect(), &root);
     sync_tab(&second, &root, &cfg.token, store()).await.expect("run 2");
@@ -570,7 +471,7 @@ async fn data_storage_state_crash(cfg: &LiveConfig) {
         assert!(recorded.contains(&ids[0]), "{name} is recorded");
     }
 
-    assert!(cleanup.run().await > 0, "the state documents are deleted");
-    assert!(ids_under(&ds, &key).await.is_empty(), "no state document is left");
+    assert!(ds.delete_all().await.unwrap() > 0, "the state documents are deleted");
+    assert!(ds.stored_ids().await.unwrap().is_empty(), "no state document is left");
     drop(teardown);
 }

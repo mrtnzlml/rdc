@@ -129,6 +129,36 @@ in the format for messages and diagnostics; there is no expiry field.
 Recovery is deterministic, so two machines recovering the same op record the
 same id.
 
+
+*Amended 2026-11-13: which local file recovery overwrites.* As built,
+completing never overwrote a local env file: it recorded the entry and the
+base and left the file, so the classifier saw the file as `Clean` or as a
+`LocalEdit`. That diverged from a normal run, which rewrites the file with
+the server's object. A file written without a field the server fills on
+create — a hand-written label or workspace with no `organization` (`rdc
+migrate` keeps whatever `organization` the source file had, so a migrated
+copy of such a file lacks it too) — then read as a `LocalEdit`, and the push
+failed deserializing it (`missing field 'organization'`). Found live, with the
+state in a host store.
+
+Decision: a local file that still builds exactly the body the crashed run
+sent — read, refs resolved, `strip_for_create`, and its per-field hashes
+(`journal::create_fields`) equal to the op's `fields` — is completed exactly
+as the driver completes it, file rewritten canonically. Any other file is
+kept, as before: one edited after the crash is the user's, and the next push
+sends the edit. The check applies to the kinds whose driver body is the file
+and nothing more (`labels`, `workspaces`, `inboxes`, `saved_views`,
+`engine_fields`); the others build more than the file (hook code, schema
+formulas and queue-scoped completion, engine deferred refs, queue and rule
+preparation), so for them the file is kept as before. Affected kinds — a
+model field the server fills on create that a file can lack — are `labels`
+and `workspaces` (`organization`); the crash matrix pins both
+(`label_without_organization_after_apply`,
+`workspace_without_organization_after_apply`). An inbox without `queues` was
+checked too and is not affected. Not chosen: making the PATCH path tolerate
+missing server-filled fields, which would leave recovery's tree different
+from a normal run's and only move the divergence.
+
 ### 5. Create retries
 
 For a journaled create, a 502/503/504 is not resent blindly: the client runs
@@ -156,7 +186,10 @@ the project tree.
 *Amended 2026-11-03* (`2026-11-03-wasm-migrate-design.md`): the Data Storage
 manifest also holds `envs/<env>/**`, its collection is chosen by the host,
 `run_cycle` checkpoints when a run starts and after `_index.md` too, and a
-hydrate decides per file which side wins. The text below describes the
+hydrate decides per file which side wins. *Amended 2026-11-12*: the blob
+documents and the per-file manifest below were replaced by one gzipped snapshot
+per env, and then rdc stopped doing that storage I/O at all: the host stores
+the snapshot through `useStateStore` (that spec's §0). The text below describes the
 state-only store as first built.
 
 - **`FsStateStore`** (CLI, desktop, the wasm default): both methods are

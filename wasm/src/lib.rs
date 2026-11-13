@@ -13,7 +13,7 @@ use rdc::cli::sync::embed;
 use rdc::state::store::{FsStateStore, StateStore};
 use rdc::vfs::{MemStore, Store};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -368,7 +368,7 @@ pub struct MigrateOptions {
     pub carry: Vec<CarryGroup>,
 }
 
-/// `migrate`'s option names must all be known, as `useDataStorageState`'s.
+/// `migrate`'s option names must all be known: an option rdc does not read must not look applied.
 pub fn check_migrate_option_keys(keys: impl IntoIterator<Item = String>) -> Result<()> {
     for k in keys {
         match k.as_str() {
@@ -721,31 +721,8 @@ pub fn log_and_route(
 
 // ---------------------------------------------------------------- state and locks
 
-/// `useDataStorageState`'s chunk size when `chunkBytes` is left out.
-pub const DEFAULT_CHUNK_BYTES: usize = 512 * 1024;
-
-fn default_chunk_bytes() -> usize {
-    DEFAULT_CHUNK_BYTES
-}
-
-fn default_collection() -> String {
-    rdc::state::data_storage_store::STATE_COLLECTION.to_string()
-}
-
-/// `useDataStorageState`'s options. A sync never mirrors `collection` as an
-/// MDH dataset, whatever its name.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DataStorageStateOptions {
-    /// Names the project's state; the host knows its org and project.
-    pub key: String,
-    /// The Data Storage collection, in each env's own org; default
-    /// [`rdc::state::data_storage_store::STATE_COLLECTION`].
-    #[serde(default = "default_collection")]
-    pub collection: String,
-    #[serde(default = "default_chunk_bytes")]
-    pub chunk_bytes: usize,
-}
+/// The host's storage of each env's state snapshot (`useStateStore`).
+pub use rdc::state::snapshot_store::SnapshotBackend;
 
 /// A held env lock; dropping it releases the lock.
 pub type HeldLock = Box<dyn Send>;
@@ -800,13 +777,22 @@ fn lock_name(api_base: &str, org_id: u64) -> String {
     format!("rdc:{}:{org_id}", api_base.trim_end_matches('/'))
 }
 
-/// `useDataStorageState`'s option names must all be known: an option rdc
-/// does not read must not look as if it were applied.
-pub fn check_state_option_keys(keys: impl IntoIterator<Item = String>) -> Result<()> {
-    for k in keys {
+/// `useStateStore`'s object must carry exactly `load` and `save`, both
+/// functions: a member rdc does not call must not look as if it were used.
+pub fn check_state_store_keys(keys: impl IntoIterator<Item = (String, bool)>) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    for (k, is_fn) in keys {
         match k.as_str() {
-            "key" | "collection" | "chunkBytes" => {}
-            _ => return Err(anyhow!("unknown option '{k}'")),
+            "load" | "save" if is_fn => {
+                seen.insert(k);
+            }
+            "load" | "save" => return Err(anyhow!("useStateStore: `{k}` must be a function")),
+            _ => return Err(anyhow!("useStateStore: unknown member '{k}'")),
+        }
+    }
+    for k in ["load", "save"] {
+        if !seen.contains(k) {
+            return Err(anyhow!("useStateStore: `{k}` is missing"));
         }
     }
     Ok(())
@@ -863,22 +849,13 @@ pub struct ProjectCore {
     name: Arc<Mutex<String>>,
     busy: Arc<Mutex<HashSet<String>>>,
     locks: Arc<dyn EnvLocks>,
-    /// Set by [`Self::use_data_storage_state`]; `None` keeps the state in
-    /// the tree.
-    state: Arc<Mutex<Option<DataStorageStateOptions>>>,
-    /// Per env, the Data Storage store its runs use, kept for the project's
-    /// life: it remembers the manifest the tree last agreed with, which
-    /// decides what its next hydrate keeps (see `DataStorageStateStore`).
-    stores: Arc<Mutex<BTreeMap<String, CachedStore>>>,
-}
-
-/// A store and what it was built for; another key, collection, chunk size or
-/// org is another store.
-struct CachedStore {
-    opts: DataStorageStateOptions,
-    api_base: String,
-    org_id: u64,
-    store: Arc<rdc::state::data_storage_store::DataStorageStateStore>,
+    /// Set by [`Self::use_state_store`]; `None` keeps the state in the tree.
+    state: Arc<Mutex<Option<Arc<dyn SnapshotBackend>>>>,
+    /// Per env, the store its runs use, kept for the project's life: it
+    /// remembers the snapshot the tree last agreed with, which decides what
+    /// its next hydrate keeps (see `SnapshotStateStore`). Emptied by
+    /// [`Self::use_state_store`].
+    stores: Arc<Mutex<BTreeMap<String, Arc<rdc::state::snapshot_store::SnapshotStateStore>>>>,
 }
 
 impl ProjectCore {
@@ -900,60 +877,35 @@ impl ProjectCore {
         self
     }
 
-    /// Keep each env's sync state (`.rdc/state/<env>.*`, `.rdc/conflicts/<env>/`)
-    /// in Data Storage under `key` from the next `sync` or `watch` on.
-    pub fn use_data_storage_state(&self, opts: DataStorageStateOptions) -> Result<()> {
-        if opts.key.trim().is_empty() {
-            return Err(anyhow!("useDataStorageState: `key` must not be empty."));
-        }
-        if opts.collection.trim().is_empty() {
-            return Err(anyhow!("useDataStorageState: `collection` must not be empty."));
-        }
-        *self.state.lock().unwrap() = Some(opts);
-        Ok(())
+    /// Keep each env's state (`.rdc/state/<env>.*`, `.rdc/conflicts/<env>/`,
+    /// `envs/<env>/`) in the host's `backend` from the next `sync`, `watch`
+    /// or `migrate` on.
+    pub fn use_state_store(&self, backend: Arc<dyn SnapshotBackend>) {
+        *self.state.lock().unwrap() = Some(backend);
+        self.stores.lock().unwrap().clear();
     }
 
-    /// Where a run keeps `env`'s state: Data Storage, on the env's cluster
-    /// with the run's token, when `opts` is set; else the tree itself.
-    fn state_store(
-        &self,
-        opts: Option<DataStorageStateOptions>,
-        env: &str,
-        api_base: &str,
-        org_id: u64,
-        token: &str,
-    ) -> Result<Arc<dyn StateStore>> {
-        let Some(o) = opts else {
-            return Ok(Arc::new(FsStateStore));
+    fn state_on(&self) -> bool {
+        self.state.lock().unwrap().is_some()
+    }
+
+    /// Where a run keeps `env`'s state: the host's store when one is set,
+    /// else the tree itself.
+    fn state_store(&self, env: &str) -> Arc<dyn StateStore> {
+        let Some(backend) = self.state.lock().unwrap().clone() else {
+            return Arc::new(FsStateStore);
         };
-        let mut stores = self.stores.lock().unwrap();
-        if let Some(c) = stores.get(env)
-            && c.opts == o
-            && c.api_base == api_base
-            && c.org_id == org_id
-        {
-            c.store.use_token(token);
-            return Ok(c.store.clone());
-        }
-        let base = rdc::config::EnvConfig { api_base: api_base.to_string(), org_id }.data_storage_base();
-        let client = rdc::api::DataStorageClient::new(base, token.to_string())?;
-        let store = Arc::new(rdc::state::data_storage_store::DataStorageStateStore::new(
-            client,
-            o.collection.clone(),
-            o.key.clone(),
-            o.chunk_bytes,
-        ));
-        stores.insert(env.to_string(), CachedStore { opts: o, api_base: api_base.to_string(), org_id, store: store.clone() });
-        Ok(store)
+        self.stores
+            .lock()
+            .unwrap()
+            .entry(env.to_string())
+            .or_insert_with(|| Arc::new(rdc::state::snapshot_store::SnapshotStateStore::new(backend)))
+            .clone()
     }
 
     /// A renamed or removed env's store remembers a tree that is gone.
     fn forget_store(&self, env: &str) {
         self.stores.lock().unwrap().remove(env);
-    }
-
-    fn state_options(&self) -> Option<DataStorageStateOptions> {
-        self.state.lock().unwrap().clone()
     }
 
     /// Hold the lock of the org `env` syncs with, or fail when another tab
@@ -1138,7 +1090,6 @@ impl ProjectCore {
         route: Arc<dyn embed::PromptRoute>,
     ) -> Result<CycleOutcome> {
         let _claim = self.claim(&env)?;
-        let state_opts = self.state_options();
         let (api_base, org_id) = self.env_config(&env)?;
         let _lock = self.lock_env(&env, &api_base, org_id).await?;
         let root = self.root.clone();
@@ -1146,7 +1097,7 @@ impl ProjectCore {
         let o = rdc::vfs::scope(store.clone(), async {
             rdc::cli::init::write_scaffold_files(&root, &env, &api_base, org_id)?;
             let token = rdc::secrets::resolve_token(&root, &env, &api_base).await?;
-            let state = self.state_store(state_opts, &env, &api_base, org_id, &token)?;
+            let state = self.state_store(&env);
             embed::with_route(
                 route,
                 embed::sync_logged_in_with_state(store.clone(), state, &root, &env, &token, opts.into(), log),
@@ -1169,10 +1120,10 @@ impl ProjectCore {
     /// `rdc migrate <src> <tgt>` on the tree (`cli::migrate::run_at`), its
     /// log on `log`.
     ///
-    /// Both envs are claimed for the run. With Data Storage state on, each
-    /// env's state is loaded from its own org first, the target org's Web
-    /// Lock is held throughout, and the target's state is saved after the
-    /// run (not under `dryRun`).
+    /// Both envs are claimed for the run. With a host state store set, each
+    /// env's state is loaded from it first, the target org's Web Lock is
+    /// held throughout, and the target's state is saved after the run (not
+    /// under `dryRun`).
     pub async fn migrate(
         self,
         src: String,
@@ -1186,23 +1137,12 @@ impl ProjectCore {
         let root = self.root.clone();
         let store = self.store();
         let mut lock = None;
-        let (src_state, tgt_state): (Arc<dyn StateStore>, Arc<dyn StateStore>) = match self.state_options() {
-            Some(o) if src != tgt => {
-                let (src_base, src_org) = self.env_config(&src)?;
-                let (tgt_base, tgt_org) = self.env_config(&tgt)?;
-                lock = Some(self.lock_env(&tgt, &tgt_base, tgt_org).await?);
-                let (src_token, tgt_token) = rdc::vfs::scope(store.clone(), async {
-                    let s = rdc::secrets::resolve_token(&root, &src, &src_base).await?;
-                    let t = rdc::secrets::resolve_token(&root, &tgt, &tgt_base).await?;
-                    Ok::<_, anyhow::Error>((s, t))
-                })
-                .await?;
-                (
-                    self.state_store(Some(o.clone()), &src, &src_base, src_org, &src_token)?,
-                    self.state_store(Some(o), &tgt, &tgt_base, tgt_org, &tgt_token)?,
-                )
-            }
-            _ => (Arc::new(FsStateStore), Arc::new(FsStateStore)),
+        let (src_state, tgt_state): (Arc<dyn StateStore>, Arc<dyn StateStore>) = if self.state_on() && src != tgt {
+            let (tgt_base, tgt_org) = self.env_config(&tgt)?;
+            lock = Some(self.lock_env(&tgt, &tgt_base, tgt_org).await?);
+            (self.state_store(&src), self.state_store(&tgt))
+        } else {
+            (Arc::new(FsStateStore), Arc::new(FsStateStore))
         };
         let report = embed::migrate_logged_in(store, src_state, tgt_state, &root, &src, &tgt, opts, log).await?;
         drop(lock);
@@ -1225,7 +1165,6 @@ impl ProjectCore {
         cancel: rdc::cli::sync::watch::CancelToken,
     ) -> Result<(WatchControl, impl Future<Output = Result<()>> + 'static)> {
         let claim = self.claim(&env)?;
-        let state_opts = self.state_options();
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let control = WatchControl { triggers: tx, cancel: cancel.clone() };
         let this = self.clone();
@@ -1240,7 +1179,7 @@ impl ProjectCore {
                 rdc::secrets::resolve_token(&root, &env, &api_base).await
             })
             .await?;
-            let state = this.state_store(state_opts, &env, &api_base, org_id, &token)?;
+            let state = this.state_store(&env);
             embed::watch_logged_in_with_state(
                 store, state, &root, &env, &api_base, token, poll, log, route, cancel, on_idle, Some(rx),
             )
@@ -1491,10 +1430,9 @@ mod state_tests {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockBuilder, MockServer, ResponseTemplate};
 
-    const DS: &str = "/svc/data-storage/api/v1";
 
-    /// `m`, only for requests carrying `token` when one is given. The API
-    /// sends `token <t>`, Data Storage `Bearer <t>`.
+    /// `m`, only for requests carrying `token` when one is given (the API
+    /// sends `token <t>`).
     fn with_token(m: MockBuilder, token: Option<&str>, scheme: &str) -> MockBuilder {
         match token {
             Some(t) => m.and(header("authorization", format!("{scheme} {t}").as_str())),
@@ -1502,9 +1440,8 @@ mod state_tests {
         }
     }
 
-    /// An empty org and an empty Data Storage (no manifest is ever found,
-    /// every write accepted and every compare-and-swap matched), answering
-    /// only `token` when one is given.
+    /// An empty org (Data Storage unmounted: no MDH), answering only `token`
+    /// when one is given.
     async fn mount_world(server: &MockServer, token: Option<&str>) {
         with_token(Mock::given(method("GET")).and(path("/organizations/1")), token, "token")
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1523,81 +1460,6 @@ mod state_tests {
                 .mount(server)
                 .await;
         }
-        with_token(Mock::given(method("POST")).and(path(format!("{DS}/data/find"))), token, "Bearer")
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code": "ok", "message": "", "result": []})))
-            .mount(server)
-            .await;
-        with_token(Mock::given(method("POST")).and(path(format!("{DS}/data/replace_one"))), token, "Bearer")
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "code": "ok", "message": "", "result": {"matched_count": 1, "modified_count": 1, "upserted_id": null}
-            })))
-            .mount(server)
-            .await;
-        with_token(Mock::given(method("POST")).and(path(format!("{DS}/data/insert_many"))), token, "Bearer")
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code": "ok", "message": ""})))
-            .mount(server)
-            .await;
-    }
-
-    /// The org endpoints of [`mount_world`] over a Data Storage that keeps
-    /// what it is sent: manifests and blobs are found again, and a stale
-    /// compare-and-swap matches nothing. The collections are returned.
-    async fn mount_world_with_storage(server: &MockServer) -> Arc<Mutex<BTreeMap<String, Vec<serde_json::Value>>>> {
-        use serde_json::{Value, json};
-        let store: Arc<Mutex<BTreeMap<String, Vec<Value>>>> = Arc::default();
-        let ok = |result: Value| ResponseTemplate::new(200).set_body_json(json!({ "code": "ok", "message": "", "result": result }));
-        // Top-level equality, or `{"$in": [...]}`.
-        fn matches(doc: &Value, filter: &Value) -> bool {
-            filter.as_object().is_some_and(|f| {
-                f.iter().all(|(k, want)| match want.get("$in").and_then(Value::as_array) {
-                    Some(any) => any.contains(&doc[k]),
-                    None => &doc[k] == want,
-                })
-            })
-        }
-        let db = store.clone();
-        Mock::given(method("POST"))
-            .and(wiremock::matchers::path_regex(format!("^{DS}/data/")))
-            .respond_with(move |req: &wiremock::Request| {
-                let body: Value = serde_json::from_slice(&req.body).unwrap();
-                let name = body["collectionName"].as_str().unwrap().to_string();
-                let mut db = db.lock().unwrap();
-                let docs = db.entry(name).or_default();
-                match req.url.path().rsplit('/').next().unwrap() {
-                    "find" => ok(Value::Array(docs.iter().filter(|d| matches(d, &body["query"])).cloned().collect())),
-                    "insert_many" => {
-                        let new = body["documents"].as_array().unwrap();
-                        if new.iter().any(|n| docs.iter().any(|d| d["_id"] == n["_id"])) {
-                            return ResponseTemplate::new(400).set_body_json(json!({ "code": "error", "message": "duplicate key" }));
-                        }
-                        docs.extend(new.iter().cloned());
-                        ok(Value::Null)
-                    }
-                    "replace_one" => {
-                        let mut doc = body["replacement"].clone();
-                        if let Some(i) = docs.iter().position(|d| matches(d, &body["filter"])) {
-                            doc["_id"] = docs[i]["_id"].clone();
-                            docs[i] = doc;
-                            ok(json!({ "matched_count": 1, "modified_count": 1, "upserted_id": null }))
-                        } else if body["options"]["upsert"] == true {
-                            doc["_id"] = body["filter"]["_id"].clone();
-                            docs.push(doc);
-                            ok(json!({ "matched_count": 0, "modified_count": 0, "upserted_id": body["filter"]["_id"] }))
-                        } else {
-                            ok(json!({ "matched_count": 0, "modified_count": 0, "upserted_id": null }))
-                        }
-                    }
-                    "delete_many" => {
-                        docs.retain(|d| !matches(d, &body["filter"]));
-                        ok(json!({ "deleted_count": 0 }))
-                    }
-                    other => panic!("unexpected Data Storage call {other}"),
-                }
-            })
-            .mount(server)
-            .await;
-        mount_world(server, None).await;
-        store
     }
 
     fn token_env(server: &MockServer) -> EnvInput {
@@ -1663,21 +1525,8 @@ mod state_tests {
         panic!("the watch ended before it started");
     }
 
-    fn state_requests(requests: &[wiremock::Request]) -> Vec<&wiremock::Request> {
-        requests_to(requests, rdc::state::data_storage_store::STATE_COLLECTION)
-    }
 
-    fn requests_to<'a>(requests: &'a [wiremock::Request], collection: &str) -> Vec<&'a wiremock::Request> {
-        requests
-            .iter()
-            .filter(|r| serde_json::from_slice::<serde_json::Value>(&r.body).is_ok_and(|b| b["collectionName"] == collection))
-            .collect()
-    }
 
-    /// The state writes among `requests`: blob and manifest saves.
-    fn state_writes<'a>(requests: &'a [wiremock::Request], collection: &str) -> Vec<&'a wiremock::Request> {
-        requests_to(requests, collection).into_iter().filter(|r| !r.url.path().ends_with("/data/find")).collect()
-    }
 
     /// `acme` with envs `dev` and `prod`, both on `server`'s org 1; `dev`
     /// holds two labels and `prod` one of its own. Both are read once.
@@ -1737,48 +1586,7 @@ mod state_tests {
         assert!(p.claim("dev").is_ok() && p.claim("prod").is_ok());
     }
 
-    #[tokio::test]
-    async fn a_dry_run_migrate_writes_nothing_anywhere() {
-        let server = MockServer::start().await;
-        mount_world(&server, None).await;
-        let p = two_envs(&server, &MemLocks::default()).await;
-        p.use_data_storage_state(DataStorageStateOptions { collection: "_SA_EXTENSION__rdc_state".into(), ..ds_state("acme-key") }).unwrap();
-        sync(&p, "prod").await.expect("prod's state is in Data Storage");
-        let before = p.files();
-        server.reset().await;
-        mount_world(&server, None).await;
 
-        let (out, lines) = migrate(&p, MigrateOptions { dry_run: true, mirror: true, ..MigrateOptions::default() }).await;
-        let r = out.expect("the dry run");
-        assert!(r.dry_run && r.deletes == 1 && r.creates == 2, "{r:?}");
-        assert!(lines.iter().any(|l| l.contains("would migrate")), "{lines:?}");
-        assert_eq!(p.files(), before, "the tree is unchanged");
-        let requests = server.received_requests().await.unwrap();
-        assert!(!requests_to(&requests, "_SA_EXTENSION__rdc_state").is_empty(), "both envs' state was read");
-        assert!(state_writes(&requests, "_SA_EXTENSION__rdc_state").is_empty(), "nothing was saved");
-    }
-
-    #[tokio::test]
-    async fn migrate_saves_the_target_in_the_configured_collection() {
-        let server = MockServer::start().await;
-        mount_world(&server, None).await;
-        let p = two_envs(&server, &MemLocks::default()).await;
-        p.use_data_storage_state(DataStorageStateOptions { collection: "_SA_EXTENSION__rdc_state".into(), ..ds_state("acme-key") }).unwrap();
-        server.reset().await;
-        mount_world(&server, None).await;
-
-        migrate(&p, MigrateOptions::default()).await.0.expect("the migrate");
-
-        let requests = server.received_requests().await.unwrap();
-        assert!(state_requests(&requests).is_empty(), "the default collection was not used");
-        let manifest = requests
-            .iter()
-            .filter(|r| r.url.path().ends_with("/data/insert_many"))
-            .filter_map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
-            .find(|b| b["collectionName"] == "_SA_EXTENSION__rdc_state" && b["documents"][0]["_id"] == "acme-key/prod")
-            .expect("the target's manifest was saved");
-        assert!(manifest["documents"][0]["files"].get("envs/prod/labels/a.json").is_some(), "{manifest}");
-    }
 
     #[tokio::test]
     async fn migrate_takes_the_targets_lock_and_the_envs_claims() {
@@ -1792,7 +1600,7 @@ mod state_tests {
         assert!(err.to_string().contains("\"dev\" is already being synced or watched"), "{err}");
         drop(claim);
 
-        p.use_data_storage_state(ds_state("acme-key")).unwrap();
+        p.use_state_store(MemBackend::new());
         let held = locks.acquire(lock_of(&server)).await.unwrap().expect("free");
         let err = migrate(&p, MigrateOptions::default()).await.0.expect_err("the org is locked elsewhere");
         assert_eq!(err.to_string(), "env 'prod' is already being synced in another tab");
@@ -1811,60 +1619,7 @@ mod state_tests {
         assert!(!p.files().contains_key("envs/prod/labels/a.json"));
     }
 
-    /// The project keeps one store per env, so its second sync knows the
-    /// manifest its first one saved and keeps the host's edit made between
-    /// them. A store per call would see a "first" hydrate and put the saved
-    /// tree back over the edit.
-    #[tokio::test]
-    async fn a_projects_second_sync_keeps_the_hosts_edit() {
-        let server = MockServer::start().await;
-        let db = mount_world_with_storage(&server).await;
-        let p = project_on(&server, &MemLocks::default());
-        p.use_data_storage_state(ds_state("acme-key")).unwrap();
-        sync(&p, "dev").await.expect("loading dev");
-        assert!(db.lock().unwrap()["__rdc_state"].iter().any(|d| d["_id"] == "acme-key/dev"), "a manifest was saved");
 
-        p.write_file("envs/dev/overlay.toml", b"version = 1\n# the host's edit\n").unwrap();
-        p.write_file("envs/dev/labels/new.json", b"{}\n").unwrap();
-        sync(&p, "dev").await.expect("the second sync");
-        let files = p.files();
-        assert_eq!(files["envs/dev/overlay.toml"], b"version = 1\n# the host's edit\n");
-        assert!(files.contains_key("envs/dev/labels/new.json"));
-
-        // A new project (a reopened tab) gets the edit back from Data Storage.
-        let reopened = ProjectCore::open(files.into_iter().filter(|(k, _)| k == "rdc.toml" || k.starts_with("secrets/")))
-            .unwrap()
-            .with_locks(Arc::new(MemLocks::default()));
-        reopened.use_data_storage_state(ds_state("acme-key")).unwrap();
-        sync(&reopened, "dev").await.expect("the reopened tab's sync");
-        assert_eq!(reopened.files()["envs/dev/overlay.toml"], b"version = 1\n# the host's edit\n");
-    }
-
-    /// A dry-run migrate saves nothing, but in a new project its loading of
-    /// the envs is a first hydrate: the tree's `envs/<env>/` becomes the
-    /// saved one, as for any first run.
-    #[tokio::test]
-    async fn a_dry_run_migrate_in_a_new_project_loads_the_saved_trees() {
-        let server = MockServer::start().await;
-        let db = mount_world_with_storage(&server).await;
-        let first = two_envs(&server, &MemLocks::default()).await;
-        first.use_data_storage_state(ds_state("acme-key")).unwrap();
-        sync(&first, "dev").await.unwrap();
-        sync(&first, "prod").await.unwrap();
-        let saved = db.lock().unwrap().clone();
-
-        let mut files = first.files();
-        files.insert("envs/prod/labels/stray.json".into(), b"{}\n".to_vec());
-        files.insert("envs/prod/labels/c.json".into(), b"{\"name\": \"edited before loading\"}\n".to_vec());
-        let reopened = ProjectCore::open(files).unwrap().with_locks(Arc::new(MemLocks::default()));
-        reopened.use_data_storage_state(ds_state("acme-key")).unwrap();
-        let r = migrate(&reopened, MigrateOptions { dry_run: true, ..MigrateOptions::default() }).await.0.unwrap();
-        assert!(r.dry_run);
-        let after = reopened.files();
-        assert!(!after.contains_key("envs/prod/labels/stray.json"), "a file the saved tree lacks is removed");
-        assert_eq!(after["envs/prod/labels/c.json"], first.files()["envs/prod/labels/c.json"], "the saved version is back");
-        assert_eq!(*db.lock().unwrap(), saved, "nothing was saved");
-    }
 
     #[tokio::test]
     async fn a_dry_run_sync_returns_its_plan_as_camel_case() {
@@ -1927,64 +1682,9 @@ mod state_tests {
         assert_eq!(keys(&["mirror", "prune"]).unwrap_err().to_string(), "unknown option 'prune'");
     }
 
-    fn ds_state(key: &str) -> DataStorageStateOptions {
-        DataStorageStateOptions { key: key.into(), collection: default_collection(), chunk_bytes: DEFAULT_CHUNK_BYTES }
-    }
 
-    #[tokio::test]
-    async fn sync_uses_data_storage_state_when_set() {
-        let server = MockServer::start().await;
-        mount_world(&server, None).await;
-        let p = project_on(&server, &MemLocks::default());
-        p.use_data_storage_state(ds_state("acme-key")).unwrap();
 
-        sync(&p, "dev").await.expect("the sync succeeds");
 
-        let requests = server.received_requests().await.unwrap();
-        assert!(!state_requests(&requests).is_empty(), "no request reached the state collection");
-        // The first manifest is the tree the run starts from; the last one
-        // carries the lockfile and the env tree.
-        let manifests: Vec<serde_json::Value> = requests
-            .iter()
-            .filter_map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
-            .filter_map(|b| {
-                if b["documents"][0]["_id"] == "acme-key/dev" {
-                    Some(b["documents"][0].clone())
-                } else if b["filter"]["_id"] == "acme-key/dev" {
-                    Some(b["replacement"].clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let manifest = manifests.last().expect("the run published a manifest for acme-key/dev");
-        assert!(manifest["files"].get(".rdc/state/dev.lock.json").is_some(), "the lockfile is in the manifest: {manifest}");
-        assert!(manifest["files"].get("envs/dev/_index.md").is_some(), "so is the env tree: {manifest}");
-    }
-
-    #[test]
-    fn data_storage_state_options_default_the_chunk_size_and_need_a_key() {
-        let o: DataStorageStateOptions = serde_json::from_value(serde_json::json!({"key": "k"})).unwrap();
-        assert_eq!((o.key.as_str(), o.chunk_bytes), ("k", 524_288));
-        assert_eq!(o.collection, "__rdc_state");
-        let o: DataStorageStateOptions =
-            serde_json::from_value(serde_json::json!({"key": "k", "collection": "_SA_EXTENSION__rdc_state"})).unwrap();
-        assert_eq!(o.collection, "_SA_EXTENSION__rdc_state");
-        let p = ProjectCore::open(Vec::new()).unwrap();
-        assert!(p.use_data_storage_state(DataStorageStateOptions { collection: " ".into(), ..ds_state("k") }).is_err());
-        let o: DataStorageStateOptions =
-            serde_json::from_value(serde_json::json!({"key": "k", "chunkBytes": 10})).unwrap();
-        assert_eq!(o.chunk_bytes, 10);
-        let p = ProjectCore::open(Vec::new()).unwrap();
-        assert!(p.use_data_storage_state(ds_state(" ")).is_err(), "an empty key is refused");
-    }
-
-    #[test]
-    fn an_unknown_state_option_is_refused() {
-        let keys = |ks: &[&str]| check_state_option_keys(ks.iter().map(|k| k.to_string()));
-        assert!(keys(&["key", "chunkBytes", "collection"]).is_ok());
-        assert_eq!(keys(&["key", "chunk_bytes"]).unwrap_err().to_string(), "unknown option 'chunk_bytes'");
-    }
 
     #[tokio::test]
     async fn default_stays_in_memory() {
@@ -1994,8 +1694,6 @@ mod state_tests {
 
         sync(&p, "dev").await.expect("the sync succeeds");
 
-        let requests = server.received_requests().await.unwrap();
-        assert!(state_requests(&requests).is_empty(), "the state collection was touched");
         assert!(p.files().contains_key(".rdc/state/dev.lock.json"), "the state stays in the tree");
     }
 
@@ -2005,7 +1703,7 @@ mod state_tests {
         mount_world(&server, None).await;
         let locks = MemLocks::default();
         let p = project_on(&server, &locks);
-        p.use_data_storage_state(ds_state("acme-key")).unwrap();
+        p.use_state_store(MemBackend::new());
         // Another tab: its own project over the same lock manager.
         let held = locks.acquire(lock_of(&server)).await.unwrap().expect("free");
 
@@ -2026,12 +1724,12 @@ mod state_tests {
     }
 
     #[tokio::test]
-    async fn a_data_storage_tab_and_a_plain_tab_on_one_org_exclude_each_other() {
+    async fn a_stateful_tab_and_a_plain_tab_on_one_org_exclude_each_other() {
         let server = MockServer::start().await;
         mount_world(&server, None).await;
         let locks = MemLocks::default();
         let with_state = project_on(&server, &locks);
-        with_state.use_data_storage_state(ds_state("acme-key")).unwrap();
+        with_state.use_state_store(MemBackend::new());
         let plain = ProjectCore::open(with_state.files()).unwrap().with_locks(Arc::new(locks.clone()));
 
         // Hold the plain tab's sync open at its first request.
@@ -2092,7 +1790,7 @@ mod state_tests {
     }
 
     #[tokio::test]
-    async fn a_watch_with_data_storage_state_survives_a_401() {
+    async fn a_watch_with_a_host_state_store_survives_a_401() {
         let server = MockServer::start().await;
         let login = |key: &str| {
             Mock::given(method("POST"))
@@ -2109,14 +1807,15 @@ mod state_tests {
             ..token_env(&server)
         };
         let p = ProjectCore::create("acme", &env).unwrap().with_locks(Arc::new(MemLocks::default()));
-        p.use_data_storage_state(ds_state("acme-key")).unwrap();
+        let backend = MemBackend::new();
+        p.use_state_store(backend.clone());
 
         let (control, fut, mut lines, mut idles) = start_watch(&p);
         let drive = async {
             started(&mut lines).await;
             // `t1` is revoked: it now gets 401 everywhere; a re-login hands out `t2`.
             server.reset().await;
-            for revoked in ["token t1", "Bearer t1"] {
+            for revoked in ["token t1"] {
                 Mock::given(header("authorization", revoked))
                     .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({"detail": "expired"})))
                     .mount(&server)
@@ -2141,15 +1840,249 @@ mod state_tests {
             1,
             "a cycle after the retry must not log in again"
         );
-        let after = state_requests(&requests[relogin..]);
-        assert!(!after.is_empty(), "the retried cycle reached the state collection");
-        for r in after {
-            assert_eq!(
-                r.headers.get("authorization").and_then(|v| v.to_str().ok()),
-                Some("Bearer t2"),
-                "{} after the re-login",
-                r.url.path()
-            );
+        assert!(relogin > 0);
+        assert!(backend.loads() >= 3, "every cycle loaded the state: {}", backend.loads());
+    }
+
+    /// A JS-shaped host store: `load`/`save` over memory, with the stored rev
+    /// checked atomically, and every call counted.
+    #[derive(Default)]
+    struct MemBackend {
+        stored: Mutex<BTreeMap<String, (u64, Vec<u8>)>>,
+        calls: Mutex<Vec<(String, String)>>,
+        /// When set, every save answers this error.
+        fail_saves: Mutex<Option<String>>,
+        /// When set, another tab saves just before the next save.
+        race_next_save: Mutex<bool>,
+    }
+
+    impl MemBackend {
+        fn new() -> Arc<MemBackend> {
+            Arc::new(MemBackend::default())
         }
+        fn count(&self, what: &str, env: &str) -> usize {
+            self.calls.lock().unwrap().iter().filter(|(w, e)| w == what && e == env).count()
+        }
+        fn loads(&self) -> usize {
+            self.calls.lock().unwrap().iter().filter(|(w, _)| w == "load").count()
+        }
+        fn files(&self, env: &str) -> BTreeMap<String, String> {
+            let stored = self.stored.lock().unwrap();
+            rdc::state::snapshot::decode(&stored[env].1).unwrap()
+        }
+    }
+
+    impl SnapshotBackend for MemBackend {
+        fn load<'a>(&'a self, env: &'a str) -> rdc::rt::BoxFuture<'a, Result<rdc::state::snapshot_store::Stored>> {
+            self.calls.lock().unwrap().push(("load".into(), env.into()));
+            let got = self.stored.lock().unwrap().get(env).cloned();
+            Box::pin(async move { Ok(got) })
+        }
+        fn save<'a>(
+            &'a self,
+            env: &'a str,
+            snapshot: Vec<u8>,
+            expected_rev: Option<u64>,
+            next_rev: u64,
+        ) -> rdc::rt::BoxFuture<'a, Result<bool>> {
+            self.calls.lock().unwrap().push(("save".into(), env.into()));
+            let out = match self.fail_saves.lock().unwrap().clone() {
+                Some(msg) => Err(anyhow!(msg)),
+                None => {
+                    let mut stored = self.stored.lock().unwrap();
+                    if std::mem::take(&mut *self.race_next_save.lock().unwrap())
+                        && let Some(e) = stored.get_mut(env)
+                    {
+                        e.0 += 1;
+                    }
+                    if stored.get(env).map(|e| e.0) == expected_rev {
+                        assert_eq!(next_rev, expected_rev.map_or(1, |r| r + 1), "nextRev is expectedRev + 1");
+                        stored.insert(env.to_string(), (next_rev, snapshot));
+                        Ok(true)
+                    } else {
+                        Ok(false)
+                    }
+                }
+            };
+            Box::pin(async move { out })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sync_loads_once_and_saves_once_per_save_point() {
+        let server = MockServer::start().await;
+        mount_world(&server, None).await;
+        let p = project_on(&server, &MemLocks::default());
+        let backend = MemBackend::new();
+        p.use_state_store(backend.clone());
+
+        sync(&p, "dev").await.expect("the sync succeeds");
+        assert_eq!(backend.count("load", "dev"), 1, "one load per run");
+        let first_saves = backend.count("save", "dev");
+        assert!((1..=3).contains(&first_saves), "a save at the run's start, commit and after _index.md: {first_saves}");
+        let files = backend.files("dev");
+        assert!(files.contains_key(".rdc/state/dev.lock.json") && files.contains_key("envs/dev/_index.md"), "{:?}", files.keys());
+
+        // A run that changes nothing loads once and saves nothing.
+        sync(&p, "dev").await.expect("the second sync");
+        assert_eq!((backend.count("load", "dev"), backend.count("save", "dev")), (2, first_saves));
+    }
+
+    /// The project keeps one store per env, so its second sync knows the
+    /// snapshot its first one saved and keeps the host's edit made between
+    /// them. A store per call would see a "first" hydrate and put the saved
+    /// tree back over the edit.
+    #[tokio::test]
+    async fn a_projects_second_sync_keeps_the_hosts_edit() {
+        let server = MockServer::start().await;
+        mount_world(&server, None).await;
+        let backend = MemBackend::new();
+        let p = project_on(&server, &MemLocks::default());
+        p.use_state_store(backend.clone());
+        sync(&p, "dev").await.expect("loading dev");
+        p.write_file("envs/dev/overlay.toml", b"version = 1\n# the host's edit\n").unwrap();
+        p.write_file("envs/dev/labels/new.json", b"{}\n").unwrap();
+        sync(&p, "dev").await.expect("the second sync");
+        let files = p.files();
+        assert_eq!(files["envs/dev/overlay.toml"], b"version = 1\n# the host's edit\n");
+        assert!(files.contains_key("envs/dev/labels/new.json"));
+
+        // A new project (a reopened tab) gets the edit back from the store.
+        let reopened = ProjectCore::open(files.into_iter().filter(|(k, _)| k == "rdc.toml" || k.starts_with("secrets/")))
+            .unwrap()
+            .with_locks(Arc::new(MemLocks::default()));
+        reopened.use_state_store(backend.clone());
+        sync(&reopened, "dev").await.expect("the reopened tab's sync");
+        assert_eq!(reopened.files()["envs/dev/overlay.toml"], b"version = 1\n# the host's edit\n");
+    }
+
+    #[tokio::test]
+    async fn a_save_the_host_refuses_is_another_runs_change() {
+        let server = MockServer::start().await;
+        mount_world(&server, None).await;
+        let backend = MemBackend::new();
+        let p = project_on(&server, &MemLocks::default());
+        p.use_state_store(backend.clone());
+        sync(&p, "dev").await.unwrap();
+        *backend.race_next_save.lock().unwrap() = true;
+        p.write_file("envs/dev/labels/new.json", b"{}\n").unwrap();
+        let out = sync(&p, "dev").await;
+        let err = out.expect_err("another run saved in between");
+        assert!(format!("{err:#}").contains("the state of env 'dev' was changed by another run"), "{err:#}");
+
+        *backend.fail_saves.lock().unwrap() = Some("quota exceeded".into());
+        p.write_file("envs/dev/labels/other.json", b"{}\n").unwrap();
+        let err = sync(&p, "dev").await.expect_err("a failed save fails the run");
+        assert!(format!("{err:#}").contains("quota exceeded"), "the host's message: {err:#}");
+    }
+
+    #[tokio::test]
+    async fn migrate_loads_both_envs_and_saves_the_target_once() {
+        let server = MockServer::start().await;
+        mount_world(&server, None).await;
+        let p = two_envs(&server, &MemLocks::default()).await;
+        let backend = MemBackend::new();
+        p.use_state_store(backend.clone());
+
+        migrate(&p, MigrateOptions { dry_run: true, ..MigrateOptions::default() }).await.0.unwrap();
+        assert_eq!((backend.count("load", "dev"), backend.count("load", "prod")), (1, 1), "one load per env");
+        assert_eq!(backend.calls.lock().unwrap().iter().filter(|(w, _)| w == "save").count(), 0, "a dry run saves nothing");
+
+        migrate(&p, MigrateOptions::default()).await.0.unwrap();
+        assert_eq!((backend.count("save", "dev"), backend.count("save", "prod")), (0, 1), "one save, of the target");
+        assert!(backend.files("prod").contains_key("envs/prod/labels/a.json"));
+    }
+
+    /// A dry-run migrate saves nothing, but in a new project its loading of
+    /// the envs is a first hydrate: the tree's `envs/<env>/` becomes the
+    /// saved one, as for any first run.
+    #[tokio::test]
+    async fn a_dry_run_migrate_in_a_new_project_loads_the_saved_trees() {
+        let server = MockServer::start().await;
+        mount_world(&server, None).await;
+        let backend = MemBackend::new();
+        let first = two_envs(&server, &MemLocks::default()).await;
+        first.use_state_store(backend.clone());
+        sync(&first, "dev").await.unwrap();
+        sync(&first, "prod").await.unwrap();
+        let saves = backend.calls.lock().unwrap().iter().filter(|(w, _)| w == "save").count();
+
+        let mut files = first.files();
+        files.insert("envs/prod/labels/stray.json".into(), b"{}\n".to_vec());
+        files.insert("envs/prod/labels/c.json".into(), b"{\"name\": \"edited before loading\"}\n".to_vec());
+        let reopened = ProjectCore::open(files).unwrap().with_locks(Arc::new(MemLocks::default()));
+        reopened.use_state_store(backend.clone());
+        let r = migrate(&reopened, MigrateOptions { dry_run: true, ..MigrateOptions::default() }).await.0.unwrap();
+        assert!(r.dry_run);
+        let after = reopened.files();
+        assert!(!after.contains_key("envs/prod/labels/stray.json"), "a file the saved tree lacks is removed");
+        assert_eq!(after["envs/prod/labels/c.json"], first.files()["envs/prod/labels/c.json"], "the saved version is back");
+        assert_eq!(backend.calls.lock().unwrap().iter().filter(|(w, _)| w == "save").count(), saves, "nothing was saved");
+    }
+
+    #[test]
+    fn the_state_store_must_have_exactly_load_and_save() {
+        let check = |ks: &[(&str, bool)]| check_state_store_keys(ks.iter().map(|(k, f)| (k.to_string(), *f)));
+        assert!(check(&[("load", true), ("save", true)]).is_ok());
+        assert_eq!(check(&[("load", true)]).unwrap_err().to_string(), "useStateStore: `save` is missing");
+        assert_eq!(check(&[("load", true), ("save", false)]).unwrap_err().to_string(), "useStateStore: `save` must be a function");
+        assert_eq!(
+            check(&[("load", true), ("save", true), ("key", false)]).unwrap_err().to_string(),
+            "useStateStore: unknown member 'key'"
+        );
+    }
+
+    /// Two envs of one project, each on its own org (so each its own Web
+    /// Lock), synced at once. Both follow a hand rename and so both record a
+    /// row in the one project-level `.rdc/mapping.toml`; neither row is lost.
+    #[tokio::test]
+    async fn concurrent_syncs_of_two_envs_keep_both_mapping_rows() {
+        let (a, b) = (MockServer::start().await, MockServer::start().await);
+        mount_world(&a, None).await;
+        mount_world(&b, None).await;
+        let p = project_on(&a, &MemLocks::default());
+        p.add_env(&EnvInput { name: "prod".into(), ..token_env(&b) }).unwrap();
+        // Both envs hold labels `one` and `two`; dev renames `one` by hand,
+        // prod renames `two`.
+        for (env, server, renamed) in [("dev", &a, "one"), ("prod", &b, "two")] {
+            p.run(|root| {
+                let paths = rdc::paths::Paths::for_env(root, env);
+                let mut lf = rdc::state::Lockfile::default();
+                for (slug, id) in [("one", 11u64), ("two", 12)] {
+                    let entry = rdc::state::ObjectEntry { id, modified_at: None, modified_by: None, content_hash: None, secrets_hash: None };
+                    lf.upsert("labels", slug, entry);
+                    let at = if slug == renamed { format!("{slug}-renamed") } else { slug.to_string() };
+                    let body = serde_json::json!({
+                        "id": id, "url": format!("{}/labels/{id}", server.uri()), "name": slug,
+                        "organization": format!("{}/organizations/1", server.uri()),
+                    });
+                    let file = paths.labels_dir().join(format!("{at}.json"));
+                    rdc::vfs::create_dir_all(file.parent().unwrap()).unwrap();
+                    rdc::vfs::write(&file, serde_json::to_vec_pretty(&body).unwrap()).unwrap();
+                }
+                rdc::vfs::create_dir_all(paths.lockfile().parent().unwrap()).unwrap();
+                lf.save(&paths.lockfile()).unwrap();
+            });
+        }
+
+        // A third task watches the two runs overlap: both envs claimed at once.
+        let overlapped = async {
+            for _ in 0..10_000 {
+                if p.busy.lock().unwrap().len() == 2 {
+                    return true;
+                }
+                tokio::task::yield_now().await;
+            }
+            false
+        };
+        let (dev, prod, both) = tokio::join!(sync(&p, "dev"), sync(&p, "prod"), overlapped);
+        dev.expect("the dev sync");
+        prod.expect("the prod sync");
+        assert!(both, "the two syncs ran at the same time");
+
+        let text = String::from_utf8(p.files()[".rdc/mapping.toml"].clone()).unwrap();
+        let mapping = p.run(|root| rdc::mapping::GenericMapping::load(&root.join(".rdc/mapping.toml"))).unwrap();
+        assert_eq!(mapping.orient("dev", "prod").labels.get("one-renamed").map(String::as_str), Some("one"), "{text}");
+        assert_eq!(mapping.orient("prod", "dev").labels.get("two-renamed").map(String::as_str), Some("two"), "{text}");
     }
 }

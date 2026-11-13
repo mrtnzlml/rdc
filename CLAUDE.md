@@ -162,8 +162,11 @@ Project-specific instructions for working in this repo.
   `src/state/journal.rs` writes an op into the lockfile's `pending` before each
   POST and sets its `id` after the response; `commit` drops ops whose lockfile
   entry now has that id. `src/cli/sync/recover.rs` finishes leftovers before
-  classify, never overwrites an existing local file, prompts on several
-  candidates and stops under `--yes`. A 502/503/504 on a journaled create runs
+  classify, prompts on several candidates and stops under `--yes`. It
+  overwrites a local file only when it still builds exactly the body that was
+  sent (then it completes as the driver does, so the file gets what the server
+  filled in, e.g. a hand-written label's `organization`); a file edited after
+  the crash is kept. A 502/503/504 on a journaled create runs
   the matcher before each resend, up to the same five sends with backoff as any
   other request.
 - The lockfile is **v4**; a v3 rdc refuses it on purpose, because v3 ignores
@@ -177,30 +180,35 @@ Project-specific instructions for working in this repo.
   per sent sub-key, and the matcher ignores sub-keys the server added. The
   top-level `secrets` is never hashed, nor is a secret-named sub-key of hook
   `config` / engine `settings`; secret-named keys anywhere else are hashed.
-- `StateStore`: `FsStateStore` is a no-op; `DataStorageStateStore` keeps blobs and
-  a CAS manifest per env in the env's own org, in a host-chosen collection
-  (default `__rdc_state`). Blob ids carry the chunk size
-  (`<sha256>/<chunk_bytes>/<n>`): without it, two stores with different chunk
-  sizes on one key corrupted the state for good. The manifest holds the state
+- `StateStore`: `FsStateStore` is a no-op (the CLI). In the browser the
+  **host** stores the state (owner decision 2026-11-12, after the original
+  wasm design's "the host owns persistence"): `state::snapshot_store` keeps one
+  opaque snapshot per env (`state::snapshot`: gzip of `{files: {path: index},
+  contents: [text]}`) through a `SnapshotBackend` — `load(env)` and
+  `save(env, bytes, expected_rev, next_rev) -> bool`, `false` meaning another
+  run won. rdc never talks to Data Storage for state any more; do not bring a
+  Data Storage state store back into rdc. rdc keeps the save points, the
+  three-way merge, the path checks and the CAS error.
+  The snapshot holds the state
   **and `envs/<env>/**`**:
   without the tree, a closed tab came back with every object reading as a local
   delete. `run_cycle` checkpoints when a run starts and after `_index.md` (only
   a warning when that one fails) as well as at every journal persist; all three are no-ops on disk, so the CLI is
   unchanged, but a test store counts them.
-- Hydrate (`plan_hydrate`): the state files are always the manifest's; the env
-  tree is the manifest's on a store's **first** hydrate, the tree's own when the
-  manifest is still the one the store last saw, and a three-way merge (refusing
-  a file both sides changed) otherwise. So the store must live as long as the
+- Hydrate (`plan_hydrate`): the state files are always the stored snapshot's;
+  the env tree is the snapshot's on a store's **first** hydrate, the tree's own
+  when the stored rev is still the one the store last saw, and a three-way merge
+  (refusing a file both sides changed) otherwise. So the store must live as long as the
   tab's `Project` (`wasm/` caches one per env); a store per run would wipe the
   host's edits on every sync.
-- `is_internal_collection` is true for `__` names, for the Chrome extension's
-  `_SA_EXTENSION__*` names (**on every surface, the CLI included** — an owner
-  decision of 2026-11-03 and a deliberate CLI behaviour change), and for the
-  collection of the task's scoped state store. Every MDH path goes through it
-  (listing, `local_only_dataset_slugs`) or through migrate's own skip
-  (`state_datasets`, which skips `_SA_EXTENSION__*` and the scoped collection
-  on the source and keeps `--mirror` from pruning them on the target, but
-  still copies other `__` datasets, as before). rdc has no collection drop,
+- `is_internal_collection` is true for `__` names and for the Chrome
+  extension's `_SA_EXTENSION__*` names (**on every surface, the CLI
+  included** — an owner decision of 2026-11-03 and a deliberate CLI
+  behaviour change). rdc knows no state collection of its own any more. Every
+  MDH path goes through it (listing, `local_only_dataset_slugs`) or through
+  migrate's own skip (`state_datasets`, which skips `_SA_EXTENSION__*` on the
+  source and keeps `--mirror` from pruning it on the target, but still copies
+  other `__` datasets, as before). rdc has no collection drop,
   so no path can delete such a collection.
 - A tree that pulled an `_SA_EXTENSION__*` dataset before the rule: the next
   sync removes it locally **only if the env lists at least one other dataset**
@@ -214,6 +222,13 @@ Project-specific instructions for working in this repo.
   computes, never a second pass, and the log stays byte-identical; skipped
   items are `plan::record`ed at each site that decides not to write, into a
   task-local collector around one cycle. A new skip site must record too.
+- In wasm, syncs of **different envs of one `Project` may run concurrently**
+  (`wasm/README.md`). It is safe because every project-level read-modify-write
+  a sync does — `.rdc/mapping.toml` rows (`record_mapping_rows`), its stub, the
+  scaffold docs — is synchronous, and wasm32 is single-threaded, so nothing
+  interleaves inside one. Keep it so: an `.await` between reading and writing a
+  project-level file would turn this into a lost update. `api::core_writes` is
+  process-wide, so one run can trigger another's settle pass (a harmless read).
 - `.rdc/mapping.toml`, `rdc.toml` and `secrets/` are **host-owned** in the
   browser, never in Data Storage: the mapping is project-level and each env's
   state lives in another org, so two copies would have no correct merge. See
@@ -228,7 +243,8 @@ Project-specific instructions for working in this repo.
 - Tests: the fake-only crash matrix is `tests/live/support/fake/crash_matrix.rs`
   (with `recover.rs`, `state_store.rs`, and `browser_migrate.rs` for the closed
   tab across two orgs); live scenarios are
-  `tests/live/scenarios/crash_recovery.rs`.
+  `tests/live/scenarios/crash_recovery.rs`. Their host store is test-only:
+  `tests/live/support/ds_state.rs`, over Data Storage by raw HTTP.
 
 ## Customer confidentiality
 

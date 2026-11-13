@@ -39,8 +39,9 @@ pub struct DataStorage {
     pub collections: BTreeMap<String, Collection>,
     /// Feeds generated ObjectIds.
     next_oid: u64,
-    /// `data/find` requests answered, for tests that count downloads.
-    pub finds: usize,
+    /// Requests answered per verb (`"data/find"`, ...) and collection, for
+    /// tests that count round trips.
+    pub calls: BTreeMap<(String, String), usize>,
 }
 
 impl DataStorage {
@@ -58,6 +59,24 @@ impl DataStorage {
         self.next_oid += 1;
         json!({ "$oid": format!("{:024x}", self.next_oid) })
     }
+}
+
+/// The files a stored sync-state document's `snapshot` holds (base64 of the
+/// gzip of `{files: {path: index}, contents: [text]}`).
+#[allow(dead_code)]
+pub fn snapshot_files(doc: &Value) -> BTreeMap<String, String> {
+    use std::io::Read;
+    let b64 = doc["snapshot"].as_str().expect("a snapshot");
+    let gz = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).unwrap();
+    let mut json = Vec::new();
+    flate2::read::GzDecoder::new(&gz[..]).read_to_end(&mut json).unwrap();
+    let snap: Value = serde_json::from_slice(&json).unwrap();
+    snap["files"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(rel, i)| (rel.clone(), snap["contents"][i.as_u64().unwrap() as usize].as_str().unwrap().to_string()))
+        .collect()
 }
 
 /// The answer to `req` when it is a Data Storage request and Data Storage is
@@ -98,6 +117,9 @@ fn route(ds: &mut DataStorage, verb: &str, body: &Value) -> Answer {
             .map(str::to_string)
             .ok_or_else(|| (422, "collectionName is required".to_string()))
     };
+    if let Ok(n) = name() {
+        *ds.calls.entry((verb.to_string(), n)).or_default() += 1;
+    }
     match verb {
         "collections/list" => {
             let listed: Vec<Value> = ds
@@ -156,7 +178,6 @@ fn route(ds: &mut DataStorage, verb: &str, body: &Value) -> Answer {
             None => Err((404, "Dataset not found".to_string())),
         },
         "data/find" => {
-            ds.finds += 1;
             let query = body.get("query").ok_or_else(|| bad("query is required"))?;
             check(query)?;
             let projection = body.get("projection").filter(|p| !p.is_null());
@@ -393,7 +414,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn find_insert_replace_delete() {
+    async fn insert_and_delete() {
         let fake = FakeOrg::start().await;
         fake.enable_data_storage();
         let c = client(&fake);
@@ -402,29 +423,8 @@ mod tests {
         assert!(rdc::api::anyhow_has_status(&err, 400) && format!("{err:#}").contains("batch op errors occurred"));
         assert_eq!(fake.state().data_storage.as_ref().unwrap().docs("s").len(), 3, "the non-conflicting one went in");
 
-        let prefix = c.find("s", &json!({ "_id": { "$regex": "^a/" } }), Some(&json!({ "_id": 1 })), None).await.unwrap();
-        assert_eq!(prefix, vec![json!({ "_id": "a/1" })]);
-        let some = c.find("s", &json!({ "_id": { "$in": ["b/1", "c/1"] } }), None, None).await.unwrap();
-        assert_eq!(some.len(), 2);
-
-        let cas = c.replace_where("s", &json!({ "_id": "a/1", "t": "nope" }), &json!({ "t": "z" }), false, None).await.unwrap();
-        assert_eq!(cas.matched_count, 0);
-        let cas = c.replace_where("s", &json!({ "_id": "a/1", "t": "x" }), &json!({ "t": "z" }), false, None).await.unwrap();
-        assert_eq!((cas.matched_count, cas.modified_count), (1, 1));
-        let up = c.replace_where("s", &json!({ "_id": "d/1" }), &json!({ "t": "w" }), true, None).await.unwrap();
-        assert_eq!((up.matched_count, up.upserted_id), (0, Some(json!("d/1"))));
-        assert_eq!(fake.state().data_storage.as_ref().unwrap().doc("s", &json!("d/1")), Some(json!({ "_id": "d/1", "t": "w" })));
-
         assert_eq!(c.delete_many_by_ids("s", &[json!("a/1"), json!("zz")], None).await.unwrap(), 1);
-        assert_eq!(c.count_documents("s", None).await.unwrap(), 3);
-    }
-
-    #[tokio::test]
-    async fn an_unsupported_pattern_is_refused() {
-        let fake = FakeOrg::start().await;
-        fake.enable_data_storage();
-        let err = client(&fake).find("s", &json!({ "_id": { "$regex": "a.*" } }), None, None).await.unwrap_err();
-        assert!(rdc::api::anyhow_has_status(&err, 400), "{err:#}");
+        assert_eq!(c.count_documents("s", None).await.unwrap(), 2);
     }
 
     #[tokio::test]
