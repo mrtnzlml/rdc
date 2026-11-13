@@ -215,7 +215,10 @@ Credential sources:
                    stdin), log in at POST /v1/auth/login, and cache the token
                    with a 162-hour expiry.
   --browser        enter the token in a local browser form.
-  none of these    read a token from stdin, e.g. `rdc auth dev < token.txt`.
+  none of these    read the token from stdin when stdin is a pipe or a file,
+                   e.g. `rdc auth dev < token.txt`. Otherwise open the browser
+                   form, or, over SSH, on Linux without a display, or with
+                   --no-browser, show a masked prompt on the terminal.
 
 Every command looks for a token in this order: $RDC_TOKEN_<ENV>; an
 unexpired token in secrets/<env>.secrets.json; a username and password from
@@ -457,6 +460,10 @@ pub enum Command {
         /// no terminal is needed.
         #[arg(long, conflicts_with_all = ["token", "username"])]
         browser: bool,
+        /// Never open the browser form: with no token on stdin, prompt for
+        /// one on the terminal instead.
+        #[arg(long, conflicts_with_all = ["token", "username", "browser"])]
+        no_browser: bool,
     },
     /// Check and repair an env's local snapshot, offline.
     #[command(long_about = DOCTOR_LONG_ABOUT)]
@@ -582,9 +589,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 crate::cli::migrate::Carry::from_groups(&carry),
             )
         }
-        Some(Command::Auth { env, token, username, browser }) => {
+        Some(Command::Auth { env, token, username, browser, no_browser }) => {
             let env = crate::cli::env_picker::pick_env("Set the token for which environment?", "rdc auth <env>", env)?;
-            crate::cli::auth::run(&env, token, username, browser).await
+            crate::cli::auth::run(&env, token, username, browser, no_browser).await
         }
         Some(Command::Doctor { env, dry_run }) => {
             let env = crate::cli::env_picker::pick_env("Run the doctor on which environment?", "rdc doctor <env>", env)?;

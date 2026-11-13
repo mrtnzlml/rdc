@@ -278,7 +278,7 @@ fn resolve_token_lookup_from_at<F: Fn(&str) -> Option<String>>(
         message: format!(
             "no token for env '{env}': set ${token_var}, \
              set ${user_var} + ${pass_var}, \
-             or run `rdc auth {env}` (`rdc auth {env} --browser` without a terminal)"
+             or run `rdc auth {env}`"
         ),
     })
 }

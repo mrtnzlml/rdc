@@ -1,4 +1,4 @@
-//! `rdc auth <env> [--token <value> | --username <user> | --browser]` — set or refresh
+//! `rdc auth <env> [--token <value> | --username <user> | --browser | --no-browser]` — set or refresh
 //! an env's API token (per spec §6).
 //!
 //! The new token is validated by `GET /organizations/{org_id}` before being
@@ -12,7 +12,10 @@
 //!   issued token + computed expiry (162h from now).
 //! - `--browser` — take the token in a one-time local web form (see
 //!   [`crate::cli::auth_browser`]); for callers with no terminal.
-//! - Neither — read a token from stdin (e.g. `read -s T && echo $T | rdc auth dev`).
+//! - None of these — see `pick_source`: read the token from stdin when it
+//!   is a pipe or a file (`rdc auth dev < token.txt`, CI); otherwise open the
+//!   browser form, or show a masked prompt on a terminal when no browser can
+//!   be used (SSH, Linux without a display) or `--no-browser` is passed.
 
 use crate::api::{anyhow_has_status, RossumClient};
 use crate::config::{EnvConfig, ProjectConfig};
@@ -27,6 +30,7 @@ pub async fn run(
     token_arg: Option<String>,
     username_arg: Option<String>,
     browser: bool,
+    no_browser: bool,
 ) -> Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     let cfg_path = cwd.join("rdc.toml");
@@ -36,7 +40,25 @@ pub async fn run(
 
     let log = crate::log::Log::new(crate::cli::resolve::detect_color_mode());
 
-    if browser {
+    let source = match (&token_arg, &username_arg, browser) {
+        (None, None, false) => pick_source(
+            stdin_is_pipe_or_file(),
+            std::io::stdin().is_terminal(),
+            no_browser,
+            browser_usable(|k| std::env::var(k).ok()),
+        ),
+        _ => Source::Stdin,
+    };
+    if source == Source::Nothing {
+        return Err(anyhow!(
+            "no token provided, and rdc cannot ask for one: stdin is neither a terminal \
+             nor a pipe, and {}; pass `--token <value>`, pipe a token via stdin, \
+             use `--username <U>`, or set $RDC_TOKEN_<ENV>",
+            if no_browser { "--no-browser was passed" } else { "no browser can be opened (SSH session or no display)" }
+        ));
+    }
+
+    if browser || source == Source::Browser {
         let org_name = crate::cli::auth_browser::run(env_cfg, &cwd, env).await?;
         log.event(
             Action::Auth,
@@ -73,6 +95,7 @@ pub async fn run(
 
     let new_token = match token_arg {
         Some(t) => t,
+        None if source == Source::Prompt => read_token_for_auth(env)?,
         None => {
             use std::io::Read;
             let mut buf = String::new();
@@ -101,6 +124,79 @@ pub async fn run(
         ),
     );
     Ok(())
+}
+
+/// Where `rdc auth <env>` with no credential flag takes the token from.
+#[derive(Debug, PartialEq, Eq)]
+enum Source {
+    Stdin,
+    Browser,
+    Prompt,
+    Nothing,
+}
+
+/// Piped or redirected stdin always wins, so scripts and CI keep working.
+/// Otherwise the browser form, unless it cannot be used or `--no-browser`
+/// was passed; then a terminal prompt, if there is a terminal.
+fn pick_source(stdin_piped: bool, stdin_tty: bool, no_browser: bool, browser_ok: bool) -> Source {
+    if stdin_piped {
+        Source::Stdin
+    } else if !no_browser && browser_ok {
+        Source::Browser
+    } else if stdin_tty {
+        Source::Prompt
+    } else {
+        Source::Nothing
+    }
+}
+
+/// False over SSH (the form would open on the remote machine's 127.0.0.1)
+/// and on Linux and other Unixes without a display. `var` reads one
+/// environment variable.
+fn browser_usable(var: impl Fn(&str) -> Option<String>) -> bool {
+    let set = |k: &str| var(k).is_some_and(|v| !v.is_empty());
+    if set("SSH_CONNECTION") || set("SSH_CLIENT") || set("SSH_TTY") {
+        return false;
+    }
+    cfg!(any(target_os = "macos", windows)) || set("DISPLAY") || set("WAYLAND_DISPLAY")
+}
+
+/// True when stdin is a pipe or a regular file, i.e. someone sent a token.
+/// A terminal, `/dev/null` (Claude Code's `!` commands) or a closed stdin
+/// is false.
+#[cfg(unix)]
+fn stdin_is_pipe_or_file() -> bool {
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::FileTypeExt;
+    let Ok(fd) = std::io::stdin().as_fd().try_clone_to_owned() else {
+        return false;
+    };
+    std::fs::File::from(fd)
+        .metadata()
+        .map(|m| m.file_type().is_fifo() || m.file_type().is_file())
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn stdin_is_pipe_or_file() -> bool {
+    !std::io::stdin().is_terminal()
+}
+
+/// Masked terminal prompt for `rdc auth <env>` when the browser form is
+/// not used.
+fn read_token_for_auth(env: &str) -> Result<String> {
+    use inquire::{Password, PasswordDisplayMode};
+    let token = Password::new(&format!("API token for env '{env}'"))
+        .with_display_mode(PasswordDisplayMode::Masked)
+        .without_confirmation()
+        .with_help_message("Ctrl+C to cancel")
+        .prompt()
+        .map_err(|e| anyhow!("token prompt failed: {e}"))?;
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        return Err(anyhow!("empty token"));
+    }
+    Ok(token)
 }
 
 /// Read a password from stdin (non-TTY) or prompt via `inquire::Password`
@@ -337,3 +433,49 @@ impl Drop for EchoOff {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn piped_stdin_wins_over_everything() {
+        for (tty, no_browser, ok) in [(false, false, true), (true, true, false), (false, true, true)] {
+            assert_eq!(pick_source(true, tty, no_browser, ok), Source::Stdin);
+        }
+    }
+
+    #[test]
+    fn browser_is_the_default_without_piped_stdin() {
+        assert_eq!(pick_source(false, true, false, true), Source::Browser);
+        assert_eq!(pick_source(false, false, false, true), Source::Browser);
+    }
+
+    #[test]
+    fn terminal_prompt_without_a_usable_browser_or_with_no_browser() {
+        assert_eq!(pick_source(false, true, false, false), Source::Prompt);
+        assert_eq!(pick_source(false, true, true, true), Source::Prompt);
+    }
+
+    #[test]
+    fn nothing_without_terminal_or_browser() {
+        assert_eq!(pick_source(false, false, false, false), Source::Nothing);
+        assert_eq!(pick_source(false, false, true, true), Source::Nothing);
+    }
+
+    #[test]
+    fn ssh_disables_the_browser() {
+        for k in ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"] {
+            let env = |name: &str| (name == k || name == "DISPLAY").then(|| "x".to_string());
+            assert!(!browser_usable(env), "{k}");
+        }
+    }
+
+    #[test]
+    fn display_decides_on_linux() {
+        let display = |name: &str| (name == "DISPLAY").then(|| "x".to_string());
+        assert!(browser_usable(display));
+        let none = |_: &str| None;
+        assert_eq!(browser_usable(none), cfg!(any(target_os = "macos", windows)));
+    }
+}

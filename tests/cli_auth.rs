@@ -254,3 +254,75 @@ fn auth_without_a_token_or_terminal_suggests_browser() {
         .assert().failure()
         .stderr(predicate::str::contains("--browser"));
 }
+
+fn project_with_dev_env() -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("rdc.toml"),
+        "[envs.dev]\napi_base = \"https://example.rossum.app/api/v1\"\norg_id = 1\n",
+    )
+    .unwrap();
+    dir
+}
+
+/// With no flag and no token on stdin (here `/dev/null`, as under Claude
+/// Code's `!`), `rdc auth` opens the browser form instead of waiting.
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn auth_without_piped_stdin_defaults_to_the_browser_form() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    let dir = project_with_dev_env();
+    let no_bin = TempDir::new().unwrap();
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("rdc"))
+        .current_dir(dir.path())
+        .env("PATH", no_bin.path())
+        .env_remove("SSH_CONNECTION")
+        .env_remove("SSH_CLIENT")
+        .env_remove("SSH_TTY")
+        .args(["auth", "dev"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut first = String::new();
+    BufReader::new(child.stderr.take().unwrap()).read_line(&mut first).unwrap();
+    child.kill().unwrap();
+    let _ = child.wait();
+    assert!(first.contains("http://127.0.0.1:"), "{first}");
+}
+
+/// Over SSH there is no usable browser, and without a terminal there is no
+/// prompt either, so rdc errors instead of waiting.
+#[test]
+fn auth_over_ssh_without_a_terminal_errors() {
+    let dir = project_with_dev_env();
+    let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("rdc"));
+    cmd.current_dir(dir.path())
+        .env("SSH_CONNECTION", "10.0.0.1 1 10.0.0.2 22")
+        .args(["auth", "dev"])
+        .stdin(std::process::Stdio::null());
+    assert_cmd::assert::OutputAssertExt::assert(cmd.output().unwrap()).failure()
+        .stderr(predicate::str::contains("no browser can be opened"));
+}
+
+#[test]
+fn auth_no_browser_without_a_terminal_errors() {
+    let dir = project_with_dev_env();
+    let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("rdc"));
+    cmd.current_dir(dir.path())
+        .args(["auth", "dev", "--no-browser"])
+        .stdin(std::process::Stdio::null());
+    assert_cmd::assert::OutputAssertExt::assert(cmd.output().unwrap()).failure()
+        .stderr(predicate::str::contains("--no-browser was passed"));
+}
+
+#[test]
+fn auth_no_browser_conflicts_with_browser() {
+    let dir = project_with_dev_env();
+    Command::cargo_bin("rdc").unwrap()
+        .current_dir(dir.path())
+        .args(["auth", "dev", "--browser", "--no-browser"])
+        .assert().failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}

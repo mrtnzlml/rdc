@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 /// Files allowed to touch the real disk. `vfs.rs` is the implementation,
 /// `upgrade.rs` and `main.rs` are native-only, and `api/retry.rs`'s HTTP-trace
 /// sink appends to a file named by an environment variable and is never
-/// active in the browser.
-const ALLOWED: &[&str] = &["src/vfs.rs", "src/upgrade.rs", "src/main.rs", "src/api/retry.rs"];
+/// active in the browser. `cli/auth.rs` is native-only and reads the
+/// metadata of stdin, not of a project file.
+const ALLOWED: &[&str] = &["src/vfs.rs", "src/upgrade.rs", "src/main.rs", "src/api/retry.rs", "src/cli/auth.rs"];
 
 const NEEDLES: &[&str] = &[".exists()", ".is_dir()", ".is_file()", "OpenOptions", "DirBuilder",
     ".symlink_metadata()", ".metadata()", ".canonicalize()", ".read_dir(",
