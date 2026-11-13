@@ -219,9 +219,10 @@ color-scheme:light dark}
 *{box-sizing:border-box}
 html,body{margin:0;min-height:100%}
 body{background:var(--paper);color:var(--ink);font:15px/1.55 var(--sans);-webkit-font-smoothing:antialiased}
-#app{position:relative;min-height:100vh;overflow:hidden;isolation:isolate;padding:4.5rem 1.5rem;--col:14.5rem;--gap:15.5rem}
-main{max-width:26rem;margin:0 auto}
-.ghost{position:absolute;z-index:-1;top:9.25rem;width:var(--col);margin:0;overflow:hidden;pointer-events:none;user-select:none;
+#app{position:relative;min-height:100vh;overflow:hidden;isolation:isolate;padding:4.5rem 1.5rem;--col:14.5rem;--gap:15.5rem;
+display:flex;flex-direction:column;justify-content:center}
+main{position:relative;width:100%;max-width:26rem;margin:0 auto}
+.ghost{position:absolute;z-index:-1;top:4.75rem;width:var(--col);margin:0;overflow:hidden;pointer-events:none;user-select:none;
 font:11.5px/2 var(--mono);color:color-mix(in srgb,var(--ink) 7%,transparent);white-space:pre;
 -webkit-mask-image:linear-gradient(to right,#000 62%,transparent);mask-image:linear-gradient(to right,#000 62%,transparent)}
 .ghost b{font-weight:400;color:color-mix(in srgb,var(--ink) 15%,transparent)}
@@ -300,7 +301,9 @@ catch(_){f.submit();return}
 const next=new DOMParser().parseFromString(html,'text/html').getElementById('app');
 document.getElementById('app').replaceWith(document.adoptNode(next));
 if(next.classList.contains('saved')){
-const n=next.querySelector('.note');setTimeout(()=>{window.close();n.textContent='You can close this tab.'},3000);
+const n=next.querySelector('.note');let s=3;
+const t=setInterval(()=>{s--;if(s>0){n.textContent=`This tab closes in ${s} second${s>1?'s':''}.`;return}
+clearInterval(t);window.close();n.textContent='You can close this tab.'},1000);
 }else{arm();const t=document.getElementById('token');if(t)t.focus()}
 });
 "#;
@@ -395,7 +398,7 @@ fn page(env: &str, class: &str, left: u64, ghosts: &str, main: &str) -> String {
         "<!doctype html><html lang=en><meta charset=utf-8>\
          <meta name=viewport content='width=device-width,initial-scale=1'>\
          <title>rdc auth {env}</title><style>{STYLE}</style>\
-         <div id=app class={class} data-left={left}>{ghosts}<main>{main}</main></div>\
+         <div id=app class={class} data-left={left}><main>{ghosts}{main}</main></div>\
          <template id=timeout>{timeout}</template>\
          <script nonce={NONCE}>{SCRIPT}</script></html>",
         env = escape(env),
