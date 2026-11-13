@@ -59,7 +59,7 @@ pub async fn run(
     }
 
     if browser || source == Source::Browser {
-        let org_name = crate::cli::auth_browser::run(env_cfg, &cwd, env).await?;
+        let org_name = crate::cli::auth_browser::run(&cfg, &cwd, env).await?;
         log.event(
             Action::Auth,
             &format!("saved token to {} (org '{}')", paths.secrets_file().display(), org_name),
