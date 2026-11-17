@@ -1,6 +1,7 @@
 pub mod base_cache;
 pub mod journal;
 pub mod lockfile;
+pub mod orphans;
 pub mod snapshot;
 pub mod snapshot_store;
 pub mod store;
