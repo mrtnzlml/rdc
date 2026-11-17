@@ -143,6 +143,7 @@ pub async fn run(env_specs: Vec<String>, force: bool) -> Result<()> {
         scaffold.extend(write_env_scaffolds(&cwd, env)?);
     }
     scaffold.push(write_mapping_scaffold(&cwd)?);
+    crate::state::orphans::prune_orphans(&cwd, &cfg, false);
 
     // The per-file summary is the whole output of a regenerate-only run, and
     // the receipt a `--force` user needs elsewhere ("did it touch my README?").
@@ -1252,6 +1253,8 @@ prompt is `[k]` (force-push), `[r]` (adopt remote), `[s]` (skip),
 - `.rdc/state/<env>.lock.json` (slug↔id and base hashes; rdc owns this)
   A `pending` entry in it is the journal of a create that was in flight. It is
   normal after an interrupted sync: the next sync finishes it, so do not delete it.
+  Removing an env from `rdc.toml` makes the next `rdc sync` or `rdc init`
+  delete that env's files under `.rdc/`.
 - `.rdc/conflicts/<env>/` (the remote side of an unresolved conflict;
   either consume the changes or delete the file)
 - `secrets/<env>.secrets.json` (rdc's token cache). Its neighbour

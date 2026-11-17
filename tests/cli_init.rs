@@ -1272,3 +1272,28 @@ fn scaffolded_testkit_passes_its_own_pytest_suite() {
         String::from_utf8_lossy(&out.stdout)
     );
 }
+
+/// Re-running `rdc init` removes the `.rdc/` files of an env that is no
+/// longer in `rdc.toml`.
+#[test]
+fn init_prunes_state_of_an_env_removed_from_rdc_toml() {
+    let dir = TempDir::new().unwrap();
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["init", "--env", "dev=https://example.invalid/api/v1:1"])
+        .assert()
+        .success();
+    let orphan = dir.path().join(".rdc/state/old.lock.json");
+    std::fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+    std::fs::write(&orphan, "{}").unwrap();
+
+    Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["init", "--force"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("removed .rdc/state/old.lock.json"));
+    assert!(!orphan.exists());
+}

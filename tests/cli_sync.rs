@@ -330,6 +330,80 @@ async fn sync_restores_the_per_env_scaffolds_but_not_on_a_dry_run() {
     assert!(stub["hooks"].as_object().unwrap().is_empty(), "{stub}");
 }
 
+/// `rdc init --env dev=<server>` plus a cached token, for the prune tests.
+async fn init_dev_project(server: &MockServer) -> TempDir {
+    Mock::given(method("GET"))
+        .and(path("/api/v1/organizations/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture("organization.json")))
+        .mount(server)
+        .await;
+    mock_empty_lists_except(server, &[]).await;
+    let project = TempDir::new().unwrap();
+    assert_cmd::Command::cargo_bin("rdc")
+        .unwrap()
+        .current_dir(project.path())
+        .args(["init", "--env", &format!("dev={}/api/v1:1", server.uri())])
+        .assert()
+        .success();
+    std::fs::write(project.path().join("secrets/dev.secrets.json"), r#"{"api_token":"TEST_TOKEN"}"#)
+        .unwrap();
+    project
+}
+
+fn touch(root: &std::path::Path, rel: &str) -> std::path::PathBuf {
+    let p = root.join(rel);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, "{}").unwrap();
+    p
+}
+
+/// An env removed from `rdc.toml` leaves its `.rdc/` files behind; the next
+/// sync of any env removes them (and a dry run only reports them).
+#[tokio::test]
+async fn sync_prunes_state_of_an_env_removed_from_rdc_toml() {
+    let server = MockServer::start().await;
+    let project = init_dev_project(&server).await;
+    let orphans = [
+        touch(project.path(), ".rdc/state/old.lock.json"),
+        touch(project.path(), ".rdc/state/old.base/x.json"),
+        touch(project.path(), ".rdc/conflicts/old/a.json"),
+    ];
+
+    let _cwd_guard = cwd_lock();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    rdc::cli::sync::run("dev", false, /* dry_run = */ true, false, false, false, None)
+        .await
+        .expect("dry run should succeed");
+    for p in &orphans {
+        assert!(p.exists(), "--dry-run must keep {}", p.display());
+    }
+
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
+        .await
+        .expect("sync should succeed");
+    for p in &orphans {
+        assert!(!p.exists(), "sync should remove {}", p.display());
+    }
+    assert!(project.path().join(".rdc/state/dev.lock.json").exists());
+}
+
+/// A `rdc.toml` that fails to parse must not read as "no envs" and wipe
+/// every env's state.
+#[tokio::test]
+async fn sync_does_not_prune_when_rdc_toml_is_broken() {
+    let server = MockServer::start().await;
+    let project = init_dev_project(&server).await;
+    let orphan = touch(project.path(), ".rdc/state/old.lock.json");
+    std::fs::write(project.path().join("rdc.toml"), "not toml [").unwrap();
+
+    let _cwd_guard = cwd_lock();
+    std::env::set_current_dir(project.path()).unwrap();
+
+    assert!(rdc::cli::sync::run("dev", false, false, false, false, false, None).await.is_err());
+    assert!(orphan.exists());
+}
+
 /// A committed symlink in the env tree stops the sync before any request:
 /// otherwise push would upload the link's target as hook code.
 #[cfg(unix)]
