@@ -160,7 +160,7 @@ pub async fn run(
     // The outcome is returned so callers (and tests) can observe what the
     // cycle actually changed.
     let cwd = std::env::current_dir().context("getting current directory")?;
-    prune_orphans_at(&cwd, dry_run);
+    prune_orphans_at(&cwd, env, dry_run);
     let paths = Paths::for_env(&cwd, env);
     let _lock = crate::cli::sync::lock::EnvLock::acquire(
         &paths.env_lock(),
@@ -184,10 +184,13 @@ pub async fn run(
 
 /// Remove the `.rdc/` artifacts of envs no longer in `rdc.toml`
 /// ([`crate::state::orphans::prune_orphans`]). The CLI entry points call
-/// this once per invocation; `run_cycle` does not, so embedders never reach
-/// it. A `rdc.toml` that fails to load prunes nothing: the cycle reports it.
-pub(crate) fn prune_orphans_at(root: &std::path::Path, dry_run: bool) {
-    if let Ok(cfg) = crate::config::ProjectConfig::load(&root.join("rdc.toml")) {
+/// this before each sync; `run_cycle` does not, so embedders never reach it.
+/// A `rdc.toml` that fails to load, or does not define `env`, prunes nothing:
+/// the cycle reports it.
+pub(crate) fn prune_orphans_at(root: &std::path::Path, env: &str, dry_run: bool) {
+    if let Ok(cfg) = crate::config::ProjectConfig::load(&root.join("rdc.toml"))
+        && cfg.envs.contains_key(env)
+    {
         crate::state::orphans::prune_orphans(root, &cfg, dry_run);
     }
 }

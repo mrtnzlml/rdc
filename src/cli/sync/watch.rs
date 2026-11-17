@@ -177,7 +177,7 @@ pub async fn run_watch(
 ) -> Result<()> {
     // Construct the renderer ONCE so freshness clocks persist across cycles.
     if let Ok(cwd) = std::env::current_dir() {
-        crate::cli::sync::prune_orphans_at(&cwd, false);
+        crate::cli::sync::prune_orphans_at(&cwd, env, false);
     }
     let renderer = crate::log::Log::new(crate::cli::resolve::detect_color_mode());
     let cancel = CancelToken::new();

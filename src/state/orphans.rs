@@ -22,6 +22,11 @@ const STATE_SHAPES: [(&str, bool); 3] = [(".lock.json", false), (".lock", false)
 /// removed (or that would be), sorted; a removal failure is a warning and the
 /// path is left out.
 pub fn prune_orphans(root: &Path, cfg: &ProjectConfig, dry_run: bool) -> Vec<PathBuf> {
+    // A config that names no env is far more likely a broken `rdc.toml` (an
+    // emptied file, an `[env.dev]` typo) than a project that dropped them all.
+    if cfg.envs.is_empty() {
+        return Vec::new();
+    }
     let rdc = root.join(".rdc");
     let state = rdc.join("state");
     let conflicts = rdc.join("conflicts");
@@ -52,8 +57,21 @@ pub fn prune_orphans(root: &Path, cfg: &ProjectConfig, dry_run: bool) -> Vec<Pat
         }
     }
 
+    let rel = |p: &Path| p.strip_prefix(root).unwrap_or(p).display().to_string();
     let mut targets: Vec<PathBuf> = Vec::new();
     for (env, paths) in by_env {
+        // A lockfile still journaling a create keeps the only record of an
+        // object that may exist remotely; dropping it means a re-added env
+        // POSTs a duplicate. Keep the whole env until a sync finishes it.
+        let lockfile = state.join(format!("{env}.lock.json"));
+        if has_pending_create(&lockfile) {
+            eprintln!(
+                "warning: kept the files of env '{env}' under .rdc/: {} records an \
+                 unfinished create. Re-add the env and sync it, or delete them by hand.",
+                rel(&lockfile)
+            );
+            continue;
+        }
         let lock_path = state.join(format!("{env}.lock"));
         // Only probe a lock that exists: `try_acquire` creates the file. The
         // probe is released before the removal, because Windows cannot delete
@@ -73,7 +91,6 @@ pub fn prune_orphans(root: &Path, cfg: &ProjectConfig, dry_run: bool) -> Vec<Pat
     }
     targets.sort();
 
-    let rel = |p: &Path| p.strip_prefix(root).unwrap_or(p).display().to_string();
     let mut done = Vec::new();
     for path in targets {
         if dry_run {
@@ -98,6 +115,18 @@ pub fn prune_orphans(root: &Path, cfg: &ProjectConfig, dry_run: bool) -> Vec<Pat
         let _ = crate::vfs::remove_dir(&conflicts);
     }
     done
+}
+
+/// Whether the lockfile at `path` carries a `pending` create journal. An
+/// unreadable or unparsable file counts as one, so doubt keeps it.
+fn has_pending_create(path: &Path) -> bool {
+    if !crate::vfs::exists(path) {
+        return false;
+    }
+    crate::vfs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .is_none_or(|v| v.get("pending").is_some_and(|p| !p.is_null()))
 }
 
 #[cfg(test)]
@@ -237,6 +266,28 @@ mod tests {
         touch(d.path(), ".rdc/state/dev.lock.json");
         prune_orphans(d.path(), &cfg(), false);
         assert!(d.path().join(".rdc/state/dev.lock.json").exists());
+    }
+
+    #[test]
+    fn a_config_with_no_envs_prunes_nothing() {
+        let d = TempDir::new().unwrap();
+        let expected = orphan_set(d.path());
+        assert!(prune_orphans(d.path(), &ProjectConfig::default(), false).is_empty());
+        for p in &expected {
+            assert!(p.exists(), "{} should survive an env-less config", p.display());
+        }
+    }
+
+    #[test]
+    fn keeps_a_lockfile_with_a_pending_create() {
+        let d = TempDir::new().unwrap();
+        let lf = d.path().join(".rdc/state/old.lock.json");
+        std::fs::create_dir_all(lf.parent().unwrap()).unwrap();
+        std::fs::write(&lf, r#"{"version":4,"pending":{"ops":[]}}"#).unwrap();
+        touch(d.path(), ".rdc/conflicts/old/a.json");
+        assert!(prune_orphans(d.path(), &cfg(), false).is_empty());
+        assert!(lf.exists());
+        assert!(d.path().join(".rdc/conflicts/old/a.json").exists());
     }
 
     #[test]

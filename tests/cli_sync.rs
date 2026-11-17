@@ -404,6 +404,27 @@ async fn sync_does_not_prune_when_rdc_toml_is_broken() {
     assert!(orphan.exists());
 }
 
+/// A `rdc.toml` that parses but defines no env (empty, or a `[env.dev]`
+/// typo) must not prune the state of the env being synced.
+#[tokio::test]
+async fn sync_does_not_prune_when_rdc_toml_lacks_the_synced_env() {
+    let server = MockServer::start().await;
+    let project = init_dev_project(&server).await;
+    let _cwd_guard = cwd_lock();
+    std::env::set_current_dir(project.path()).unwrap();
+    rdc::cli::sync::run("dev", false, false, false, false, false, None)
+        .await
+        .expect("first sync should succeed");
+    let lockfile = project.path().join(".rdc/state/dev.lock.json");
+    assert!(lockfile.exists());
+    let orphan = touch(project.path(), ".rdc/state/old.lock.json");
+    std::fs::write(project.path().join("rdc.toml"), "").unwrap();
+
+    assert!(rdc::cli::sync::run("dev", false, false, false, false, false, None).await.is_err());
+    assert!(lockfile.exists(), "the synced env's lockfile must survive");
+    assert!(orphan.exists());
+}
+
 /// A committed symlink in the env tree stops the sync before any request:
 /// otherwise push would upload the link's target as hook code.
 #[cfg(unix)]
