@@ -124,12 +124,12 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.cargo/bin/wasm-bindgen
-          key: wasm-bindgen-cli-${{ runner.os }}-0.2.129
+          key: wasm-bindgen-cli-${{ runner.os }}-0.2.130
 
       - name: Install wasm-bindgen-cli
         run: |
-          if [ "$(wasm-bindgen --version 2>/dev/null)" != "wasm-bindgen 0.2.129" ]; then
-            cargo install wasm-bindgen-cli --version 0.2.129 --locked
+          if [ "$(wasm-bindgen --version 2>/dev/null)" != "wasm-bindgen 0.2.130" ]; then
+            cargo install wasm-bindgen-cli --version 0.2.130 --locked
           fi
 
       - name: Package

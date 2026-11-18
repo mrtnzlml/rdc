@@ -60,7 +60,7 @@ wasm-bindgen-futures = "0.4.79"
 [dev-dependencies]
 assert_cmd = "2"
 # Test-only state backends store the snapshot as base64 in a JSON document.
-base64 = "0.22"
+base64 = "0.23"
 http = "1"
 predicates = "3"
 pretty_assertions = "1"
