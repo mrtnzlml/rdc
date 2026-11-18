@@ -184,7 +184,11 @@ rdc applies the strategy. Otherwise rdc writes the remote copy to
 on the next sync.
 
 To delete a remote object, remove its local file and run sync with
---allow-deletes. Only objects recorded in the lockfile are deleted."#;
+--allow-deletes. Only objects recorded in the lockfile are deleted.
+
+Before the first step, rdc removes .rdc/state/<env>.* and .rdc/conflicts/<env>/
+for every env that is no longer in rdc.toml, and the obsolete .rdc/cache.
+--dry-run only lists them."#;
 
 const MIGRATE_LONG_ABOUT: &str = r#"Copy a source env's snapshot onto a target env's snapshot. Makes no remote
 calls.
