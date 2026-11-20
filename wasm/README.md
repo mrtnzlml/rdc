@@ -184,7 +184,8 @@ bridge's DTOs in camelCase. Differences from the desktop app:
     See `docs/superpowers/specs/2026-11-03-wasm-migrate-design.md` for why.
 - **Migrate**: `migrate(src, tgt, opts, onLog)` runs `rdc migrate` on the tree
   (`cli::migrate::run_at`). `opts` — `dryRun`, `mirror`, `allowRecreate`
-  (needs `mirror`), `only` (selectors) and `carry` (`"scoreThresholds"`,
+  (needs `mirror`), `only` (selectors; an `@<name>` reads `releases/<name>.txt`,
+  which the host must write into the tree first) and `carry` (`"scoreThresholds"`,
   `"emailPrefixes"`, `"automation"`, `"all"`) — are the CLI's flags; any other
   option throws. It claims both envs, as a sync claims one. With a state
   store set, it loads both envs' state first, holds the target org's Web Lock,
