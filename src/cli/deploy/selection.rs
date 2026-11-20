@@ -3,14 +3,15 @@
 //! pairs participate in the migration.
 //!
 //! The selection lives in memory for the duration of the command — it
-//! does not touch the mapping file, lockfile, overlay, or any other
-//! persistent state. Re-running with the same flags on the same snapshots
-//! yields a byte-identical plan.
+//! never writes the mapping file, lockfile, overlay, or any other
+//! persistent state. It reads only the `releases/<name>.txt` files that
+//! `@<name>` selectors name. Re-running with the same flags on the same
+//! snapshots and release files yields a byte-identical plan.
 
 // `--only` accepts any kind that migrate operates on. The dep-order list
 // is the single source of truth so adding a kind extends what --only accepts.
 use crate::paths::Paths;
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -63,15 +64,15 @@ pub(crate) fn resolve(
         return Ok(None);
     }
 
-    let matchers: Vec<Matcher> = raw_matchers
-        .iter()
-        .map(|s| Matcher::parse(s))
+    let matchers: Vec<(Matcher, String)> = expand_releases(raw_matchers, src_paths)?
+        .into_iter()
+        .map(|(s, from)| Ok((Matcher::parse(&s).map_err(|e| anyhow!("{e}{from}"))?, from)))
         .collect::<Result<_>>()?;
 
     let candidates = build_candidate_set(src_paths, tgt_paths)?;
 
     let mut items: BTreeSet<(String, String)> = BTreeSet::new();
-    for m in &matchers {
+    for (m, from) in &matchers {
         let mut hits = 0usize;
         for (kind, slug) in &candidates {
             if m.matches(kind, slug) {
@@ -81,7 +82,7 @@ pub(crate) fn resolve(
         }
         if hits == 0 {
             bail!(
-                "--only '{}' matched 0 objects across the local snapshots. \
+                "--only '{}'{from} matched 0 objects across the local snapshots. \
                  (Check the spelling against `envs/<env>/` in your project tree.)",
                 m.raw
             );
@@ -89,6 +90,43 @@ pub(crate) fn resolve(
     }
 
     Ok(Some(Selection { items }))
+}
+
+/// Replace each `@<name>` with the selectors in `releases/<name>.txt` at the
+/// project root, one per line. Blank lines and `#` comments are skipped. Each
+/// selector comes with where it was read, `""` for a CLI argument, for errors.
+/// An empty file is an error, because an empty selector list means "migrate
+/// the whole snapshot". A release cannot include another release.
+fn expand_releases(raw: &[String], paths: &Paths) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for s in raw {
+        let Some(name) = s.strip_prefix('@') else {
+            out.push((s.clone(), String::new()));
+            continue;
+        };
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            bail!("invalid --only '{s}': a release name uses only letters, digits, '-' and '_'");
+        }
+        let rel = format!("releases/{name}.txt");
+        let text = crate::vfs::read_to_string(paths.root().join(&rel))
+            .with_context(|| format!("--only '{s}': cannot read {rel}"))?;
+        let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+        let before = out.len();
+        for (i, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if line.starts_with('@') {
+                bail!("{rel} line {}: '{line}': a release file cannot include another release", i + 1);
+            }
+            out.push((line.to_string(), format!(" ({rel} line {})", i + 1)));
+        }
+        if out.len() == before {
+            bail!("--only '{s}': {rel} lists no selectors");
+        }
+    }
+    Ok(out)
 }
 
 fn build_candidate_set(src_paths: &Paths, tgt_paths: &Paths) -> Result<BTreeSet<(String, String)>> {
@@ -634,6 +672,92 @@ mod selection_tests {
             .unwrap()
             .unwrap();
         assert!(sel.contains("hooks", "only-in-tgt"));
+    }
+
+    fn write_release(root: &Path, name: &str, body: &str) {
+        let dir = root.join("releases");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("{name}.txt")), body).unwrap();
+    }
+
+    #[test]
+    fn resolve_expands_release_file() {
+        let tmp = TempDir::new().unwrap();
+        let p = make_env(tmp.path(), "test");
+        write_release(tmp.path(), "feature1", "hooks/validator-invoices\n\nrules/*\n");
+        let sel = resolve(&["@feature1".to_string()], &p, &p).unwrap().unwrap();
+        assert_eq!(sel.items.len(), 2);
+        assert!(sel.contains("hooks", "validator-invoices"));
+        assert!(sel.contains("rules", "check-totals"));
+    }
+
+    #[test]
+    fn resolve_missing_release_file_errors() {
+        let tmp = TempDir::new().unwrap();
+        let p = make_env(tmp.path(), "test");
+        let err = resolve(&["@nope".to_string()], &p, &p).unwrap_err();
+        assert!(format!("{err:#}").contains("@nope"), "got: {err:#}");
+    }
+
+    /// An empty release must not fall through to "no filter", which would
+    /// migrate the whole snapshot.
+    #[test]
+    fn resolve_empty_release_file_errors() {
+        let tmp = TempDir::new().unwrap();
+        let p = make_env(tmp.path(), "test");
+        write_release(tmp.path(), "empty", "\n");
+        let err = resolve(&["@empty".to_string()], &p, &p).unwrap_err();
+        assert!(format!("{err:#}").contains("lists no selectors"), "got: {err:#}");
+    }
+
+    #[test]
+    fn resolve_release_line_matching_nothing_errors() {
+        let tmp = TempDir::new().unwrap();
+        let p = make_env(tmp.path(), "test");
+        write_release(tmp.path(), "stale", "hooks/renamed-away\n");
+        let err = resolve(&["@stale".to_string()], &p, &p).unwrap_err();
+        assert!(format!("{err:#}").contains("matched 0 objects"), "got: {err:#}");
+    }
+
+    #[test]
+    fn resolve_release_skips_comments_and_bom() {
+        let tmp = TempDir::new().unwrap();
+        let p = make_env(tmp.path(), "test");
+        write_release(tmp.path(), "f", "\u{feff}hooks/sftp-import\n# ticket 42: hooks/x\n");
+        let sel = resolve(&["@f".to_string()], &p, &p).unwrap().unwrap();
+        assert_eq!(sel.items.len(), 1);
+        assert!(sel.contains("hooks", "sftp-import"));
+    }
+
+    #[test]
+    fn resolve_release_errors_name_file_and_line() {
+        let tmp = TempDir::new().unwrap();
+        let p = make_env(tmp.path(), "test");
+        write_release(tmp.path(), "b", "hooks/sftp-import\nhooks/renamed-away\n");
+        let err = resolve(&["@b".to_string()], &p, &p).unwrap_err();
+        assert!(format!("{err:#}").contains("releases/b.txt line 2"), "got: {err:#}");
+        write_release(tmp.path(), "c", "hooks\n");
+        let err = resolve(&["@c".to_string()], &p, &p).unwrap_err();
+        assert!(format!("{err:#}").contains("releases/c.txt line 1"), "got: {err:#}");
+    }
+
+    #[test]
+    fn resolve_rejects_release_names_that_leave_the_dir() {
+        let tmp = TempDir::new().unwrap();
+        let p = make_env(tmp.path(), "test");
+        for bad in ["@", "@../x", "@/tmp/x", "@a\\b"] {
+            let err = resolve(&[bad.to_string()], &p, &p).unwrap_err();
+            assert!(format!("{err:#}").contains("release name"), "{bad}: {err:#}");
+        }
+    }
+
+    #[test]
+    fn resolve_rejects_nested_release() {
+        let tmp = TempDir::new().unwrap();
+        let p = make_env(tmp.path(), "test");
+        write_release(tmp.path(), "outer", "@inner\n");
+        let err = resolve(&["@outer".to_string()], &p, &p).unwrap_err();
+        assert!(format!("{err:#}").contains("cannot include another release"), "got: {err:#}");
     }
 
     #[test]

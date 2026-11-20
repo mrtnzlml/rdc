@@ -440,6 +440,9 @@ Selector forms:
 | `<kind>/<slug>` | `hooks/validator-invoices` | exact `(kind, slug)` |
 | `<kind>/<glob>` | `schemas/cost-*` | `*` glob in the slug segment |
 | `*/<glob>` | `*/cost-invoices` | any kind whose slug matches |
+| `@<name>` | `@feature1` | every selector in `releases/<name>.txt`, one per line |
+
+A release file keeps the scope of a feature in git, so it is reviewed with the change. Lines starting with `#` are comments. A missing or empty file is an error, and so is a line that matches nothing or names another release.
 
 Code sidecars travel with their object: selecting `hooks/<slug>` carries `hooks/<slug>.py`, selecting `schemas/<q>` carries the queue's `formulas/*.py`.
 
