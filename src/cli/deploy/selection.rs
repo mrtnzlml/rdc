@@ -10,7 +10,7 @@
 // `--only` accepts any kind that migrate operates on. The dep-order list
 // is the single source of truth so adding a kind extends what --only accepts.
 use crate::paths::Paths;
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -63,6 +63,7 @@ pub(crate) fn resolve(
         return Ok(None);
     }
 
+    let raw_matchers = expand_releases(raw_matchers, src_paths)?;
     let matchers: Vec<Matcher> = raw_matchers
         .iter()
         .map(|s| Matcher::parse(s))
@@ -89,6 +90,28 @@ pub(crate) fn resolve(
     }
 
     Ok(Some(Selection { items }))
+}
+
+/// Replace each `@<name>` with the selectors in `.rdc/releases/<name>.txt`,
+/// one per line; blank lines are skipped. An empty file is an error, because
+/// an empty selector list means "migrate the whole snapshot".
+fn expand_releases(raw: &[String], paths: &Paths) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for s in raw {
+        let Some(name) = s.strip_prefix('@') else {
+            out.push(s.clone());
+            continue;
+        };
+        let file = paths.root().join(".rdc").join("releases").join(format!("{name}.txt"));
+        let text = crate::vfs::read_to_string(&file)
+            .with_context(|| format!("--only '{s}': cannot read {}", file.display()))?;
+        let before = out.len();
+        out.extend(text.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from));
+        if out.len() == before {
+            bail!("--only '{s}': {} lists no selectors", file.display());
+        }
+    }
+    Ok(out)
 }
 
 fn build_candidate_set(src_paths: &Paths, tgt_paths: &Paths) -> Result<BTreeSet<(String, String)>> {
@@ -634,6 +657,51 @@ mod selection_tests {
             .unwrap()
             .unwrap();
         assert!(sel.contains("hooks", "only-in-tgt"));
+    }
+
+    fn write_release(root: &Path, name: &str, body: &str) {
+        let dir = root.join(".rdc/releases");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("{name}.txt")), body).unwrap();
+    }
+
+    #[test]
+    fn resolve_expands_release_file() {
+        let tmp = TempDir::new().unwrap();
+        let p = make_env(tmp.path(), "test");
+        write_release(tmp.path(), "feature1", "hooks/validator-invoices\n\nrules/*\n");
+        let sel = resolve(&["@feature1".to_string()], &p, &p).unwrap().unwrap();
+        assert_eq!(sel.items.len(), 2);
+        assert!(sel.contains("hooks", "validator-invoices"));
+        assert!(sel.contains("rules", "check-totals"));
+    }
+
+    #[test]
+    fn resolve_missing_release_file_errors() {
+        let tmp = TempDir::new().unwrap();
+        let p = make_env(tmp.path(), "test");
+        let err = resolve(&["@nope".to_string()], &p, &p).unwrap_err();
+        assert!(format!("{err:#}").contains("@nope"), "got: {err:#}");
+    }
+
+    /// An empty release must not fall through to "no filter", which would
+    /// migrate the whole snapshot.
+    #[test]
+    fn resolve_empty_release_file_errors() {
+        let tmp = TempDir::new().unwrap();
+        let p = make_env(tmp.path(), "test");
+        write_release(tmp.path(), "empty", "\n");
+        let err = resolve(&["@empty".to_string()], &p, &p).unwrap_err();
+        assert!(format!("{err:#}").contains("lists no selectors"), "got: {err:#}");
+    }
+
+    #[test]
+    fn resolve_release_line_matching_nothing_errors() {
+        let tmp = TempDir::new().unwrap();
+        let p = make_env(tmp.path(), "test");
+        write_release(tmp.path(), "stale", "hooks/renamed-away\n");
+        let err = resolve(&["@stale".to_string()], &p, &p).unwrap_err();
+        assert!(format!("{err:#}").contains("matched 0 objects"), "got: {err:#}");
     }
 
     #[test]
