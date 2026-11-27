@@ -410,6 +410,8 @@ pub enum Command {
         /// matches within a segment: `hooks/*`, `schemas/cost-*`,
         /// `*/cost-invoices`. A selector that matches nothing is an error.
         /// Related objects, such as a queue's schema, are not added.
+        /// `@<name>` reads the selectors from `releases/<name>.txt`,
+        /// one per line.
         #[arg(long = "only", value_name = "SELECTOR", action = clap::ArgAction::Append)]
         only: Vec<String>,
         /// Take these field groups from the source env instead of keeping
